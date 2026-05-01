@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/triple-store"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+authors = ["jlowens"]
+publish = false
+
+[workspace.dependencies]
+async-channel = "2"
+parking_lot = "0.12"
+thiserror = "2"
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Add specific lint policies as the codebase grows.
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
