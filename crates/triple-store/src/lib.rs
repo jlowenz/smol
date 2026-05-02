@@ -8,6 +8,7 @@
 pub mod fact;
 pub mod fact_store;
 pub mod id;
+pub mod in_memory_store;
 pub mod intern;
 pub mod pattern;
 pub mod predicates;

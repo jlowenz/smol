@@ -43,14 +43,14 @@ pub trait FactStore: Send + Sync {
     /// Requires: `tx_id` is active.
     /// Ensures: any prior open fact at `(subject, predicate, asserter)` is
     /// closed at the new fact's `valid.start`; a new open fact is added.
-    fn assert_single(&self, tx_id: TxId, fact: &PendingFact) -> Result<(), Error>;
+    fn assert_single(&self, tx_id: TxId, fact: PendingFact) -> Result<(), Error>;
 
     /// Assert a fact under `Cardinality::Set`.
     ///
     /// Requires: `tx_id` is active.
     /// Ensures: if `(subject, predicate, asserter, object)` is already open,
     /// no change; else a new open fact is added. Distinct objects coexist.
-    fn assert_set(&self, tx_id: TxId, fact: &PendingFact) -> Result<(), Error>;
+    fn assert_set(&self, tx_id: TxId, fact: PendingFact) -> Result<(), Error>;
 
     /// Assert a fact under `Cardinality::Indexed`.
     ///
@@ -61,7 +61,7 @@ pub trait FactStore: Send + Sync {
     fn assert_indexed(
         &self,
         tx_id: TxId,
-        fact: &PendingFact,
+        fact: PendingFact,
         index_key: OrderingKey,
     ) -> Result<(), Error>;
 
