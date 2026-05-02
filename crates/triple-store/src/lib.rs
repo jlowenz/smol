@@ -6,8 +6,10 @@
 //! The `FactStore` trait and `Store` API are added in subsequent phases.
 
 pub mod fact;
+pub mod fact_store;
 pub mod id;
 pub mod intern;
 pub mod pattern;
+pub mod predicates;
 pub mod term;
 pub mod time;
