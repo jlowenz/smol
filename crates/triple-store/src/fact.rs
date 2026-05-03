@@ -7,7 +7,7 @@
 use crate::id::{EntityId, TxId};
 use crate::predicates::OrderingKey;
 use crate::term::{Predicate, Term};
-use crate::time::Interval;
+use crate::time::{Interval, Timestamp};
 
 /// A committed fact: triple + asserter + bitemporal metadata + optional
 /// ordering key (PRD §2.2).
@@ -52,6 +52,37 @@ pub struct PendingFact {
     pub object: Term,
     pub asserter: EntityId,
     pub valid: Option<Interval>,
+}
+
+impl PendingFact {
+    /// Materialize this `PendingFact` as a committed `Fact` at `commit_time`.
+    ///
+    /// `index_key` is `Some(_)` for `Cardinality::Indexed`, `None` otherwise.
+    /// `asserted` is set to `Interval::new_open(commit_time)`. `valid` is
+    /// taken as-is when `Some`, otherwise defaulted to
+    /// `Interval::new_open(commit_time)`.
+    ///
+    /// Consumes `self` because the typical caller (the commit path) has no
+    /// further use for the `PendingFact` after materializing.
+    pub fn into_fact(
+        self,
+        commit_time: Timestamp,
+        tx_id: TxId,
+        index_key: Option<OrderingKey>,
+    ) -> Fact {
+        Fact {
+            subject: self.subject,
+            predicate: self.predicate,
+            object: self.object,
+            asserter: self.asserter,
+            valid: self
+                .valid
+                .unwrap_or_else(|| Interval::new_open(commit_time)),
+            asserted: Interval::new_open(commit_time),
+            index_key,
+            tx_id,
+        }
+    }
 }
 
 #[cfg(test)]
