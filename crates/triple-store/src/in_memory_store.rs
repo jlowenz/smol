@@ -14,7 +14,8 @@ use parking_lot::RwLock;
 use crate::fact::{Fact, PendingFact};
 use crate::fact_store::{CommitChange, Error};
 use crate::id::{EntityId, TxId};
-use crate::term::Predicate;
+use crate::predicates::OrderingKey;
+use crate::term::{Predicate, Term};
 use crate::time::{Clock, SystemClock};
 
 const DEFAULT_SHARD_COUNT: usize = 16;
@@ -37,11 +38,17 @@ struct Shard {
 ///
 /// Each variant carries its cardinality in the type, so commit can dispatch
 /// without consulting the predicate registry (which is above the FactStore
-/// boundary, per PRD §3.2). `AssertSet`, `AssertIndexed`, and `Retract` land
-/// in subsequent chunks.
+/// boundary, per PRD §3.2). `Retract` variants land in a subsequent chunk;
+/// once added, mixed `Assert`/`Retract` prefixes will satisfy the lint.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TentativeOp {
     AssertSingle(PendingFact),
+    AssertSet(PendingFact),
+    AssertIndexed {
+        fact: PendingFact,
+        index_key: OrderingKey,
+    },
 }
 
 /// Per-transaction tentative buffer. A single lock is acceptable in v0: each
@@ -122,12 +129,15 @@ impl InMemoryStore {
     /// Commit a transaction: drain its tentative ops, apply them to the
     /// per-shard fact buckets, and return one `CommitChange` per *kept* op.
     ///
-    /// **Collapse-to-last (Single cardinality).** Within one transaction, the
-    /// only externally observable state for a `(subject, predicate, asserter)`
-    /// key is the *final* asserted value — intermediate values during the tx
-    /// were tentative and never visible. Commit therefore keeps only the last
-    /// `TentativeOp::AssertSingle` per key (insertion order preserved across
-    /// distinct keys), discarding any earlier asserts for the same key.
+    /// **Collapse-to-last (Single and Indexed cardinality).** Within one
+    /// transaction, the only externally observable state for a given identity
+    /// key is the *final* asserted value. Commit keeps only the last op per
+    /// key, discarding earlier ones for the same key.
+    ///
+    /// **Deduplication (Set cardinality).** Within one transaction, multiple
+    /// asserts for the same `(subject, predicate, asserter, object)` have the
+    /// same observable effect; only the last is applied. If the fact is already
+    /// open in the store, no `CommitChange` is produced.
     ///
     /// Requires: `tx_id` is an active transaction.
     /// Ensures: the transaction is no longer active after this call (subsequent
@@ -135,7 +145,8 @@ impl InMemoryStore {
     /// `Error::UnknownTransaction`); each *kept* tentative assert is reflected
     /// as a `CommitChange::Asserted` (no prior open fact at the key) or
     /// `CommitChange::Updated` (a prior open fact existed and has been closed
-    /// at the new fact's `valid.start`).
+    /// at the new fact's `valid.start`). Set asserts against already-open facts
+    /// produce no `CommitChange`.
     pub fn commit(&self, tx_id: TxId) -> Result<Vec<CommitChange>, Error> {
         // Drain the tentative ops atomically; any concurrent operation on
         // this tx_id afterward will fail with UnknownTransaction.
@@ -146,60 +157,125 @@ impl InMemoryStore {
             .remove(&tx_id)
             .ok_or(Error::UnknownTransaction(tx_id))?;
 
-        // First pass: record the index of the last Assert per
-        // (subject, predicate, asserter) key, so we can collapse intermediate
-        // asserts in the second pass.
-        let mut last_assert_idx: HashMap<(EntityId, Predicate, EntityId), usize> =
+        // First pass: for each cardinality, record the index of the last op
+        // per identity key so intermediate duplicates can be skipped.
+        let mut last_single_idx: HashMap<(EntityId, Predicate, EntityId), usize> =
             HashMap::with_capacity(ops.len());
+        let mut last_set_idx: HashMap<(EntityId, Predicate, EntityId, Term), usize> =
+            HashMap::with_capacity(ops.len());
+        let mut last_indexed_idx: HashMap<(EntityId, Predicate, EntityId, OrderingKey), usize> =
+            HashMap::with_capacity(ops.len());
+
         for (i, op) in ops.iter().enumerate() {
             match op {
                 TentativeOp::AssertSingle(p) => {
-                    last_assert_idx.insert((p.subject, p.predicate, p.asserter), i);
+                    last_single_idx.insert((p.subject, p.predicate, p.asserter), i);
+                }
+                TentativeOp::AssertSet(p) => {
+                    last_set_idx.insert((p.subject, p.predicate, p.asserter, p.object.clone()), i);
+                }
+                TentativeOp::AssertIndexed { fact: p, index_key } => {
+                    last_indexed_idx.insert((p.subject, p.predicate, p.asserter, *index_key), i);
                 }
             }
         }
 
-        let commit_time = self.clock.now();
-        let mut changes = Vec::with_capacity(last_assert_idx.len());
+        // Collect the selected indices (one per identity key, the last occurrence).
+        // No sort needed: selected ops have disjoint identity keys and share a
+        // single commit timestamp, so application order has no semantic effect.
+        let selected: Vec<usize> = last_single_idx
+            .values()
+            .chain(last_set_idx.values())
+            .chain(last_indexed_idx.values())
+            .copied()
+            .collect();
 
-        // Second pass: apply only the last assert per key, in original order.
-        for (i, op) in ops.into_iter().enumerate() {
+        let commit_time = self.clock.now();
+        let mut changes = Vec::with_capacity(selected.len());
+
+        // Wrap in Option so each selected element can be moved out by index
+        // without consuming the whole vec. The unwrap is safe: every index in
+        // `selected` was produced by the first pass over this same `ops` slice.
+        let mut ops: Vec<Option<TentativeOp>> = ops.into_iter().map(Some).collect();
+
+        // Second pass: visit only the selected ops, in original insertion order.
+        for op in selected.into_iter().map(|i| ops[i].take().unwrap()) {
             match op {
                 TentativeOp::AssertSingle(pending) => {
-                    let key = (pending.subject, pending.predicate, pending.asserter);
-                    if last_assert_idx[&key] != i {
-                        continue;
-                    }
-
                     let new_fact = pending.into_fact(commit_time, tx_id, None);
-                    let shard = self.shard_for(new_fact.subject);
-                    let mut facts = shard.facts.write();
-                    let bucket = facts
-                        .entry((new_fact.subject, new_fact.predicate))
-                        .or_default();
-
-                    // Single cardinality: at most one open fact per
-                    // (subject, predicate, asserter). Locate it (if any) and
-                    // close its valid interval at the new fact's start.
-                    let prior_idx = bucket
-                        .iter()
-                        .position(|f| f.valid.is_open() && f.asserter == new_fact.asserter);
-
-                    match prior_idx {
-                        Some(idx) => {
-                            bucket[idx].valid.close(new_fact.valid.start);
-                            let closed = bucket[idx].clone();
-                            bucket.push(new_fact.clone());
-                            changes.push(CommitChange::Updated {
-                                closed,
-                                opened: new_fact,
-                            });
+                    let change = self.with_bucket(new_fact.subject, new_fact.predicate, |bucket| {
+                        // Single: at most one open fact per (subject, predicate, asserter).
+                        let prior_idx = bucket
+                            .iter()
+                            .position(|f| f.valid.is_open() && f.asserter == new_fact.asserter);
+                        match prior_idx {
+                            Some(idx) => {
+                                bucket[idx].valid.close(new_fact.valid.start);
+                                let closed = bucket[idx].clone();
+                                bucket.push(new_fact.clone());
+                                Some(CommitChange::Updated {
+                                    closed,
+                                    opened: new_fact,
+                                })
+                            }
+                            None => {
+                                bucket.push(new_fact.clone());
+                                Some(CommitChange::Asserted { fact: new_fact })
+                            }
                         }
-                        None => {
+                    });
+                    changes.extend(change);
+                }
+
+                TentativeOp::AssertSet(pending) => {
+                    let new_fact = pending.into_fact(commit_time, tx_id, None);
+                    let change = self.with_bucket(new_fact.subject, new_fact.predicate, |bucket| {
+                        // Set: idempotent on (subject, predicate, asserter, object).
+                        // If this exact tuple is already open, produce no change.
+                        let already_open = bucket.iter().any(|f| {
+                            f.valid.is_open()
+                                && f.asserter == new_fact.asserter
+                                && f.object == new_fact.object
+                        });
+                        if already_open {
+                            None
+                        } else {
                             bucket.push(new_fact.clone());
-                            changes.push(CommitChange::Asserted { fact: new_fact });
+                            Some(CommitChange::Asserted { fact: new_fact })
                         }
-                    }
+                    });
+                    changes.extend(change);
+                }
+
+                TentativeOp::AssertIndexed {
+                    fact: pending,
+                    index_key,
+                } => {
+                    let new_fact = pending.into_fact(commit_time, tx_id, Some(index_key));
+                    let change = self.with_bucket(new_fact.subject, new_fact.predicate, |bucket| {
+                        // Indexed: at most one open fact per (subject, predicate, asserter, index_key).
+                        let prior_idx = bucket.iter().position(|f| {
+                            f.valid.is_open()
+                                && f.asserter == new_fact.asserter
+                                && f.index_key == Some(index_key)
+                        });
+                        match prior_idx {
+                            Some(idx) => {
+                                bucket[idx].valid.close(new_fact.valid.start);
+                                let closed = bucket[idx].clone();
+                                bucket.push(new_fact.clone());
+                                Some(CommitChange::Updated {
+                                    closed,
+                                    opened: new_fact,
+                                })
+                            }
+                            None => {
+                                bucket.push(new_fact.clone());
+                                Some(CommitChange::Asserted { fact: new_fact })
+                            }
+                        }
+                    });
+                    changes.extend(change);
                 }
             }
         }
@@ -227,11 +303,71 @@ impl InMemoryStore {
         Ok(())
     }
 
+    /// Append a `Set`-cardinality assertion to the tentative buffer for `tx_id`.
+    ///
+    /// Idempotency (`(subject, predicate, asserter, object)` already open → no
+    /// change) is enforced at commit time, keeping the assert path O(1) and
+    /// consistent with the other cardinalities.
+    ///
+    /// Requires: `tx_id` is an active transaction.
+    /// Ensures: the assertion is visible to `commit(tx_id)` and discarded by
+    /// `rollback(tx_id)`.
+    pub fn assert_set(&self, tx_id: TxId, fact: PendingFact) -> Result<(), Error> {
+        let mut buf = self.tentative.by_tx.write();
+        let entries = buf
+            .get_mut(&tx_id)
+            .ok_or(Error::UnknownTransaction(tx_id))?;
+        entries.push(TentativeOp::AssertSet(fact));
+        Ok(())
+    }
+
+    /// Append an `Indexed`-cardinality assertion to the tentative buffer for
+    /// `tx_id`.
+    ///
+    /// `index_key` identifies the slot within the asserter's namespace: two
+    /// indexed facts with distinct keys coexist; two with the same key obey
+    /// collapse-to-last within the tx, and supersession (Updated) at commit.
+    ///
+    /// Requires: `tx_id` is an active transaction.
+    /// Ensures: the assertion (with `index_key`) is visible to `commit(tx_id)`
+    /// and discarded by `rollback(tx_id)`. Supersession of any prior open fact
+    /// at `(subject, predicate, asserter, index_key)` is performed at commit.
+    pub fn assert_indexed(
+        &self,
+        tx_id: TxId,
+        fact: PendingFact,
+        index_key: OrderingKey,
+    ) -> Result<(), Error> {
+        let mut buf = self.tentative.by_tx.write();
+        let entries = buf
+            .get_mut(&tx_id)
+            .ok_or(Error::UnknownTransaction(tx_id))?;
+        entries.push(TentativeOp::AssertIndexed { fact, index_key });
+        Ok(())
+    }
+
     // === Internal helpers ===
 
     /// Hash-mod the entity to its owning shard.
     fn shard_for(&self, entity: EntityId) -> &Shard {
         &self.shards[(entity.0 as usize) % self.shards.len()]
+    }
+
+    /// Acquire a write lock on `subject`'s shard, locate (or create) the
+    /// `(subject, predicate)` bucket, and call `f` with a mutable reference
+    /// to that bucket. The lock is held for the duration of `f` and released
+    /// on return.
+    ///
+    /// The closure-based design is required by Rust's borrowing rules: returning
+    /// `&mut Vec<Fact>` directly would require the caller to hold the
+    /// `RwLockWriteGuard` explicitly, and there is no way to return both the
+    /// guard and a reference into its contents from a single function.
+    fn with_bucket<F, R>(&self, subject: EntityId, predicate: Predicate, f: F) -> R
+    where
+        F: FnOnce(&mut Vec<Fact>) -> R,
+    {
+        let mut facts = self.shard_for(subject).facts.write();
+        f(facts.entry((subject, predicate)).or_default())
     }
 }
 
@@ -528,6 +664,206 @@ mod tests {
 
         assert_eq!(by_subject[&EntityId(1)].object, Term::Int(43));
         assert_eq!(by_subject[&EntityId(2)].object, Term::Int(20));
+    }
+
+    // --- Set cardinality ---
+
+    #[test]
+    fn assert_set_unknown_tx_errors() {
+        let s = InMemoryStore::new();
+        let bogus = TxId(999);
+        let err = s.assert_set(bogus, pending(1, 1, 0)).unwrap_err();
+        assert_eq!(err, Error::UnknownTransaction(bogus));
+    }
+
+    #[test]
+    fn commit_set_first_assert_yields_asserted() {
+        let clock = TickClock::new(100);
+        let s = InMemoryStore::with_clock(clock.clone());
+        let tx = s.begin_tx();
+        s.assert_set(tx, pending(1, 1, 42)).unwrap();
+        let changes = s.commit(tx).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        let CommitChange::Asserted { fact } = &changes[0] else {
+            panic!("expected Asserted, got {:?}", changes[0]);
+        };
+        assert_eq!(fact.object, Term::Int(42));
+        assert!(fact.valid.is_open());
+        assert_eq!(fact.index_key, None);
+    }
+
+    #[test]
+    fn commit_set_already_open_is_noop() {
+        let s = InMemoryStore::new();
+
+        let tx1 = s.begin_tx();
+        s.assert_set(tx1, pending(1, 1, 42)).unwrap();
+        let changes1 = s.commit(tx1).unwrap();
+        assert_eq!(changes1.len(), 1, "first assert should produce Asserted");
+
+        // Same (subject, predicate, asserter, object) — already open.
+        let tx2 = s.begin_tx();
+        s.assert_set(tx2, pending(1, 1, 42)).unwrap();
+        let changes2 = s.commit(tx2).unwrap();
+        assert!(
+            changes2.is_empty(),
+            "re-assert of open fact must be a no-op"
+        );
+    }
+
+    #[test]
+    fn commit_set_distinct_objects_coexist() {
+        let s = InMemoryStore::new();
+        let tx = s.begin_tx();
+        s.assert_set(tx, pending(1, 1, 10)).unwrap();
+        s.assert_set(tx, pending(1, 1, 20)).unwrap();
+        let changes = s.commit(tx).unwrap();
+
+        // Both objects are new, so both produce Asserted.
+        assert_eq!(changes.len(), 2);
+        assert!(
+            changes
+                .iter()
+                .all(|c| matches!(c, CommitChange::Asserted { .. }))
+        );
+    }
+
+    #[test]
+    fn commit_set_deduplicates_same_object_within_tx() {
+        let s = InMemoryStore::new();
+        let tx = s.begin_tx();
+        s.assert_set(tx, pending(1, 1, 42)).unwrap();
+        s.assert_set(tx, pending(1, 1, 42)).unwrap();
+        let changes = s.commit(tx).unwrap();
+
+        // Only one Asserted despite two ops — the second is a duplicate.
+        assert_eq!(changes.len(), 1);
+        let CommitChange::Asserted { fact } = &changes[0] else {
+            panic!("expected Asserted, got {:?}", changes[0]);
+        };
+        assert_eq!(fact.object, Term::Int(42));
+    }
+
+    #[test]
+    fn commit_set_different_asserters_do_not_interfere() {
+        let s = InMemoryStore::new();
+
+        let tx1 = s.begin_tx();
+        s.assert_set(tx1, pending(1, 1, 42)).unwrap(); // asserter=1
+        s.commit(tx1).unwrap();
+
+        // Asserter 2 asserts the same object about subject 1 — different
+        // asserter namespace, should produce a new Asserted, not a no-op.
+        let tx2 = s.begin_tx();
+        s.assert_set(tx2, pending(1, 2, 42)).unwrap(); // asserter=2
+        let changes = s.commit(tx2).unwrap();
+        assert_eq!(changes.len(), 1);
+        let CommitChange::Asserted { fact } = &changes[0] else {
+            panic!("expected Asserted, got {:?}", changes[0]);
+        };
+        assert_eq!(fact.asserter, EntityId(2));
+    }
+
+    // --- Indexed cardinality ---
+
+    fn key(v: f64) -> OrderingKey {
+        OrderingKey::new(v).unwrap()
+    }
+
+    #[test]
+    fn assert_indexed_unknown_tx_errors() {
+        let s = InMemoryStore::new();
+        let bogus = TxId(999);
+        let err = s
+            .assert_indexed(bogus, pending(1, 1, 0), key(1.0))
+            .unwrap_err();
+        assert_eq!(err, Error::UnknownTransaction(bogus));
+    }
+
+    #[test]
+    fn commit_indexed_first_assert_yields_asserted() {
+        let clock = TickClock::new(100);
+        let s = InMemoryStore::with_clock(clock.clone());
+        let tx = s.begin_tx();
+        s.assert_indexed(tx, pending(1, 1, 42), key(0.0)).unwrap();
+        let changes = s.commit(tx).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        let CommitChange::Asserted { fact } = &changes[0] else {
+            panic!("expected Asserted, got {:?}", changes[0]);
+        };
+        assert_eq!(fact.object, Term::Int(42));
+        assert_eq!(fact.index_key, Some(key(0.0)));
+        assert!(fact.valid.is_open());
+    }
+
+    #[test]
+    fn commit_indexed_same_slot_supersedes() {
+        let clock = TickClock::new(100);
+        let s = InMemoryStore::with_clock(clock.clone());
+
+        let tx1 = s.begin_tx();
+        s.assert_indexed(tx1, pending(1, 1, 10), key(1.0)).unwrap();
+        let changes1 = s.commit(tx1).unwrap();
+        assert!(matches!(&changes1[0], CommitChange::Asserted { .. }));
+
+        clock.set(200);
+        let tx2 = s.begin_tx();
+        s.assert_indexed(tx2, pending(1, 1, 20), key(1.0)).unwrap();
+        let changes2 = s.commit(tx2).unwrap();
+
+        assert_eq!(changes2.len(), 1);
+        let CommitChange::Updated { closed, opened } = &changes2[0] else {
+            panic!("expected Updated, got {:?}", changes2[0]);
+        };
+        assert_eq!(closed.object, Term::Int(10));
+        assert_eq!(closed.valid.end, Some(Timestamp::from_nanos(200)));
+        assert_eq!(opened.object, Term::Int(20));
+        assert!(opened.valid.is_open());
+        assert_eq!(opened.index_key, Some(key(1.0)));
+    }
+
+    #[test]
+    fn commit_indexed_distinct_keys_coexist() {
+        let s = InMemoryStore::new();
+        let tx = s.begin_tx();
+        s.assert_indexed(tx, pending(1, 1, 10), key(0.0)).unwrap();
+        s.assert_indexed(tx, pending(1, 1, 20), key(1.0)).unwrap();
+        let changes = s.commit(tx).unwrap();
+
+        assert_eq!(changes.len(), 2);
+        assert!(
+            changes
+                .iter()
+                .all(|c| matches!(c, CommitChange::Asserted { .. }))
+        );
+        let keys: Vec<_> = changes
+            .iter()
+            .map(|c| match c {
+                CommitChange::Asserted { fact } => fact.index_key,
+                _ => panic!(),
+            })
+            .collect();
+        assert!(keys.contains(&Some(key(0.0))));
+        assert!(keys.contains(&Some(key(1.0))));
+    }
+
+    #[test]
+    fn commit_indexed_collapses_same_slot_within_tx() {
+        let clock = TickClock::new(100);
+        let s = InMemoryStore::with_clock(clock.clone());
+        let tx = s.begin_tx();
+        s.assert_indexed(tx, pending(1, 1, 10), key(0.0)).unwrap();
+        s.assert_indexed(tx, pending(1, 1, 20), key(0.0)).unwrap(); // same slot, later in tx
+        let changes = s.commit(tx).unwrap();
+
+        // Only the last value (20) survives; 10 was never observable.
+        assert_eq!(changes.len(), 1);
+        let CommitChange::Asserted { fact } = &changes[0] else {
+            panic!("expected Asserted, got {:?}", changes[0]);
+        };
+        assert_eq!(fact.object, Term::Int(20));
     }
 
     #[test]
