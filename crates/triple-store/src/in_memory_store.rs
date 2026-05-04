@@ -38,15 +38,33 @@ struct Shard {
 ///
 /// Each variant carries its cardinality in the type, so commit can dispatch
 /// without consulting the predicate registry (which is above the FactStore
-/// boundary, per PRD §3.2). `Retract` variants land in a subsequent chunk;
-/// once added, mixed `Assert`/`Retract` prefixes will satisfy the lint.
-#[allow(clippy::enum_variant_names)]
+/// boundary, per PRD §3.2).
+///
+/// Precondition (enforced via `debug_assert` in commit): no identity key may
+/// appear in both an Assert and a Retract variant within the same transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TentativeOp {
     AssertSingle(PendingFact),
     AssertSet(PendingFact),
     AssertIndexed {
         fact: PendingFact,
+        index_key: OrderingKey,
+    },
+    RetractSingle {
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
+    },
+    RetractSet {
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
+        object: Term,
+    },
+    RetractIndexed {
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
         index_key: OrderingKey,
     },
 }
@@ -165,6 +183,14 @@ impl InMemoryStore {
             HashMap::with_capacity(ops.len());
         let mut last_indexed_idx: HashMap<(EntityId, Predicate, EntityId, OrderingKey), usize> =
             HashMap::with_capacity(ops.len());
+        let mut last_retract_single_idx: HashMap<(EntityId, Predicate, EntityId), usize> =
+            HashMap::new();
+        let mut last_retract_set_idx: HashMap<(EntityId, Predicate, EntityId, Term), usize> =
+            HashMap::new();
+        let mut last_retract_indexed_idx: HashMap<
+            (EntityId, Predicate, EntityId, OrderingKey),
+            usize,
+        > = HashMap::new();
 
         for (i, op) in ops.iter().enumerate() {
             match op {
@@ -177,16 +203,72 @@ impl InMemoryStore {
                 TentativeOp::AssertIndexed { fact: p, index_key } => {
                     last_indexed_idx.insert((p.subject, p.predicate, p.asserter, *index_key), i);
                 }
+                TentativeOp::RetractSingle {
+                    subject,
+                    predicate,
+                    asserter,
+                } => {
+                    last_retract_single_idx.insert((*subject, *predicate, *asserter), i);
+                }
+                TentativeOp::RetractSet {
+                    subject,
+                    predicate,
+                    asserter,
+                    object,
+                } => {
+                    last_retract_set_idx
+                        .insert((*subject, *predicate, *asserter, object.clone()), i);
+                }
+                TentativeOp::RetractIndexed {
+                    subject,
+                    predicate,
+                    asserter,
+                    index_key,
+                } => {
+                    last_retract_indexed_idx
+                        .insert((*subject, *predicate, *asserter, *index_key), i);
+                }
+            }
+        }
+
+        // Precondition check: no identity key should appear in both an assert and
+        // a retract in the same transaction — the resulting asserted-interval
+        // semantics are undefined (two ops, one commit timestamp, same slot).
+        #[cfg(debug_assertions)]
+        {
+            for key in last_single_idx.keys() {
+                debug_assert!(
+                    !last_retract_single_idx.contains_key(key),
+                    "assert and retract same Single key in one tx: {key:?}"
+                );
+            }
+            for key in last_set_idx.keys() {
+                debug_assert!(
+                    !last_retract_set_idx.contains_key(key),
+                    "assert and retract same Set key in one tx: {key:?}"
+                );
+            }
+            for key in last_indexed_idx.keys() {
+                debug_assert!(
+                    !last_retract_indexed_idx.contains_key(key),
+                    "assert and retract same Indexed key in one tx: {key:?}"
+                );
             }
         }
 
         // Collect the selected indices (one per identity key, the last occurrence).
         // No sort needed: selected ops have disjoint identity keys and share a
         // single commit timestamp, so application order has no semantic effect.
+        // Note: a failed retract (OpenFactNotFound) aborts commit and leaves any
+        // already-applied ops in place. Well-formed callers should not produce
+        // retract-not-found; the Store API layer is responsible for validation.
         let selected: Vec<usize> = last_single_idx
             .values()
             .chain(last_set_idx.values())
             .chain(last_indexed_idx.values())
+            .chain(last_retract_single_idx.values())
+            .chain(last_retract_set_idx.values())
+            .chain(last_retract_indexed_idx.values())
             .copied()
             .collect();
 
@@ -279,6 +361,76 @@ impl InMemoryStore {
                     });
                     changes.extend(change);
                 }
+
+                TentativeOp::RetractSingle {
+                    subject,
+                    predicate,
+                    asserter,
+                } => {
+                    let result = self.with_bucket(subject, predicate, |bucket| {
+                        let idx = bucket
+                            .iter()
+                            .position(|f| f.asserted.is_open() && f.asserter == asserter);
+                        match idx {
+                            Some(i) => {
+                                bucket[i].asserted.close(commit_time);
+                                Ok(Some(CommitChange::Retracted {
+                                    closed: bucket[i].clone(),
+                                }))
+                            }
+                            None => Err(Error::OpenFactNotFound),
+                        }
+                    });
+                    changes.extend(result?);
+                }
+
+                TentativeOp::RetractSet {
+                    subject,
+                    predicate,
+                    asserter,
+                    object,
+                } => {
+                    let result = self.with_bucket(subject, predicate, |bucket| {
+                        let idx = bucket.iter().position(|f| {
+                            f.asserted.is_open() && f.asserter == asserter && f.object == object
+                        });
+                        match idx {
+                            Some(i) => {
+                                bucket[i].asserted.close(commit_time);
+                                Ok(Some(CommitChange::Retracted {
+                                    closed: bucket[i].clone(),
+                                }))
+                            }
+                            None => Err(Error::OpenFactNotFound),
+                        }
+                    });
+                    changes.extend(result?);
+                }
+
+                TentativeOp::RetractIndexed {
+                    subject,
+                    predicate,
+                    asserter,
+                    index_key,
+                } => {
+                    let result = self.with_bucket(subject, predicate, |bucket| {
+                        let idx = bucket.iter().position(|f| {
+                            f.asserted.is_open()
+                                && f.asserter == asserter
+                                && f.index_key == Some(index_key)
+                        });
+                        match idx {
+                            Some(i) => {
+                                bucket[i].asserted.close(commit_time);
+                                Ok(Some(CommitChange::Retracted {
+                                    closed: bucket[i].clone(),
+                                }))
+                            }
+                            None => Err(Error::OpenFactNotFound),
+                        }
+                    });
+                    changes.extend(result?);
+                }
             }
         }
 
@@ -345,6 +497,88 @@ impl InMemoryStore {
             .get_mut(&tx_id)
             .ok_or(Error::UnknownTransaction(tx_id))?;
         entries.push(TentativeOp::AssertIndexed { fact, index_key });
+        Ok(())
+    }
+
+    /// Record a `Single`-cardinality retraction in the tentative buffer for `tx_id`.
+    ///
+    /// Requires: `tx_id` is an active transaction; no assert for the same
+    /// `(subject, predicate, asserter)` key appears in the same transaction.
+    /// Ensures: at commit, the asserted-open fact at the key has its `asserted`
+    /// interval closed at `commit_time`. Returns `Error::OpenFactNotFound` if no
+    /// such fact exists when the transaction commits.
+    pub fn retract_single(
+        &self,
+        tx_id: TxId,
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
+    ) -> Result<(), Error> {
+        let mut buf = self.tentative.by_tx.write();
+        let entries = buf
+            .get_mut(&tx_id)
+            .ok_or(Error::UnknownTransaction(tx_id))?;
+        entries.push(TentativeOp::RetractSingle {
+            subject,
+            predicate,
+            asserter,
+        });
+        Ok(())
+    }
+
+    /// Record a `Set`-cardinality retraction in the tentative buffer for `tx_id`.
+    ///
+    /// Requires: `tx_id` is an active transaction; no assert for the same
+    /// `(subject, predicate, asserter, object)` key appears in the same transaction.
+    /// Ensures: at commit, the asserted-open fact matching the identity key has its
+    /// `asserted` interval closed at `commit_time`. Returns `Error::OpenFactNotFound`
+    /// if no such fact exists when the transaction commits.
+    pub fn retract_set(
+        &self,
+        tx_id: TxId,
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
+        object: Term,
+    ) -> Result<(), Error> {
+        let mut buf = self.tentative.by_tx.write();
+        let entries = buf
+            .get_mut(&tx_id)
+            .ok_or(Error::UnknownTransaction(tx_id))?;
+        entries.push(TentativeOp::RetractSet {
+            subject,
+            predicate,
+            asserter,
+            object,
+        });
+        Ok(())
+    }
+
+    /// Record an `Indexed`-cardinality retraction in the tentative buffer for `tx_id`.
+    ///
+    /// Requires: `tx_id` is an active transaction; no assert for the same
+    /// `(subject, predicate, asserter, index_key)` key appears in the same transaction.
+    /// Ensures: at commit, the asserted-open fact at the slot has its `asserted`
+    /// interval closed at `commit_time`. Returns `Error::OpenFactNotFound` if no
+    /// such fact exists when the transaction commits.
+    pub fn retract_indexed(
+        &self,
+        tx_id: TxId,
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
+        index_key: OrderingKey,
+    ) -> Result<(), Error> {
+        let mut buf = self.tentative.by_tx.write();
+        let entries = buf
+            .get_mut(&tx_id)
+            .ok_or(Error::UnknownTransaction(tx_id))?;
+        entries.push(TentativeOp::RetractIndexed {
+            subject,
+            predicate,
+            asserter,
+            index_key,
+        });
         Ok(())
     }
 
@@ -871,6 +1105,206 @@ mod tests {
             panic!("expected Asserted, got {:?}", changes[0]);
         };
         assert_eq!(fact.object, Term::Int(20));
+    }
+
+    // --- Retract: Single cardinality ---
+
+    #[test]
+    fn retract_single_unknown_tx_errors() {
+        let s = InMemoryStore::new();
+        let bogus = TxId(999);
+        let err = s
+            .retract_single(bogus, EntityId(1), Predicate(0), EntityId(1))
+            .unwrap_err();
+        assert_eq!(err, Error::UnknownTransaction(bogus));
+    }
+
+    #[test]
+    fn commit_retract_single_closes_asserted_preserves_valid() {
+        let clock = TickClock::new(100);
+        let s = InMemoryStore::with_clock(clock.clone());
+
+        let tx1 = s.begin_tx();
+        s.assert_single(tx1, pending(1, 1, 42)).unwrap();
+        s.commit(tx1).unwrap();
+
+        clock.set(200);
+        let tx2 = s.begin_tx();
+        s.retract_single(tx2, EntityId(1), Predicate(0), EntityId(1))
+            .unwrap();
+        let changes = s.commit(tx2).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        let CommitChange::Retracted { closed } = &changes[0] else {
+            panic!("expected Retracted, got {:?}", changes[0]);
+        };
+        assert_eq!(closed.object, Term::Int(42));
+        // Asserted interval closed at retract time; valid interval untouched.
+        assert_eq!(closed.asserted.end, Some(Timestamp::from_nanos(200)));
+        assert!(closed.valid.is_open());
+    }
+
+    #[test]
+    fn commit_retract_single_not_found_errors() {
+        let s = InMemoryStore::new();
+        let tx = s.begin_tx();
+        s.retract_single(tx, EntityId(1), Predicate(0), EntityId(1))
+            .unwrap();
+        let err = s.commit(tx).unwrap_err();
+        assert_eq!(err, Error::OpenFactNotFound);
+    }
+
+    #[test]
+    fn commit_retract_single_after_retract_leaves_no_open_fact() {
+        let clock = TickClock::new(100);
+        let s = InMemoryStore::with_clock(clock.clone());
+
+        let tx1 = s.begin_tx();
+        s.assert_single(tx1, pending(1, 1, 42)).unwrap();
+        s.commit(tx1).unwrap();
+
+        // Retract at t=200.
+        clock.set(200);
+        let tx2 = s.begin_tx();
+        s.retract_single(tx2, EntityId(1), Predicate(0), EntityId(1))
+            .unwrap();
+        s.commit(tx2).unwrap();
+
+        // Subsequent assert at t=300 sees no prior open fact → Asserted, not Updated.
+        clock.set(300);
+        let tx3 = s.begin_tx();
+        s.assert_single(tx3, pending(1, 1, 99)).unwrap();
+        let changes = s.commit(tx3).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(&changes[0], CommitChange::Asserted { .. }),
+            "expected Asserted after retract, got {:?}",
+            changes[0]
+        );
+    }
+
+    #[test]
+    fn commit_collapses_duplicate_retracts_within_tx() {
+        let clock = TickClock::new(100);
+        let s = InMemoryStore::with_clock(clock.clone());
+
+        let tx1 = s.begin_tx();
+        s.assert_single(tx1, pending(1, 1, 42)).unwrap();
+        s.commit(tx1).unwrap();
+
+        // Two retracts for the same key in one tx — should collapse to one.
+        clock.set(200);
+        let tx2 = s.begin_tx();
+        s.retract_single(tx2, EntityId(1), Predicate(0), EntityId(1))
+            .unwrap();
+        s.retract_single(tx2, EntityId(1), Predicate(0), EntityId(1))
+            .unwrap();
+        let changes = s.commit(tx2).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(&changes[0], CommitChange::Retracted { .. }));
+    }
+
+    // --- Retract: Set cardinality ---
+
+    #[test]
+    fn retract_set_unknown_tx_errors() {
+        let s = InMemoryStore::new();
+        let bogus = TxId(999);
+        let err = s
+            .retract_set(bogus, EntityId(1), Predicate(0), EntityId(1), Term::Int(42))
+            .unwrap_err();
+        assert_eq!(err, Error::UnknownTransaction(bogus));
+    }
+
+    #[test]
+    fn commit_retract_set_removes_matching_object_leaves_others() {
+        let s = InMemoryStore::new();
+
+        // Assert two objects for the same (s, p, asserter).
+        let tx1 = s.begin_tx();
+        s.assert_set(tx1, pending(1, 1, 10)).unwrap();
+        s.assert_set(tx1, pending(1, 1, 20)).unwrap();
+        s.commit(tx1).unwrap();
+
+        // Retract only the first object.
+        let tx2 = s.begin_tx();
+        s.retract_set(tx2, EntityId(1), Predicate(0), EntityId(1), Term::Int(10))
+            .unwrap();
+        let changes = s.commit(tx2).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        let CommitChange::Retracted { closed } = &changes[0] else {
+            panic!("expected Retracted, got {:?}", changes[0]);
+        };
+        assert_eq!(closed.object, Term::Int(10));
+        assert!(closed.valid.is_open()); // valid preserved
+
+        // The second object (20) is still asserted-open.
+        // Assert it again — should be a no-op, confirming it's still there.
+        let tx3 = s.begin_tx();
+        s.assert_set(tx3, pending(1, 1, 20)).unwrap();
+        let changes3 = s.commit(tx3).unwrap();
+        assert!(
+            changes3.is_empty(),
+            "object 20 should still be asserted-open"
+        );
+    }
+
+    #[test]
+    fn commit_retract_set_not_found_errors() {
+        let s = InMemoryStore::new();
+        let tx = s.begin_tx();
+        s.retract_set(tx, EntityId(1), Predicate(0), EntityId(1), Term::Int(42))
+            .unwrap();
+        let err = s.commit(tx).unwrap_err();
+        assert_eq!(err, Error::OpenFactNotFound);
+    }
+
+    // --- Retract: Indexed cardinality ---
+
+    #[test]
+    fn retract_indexed_unknown_tx_errors() {
+        let s = InMemoryStore::new();
+        let bogus = TxId(999);
+        let err = s
+            .retract_indexed(bogus, EntityId(1), Predicate(0), EntityId(1), key(1.0))
+            .unwrap_err();
+        assert_eq!(err, Error::UnknownTransaction(bogus));
+    }
+
+    #[test]
+    fn commit_retract_indexed_removes_slot_leaves_others() {
+        let s = InMemoryStore::new();
+
+        let tx1 = s.begin_tx();
+        s.assert_indexed(tx1, pending(1, 1, 10), key(0.0)).unwrap();
+        s.assert_indexed(tx1, pending(1, 1, 20), key(1.0)).unwrap();
+        s.commit(tx1).unwrap();
+
+        let tx2 = s.begin_tx();
+        s.retract_indexed(tx2, EntityId(1), Predicate(0), EntityId(1), key(0.0))
+            .unwrap();
+        let changes = s.commit(tx2).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        let CommitChange::Retracted { closed } = &changes[0] else {
+            panic!("expected Retracted, got {:?}", changes[0]);
+        };
+        assert_eq!(closed.object, Term::Int(10));
+        assert_eq!(closed.index_key, Some(key(0.0)));
+        assert!(closed.valid.is_open());
+    }
+
+    #[test]
+    fn commit_retract_indexed_not_found_errors() {
+        let s = InMemoryStore::new();
+        let tx = s.begin_tx();
+        s.retract_indexed(tx, EntityId(1), Predicate(0), EntityId(1), key(0.0))
+            .unwrap();
+        let err = s.commit(tx).unwrap_err();
+        assert_eq!(err, Error::OpenFactNotFound);
     }
 
     #[test]
