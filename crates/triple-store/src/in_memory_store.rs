@@ -143,10 +143,10 @@ impl InMemoryStore {
     /// Ensures: the transaction is no longer active after this call (subsequent
     /// `assert_*` / `retract_*` / `commit` / `rollback` return
     /// `Error::UnknownTransaction`); each *kept* tentative assert is reflected
-    /// as a `CommitChange::Asserted` (no prior open fact at the key) or
-    /// `CommitChange::Updated` (a prior open fact existed and has been closed
-    /// at the new fact's `valid.start`). Set asserts against already-open facts
-    /// produce no `CommitChange`.
+    /// as a `CommitChange::Asserted` (no prior asserted-open fact at the key)
+    /// or `CommitChange::Updated` (a prior asserted-open fact had its `asserted`
+    /// interval closed at `commit_time`, and a new fact was opened). Set asserts
+    /// against already-asserted-open facts produce no `CommitChange`.
     pub fn commit(&self, tx_id: TxId) -> Result<Vec<CommitChange>, Error> {
         // Drain the tentative ops atomically; any concurrent operation on
         // this tx_id afterward will fail with UnknownTransaction.
@@ -204,13 +204,15 @@ impl InMemoryStore {
                 TentativeOp::AssertSingle(pending) => {
                     let new_fact = pending.into_fact(commit_time, tx_id, None);
                     let change = self.with_bucket(new_fact.subject, new_fact.predicate, |bucket| {
-                        // Single: at most one open fact per (subject, predicate, asserter).
+                        // Single: at most one asserted-open fact per (subject, predicate, asserter).
+                        // Supersession closes the prior fact's asserted interval at commit_time
+                        // (the intervals meet); valid intervals are untouched.
                         let prior_idx = bucket
                             .iter()
-                            .position(|f| f.valid.is_open() && f.asserter == new_fact.asserter);
+                            .position(|f| f.asserted.is_open() && f.asserter == new_fact.asserter);
                         match prior_idx {
                             Some(idx) => {
-                                bucket[idx].valid.close(new_fact.valid.start);
+                                bucket[idx].asserted.close(commit_time);
                                 let closed = bucket[idx].clone();
                                 bucket.push(new_fact.clone());
                                 Some(CommitChange::Updated {
@@ -231,9 +233,9 @@ impl InMemoryStore {
                     let new_fact = pending.into_fact(commit_time, tx_id, None);
                     let change = self.with_bucket(new_fact.subject, new_fact.predicate, |bucket| {
                         // Set: idempotent on (subject, predicate, asserter, object).
-                        // If this exact tuple is already open, produce no change.
+                        // If this exact tuple is asserted-open, produce no change.
                         let already_open = bucket.iter().any(|f| {
-                            f.valid.is_open()
+                            f.asserted.is_open()
                                 && f.asserter == new_fact.asserter
                                 && f.object == new_fact.object
                         });
@@ -253,15 +255,15 @@ impl InMemoryStore {
                 } => {
                     let new_fact = pending.into_fact(commit_time, tx_id, Some(index_key));
                     let change = self.with_bucket(new_fact.subject, new_fact.predicate, |bucket| {
-                        // Indexed: at most one open fact per (subject, predicate, asserter, index_key).
+                        // Indexed: at most one asserted-open fact per (subject, predicate, asserter, index_key).
                         let prior_idx = bucket.iter().position(|f| {
-                            f.valid.is_open()
+                            f.asserted.is_open()
                                 && f.asserter == new_fact.asserter
                                 && f.index_key == Some(index_key)
                         });
                         match prior_idx {
                             Some(idx) => {
-                                bucket[idx].valid.close(new_fact.valid.start);
+                                bucket[idx].asserted.close(commit_time);
                                 let closed = bucket[idx].clone();
                                 bucket.push(new_fact.clone());
                                 Some(CommitChange::Updated {
@@ -610,13 +612,15 @@ mod tests {
             panic!("expected Updated, got {:?}", changes2[0]);
         };
 
-        // Prior fact: was opened at 100, now closed at 200.
+        // Prior fact: asserted interval closed at 200; valid interval preserved.
         assert_eq!(closed.object, Term::Int(42));
-        assert_eq!(closed.valid.start, Timestamp::from_nanos(100));
-        assert_eq!(closed.valid.end, Some(Timestamp::from_nanos(200)));
+        assert_eq!(closed.asserted.end, Some(Timestamp::from_nanos(200)));
+        assert!(closed.valid.is_open());
 
-        // New fact: opened at 200, currently open.
+        // New fact: asserted interval opened at 200 (meets prior's close).
         assert_eq!(opened.object, Term::Int(43));
+        assert_eq!(opened.asserted.start, Timestamp::from_nanos(200));
+        assert!(opened.asserted.is_open());
         assert_eq!(opened.valid.start, Timestamp::from_nanos(200));
         assert!(opened.valid.is_open());
     }
@@ -818,8 +822,11 @@ mod tests {
             panic!("expected Updated, got {:?}", changes2[0]);
         };
         assert_eq!(closed.object, Term::Int(10));
-        assert_eq!(closed.valid.end, Some(Timestamp::from_nanos(200)));
+        assert_eq!(closed.asserted.end, Some(Timestamp::from_nanos(200)));
+        assert!(closed.valid.is_open());
         assert_eq!(opened.object, Term::Int(20));
+        assert_eq!(opened.asserted.start, Timestamp::from_nanos(200));
+        assert!(opened.asserted.is_open());
         assert!(opened.valid.is_open());
         assert_eq!(opened.index_key, Some(key(1.0)));
     }

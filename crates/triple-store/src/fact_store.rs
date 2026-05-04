@@ -10,7 +10,6 @@ use crate::fact::{Fact, PendingFact};
 use crate::id::{EntityId, TxId};
 use crate::predicates::OrderingKey;
 use crate::term::{Predicate, Term};
-use crate::time::Timestamp;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -26,12 +25,13 @@ pub enum Error {
 /// into a `ChangeEvent` for subscribers (PRD §3.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitChange {
-    /// A fact was opened with no prior open fact at its identity key.
+    /// A fact was asserted with no prior asserted-open fact at its identity key.
     Asserted { fact: Fact },
-    /// A prior open fact was superseded by a new one
-    /// (Single or Indexed cardinality assert).
+    /// A prior asserted-open fact was superseded: its `asserted` interval was
+    /// closed at `commit_time` and a new fact was opened (Single or Indexed).
     Updated { closed: Fact, opened: Fact },
-    /// A prior open fact was closed via an explicit retract.
+    /// A prior asserted-open fact was explicitly retracted: its `asserted`
+    /// interval was closed at `commit_time`. The `valid` interval is preserved.
     Retracted { closed: Fact },
 }
 
@@ -65,43 +65,43 @@ pub trait FactStore: Send + Sync {
         index_key: OrderingKey,
     ) -> Result<(), Error>;
 
-    /// Retract under `Cardinality::Single`: close the unique open fact at
-    /// `(subject, predicate, asserter)`.
+    /// Retract under `Cardinality::Single`: close the asserted interval of the
+    /// unique asserted-open fact at `(subject, predicate, asserter)`.
     ///
-    /// Requires: an open fact exists at that key; `tx_id` is active.
-    /// Ensures: the open fact's `valid.end` is set to `valid_end` if `Some`,
-    /// else to the commit timestamp.
+    /// Retraction only closes the `asserted` interval; the `valid` interval is
+    /// preserved as part of the immutable historical record. The closed interval
+    /// meets the successor's open interval at `commit_time`.
+    ///
+    /// Requires: an asserted-open fact exists at that key; `tx_id` is active.
+    /// Ensures: `fact.asserted.end == Some(commit_time)`; fact remains queryable
+    /// as historical knowledge for any assert-time `t < commit_time`.
     fn retract_single(
         &self,
         tx_id: TxId,
         subject: EntityId,
         predicate: Predicate,
         asserter: EntityId,
-        valid_end: Option<Timestamp>,
     ) -> Result<(), Error>;
 
-    /// Retract under `Cardinality::Set`: close the open fact matching
-    /// `(subject, predicate, asserter, object)`.
+    /// Retract under `Cardinality::Set`: close the asserted interval of the
+    /// open fact matching `(subject, predicate, asserter, object)`.
     ///
-    /// Requires: an open fact exists at that key; `tx_id` is active.
-    /// Ensures: the open fact's `valid.end` is set to `valid_end` if `Some`,
-    /// else to the commit timestamp.
+    /// Requires: an asserted-open fact exists at that key; `tx_id` is active.
+    /// Ensures: `fact.asserted.end == Some(commit_time)`; `valid` preserved.
     fn retract_set(
         &self,
         tx_id: TxId,
         subject: EntityId,
         predicate: Predicate,
         asserter: EntityId,
-        object: &Term,
-        valid_end: Option<Timestamp>,
+        object: Term,
     ) -> Result<(), Error>;
 
-    /// Retract under `Cardinality::Indexed`: close the open fact at
-    /// `(subject, predicate, asserter, index_key)`.
+    /// Retract under `Cardinality::Indexed`: close the asserted interval of
+    /// the open fact at `(subject, predicate, asserter, index_key)`.
     ///
-    /// Requires: an open fact exists at that key; `tx_id` is active.
-    /// Ensures: the open fact's `valid.end` is set to `valid_end` if `Some`,
-    /// else to the commit timestamp.
+    /// Requires: an asserted-open fact exists at that key; `tx_id` is active.
+    /// Ensures: `fact.asserted.end == Some(commit_time)`; `valid` preserved.
     fn retract_indexed(
         &self,
         tx_id: TxId,
@@ -109,7 +109,6 @@ pub trait FactStore: Send + Sync {
         predicate: Predicate,
         asserter: EntityId,
         index_key: OrderingKey,
-        valid_end: Option<Timestamp>,
     ) -> Result<(), Error>;
 
     // === Commit / rollback ===
