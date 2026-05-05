@@ -12,6 +12,12 @@ use crate::predicates::OrderingKey;
 use crate::term::{Predicate, Term};
 use crate::time::{Interval, Timestamp};
 
+/// Exposes the temporal metadata of a committed fact for generic query filtering.
+pub trait BitemporalFact {
+    fn asserted(&self) -> &Interval;
+    fn valid(&self) -> &Interval;
+}
+
 /// A fact asserted about the world.
 ///
 /// Carries the semantic content of an assertion: who is asserting what about
@@ -97,6 +103,15 @@ pub struct StoredFact {
     /// Set iff this fact was committed under `Cardinality::Indexed`.
     pub index_key: Option<OrderingKey>,
     pub tx_id: TxId,
+}
+
+impl BitemporalFact for StoredFact {
+    fn asserted(&self) -> &Interval {
+        &self.asserted
+    }
+    fn valid(&self) -> &Interval {
+        &self.valid
+    }
 }
 
 impl StoredFact {

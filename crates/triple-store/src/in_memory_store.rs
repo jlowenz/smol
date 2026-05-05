@@ -19,9 +19,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
-use crate::fact::{Fact, StoredFact};
+use crate::fact::{BitemporalFact, Fact, StoredFact};
 use crate::id::{EntityId, TxId};
+use crate::pattern::{Match, MatchAsserter, Pattern};
 use crate::predicates::OrderingKey;
+use crate::queryable::Queryable;
 use crate::storage::{CommitChange, Error as StorageError, Storage};
 use crate::term::{Predicate, Term};
 use crate::time::{Clock, SystemClock, Timestamp};
@@ -122,6 +124,103 @@ impl Storage<StoredFact> for InMemoryStorage {
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
         f(bucket)
+    }
+}
+
+// ── Pattern matching ─────────────────────────────────────────────────────────
+
+fn matches_pattern(fact: &StoredFact, pattern: Option<&Pattern>) -> bool {
+    let Some(pat) = pattern else {
+        return true;
+    };
+    if let Match::Is(s) = &pat.subject {
+        if fact.subject != *s {
+            return false;
+        }
+    }
+    if let Match::Is(p) = &pat.predicate {
+        if fact.predicate != *p {
+            return false;
+        }
+    }
+    if let Match::Is(o) = &pat.object {
+        if fact.object != *o {
+            return false;
+        }
+    }
+    match &pat.asserter {
+        MatchAsserter::Any => {}
+        MatchAsserter::Specific(a) => {
+            if fact.asserter != *a {
+                return false;
+            }
+        }
+        MatchAsserter::SameAsSubject => {
+            if fact.asserter != fact.subject {
+                return false;
+            }
+        }
+        MatchAsserter::DifferentFromSubject => {
+            if fact.asserter == fact.subject {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ── Queryable for InMemoryStorage ─────────────────────────────────────────────
+
+impl Queryable<StoredFact> for InMemoryStorage {
+    fn query_open(
+        &self,
+        subject: EntityId,
+        predicate: Predicate,
+        pattern: Option<&Pattern>,
+    ) -> Vec<StoredFact> {
+        self.with_facts(subject, predicate, |facts| {
+            facts
+                .iter()
+                .filter(|f| f.asserted.is_open() && matches_pattern(f, pattern))
+                .cloned()
+                .collect()
+        })
+    }
+
+    fn query_at(
+        &self,
+        subject: EntityId,
+        predicate: Predicate,
+        tx_time: Timestamp,
+        valid_time: Timestamp,
+        pattern: Option<&Pattern>,
+    ) -> Vec<StoredFact> {
+        self.with_facts(subject, predicate, |facts| {
+            facts
+                .iter()
+                .filter(|f| {
+                    f.asserted().contains(tx_time)
+                        && f.valid().contains(valid_time)
+                        && matches_pattern(f, pattern)
+                })
+                .cloned()
+                .collect()
+        })
+    }
+
+    fn history(
+        &self,
+        subject: EntityId,
+        predicate: Predicate,
+        pattern: Option<&Pattern>,
+    ) -> Vec<StoredFact> {
+        self.with_facts(subject, predicate, |facts| {
+            facts
+                .iter()
+                .filter(|f| matches_pattern(f, pattern))
+                .cloned()
+                .collect()
+        })
     }
 }
 
@@ -497,6 +596,37 @@ impl Default for InMemoryTripleStore {
     }
 }
 
+impl Queryable<StoredFact> for InMemoryTripleStore {
+    fn query_open(
+        &self,
+        subject: EntityId,
+        predicate: Predicate,
+        pattern: Option<&Pattern>,
+    ) -> Vec<StoredFact> {
+        self.storage.query_open(subject, predicate, pattern)
+    }
+
+    fn query_at(
+        &self,
+        subject: EntityId,
+        predicate: Predicate,
+        tx_time: Timestamp,
+        valid_time: Timestamp,
+        pattern: Option<&Pattern>,
+    ) -> Vec<StoredFact> {
+        self.storage.query_at(subject, predicate, tx_time, valid_time, pattern)
+    }
+
+    fn history(
+        &self,
+        subject: EntityId,
+        predicate: Predicate,
+        pattern: Option<&Pattern>,
+    ) -> Vec<StoredFact> {
+        self.storage.history(subject, predicate, pattern)
+    }
+}
+
 impl TripleStore<StoredFact> for InMemoryTripleStore {
     type Tx<'a> = InMemoryTransaction<'a>;
 
@@ -506,6 +636,10 @@ impl TripleStore<StoredFact> for InMemoryTripleStore {
             tx_id: TxId(self.next_tx.fetch_add(1, Ordering::Relaxed)),
             ops: Vec::new(),
         }
+    }
+
+    fn now(&self) -> Timestamp {
+        self.clock.now()
     }
 }
 
@@ -1043,5 +1177,250 @@ mod tests {
         let mut tx = s.new_transaction();
         tx.retract_indexed(EntityId(1), Predicate(0), EntityId(1), key(0.0));
         assert_eq!(tx.commit().unwrap_err(), TxError::OpenFactNotFound);
+    }
+
+    // ── Query: query_open ────────────────────────────────────────────────────
+
+    #[test]
+    fn query_open_returns_only_asserted_open_facts() {
+        let clock = TickClock::new(100);
+        let s = InMemoryTripleStore::with_clock(clock.clone());
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 42));
+        tx1.commit().unwrap();
+
+        // Supersede at t=200: first fact is closed, second is open.
+        clock.set(200);
+        let mut tx2 = s.new_transaction();
+        tx2.assert_single(mk_fact(1, 1, 99));
+        tx2.commit().unwrap();
+
+        let results = s.query_open(EntityId(1), Predicate(0), None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].object, Term::Int(99));
+        assert!(results[0].asserted.is_open());
+    }
+
+    #[test]
+    fn query_open_empty_when_no_facts() {
+        let s = InMemoryTripleStore::new();
+        let results = s.query_open(EntityId(1), Predicate(0), None);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn query_open_empty_after_retract() {
+        let clock = TickClock::new(100);
+        let s = InMemoryTripleStore::with_clock(clock.clone());
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 42));
+        tx1.commit().unwrap();
+
+        clock.set(200);
+        let mut tx2 = s.new_transaction();
+        tx2.retract_single(EntityId(1), Predicate(0), EntityId(1));
+        tx2.commit().unwrap();
+
+        assert!(s.query_open(EntityId(1), Predicate(0), None).is_empty());
+    }
+
+    #[test]
+    fn query_open_set_returns_all_open_members() {
+        let s = InMemoryTripleStore::new();
+        let mut tx = s.new_transaction();
+        tx.assert_set(mk_fact(1, 1, 10));
+        tx.assert_set(mk_fact(1, 1, 20));
+        tx.assert_set(mk_fact(1, 1, 30));
+        tx.commit().unwrap();
+
+        let results = s.query_open(EntityId(1), Predicate(0), None);
+        assert_eq!(results.len(), 3);
+    }
+
+    // ── Query: query_at ──────────────────────────────────────────────────────
+
+    #[test]
+    fn query_at_returns_fact_visible_at_both_tx_and_valid_time() {
+        let clock = TickClock::new(100);
+        let s = InMemoryTripleStore::with_clock(clock.clone());
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 42));
+        tx1.commit().unwrap();
+
+        // Fact asserted at t=100, open. Valid at tx_time=150, valid_time=150.
+        let t150 = Timestamp::from_nanos(150);
+        let results = s.query_at(EntityId(1), Predicate(0), t150, t150, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].object, Term::Int(42));
+    }
+
+    #[test]
+    fn query_at_excludes_fact_not_yet_asserted() {
+        let clock = TickClock::new(100);
+        let s = InMemoryTripleStore::with_clock(clock.clone());
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 42));
+        tx1.commit().unwrap();
+
+        // Query at t=50, before the fact was asserted.
+        let t50 = Timestamp::from_nanos(50);
+        let results = s.query_at(EntityId(1), Predicate(0), t50, t50, None);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn query_at_sees_closed_fact_at_its_asserted_time() {
+        let clock = TickClock::new(100);
+        let s = InMemoryTripleStore::with_clock(clock.clone());
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 42));
+        tx1.commit().unwrap();
+
+        clock.set(200);
+        let mut tx2 = s.new_transaction();
+        tx2.assert_single(mk_fact(1, 1, 99));
+        tx2.commit().unwrap();
+
+        // At t=150 (between 100 and 200), the original fact was asserted-open.
+        let t150 = Timestamp::from_nanos(150);
+        let results = s.query_at(EntityId(1), Predicate(0), t150, t150, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].object, Term::Int(42));
+
+        // At t=250 only the replacement is asserted-open.
+        let t250 = Timestamp::from_nanos(250);
+        let results = s.query_at(EntityId(1), Predicate(0), t250, t250, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].object, Term::Int(99));
+    }
+
+    // ── Query: history ───────────────────────────────────────────────────────
+
+    #[test]
+    fn history_returns_all_facts_open_and_closed() {
+        let clock = TickClock::new(100);
+        let s = InMemoryTripleStore::with_clock(clock.clone());
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 42));
+        tx1.commit().unwrap();
+
+        clock.set(200);
+        let mut tx2 = s.new_transaction();
+        tx2.assert_single(mk_fact(1, 1, 99));
+        tx2.commit().unwrap();
+
+        let all = s.history(EntityId(1), Predicate(0), None);
+        assert_eq!(all.len(), 2);
+        let objects: Vec<_> = all.iter().map(|f| &f.object).collect();
+        assert!(objects.contains(&&Term::Int(42)));
+        assert!(objects.contains(&&Term::Int(99)));
+    }
+
+    #[test]
+    fn history_empty_when_no_facts() {
+        let s = InMemoryTripleStore::new();
+        assert!(s.history(EntityId(1), Predicate(0), None).is_empty());
+    }
+
+    // ── Query: query_as_of ───────────────────────────────────────────────────
+
+    #[test]
+    fn query_as_of_none_resolves_to_clock_now() {
+        let clock = TickClock::new(100);
+        let s = InMemoryTripleStore::with_clock(clock.clone());
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 42));
+        tx1.commit().unwrap();
+
+        // AsOf::default() has both fields None — should resolve to clock's now (100),
+        // and the fact asserted at 100 is visible there.
+        use crate::pattern::AsOf;
+        let results = s.query_as_of(EntityId(1), Predicate(0), AsOf::default(), None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].object, Term::Int(42));
+    }
+
+    #[test]
+    fn query_as_of_explicit_timestamps_used_directly() {
+        let clock = TickClock::new(100);
+        let s = InMemoryTripleStore::with_clock(clock.clone());
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 42));
+        tx1.commit().unwrap();
+
+        clock.set(200);
+        let mut tx2 = s.new_transaction();
+        tx2.assert_single(mk_fact(1, 1, 99));
+        tx2.commit().unwrap();
+
+        use crate::pattern::AsOf;
+        // Explicit tx_time=150 (between the two commits), valid_time=150.
+        let as_of = AsOf {
+            tx_time: Some(Timestamp::from_nanos(150)),
+            valid_time: Some(Timestamp::from_nanos(150)),
+        };
+        let results = s.query_as_of(EntityId(1), Predicate(0), as_of, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].object, Term::Int(42));
+    }
+
+    // ── Query: pattern filtering ─────────────────────────────────────────────
+
+    #[test]
+    fn query_open_filters_by_object() {
+        let s = InMemoryTripleStore::new();
+        let mut tx = s.new_transaction();
+        tx.assert_set(mk_fact(1, 1, 10));
+        tx.assert_set(mk_fact(1, 1, 20));
+        tx.commit().unwrap();
+
+        use crate::pattern::{Match, MatchAsserter, Pattern};
+        let pat = Pattern {
+            subject: Match::Any,
+            predicate: Match::Any,
+            object: Match::Is(Term::Int(10)),
+            asserter: MatchAsserter::Any,
+        };
+        let results = s.query_open(EntityId(1), Predicate(0), Some(&pat));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].object, Term::Int(10));
+    }
+
+    #[test]
+    fn query_open_filters_internal_vs_external_asserter() {
+        let s = InMemoryTripleStore::new();
+        let mut tx = s.new_transaction();
+        tx.assert_set(mk_fact(1, 1, 10)); // internal: subject=1, asserter=1
+        tx.assert_set(mk_fact(1, 2, 20)); // external: subject=1, asserter=2
+        tx.commit().unwrap();
+
+        use crate::pattern::{Match, MatchAsserter, Pattern};
+        let internal_pat = Pattern {
+            subject: Match::Any,
+            predicate: Match::Any,
+            object: Match::Any,
+            asserter: MatchAsserter::SameAsSubject,
+        };
+        let results = s.query_open(EntityId(1), Predicate(0), Some(&internal_pat));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].asserter, EntityId(1));
+
+        let external_pat = Pattern {
+            subject: Match::Any,
+            predicate: Match::Any,
+            object: Match::Any,
+            asserter: MatchAsserter::DifferentFromSubject,
+        };
+        let results = s.query_open(EntityId(1), Predicate(0), Some(&external_pat));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].asserter, EntityId(2));
     }
 }
