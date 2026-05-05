@@ -24,6 +24,7 @@ pub mod id;
 pub mod in_memory_store;
 pub mod intern;
 pub mod pattern;
+pub mod predicate_registry;
 pub mod predicates;
 pub mod queryable;
 pub mod storage;

@@ -1,6 +1,18 @@
 # Chunk 9: Predicate Registry with Visibility Metadata
 
-## Status
+## Status: Complete
+
+79 existing tests continue to pass; 24 new tests added (103 total).
+
+Design decisions recorded from review:
+- `PredicateMeta` carries both `visibility` and `cardinality` (not visibility alone).
+- Re-declaration conflict means either field differs; same metadata is idempotent.
+- `PredicateError::ConflictingDeclaration { name, existing, requested }` covers both.
+- Default: `Visibility::Private` + `Cardinality::Single` (most conservative).
+- `Visibility` derives `Ord` (`Private < Shared < Public`).
+- `predicate_name` accessor added to `InMemoryTripleStore`.
+
+---
 
 Chunk 8 closed out the change-event surface. The next missing P0 piece is the
 **predicate registry** with declared visibility (PRD §2.5, §5.1). The store

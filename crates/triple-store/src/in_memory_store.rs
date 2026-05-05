@@ -24,7 +24,8 @@ use crate::change::{ChangeEvent, ChangeKind, Subscriber, Subscription};
 use crate::fact::{BitemporalFact, Fact, StoredFact};
 use crate::id::{EntityId, SubscriptionId, TxId};
 use crate::pattern::{Match, MatchAsserter, Pattern};
-use crate::predicates::OrderingKey;
+use crate::predicate_registry::{PredicateError, PredicateMeta, PredicateRegistry, Visibility};
+use crate::predicates::{Cardinality, OrderingKey};
 use crate::queryable::Queryable;
 use crate::storage::{CommitChange, Error as StorageError, Storage};
 use crate::term::{Predicate, Term};
@@ -337,7 +338,8 @@ impl<'a> Transaction<StoredFact> for InMemoryTransaction<'a> {
 
 // ── InMemoryTripleStore ───────────────────────────────────────────────────────
 
-/// In-memory `TripleStore`: owns storage, clock, and `TxId` generation.
+/// In-memory `TripleStore`: owns storage, clock, `TxId` generation, and the
+/// predicate registry.
 pub struct InMemoryTripleStore {
     storage: InMemoryStorage,
     clock: Arc<dyn Clock>,
@@ -346,6 +348,7 @@ pub struct InMemoryTripleStore {
     /// Pattern subscribers, populated by `subscribe`. Read on every commit;
     /// written on subscribe/unsubscribe and lazy cleanup of dead receivers.
     subscribers: RwLock<Vec<Subscriber>>,
+    predicates: RwLock<PredicateRegistry>,
 }
 
 impl InMemoryTripleStore {
@@ -375,6 +378,7 @@ impl InMemoryTripleStore {
             next_tx: AtomicU64::new(1),
             next_subscription: AtomicU64::new(1),
             subscribers: RwLock::new(Vec::new()),
+            predicates: RwLock::new(PredicateRegistry::new()),
         }
     }
 
@@ -405,6 +409,47 @@ impl InMemoryTripleStore {
     /// No-op if the id is unknown (e.g., already pruned by lazy cleanup).
     pub fn unsubscribe(&self, id: SubscriptionId) {
         self.subscribers.write().retain(|s| s.id != id);
+    }
+
+    // ── Predicate registry ────────────────────────────────────────────────────
+
+    /// Declare a predicate with explicit visibility and cardinality.
+    ///
+    /// Requires: if `name` has been declared before, its visibility and
+    ///   cardinality must match.
+    /// Ensures: on `Ok(id)`, `predicate_meta(id)` reflects the declared values.
+    ///   Re-declaration with identical metadata is idempotent.
+    pub fn declare_predicate(
+        &self,
+        name: &str,
+        visibility: Visibility,
+        cardinality: Cardinality,
+    ) -> Result<Predicate, PredicateError> {
+        self.predicates.write().declare(name, visibility, cardinality)
+    }
+
+    /// Look up a predicate handle by name without declaring it.
+    ///
+    /// Ensures: `Some(id)` iff `name` has been declared or implicitly interned
+    ///   in this store; else `None`.
+    pub fn predicate(&self, name: &str) -> Option<Predicate> {
+        self.predicates.read().lookup(name)
+    }
+
+    /// Return metadata for a predicate.
+    ///
+    /// Ensures: never panics. Predicates never explicitly declared return
+    ///   default metadata (`Visibility::Private`, `Cardinality::Single`).
+    pub fn predicate_meta(&self, id: Predicate) -> PredicateMeta {
+        self.predicates.read().meta(id)
+    }
+
+    /// Resolve a predicate handle to its name.
+    ///
+    /// Ensures: `Some(name)` iff `id` was issued by this store's registry;
+    ///   else `None`.
+    pub fn predicate_name(&self, id: Predicate) -> Option<String> {
+        self.predicates.read().resolve(id).map(str::to_owned)
     }
 
     /// Dispatch a transaction's changes to matching subscribers.
@@ -1763,5 +1808,97 @@ mod tests {
         let mut tx_ids: Vec<TxId> = received.iter().map(|e| e.tx_id).collect();
         tx_ids.dedup();
         assert_eq!(tx_ids.len(), 3, "each commit should carry a distinct tx_id");
+    }
+
+    // ── Predicate registry ────────────────────────────────────────────────────
+
+    use crate::predicate_registry::{PredicateError, Visibility};
+    use crate::predicates::Cardinality;
+
+    #[test]
+    fn declare_predicate_returns_stable_handle() {
+        let s = InMemoryTripleStore::new();
+        let id1 = s.declare_predicate("account.balance", Visibility::Private, Cardinality::Single).unwrap();
+        let id2 = s.declare_predicate("account.balance", Visibility::Private, Cardinality::Single).unwrap();
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn predicate_meta_round_trips_declared_values() {
+        let s = InMemoryTripleStore::new();
+        let id = s.declare_predicate("tags", Visibility::Shared, Cardinality::Set).unwrap();
+        let m = s.predicate_meta(id);
+        assert_eq!(m.id, id);
+        assert_eq!(m.visibility, Visibility::Shared);
+        assert_eq!(m.cardinality, Cardinality::Set);
+    }
+
+    #[test]
+    fn predicate_meta_default_for_unknown_predicate() {
+        let s = InMemoryTripleStore::new();
+        // Predicate(0) was never declared or interned in this store.
+        let m = s.predicate_meta(Predicate(0));
+        assert_eq!(m.visibility, Visibility::Private);
+        assert_eq!(m.cardinality, Cardinality::Single);
+    }
+
+    #[test]
+    fn predicate_name_round_trips_declared_name() {
+        let s = InMemoryTripleStore::new();
+        let id = s.declare_predicate("sys.type", Visibility::Public, Cardinality::Single).unwrap();
+        assert_eq!(s.predicate_name(id), Some("sys.type".to_owned()));
+    }
+
+    #[test]
+    fn predicate_name_returns_none_for_unknown_handle() {
+        let s = InMemoryTripleStore::new();
+        assert_eq!(s.predicate_name(Predicate(999)), None);
+    }
+
+    #[test]
+    fn predicate_lookup_returns_none_before_declare() {
+        let s = InMemoryTripleStore::new();
+        assert_eq!(s.predicate("account.balance"), None);
+    }
+
+    #[test]
+    fn predicate_lookup_returns_handle_after_declare() {
+        let s = InMemoryTripleStore::new();
+        let id = s.declare_predicate("p", Visibility::Private, Cardinality::Single).unwrap();
+        assert_eq!(s.predicate("p"), Some(id));
+    }
+
+    #[test]
+    fn declare_predicate_conflict_errors() {
+        let s = InMemoryTripleStore::new();
+        s.declare_predicate("p", Visibility::Private, Cardinality::Single).unwrap();
+        let err = s.declare_predicate("p", Visibility::Public, Cardinality::Single).unwrap_err();
+        assert!(matches!(err, PredicateError::ConflictingDeclaration { .. }));
+    }
+
+    #[test]
+    fn registry_isolated_across_store_instances() {
+        let s1 = InMemoryTripleStore::new();
+        let s2 = InMemoryTripleStore::new();
+        let id = s1.declare_predicate("p", Visibility::Public, Cardinality::Set).unwrap();
+        // s2 has its own registry; "p" is not known there.
+        assert_eq!(s2.predicate("p"), None);
+        // The handle id from s1 is unknown in s2's registry.
+        assert_eq!(s2.predicate_name(id), None);
+    }
+
+    #[test]
+    fn existing_tests_unaffected_predicate_zero_defaults_to_private() {
+        // Existing tests use Predicate(0) directly. The registry must not
+        // interfere: meta returns defaults, and assert/query still work.
+        let s = InMemoryTripleStore::new();
+        let m = s.predicate_meta(Predicate(0));
+        assert_eq!(m.visibility, Visibility::Private);
+
+        let mut tx = s.new_transaction();
+        tx.assert_single(mk_fact(1, 1, 42));
+        let changes = tx.commit().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(&changes[0], CommitChange::Asserted { .. }));
     }
 }

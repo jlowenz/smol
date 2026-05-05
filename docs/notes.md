@@ -47,3 +47,5 @@ Query functions/change functions could be separate trait for consistent composit
   - new_transaction() -> FactTransaction
   - query(...) -> Iterator (pass through to storage)
   - change handler fns... (pass through to storage)
+
+## Chunk 7
