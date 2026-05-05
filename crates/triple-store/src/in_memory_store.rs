@@ -2,12 +2,11 @@
 //!
 //! Three types collaborate:
 //! - `InMemoryStorage` — owns the sharded committed-fact buckets; implements
-//!   `Storage<StoredFact>`.
-//! - `InMemoryTransaction<'a>` — owns a private tentative buffer and a borrow
-//!   of the store; implements `Transaction<StoredFact>`. Rolling back is free:
-//!   dropping the transaction drops the buffer.
-//! - `InMemoryTripleStore` — owns storage + clock + TxId counter; implements
-//!   `TripleStore<StoredFact>` and drives the commit path.
+//!   `Storage<StoredFact>` and `Queryable<StoredFact>`.
+//! - `Inner` — holds all mutable store state; implements `Applier<StoredFact>`
+//!   to service commit callbacks from `Transaction<StoredFact>`.
+//! - `InMemoryTripleStore` — a cheap, clonable `Arc<Inner>` wrapper;
+//!   implements `TripleStore<StoredFact>`.
 //!
 //! Sharding by `EntityId` (default 16 shards) keeps lock contention
 //! proportional to the number of entities sharing a shard, not total
@@ -21,16 +20,15 @@ use async_channel::TrySendError;
 use parking_lot::RwLock;
 
 use crate::change::{ChangeEvent, ChangeKind, Subscriber, Subscription};
-use crate::fact::{BitemporalFact, Fact, StoredFact};
+use crate::fact::{BitemporalFact, StoredFact};
 use crate::id::{EntityId, SubscriptionId, TxId};
 use crate::pattern::{Match, MatchAsserter, Pattern};
-use crate::predicate_registry::{PredicateError, PredicateMeta, PredicateRegistry, Visibility};
-use crate::predicates::{Cardinality, OrderingKey};
+use crate::predicates::OrderingKey;
 use crate::queryable::Queryable;
 use crate::storage::{CommitChange, Error as StorageError, Storage};
 use crate::term::{Predicate, Term};
 use crate::time::{Clock, SystemClock, Timestamp};
-use crate::transaction::{Error as TxError, Transaction};
+use crate::transaction::{Applier, TentativeOp, Transaction, TxError};
 use crate::triple_store::TripleStore;
 
 const DEFAULT_SHARD_COUNT: usize = 16;
@@ -227,237 +225,32 @@ impl Queryable<StoredFact> for InMemoryStorage {
     }
 }
 
-// ── TentativeOp ──────────────────────────────────────────────────────────────
+// ── Inner ─────────────────────────────────────────────────────────────────────
 
-/// One operation buffered in a transaction. Carries cardinality in its type so
-/// the commit path can dispatch without a predicate registry (PRD §3.2).
+/// All mutable state for an in-memory store, held behind `Arc<Inner>`.
 ///
-/// Precondition (checked via `debug_assert` in `InMemoryTripleStore::apply`):
-/// no identity key appears in both an Assert and a Retract in the same transaction.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TentativeOp {
-    AssertSingle(Fact),
-    AssertSet(Fact),
-    AssertIndexed {
-        fact: Fact,
-        index_key: OrderingKey,
-    },
-    RetractSingle {
-        subject: EntityId,
-        predicate: Predicate,
-        asserter: EntityId,
-    },
-    RetractSet {
-        subject: EntityId,
-        predicate: Predicate,
-        asserter: EntityId,
-        object: Term,
-    },
-    RetractIndexed {
-        subject: EntityId,
-        predicate: Predicate,
-        asserter: EntityId,
-        index_key: OrderingKey,
-    },
-}
-
-// ── InMemoryTransaction ───────────────────────────────────────────────────────
-
-/// An in-flight transaction: owns its tentative buffer and borrows the store.
-///
-/// Dropping this type without calling `commit` or `rollback` is equivalent to
-/// `rollback` — the buffer is simply freed. The explicit `rollback` method
-/// exists to satisfy the `Transaction` trait and to make intent clear at call
-/// sites.
-pub struct InMemoryTransaction<'a> {
-    store: &'a InMemoryTripleStore,
-    tx_id: TxId,
-    ops: Vec<TentativeOp>,
-}
-
-impl<'a> Transaction<StoredFact> for InMemoryTransaction<'a> {
-    fn assert_single(&mut self, fact: Fact) {
-        self.ops.push(TentativeOp::AssertSingle(fact));
-    }
-
-    fn assert_set(&mut self, fact: Fact) {
-        self.ops.push(TentativeOp::AssertSet(fact));
-    }
-
-    fn assert_indexed(&mut self, fact: Fact, index_key: OrderingKey) {
-        self.ops
-            .push(TentativeOp::AssertIndexed { fact, index_key });
-    }
-
-    fn retract_single(&mut self, subject: EntityId, predicate: Predicate, asserter: EntityId) {
-        self.ops.push(TentativeOp::RetractSingle {
-            subject,
-            predicate,
-            asserter,
-        });
-    }
-
-    fn retract_set(
-        &mut self,
-        subject: EntityId,
-        predicate: Predicate,
-        asserter: EntityId,
-        object: Term,
-    ) {
-        self.ops.push(TentativeOp::RetractSet {
-            subject,
-            predicate,
-            asserter,
-            object,
-        });
-    }
-
-    fn retract_indexed(
-        &mut self,
-        subject: EntityId,
-        predicate: Predicate,
-        asserter: EntityId,
-        index_key: OrderingKey,
-    ) {
-        self.ops.push(TentativeOp::RetractIndexed {
-            subject,
-            predicate,
-            asserter,
-            index_key,
-        });
-    }
-
-    fn commit(self) -> Result<Vec<CommitChange<StoredFact>>, TxError> {
-        self.store.apply(self.tx_id, self.ops)
-    }
-
-    fn rollback(self) {
-        // Consuming self drops `ops`; no storage side-effects.
-    }
-}
-
-// ── InMemoryTripleStore ───────────────────────────────────────────────────────
-
-/// In-memory `TripleStore`: owns storage, clock, `TxId` generation, and the
-/// predicate registry.
-pub struct InMemoryTripleStore {
+/// `InMemoryTripleStore` is a thin wrapper around `Arc<Inner>`; `Transaction`
+/// clones the same `Arc` at creation time so it can call back into `apply`
+/// without borrowing the store.
+pub(crate) struct Inner {
     storage: InMemoryStorage,
     clock: Arc<dyn Clock>,
     next_tx: AtomicU64,
     next_subscription: AtomicU64,
-    /// Pattern subscribers, populated by `subscribe`. Read on every commit;
-    /// written on subscribe/unsubscribe and lazy cleanup of dead receivers.
     subscribers: RwLock<Vec<Subscriber>>,
-    predicates: RwLock<PredicateRegistry>,
 }
 
-impl InMemoryTripleStore {
-    /// Construct with the default shard count (16) and `SystemClock`.
-    pub fn new() -> Self {
-        Self::build(DEFAULT_SHARD_COUNT, Arc::new(SystemClock))
-    }
-
-    /// Construct with the default shard count and an injected clock.
-    ///
-    /// Useful in tests that need deterministic commit timestamps.
-    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
-        Self::build(DEFAULT_SHARD_COUNT, clock)
-    }
-
-    /// Construct with an explicit shard count and `SystemClock`.
-    ///
-    /// Requires: `shards >= 1`.
-    pub fn with_shards(shards: usize) -> Self {
-        Self::build(shards, Arc::new(SystemClock))
-    }
-
-    fn build(shard_count: usize, clock: Arc<dyn Clock>) -> Self {
+impl Inner {
+    fn new(shard_count: usize, clock: Arc<dyn Clock>) -> Self {
         Self {
             storage: InMemoryStorage::new(shard_count),
             clock,
             next_tx: AtomicU64::new(1),
             next_subscription: AtomicU64::new(1),
             subscribers: RwLock::new(Vec::new()),
-            predicates: RwLock::new(PredicateRegistry::new()),
         }
     }
 
-    /// Register a change-event subscription.
-    ///
-    /// The returned [`Subscription`] handle owns the receiving end of the
-    /// store's internal change-event channel. Use its `recv` / `recv_blocking`
-    /// / `try_recv` methods to consume events.
-    ///
-    /// Lifetime: the subscription remains active until either
-    /// [`unsubscribe`](Self::unsubscribe) is called with its id or the
-    /// `Subscription` handle is dropped. Drop cleanup is lazy — the entry is
-    /// removed on the next dispatch that would have delivered to it.
-    ///
-    /// Ensures: the returned `Subscription`'s id is unique within this store.
-    pub fn subscribe(&self, pattern: Pattern) -> Subscription {
-        let id = SubscriptionId(self.next_subscription.fetch_add(1, Ordering::Relaxed));
-        let (sender, receiver) = async_channel::unbounded();
-        self.subscribers.write().push(Subscriber {
-            id,
-            pattern,
-            sender,
-        });
-        Subscription::new(id, receiver)
-    }
-
-    /// Cancel a subscription. Subsequent commits do not dispatch to it.
-    /// No-op if the id is unknown (e.g., already pruned by lazy cleanup).
-    pub fn unsubscribe(&self, id: SubscriptionId) {
-        self.subscribers.write().retain(|s| s.id != id);
-    }
-
-    // ── Predicate registry ────────────────────────────────────────────────────
-
-    /// Declare a predicate with explicit visibility and cardinality.
-    ///
-    /// Requires: if `name` has been declared before, its visibility and
-    ///   cardinality must match.
-    /// Ensures: on `Ok(id)`, `predicate_meta(id)` reflects the declared values.
-    ///   Re-declaration with identical metadata is idempotent.
-    pub fn declare_predicate(
-        &self,
-        name: &str,
-        visibility: Visibility,
-        cardinality: Cardinality,
-    ) -> Result<Predicate, PredicateError> {
-        self.predicates.write().declare(name, visibility, cardinality)
-    }
-
-    /// Look up a predicate handle by name without declaring it.
-    ///
-    /// Ensures: `Some(id)` iff `name` has been declared or implicitly interned
-    ///   in this store; else `None`.
-    pub fn predicate(&self, name: &str) -> Option<Predicate> {
-        self.predicates.read().lookup(name)
-    }
-
-    /// Return metadata for a predicate.
-    ///
-    /// Ensures: never panics. Predicates never explicitly declared return
-    ///   default metadata (`Visibility::Private`, `Cardinality::Single`).
-    pub fn predicate_meta(&self, id: Predicate) -> PredicateMeta {
-        self.predicates.read().meta(id)
-    }
-
-    /// Resolve a predicate handle to its name.
-    ///
-    /// Ensures: `Some(name)` iff `id` was issued by this store's registry;
-    ///   else `None`.
-    pub fn predicate_name(&self, id: Predicate) -> Option<String> {
-        self.predicates.read().resolve(id).map(str::to_owned)
-    }
-
-    /// Dispatch a transaction's changes to matching subscribers.
-    ///
-    /// Called from `apply` after storage writes complete. Holds only the
-    /// subscribers read lock; storage shard locks have been released. Closed
-    /// receivers are collected during the read pass and pruned afterwards
-    /// under a write lock (lazy cleanup, PRD §3.4 / chunk-8 plan Q4).
     fn dispatch(&self, tx_id: TxId, changes: &[CommitChange<StoredFact>]) {
         if changes.is_empty() {
             return;
@@ -491,8 +284,9 @@ impl InMemoryTripleStore {
             guard.retain(|s| !dead.contains(&s.id));
         }
     }
+}
 
-    /// Apply a transaction's ops to storage. Called by `InMemoryTransaction::commit`.
+impl Applier<StoredFact> for Inner {
     fn apply(
         &self,
         tx_id: TxId,
@@ -756,6 +550,42 @@ fn build_event(
     })
 }
 
+// ── InMemoryTripleStore ───────────────────────────────────────────────────────
+
+/// In-memory `TripleStore`: a cheap, clonable handle to shared store state.
+///
+/// All clones share the same `Inner` (same storage, clock, and subscriptions).
+pub struct InMemoryTripleStore {
+    inner: Arc<Inner>,
+}
+
+impl InMemoryTripleStore {
+    /// Construct with the default shard count (16) and `SystemClock`.
+    pub fn new() -> Self {
+        Self { inner: Arc::new(Inner::new(DEFAULT_SHARD_COUNT, Arc::new(SystemClock))) }
+    }
+
+    /// Construct with the default shard count and an injected clock.
+    ///
+    /// Useful in tests that need deterministic commit timestamps.
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self { inner: Arc::new(Inner::new(DEFAULT_SHARD_COUNT, clock)) }
+    }
+
+    /// Construct with an explicit shard count and `SystemClock`.
+    ///
+    /// Requires: `shards >= 1`.
+    pub fn with_shards(shards: usize) -> Self {
+        Self { inner: Arc::new(Inner::new(shards, Arc::new(SystemClock))) }
+    }
+}
+
+impl Clone for InMemoryTripleStore {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
 impl Default for InMemoryTripleStore {
     fn default() -> Self {
         Self::new()
@@ -769,7 +599,7 @@ impl Queryable<StoredFact> for InMemoryTripleStore {
         predicate: Predicate,
         pattern: Option<&Pattern>,
     ) -> Vec<StoredFact> {
-        self.storage.query_open(subject, predicate, pattern)
+        self.inner.storage.query_open(subject, predicate, pattern)
     }
 
     fn query_at(
@@ -780,7 +610,7 @@ impl Queryable<StoredFact> for InMemoryTripleStore {
         valid_time: Timestamp,
         pattern: Option<&Pattern>,
     ) -> Vec<StoredFact> {
-        self.storage.query_at(subject, predicate, tx_time, valid_time, pattern)
+        self.inner.storage.query_at(subject, predicate, tx_time, valid_time, pattern)
     }
 
     fn history(
@@ -789,23 +619,29 @@ impl Queryable<StoredFact> for InMemoryTripleStore {
         predicate: Predicate,
         pattern: Option<&Pattern>,
     ) -> Vec<StoredFact> {
-        self.storage.history(subject, predicate, pattern)
+        self.inner.storage.history(subject, predicate, pattern)
     }
 }
 
 impl TripleStore<StoredFact> for InMemoryTripleStore {
-    type Tx<'a> = InMemoryTransaction<'a>;
-
-    fn new_transaction(&self) -> InMemoryTransaction<'_> {
-        InMemoryTransaction {
-            store: self,
-            tx_id: TxId(self.next_tx.fetch_add(1, Ordering::Relaxed)),
-            ops: Vec::new(),
-        }
+    fn new_transaction(&self) -> Transaction<StoredFact> {
+        let tx_id = TxId(self.inner.next_tx.fetch_add(1, Ordering::Relaxed));
+        Transaction::new(Arc::clone(&self.inner) as Arc<dyn Applier<StoredFact>>, tx_id)
     }
 
     fn now(&self) -> Timestamp {
-        self.clock.now()
+        self.inner.clock.now()
+    }
+
+    fn subscribe(&self, pattern: Pattern) -> Subscription {
+        let id = SubscriptionId(self.inner.next_subscription.fetch_add(1, Ordering::Relaxed));
+        let (sender, receiver) = async_channel::unbounded();
+        self.inner.subscribers.write().push(Subscriber { id, pattern, sender });
+        Subscription::new(id, receiver)
+    }
+
+    fn unsubscribe(&self, id: SubscriptionId) {
+        self.inner.subscribers.write().retain(|s| s.id != id);
     }
 }
 
@@ -814,9 +650,11 @@ impl TripleStore<StoredFact> for InMemoryTripleStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fact::Fact;
     use crate::storage::CommitChange;
     use crate::term::Term;
     use crate::time::Timestamp;
+    use crate::triple_store::TripleStore;
 
     // ── Test clock ──────────────────────────────────────────────────────────
 
@@ -1741,7 +1579,7 @@ mod tests {
     fn dropped_subscription_is_pruned_lazily() {
         let s = InMemoryTripleStore::new();
         let sub = s.subscribe(any_pattern());
-        assert_eq!(s.subscribers.read().len(), 1);
+        assert_eq!(s.inner.subscribers.read().len(), 1);
 
         drop(sub);
 
@@ -1751,7 +1589,7 @@ mod tests {
         tx.commit().unwrap();
 
         assert_eq!(
-            s.subscribers.read().len(),
+            s.inner.subscribers.read().len(),
             0,
             "dropped subscription should have been pruned during dispatch"
         );
@@ -1808,97 +1646,5 @@ mod tests {
         let mut tx_ids: Vec<TxId> = received.iter().map(|e| e.tx_id).collect();
         tx_ids.dedup();
         assert_eq!(tx_ids.len(), 3, "each commit should carry a distinct tx_id");
-    }
-
-    // ── Predicate registry ────────────────────────────────────────────────────
-
-    use crate::predicate_registry::{PredicateError, Visibility};
-    use crate::predicates::Cardinality;
-
-    #[test]
-    fn declare_predicate_returns_stable_handle() {
-        let s = InMemoryTripleStore::new();
-        let id1 = s.declare_predicate("account.balance", Visibility::Private, Cardinality::Single).unwrap();
-        let id2 = s.declare_predicate("account.balance", Visibility::Private, Cardinality::Single).unwrap();
-        assert_eq!(id1, id2);
-    }
-
-    #[test]
-    fn predicate_meta_round_trips_declared_values() {
-        let s = InMemoryTripleStore::new();
-        let id = s.declare_predicate("tags", Visibility::Shared, Cardinality::Set).unwrap();
-        let m = s.predicate_meta(id);
-        assert_eq!(m.id, id);
-        assert_eq!(m.visibility, Visibility::Shared);
-        assert_eq!(m.cardinality, Cardinality::Set);
-    }
-
-    #[test]
-    fn predicate_meta_default_for_unknown_predicate() {
-        let s = InMemoryTripleStore::new();
-        // Predicate(0) was never declared or interned in this store.
-        let m = s.predicate_meta(Predicate(0));
-        assert_eq!(m.visibility, Visibility::Private);
-        assert_eq!(m.cardinality, Cardinality::Single);
-    }
-
-    #[test]
-    fn predicate_name_round_trips_declared_name() {
-        let s = InMemoryTripleStore::new();
-        let id = s.declare_predicate("sys.type", Visibility::Public, Cardinality::Single).unwrap();
-        assert_eq!(s.predicate_name(id), Some("sys.type".to_owned()));
-    }
-
-    #[test]
-    fn predicate_name_returns_none_for_unknown_handle() {
-        let s = InMemoryTripleStore::new();
-        assert_eq!(s.predicate_name(Predicate(999)), None);
-    }
-
-    #[test]
-    fn predicate_lookup_returns_none_before_declare() {
-        let s = InMemoryTripleStore::new();
-        assert_eq!(s.predicate("account.balance"), None);
-    }
-
-    #[test]
-    fn predicate_lookup_returns_handle_after_declare() {
-        let s = InMemoryTripleStore::new();
-        let id = s.declare_predicate("p", Visibility::Private, Cardinality::Single).unwrap();
-        assert_eq!(s.predicate("p"), Some(id));
-    }
-
-    #[test]
-    fn declare_predicate_conflict_errors() {
-        let s = InMemoryTripleStore::new();
-        s.declare_predicate("p", Visibility::Private, Cardinality::Single).unwrap();
-        let err = s.declare_predicate("p", Visibility::Public, Cardinality::Single).unwrap_err();
-        assert!(matches!(err, PredicateError::ConflictingDeclaration { .. }));
-    }
-
-    #[test]
-    fn registry_isolated_across_store_instances() {
-        let s1 = InMemoryTripleStore::new();
-        let s2 = InMemoryTripleStore::new();
-        let id = s1.declare_predicate("p", Visibility::Public, Cardinality::Set).unwrap();
-        // s2 has its own registry; "p" is not known there.
-        assert_eq!(s2.predicate("p"), None);
-        // The handle id from s1 is unknown in s2's registry.
-        assert_eq!(s2.predicate_name(id), None);
-    }
-
-    #[test]
-    fn existing_tests_unaffected_predicate_zero_defaults_to_private() {
-        // Existing tests use Predicate(0) directly. The registry must not
-        // interfere: meta returns defaults, and assert/query still work.
-        let s = InMemoryTripleStore::new();
-        let m = s.predicate_meta(Predicate(0));
-        assert_eq!(m.visibility, Visibility::Private);
-
-        let mut tx = s.new_transaction();
-        tx.assert_single(mk_fact(1, 1, 42));
-        let changes = tx.commit().unwrap();
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], CommitChange::Asserted { .. }));
     }
 }

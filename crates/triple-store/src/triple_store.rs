@@ -1,56 +1,56 @@
-//! TripleStore trait — top-level composition of storage and transaction management.
+//! TripleStore trait — dyn-compatible top-level store interface.
 //!
 //! `TripleStore<TFact>` is the primary entry point for application code. It
-//! owns a `Storage<TFact>` backend and creates `Transaction<TFact>` handles.
-//! It is also a `Queryable<TFact>`, adding `query_as_of` for callers that
-//! want `AsOf::None` resolved against the store's clock.
+//! creates `Transaction<TFact>` handles, answers queries (via the `Queryable`
+//! supertrait), and manages change-event subscriptions. Fixing `TFact` to
+//! `StoredFact` yields a fully dyn-compatible trait
+//! (`Arc<dyn TripleStore<StoredFact>>`).
 
+use crate::change::Subscription;
 use crate::fact::BitemporalFact;
-use crate::id::EntityId;
-use crate::pattern::Pattern;
+use crate::id::{EntityId, SubscriptionId};
+use crate::pattern::{AsOf, Pattern};
 use crate::queryable::Queryable;
 use crate::term::Predicate;
-use crate::pattern::AsOf;
 use crate::time::Timestamp;
 use crate::transaction::Transaction;
 
 /// The top-level triple store interface.
 ///
-/// Implementations own a `Storage<TFact>` backend and a clock. Application
-/// code interacts with the store through transactions and queries:
+/// Inherits clock-free read methods (`query_open`, `query_at`, `history`) from
+/// `Queryable<TFact>`. All methods use only concrete types so
+/// `TripleStore<StoredFact>` is fully dyn-compatible. Application code
+/// interacts through transactions, queries, and subscriptions:
 ///
 /// ```ignore
 /// let mut tx = store.new_transaction();
 /// tx.assert_single(fact);
 /// let changes = tx.commit()?;
 ///
-/// let results = store.query_as_of(subject, predicate, AsOf::default(), None);
+/// let results = store.query_open(subject, predicate, None);
 /// ```
 pub trait TripleStore<TFact: BitemporalFact>: Queryable<TFact> + Send + Sync {
-    /// The transaction type produced by this store.
-    ///
-    /// The `'a` lifetime binds the transaction to the store: the transaction
-    /// must not outlive the store that created it.
-    type Tx<'a>: Transaction<TFact>
-    where
-        Self: 'a;
-
     /// Begin a new transaction.
     ///
-    /// Ensures: the returned transaction has an empty buffer and a unique
-    /// `TxId` (stamped on facts at commit time). The transaction borrows
-    /// from `self` and must be committed or rolled back before `self` is dropped.
-    fn new_transaction(&self) -> Self::Tx<'_>;
+    /// Ensures: returned transaction has an empty buffer and a unique `TxId`.
+    fn new_transaction(&self) -> Transaction<TFact>;
 
     /// The current time according to the store's clock.
     fn now(&self) -> Timestamp;
 
-    /// Bitemporal point-in-time query, resolving `AsOf::None` fields against `self.now()`.
+    /// Register a pattern subscription.
+    ///
+    /// Ensures: returned `Subscription` id is unique within this store instance.
+    fn subscribe(&self, pattern: Pattern) -> Subscription;
+
+    /// Cancel a subscription. No-op if `id` is unknown.
+    fn unsubscribe(&self, id: SubscriptionId);
+
+    /// Bitemporal point-in-time query, resolving `AsOf::None` fields against
+    /// `self.now()`.
     ///
     /// `as_of.tx_time = None` means "as of the current transaction time" (now).
     /// `as_of.valid_time = None` means "as of the current valid time" (now).
-    ///
-    /// Delegates to `Queryable::query_at` after resolving timestamps.
     ///
     /// Ensures: equivalent to calling `query_at` with
     ///   `tx_time = as_of.tx_time.unwrap_or_else(|| self.now())`

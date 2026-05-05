@@ -1,93 +1,371 @@
-# Chunk 10: ExecContext, AccessError, and the Store Wrapper
+# Chunk 10: dyn-Compatible TripleStore and the Store Façade
 
 ## Status
 
 Chunk 9 shipped `PredicateRegistry` with `Visibility` and `Cardinality`. Chunk
-10 introduces the **access-control enforcement layer** that reads that metadata
-(PRD §3.5, §4). The data model is in place; this chunk adds the policy.
+10 has two distinct phases:
+
+1. **Refactor** — make `TripleStore<TFact>` dyn-compatible, introduce
+   `Applier<TFact>` as the commit-callback seam, restructure
+   `InMemoryTripleStore` around `Arc<Inner>`, and move `PredicateRegistry`
+   out of the store backend.
+2. **Store** — implement `ExecContext`, `AccessError`, and the `Store` façade
+   (PRD §3.5, §4) on top of the now-dyn-compatible `TripleStore<TFact>`.
 
 ---
 
-## What Already Exists
+## Architectural Decisions
 
-- `PredicateRegistry` / `Visibility` / `Cardinality` / `PredicateMeta` — chunk 9.
-- `InMemoryTripleStore` with `declare_predicate`, `predicate_meta`,
-  `predicate_name` — chunk 9.
-- Full transaction/commit pipeline (`new_transaction` → `assert_*`/`retract_*`
-  → `commit`) — chunks 1–8.
-- `Fact.subject == Fact.asserter` is the existing internal/external
-  distinction — already modelled in `fact.rs`.
+### Why `TripleStore<TFact>` was not dyn-compatible
 
----
-
-## Scope for Chunk 10
-
-**In scope:**
-
-- New module `exec_context.rs`:
-  - `ExecContext` enum: `Entity(EntityId)` | `System`.
-  - `AccessError` enum: `Denied { predicate: Predicate, reason: &'static str }`.
-  - Three methods on `ExecContext` encoding the PRD §3.5 rules.
-- New module `store.rs`:
-  - `StoreError` enum wrapping `AccessError` and `TxError`, with `From` impls.
-  - `Store` newtype wrapper over `InMemoryTripleStore`.
-  - `Store` mutation methods — `assert_single/set/indexed`, `retract_single/set/indexed`
-    — each runs the appropriate access check then delegates a one-op transaction.
-  - `Store` query methods — `query_open`, `query_at`, `history` — each checks
-    visibility and returns an empty result (silently) for denied predicates.
-  - Predicate-registry delegation: `declare_predicate`, `predicate`,
-    `predicate_meta`, `predicate_name`.
-  - Subscription delegation: `subscribe`, `unsubscribe`.
-
-**Deferred:**
-
-- Multi-operation transaction API (begin / TxId-indexed assert / commit).
-  The `Store` uses one-op transactions internally for now.
-- `Store::clone_handle()` / `Arc<InMemoryTripleStore>` wrapping (chunk 11+).
-- Subscription filtering by subscriber identity (chunk 11+).
-- `entities_with` query (chunk 11+).
-
----
-
-## Design
-
-### `ExecContext` and `AccessError` — new file `exec_context.rs`
-
-`ExecContext` is a lightweight value type that identifies *who* is performing
-an operation. It has two variants:
+The GAT in the current trait:
 
 ```rust
-pub enum ExecContext {
-    Entity(EntityId),   // a specific entity acting under its own identity
-    System,             // privileged bypass for store-level tests and bootstrap
+type Tx<'a>: Transaction<TFact> where Self: 'a;
+fn new_transaction(&self) -> Self::Tx<'_>;
+```
+
+is the sole blocker. GATs are never dyn-compatible: the vtable would require a
+different slot per concrete `Tx` type, but a vtable is fixed when `dyn
+TripleStore<TFact>` is constructed. The `TFact` type parameter itself is not an
+obstacle — `Arc<dyn TripleStore<StoredFact>>` is valid once the GAT is removed.
+
+### Solution: `Arc<Inner>` and the `Applier<TFact>` seam
+
+The GAT exists because `InMemoryTransaction<'a>` borrows directly from the store
+(`store: &'a InMemoryTripleStore`). The transaction needs access to shared state
+after `new_transaction` returns.
+
+The borrow is replaced by **shared ownership**: the store's mutable state is
+extracted into a private `Inner` struct held behind `Arc<Inner>`.
+`new_transaction` clones that Arc into the new transaction. No borrow, no
+lifetime, no GAT.
+
+`Transaction<TFact>` is a public type in `transaction.rs`; `Inner` is private to
+`in_memory_store.rs`. The `Applier<TFact>` trait is the seam that lets
+`Transaction` call back into the store at commit time without a direct dependency
+on the concrete type:
+
+```
+InMemoryTripleStore            Transaction<StoredFact>
+ └─ Arc<Inner>  ──clone──►     └─ Arc<dyn Applier<StoredFact>>
+                                       │
+                           (Inner implements Applier<StoredFact>)
+```
+
+`Applier<TFact>` has a single method — the commit path. It is `pub(crate)` and
+has exactly one implementation in this crate.
+
+### `Transaction<TFact>` trait is retired; `Transaction<TFact>` becomes a struct
+
+The trait existed solely to name the associated type in the GAT. With
+`Transaction<TFact>` now a concrete struct returned by value from
+`new_transaction`, the trait has no structural role. Assert/retract/commit
+become inherent methods. The `TFact` parameter is retained on the struct because
+`commit` returns `Vec<CommitChange<TFact>>` — it has real meaning there.
+
+### `TripleStore<TFact>` retains its type parameter
+
+`TFact` governs the return type of query methods and commit changes. It is not
+the source of the dyn-compatibility problem. `Store` holds
+`Arc<dyn TripleStore<StoredFact>>`, fixing the fact type at the consumer boundary
+— a deliberate choice, not a Rust constraint.
+
+### `subscribe` / `unsubscribe` added to `TripleStore<TFact>`
+
+Subscriptions are dispatch-coupled to commits inside `TripleStore`
+implementations. They belong on the trait. `Subscription` is a concrete type, so
+these methods are dyn-compatible.
+
+### `PredicateRegistry` moves to `Store`
+
+`Inner` does not hold a predicate registry. `Store` owns
+`RwLock<PredicateRegistry>`. The backend is unaware of predicate metadata.
+
+---
+
+## What Already Exists (unchanged by this chunk)
+
+- `Storage<TFact>` trait + `InMemoryStorage` — not modified.
+- `Queryable<TFact>` trait + `InMemoryStorage` impl — not modified.
+- `PredicateRegistry` / `Visibility` / `Cardinality` / `PredicateMeta` — not modified.
+- `Fact`, `StoredFact`, `BitemporalFact` — not modified.
+- `ChangeEvent`, `ChangeKind`, `Subscription`, `Subscriber` — not modified.
+- `TentativeOp` — stays inside `in_memory_store.rs`; not part of any public API.
+
+---
+
+## Phase 1 — Refactor for dyn-Compatibility
+
+**Files touched:** `in_memory_store.rs`, `triple_store.rs`, `transaction.rs`, `lib.rs`
+
+### Step 1 — Extract `Inner` from `InMemoryTripleStore`
+
+Create a `pub(crate)` struct `Inner` inside `in_memory_store.rs` that owns all
+mutable store state:
+
+```rust
+pub(crate) struct Inner {
+    storage:           InMemoryStorage,
+    clock:             Arc<dyn Clock>,
+    next_tx:           AtomicU64,
+    next_subscription: AtomicU64,
+    subscribers:       RwLock<Vec<Subscriber>>,
 }
 ```
 
-`AccessError` is the rejection type returned when an operation is not permitted:
+`predicates` is intentionally absent — it moves to `Store` in Phase 2.
+
+`InMemoryTripleStore` becomes a thin public wrapper that is cheaply cloneable:
 
 ```rust
+pub struct InMemoryTripleStore {
+    inner: Arc<Inner>,
+}
+
+impl Clone for InMemoryTripleStore {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+```
+
+### Step 2 — Introduce `Applier<TFact>` and implement it on `Inner`
+
+Add `Applier<TFact>` to `transaction.rs` (it is used by `Transaction<TFact>`
+which lives there):
+
+```rust
+/// Commit-callback seam between `Transaction<TFact>` and the store backend.
+///
+/// `Transaction<TFact>` holds `Arc<dyn Applier<TFact>>`. When `commit` is
+/// called the transaction delegates here, keeping `Transaction` independent
+/// of any concrete store type.
+pub(crate) trait Applier<TFact>: Send + Sync {
+    /// Apply `ops` as transaction `tx_id` and return the resulting change set.
+    ///
+    /// Requires: `tx_id` is unique within this store instance.
+    /// Ensures: all ops are applied atomically (per shard); change events are
+    ///   dispatched to matching subscribers before returning.
+    fn apply(
+        &self,
+        tx_id: TxId,
+        ops: Vec<TentativeOp>,
+    ) -> Result<Vec<CommitChange<TFact>>, TxError>;
+}
+```
+
+Implement `Applier<StoredFact>` on `Inner` by moving the existing
+`InMemoryTripleStore::apply` logic there.
+
+### Step 3 — Replace `Transaction<TFact>` trait with a concrete struct
+
+Remove the `Transaction<TFact>: Sized` trait from `transaction.rs`. Replace it
+with a concrete struct:
+
+```rust
+pub struct Transaction<TFact> {
+    applier: Arc<dyn Applier<TFact>>,
+    tx_id:   TxId,
+    ops:     Vec<TentativeOp>,
+}
+
+impl<TFact> Transaction<TFact> {
+    pub(crate) fn new(applier: Arc<dyn Applier<TFact>>, tx_id: TxId) -> Self {
+        Self { applier, tx_id, ops: Vec::new() }
+    }
+
+    pub fn assert_single(&mut self, fact: Fact) { ... }
+    pub fn assert_set(&mut self, fact: Fact) { ... }
+    pub fn assert_indexed(&mut self, fact: Fact, index_key: OrderingKey) { ... }
+    pub fn retract_single(&mut self, subject: EntityId, predicate: Predicate, asserter: EntityId) { ... }
+    pub fn retract_set(&mut self, subject: EntityId, predicate: Predicate, asserter: EntityId, object: Term) { ... }
+    pub fn retract_indexed(&mut self, subject: EntityId, predicate: Predicate, asserter: EntityId, index_key: OrderingKey) { ... }
+
+    /// Apply all buffered operations atomically.
+    ///
+    /// Ensures: all ops committed or none (per shard); change events dispatched
+    ///   to matching subscribers before returning.
+    pub fn commit(self) -> Result<Vec<CommitChange<TFact>>, TxError> {
+        self.applier.apply(self.tx_id, self.ops)
+    }
+
+    /// Discard all buffered operations.
+    pub fn rollback(self) {}
+}
+```
+
+`TxError` and its `From<StorageError>` impl remain in `transaction.rs`.
+
+### Step 4 — Update `TripleStore<TFact>` trait
+
+Replace the current trait in `triple_store.rs`. The GAT and associated
+`Transaction<TFact>` supertrait are removed; query methods are inlined (the
+`Queryable<TFact>` supertrait is no longer needed at this level);
+`subscribe`/`unsubscribe` are added:
+
+```rust
+pub trait TripleStore<TFact: BitemporalFact>: Send + Sync {
+    /// Begin a new transaction.
+    ///
+    /// Ensures: returned transaction has an empty buffer and a unique `TxId`.
+    fn new_transaction(&self) -> Transaction<TFact>;
+
+    /// The current time according to the store's clock.
+    fn now(&self) -> Timestamp;
+
+    fn query_open(
+        &self,
+        subject: EntityId,
+        predicate: Predicate,
+        pattern: Option<&Pattern>,
+    ) -> Vec<TFact>;
+
+    fn query_at(
+        &self,
+        subject: EntityId,
+        predicate: Predicate,
+        tx_time: Timestamp,
+        valid_time: Timestamp,
+        pattern: Option<&Pattern>,
+    ) -> Vec<TFact>;
+
+    fn history(
+        &self,
+        subject: EntityId,
+        predicate: Predicate,
+        pattern: Option<&Pattern>,
+    ) -> Vec<TFact>;
+
+    /// Register a pattern subscription.
+    ///
+    /// Ensures: returned `Subscription` id is unique within this store instance.
+    fn subscribe(&self, pattern: Pattern) -> Subscription;
+
+    /// Cancel a subscription. No-op if `id` is unknown.
+    fn unsubscribe(&self, id: SubscriptionId);
+}
+```
+
+All methods use only concrete types in their signatures. `TripleStore<StoredFact>`
+is fully dyn-compatible.
+
+### Step 5 — Update `InMemoryTripleStore` to implement new `TripleStore<TFact>`
+
+`new_transaction` clones `Arc<Inner>` into a `Transaction<StoredFact>`:
+
+```rust
+fn new_transaction(&self) -> Transaction<StoredFact> {
+    let tx_id = TxId(self.inner.next_tx.fetch_add(1, Ordering::Relaxed));
+    Transaction::new(Arc::clone(&self.inner) as Arc<dyn Applier<StoredFact>>, tx_id)
+}
+```
+
+Query methods and `subscribe`/`unsubscribe` delegate to `self.inner`.
+
+The predicate-registry methods (`declare_predicate`, `predicate`, `predicate_meta`,
+`predicate_name`) are removed from `InMemoryTripleStore`; they will appear on
+`Store` in Phase 2.
+
+### Invariant — all existing tests pass
+
+Phase 1 must not break any of the 103 existing tests. Tests that directly called
+predicate-registry methods on `InMemoryTripleStore` are migrated to use `Store`
+in Phase 2.
+
+---
+
+## Phase 2 — `ExecContext`, `AccessError`, and `Store`
+
+### `ExecContext` and `AccessError` — `exec_context.rs`
+
+See **Exercise A** below.
+
+### `StoreError` — `store.rs`
+
+See **Exercise B** below.
+
+### `Store` struct — `store.rs`
+
+`Store` is a concrete, non-generic struct:
+
+```rust
+pub struct Store {
+    backend:  Arc<dyn TripleStore<StoredFact>>,
+    registry: RwLock<PredicateRegistry>,
+}
+
+impl Store {
+    /// Requires: `backend` is a fully initialised `TripleStore<StoredFact>`.
+    pub fn new(backend: Arc<dyn TripleStore<StoredFact>>) -> Self { ... }
+
+    /// Convenience constructor wrapping an `InMemoryTripleStore`.
+    pub fn in_memory() -> Self {
+        Self::new(Arc::new(InMemoryTripleStore::new()))
+    }
+}
+```
+
+**Mutation methods** each:
+1. Resolve predicate metadata from `self.registry`.
+2. Call the appropriate `ExecContext` check method.
+3. Call `self.backend.new_transaction()`, buffer one operation, commit.
+4. Propagate errors as `StoreError`.
+
+**Query methods** each:
+1. Resolve predicate metadata from `self.registry`.
+2. Call `ctx.can_read(subject, meta)`. If `false`, return `vec![]` silently
+   (PRD §3.5: "as if the predicate does not exist").
+3. Delegate to the corresponding `self.backend` query method.
+
+**Predicate-registry methods** (`declare_predicate`, `predicate`,
+`predicate_meta`, `predicate_name`) operate on `self.registry` directly; the
+backend is not involved.
+
+**Subscription methods** delegate to `self.backend`.
+
+---
+
+## Exercise Tasks
+
+### Exercise A — `ExecContext` and `AccessError`
+
+**File:** `crates/triple-store/src/exec_context.rs` (new file)
+
+Implement the `ExecContext` enum, `AccessError` enum, and three check methods
+encoding the PRD §3.5 rules. Derive `Copy + Clone + Debug + PartialEq + Eq` on
+`ExecContext`; derive `Debug + PartialEq + Eq` on `AccessError`.
+
+```rust
+pub enum ExecContext { Entity(EntityId), System }
+
 pub enum AccessError {
     Denied { predicate: Predicate, reason: &'static str },
 }
+
+impl ExecContext {
+    pub fn check_internal_assert(&self, subject: EntityId) -> Result<(), AccessError>;
+    pub fn check_external_assert(&self, meta: PredicateMeta) -> Result<(), AccessError>;
+    pub fn can_read(&self, subject: EntityId, meta: PredicateMeta) -> bool;
+}
 ```
 
-`reason` is `&'static str` — no allocation — consistent with how
-`StorageError::Internal` and `TxError::Internal` work in the rest of the codebase.
+Include a `#[cfg(test)]` module covering at minimum:
+- `System` permits internal assert for any subject.
+- `Entity(1)` permits internal assert for subject 1.
+- `Entity(1)` denies internal assert for subject 2.
+- `Entity(x)` denies external assert on `Private` predicate.
+- `Entity(x)` denies external assert on `Shared` predicate.
+- `System` denies external assert on `Private` predicate.
+- Any context permits external assert on `Public` predicate.
+- `Private` predicate: only owner and `System` can read.
+- `Shared` predicate: any context can read.
 
-The three access rules from PRD §3.5 are implemented as methods on `ExecContext`:
+### Exercise B — `StoreError` and `Store` skeleton
 
-```
-check_internal_assert(&self, subject: EntityId) -> Result<(), AccessError>
-check_external_assert(&self, meta: PredicateMeta)  -> Result<(), AccessError>
-can_read(&self, subject: EntityId, meta: PredicateMeta) -> bool
-```
+**File:** `crates/triple-store/src/store.rs` (new file)
 
-See **Exercise A** below for the precise rule logic.
-
-### `StoreError` — lives in `store.rs`
-
-`StoreError` is the error type returned by all `Store` mutation methods. It
-combines access failures with transaction failures:
+1. Implement `StoreError`:
 
 ```rust
 #[derive(Debug, PartialEq, Eq)]
@@ -97,206 +375,83 @@ pub enum StoreError {
 }
 ```
 
-Add `From<AccessError> for StoreError` and `From<TxError> for StoreError` so
-the `?` operator can be used to propagate either type inside `Store` methods.
-This is the standard Rust multi-error-source pattern.
+With `From<AccessError> for StoreError` and `From<TxError> for StoreError`.
 
-### `Store` wrapper — lives in `store.rs`
+2. Implement `Store::new`, `Store::in_memory`, and the four predicate-registry
+   methods. These require no access checks and operate on `self.registry`.
 
-`Store` is a newtype wrapper over `InMemoryTripleStore`:
-
-```rust
-pub struct Store(InMemoryTripleStore);
-```
-
-It is **not** `Clone` in this chunk (shared-handle semantics deferred). It
-exposes its own API; `InMemoryTripleStore`'s public API is not re-exported
-directly — callers go through `Store`.
-
-**Mutation methods.** Each assert/retract method:
-1. Determines whether the operation is internal or external (compare
-   `fact.subject` with `fact.asserter` for asserts; retract is always by the
-   owning context, so compare `ctx` with `subject`).
-2. Calls the appropriate check method on `ctx`.
-3. Creates a one-op transaction, runs the operation, commits.
-4. Propagates errors as `StoreError`.
-
-**Query methods.** Each query method:
-1. Calls `self.0.predicate_meta(predicate)` to retrieve visibility.
-2. Calls `ctx.can_read(subject, meta)`. If `false`, returns an empty `Vec`
-   immediately (PRD §3.5: "as if it does not exist").
-3. Otherwise delegates to the corresponding `InMemoryTripleStore` query method.
-
-The silent-empty-result behaviour for denied reads is intentional: it prevents
-information leakage by not revealing whether a predicate exists.
+3. Implement `Store::subscribe` and `Store::unsubscribe` as single-line
+   delegations to `self.backend`.
 
 ---
 
 ## PRD §3.5 Rules Reference
 
-The three rules, stated precisely for implementation:
-
 ### Internal assert
-
-> An `assert` of an **Internal** fact for entity E is only accepted from
-> entity E's context. `System` is always permitted.
-
 ```
 Entity(caller) → permit iff caller == subject
 System         → always permit
 ```
 
 ### External assert
-
-> An `assert` of an **External** fact requires the predicate's visibility to
-> be `Public`. `Private` and `Shared` predicates reject external assertions.
-
 ```
-visibility == Public  → permit (any context, including System)
-otherwise             → deny, regardless of ctx
+visibility == Public → permit (any context, including System)
+otherwise            → deny, regardless of ctx
 ```
 
-Note: `System` context is still denied for external asserts on non-Public
-predicates. `System` grants bypass for *ownership* checks (internal asserts),
-not visibility checks. This is a deliberate boundary.
+`System` is denied for external asserts on non-`Public` predicates. `System`
+grants bypass for ownership checks, not visibility checks.
 
 ### Read
-
-> `Private`: only E's own context can read.
-> `Shared`: any entity's context can read.
-> `Public`: any entity can read.
-
 ```
-Private  → permit iff ctx == Entity(subject) || ctx == System
-Shared   → always permit
-Public   → always permit
+Private → permit iff ctx == Entity(subject) || ctx == System
+Shared  → always permit
+Public  → always permit
 ```
-
----
-
-## Exercise Tasks
-
-These two tasks are scoped to be implementable from the description above and
-the existing codebase, without needing additional guidance from Claude.
-
-### Exercise A — `ExecContext` and `AccessError`
-
-**File:** `crates/triple-store/src/exec_context.rs` (new file)
-
-**What to implement:**
-
-1. The `ExecContext` enum and `AccessError` enum as shown above. Follow the
-   derive pattern of the rest of the codebase: `Copy + Clone + Debug + PartialEq + Eq`
-   where appropriate. `ExecContext` should be `Copy`; `AccessError` should be
-   `Debug + PartialEq + Eq` (not `Copy` — the `reason: &'static str` field is
-   `Copy` but the overall error type conventionally isn't).
-
-2. An `impl ExecContext` block with three methods:
-   ```
-   pub fn check_internal_assert(&self, subject: EntityId) -> Result<(), AccessError>
-   pub fn check_external_assert(&self, meta: PredicateMeta) -> Result<(), AccessError>
-   pub fn can_read(&self, subject: EntityId, meta: PredicateMeta) -> bool
-   ```
-   Translate the three rules from the **PRD §3.5 Rules Reference** section
-   above using `match` on `self`. For `Denied`, pick a short `reason` string
-   describing the violation (e.g. `"entity may not assert internal facts for
-   another entity"`).
-
-3. A `#[cfg(test)]` module with at least these cases:
-   - `System` permits internal assert for any subject.
-   - `Entity(1)` permits internal assert for subject 1.
-   - `Entity(1)` denies internal assert for subject 2.
-   - `Entity(x)` denies external assert on `Private` predicate.
-   - `Entity(x)` denies external assert on `Shared` predicate.
-   - `System` denies external assert on `Private` predicate (see note above).
-   - Any context permits external assert on `Public` predicate.
-   - `Private` predicate: only owner and `System` can read.
-   - `Shared` predicate: any context can read.
-
-**Rust hints:**
-
-- `match self { ExecContext::Entity(id) => ..., ExecContext::System => ... }`
-  is the idiomatic way to branch on enum variants with data.
-- For `check_internal_assert`, `Visibility` is not involved — only
-  `ExecContext` variant vs. `subject`.
-- For `can_read`, return `true` early for `Shared` and `Public` since both are
-  unconditionally permitted; handle `Private` as the restrictive case.
-- `Predicate(0)` is fine as a placeholder predicate id in tests (it doesn't
-  need to be registered for these unit tests).
-
----
-
-### Exercise B — `StoreError` with `From` impls
-
-**File:** `crates/triple-store/src/store.rs` (new file, just the error type for now)
-
-**What to implement:**
-
-1. The `StoreError` enum:
-   ```rust
-   pub enum StoreError {
-       Access(AccessError),
-       Transaction(TxError),
-   }
-   ```
-
-2. Two `From` impls:
-   ```rust
-   impl From<AccessError> for StoreError { ... }
-   impl From<TxError> for StoreError { ... }
-   ```
-
-3. Verify that `?` can propagate both types. A quick way to check: write a
-   dead-code function (not a test, just a local fn) that calls a fallible
-   function returning `Result<_, AccessError>` and uses `?` inside a function
-   returning `Result<_, StoreError>`. It will fail to compile if the `From`
-   impl is missing.
-
-**Rust hints:**
-
-- `From<A> for B` is the trait for "A can be infallibly converted to B".
-  `impl From<AccessError> for StoreError { fn from(e: AccessError) -> Self { Self::Access(e) } }`.
-- The `?` operator on a `Result<T, E>` inside a function returning
-  `Result<T, F>` automatically calls `F::from(e)` on the error. This is why
-  `From` impls are the idiomatic way to compose error types in Rust.
-- `#[derive(Debug, PartialEq, Eq)]` on `StoreError` requires that both wrapped
-  types also implement those traits. Check that `AccessError` and `TxError`
-  already do — they should from the existing codebase.
 
 ---
 
 ## Remaining Deliverables (not exercises)
 
-These should be implemented (or reviewed after the exercises are done):
+After the exercises are complete:
 
-- `Store` struct (newtype over `InMemoryTripleStore`) in `store.rs`.
-- All six mutation methods on `Store` with access checks.
-- Three query methods on `Store` with visibility filtering.
-- Predicate-registry and subscription delegation on `Store`.
-- `lib.rs` updated to declare both new modules.
+- All six `Store` mutation methods with access checks.
+- Three `Store` query methods with visibility filtering.
+- `lib.rs` updated to declare `exec_context` and `store` modules.
 - Tests covering: internal assert permitted/denied, external assert
-  permitted/denied, query visibility filtering, System bypass for internal
-  asserts, retract-not-found propagated as `StoreError::Transaction`.
+  permitted/denied, query visibility filtering, `System` bypass, retract-not-found
+  propagated as `StoreError::Transaction`.
 
 ---
 
 ## Expected Deliverables
 
-- `crates/triple-store/src/exec_context.rs` — `ExecContext`, `AccessError`,
-  three check methods, unit tests.
-- `crates/triple-store/src/store.rs` — `StoreError`, `Store`, delegation and
-  access-check wiring, integration tests.
-- `lib.rs` updated to declare both new modules.
-- All 103 existing tests continue to pass with no modifications.
+**Phase 1 (refactor):**
+- `in_memory_store.rs` — `Inner` extracted; `InMemoryTripleStore` thinned to
+  `Arc<Inner>` wrapper with `Clone`; predicate-registry methods removed;
+  `Inner` implements `Applier<StoredFact>`.
+- `transaction.rs` — `Transaction<TFact>` trait removed; `Applier<TFact>` trait
+  added; concrete `Transaction<TFact>` struct with inherent methods; `TxError` retained.
+- `triple_store.rs` — GAT removed; `TFact` parameter retained; query methods
+  inlined; `subscribe`/`unsubscribe` added; `Queryable` supertrait removed.
+- All 103 existing tests pass (modulo predicate-registry tests migrated to Phase 2).
+
+**Phase 2 (Store):**
+- `crates/triple-store/src/exec_context.rs` — new file.
+- `crates/triple-store/src/store.rs` — new file.
+- `lib.rs` updated.
+- All tests pass.
 
 ---
 
 ## What This Sets Up (Chunk 11 Preview)
 
-With `Store` in place:
-
-- Multi-operation transactions can be exposed on `Store` (begin / multi-assert / commit).
-- `Store::clone_handle()` can be added once `Arc<InMemoryTripleStore>` is
-  introduced, enabling multiple entity contexts to share one backend.
-- Subscriber identity can be captured at `subscribe` time (from `ExecContext`)
-  and used to filter dispatch by visibility.
+- Multi-operation transaction API on `Store`: `Store::begin() -> Transaction<StoredFact>`
+  exposes the transaction directly to callers.
+- `Store::clone_handle()` is trivial — `Arc::clone(&self.backend)` plus a
+  decision on registry-sharing strategy.
+- Subscriber identity from `ExecContext` captured at subscribe time and used to
+  filter dispatch by visibility.
+- A `DurableFileTripleStore` plugs in by implementing `TripleStore<StoredFact>`
+  (and `Applier<StoredFact>` on its inner state) with zero changes to `Store` or
+  any caller.
