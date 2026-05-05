@@ -17,10 +17,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use async_channel::TrySendError;
 use parking_lot::RwLock;
 
+use crate::change::{ChangeEvent, ChangeKind, Subscriber, Subscription};
 use crate::fact::{BitemporalFact, Fact, StoredFact};
-use crate::id::{EntityId, TxId};
+use crate::id::{EntityId, SubscriptionId, TxId};
 use crate::pattern::{Match, MatchAsserter, Pattern};
 use crate::predicates::OrderingKey;
 use crate::queryable::Queryable;
@@ -340,6 +342,10 @@ pub struct InMemoryTripleStore {
     storage: InMemoryStorage,
     clock: Arc<dyn Clock>,
     next_tx: AtomicU64,
+    next_subscription: AtomicU64,
+    /// Pattern subscribers, populated by `subscribe`. Read on every commit;
+    /// written on subscribe/unsubscribe and lazy cleanup of dead receivers.
+    subscribers: RwLock<Vec<Subscriber>>,
 }
 
 impl InMemoryTripleStore {
@@ -367,6 +373,77 @@ impl InMemoryTripleStore {
             storage: InMemoryStorage::new(shard_count),
             clock,
             next_tx: AtomicU64::new(1),
+            next_subscription: AtomicU64::new(1),
+            subscribers: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Register a change-event subscription.
+    ///
+    /// The returned [`Subscription`] handle owns the receiving end of the
+    /// store's internal change-event channel. Use its `recv` / `recv_blocking`
+    /// / `try_recv` methods to consume events.
+    ///
+    /// Lifetime: the subscription remains active until either
+    /// [`unsubscribe`](Self::unsubscribe) is called with its id or the
+    /// `Subscription` handle is dropped. Drop cleanup is lazy — the entry is
+    /// removed on the next dispatch that would have delivered to it.
+    ///
+    /// Ensures: the returned `Subscription`'s id is unique within this store.
+    pub fn subscribe(&self, pattern: Pattern) -> Subscription {
+        let id = SubscriptionId(self.next_subscription.fetch_add(1, Ordering::Relaxed));
+        let (sender, receiver) = async_channel::unbounded();
+        self.subscribers.write().push(Subscriber {
+            id,
+            pattern,
+            sender,
+        });
+        Subscription::new(id, receiver)
+    }
+
+    /// Cancel a subscription. Subsequent commits do not dispatch to it.
+    /// No-op if the id is unknown (e.g., already pruned by lazy cleanup).
+    pub fn unsubscribe(&self, id: SubscriptionId) {
+        self.subscribers.write().retain(|s| s.id != id);
+    }
+
+    /// Dispatch a transaction's changes to matching subscribers.
+    ///
+    /// Called from `apply` after storage writes complete. Holds only the
+    /// subscribers read lock; storage shard locks have been released. Closed
+    /// receivers are collected during the read pass and pruned afterwards
+    /// under a write lock (lazy cleanup, PRD §3.4 / chunk-8 plan Q4).
+    fn dispatch(&self, tx_id: TxId, changes: &[CommitChange<StoredFact>]) {
+        if changes.is_empty() {
+            return;
+        }
+        let mut dead: Vec<SubscriptionId> = Vec::new();
+        {
+            let guard = self.subscribers.read();
+            if guard.is_empty() {
+                return;
+            }
+            for sub in guard.iter() {
+                for change in changes {
+                    let Some(event) = build_event(change, tx_id, &sub.pattern) else {
+                        continue;
+                    };
+                    match sub.sender.try_send(event) {
+                        Ok(()) => {}
+                        Err(TrySendError::Closed(_)) => {
+                            dead.push(sub.id);
+                            break;
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            // Bounded channel full: drop in v0 (PRD §5.3 deferred).
+                        }
+                    }
+                }
+            }
+        }
+        if !dead.is_empty() {
+            let mut guard = self.subscribers.write();
+            guard.retain(|s| !dead.contains(&s.id));
         }
     }
 
@@ -586,8 +663,52 @@ impl InMemoryTripleStore {
             }
         }
 
+        self.dispatch(tx_id, &changes);
         Ok(changes)
     }
+}
+
+/// Project a `CommitChange` into a `ChangeEvent` if the represented fact
+/// matches `pattern`.
+///
+/// Match-side per chunk-8 plan Q3: `Asserted`/`Updated` match the opened
+/// (new-state) fact; `Retracted` matches the closed fact (no new state to
+/// match against).
+fn build_event(
+    change: &CommitChange<StoredFact>,
+    tx_id: TxId,
+    pattern: &Pattern,
+) -> Option<ChangeEvent> {
+    let (fact, kind) = match change {
+        CommitChange::Asserted { fact } => (
+            fact,
+            ChangeKind::Asserted {
+                new_object: fact.object.clone(),
+            },
+        ),
+        CommitChange::Updated { closed, opened } => (
+            opened,
+            ChangeKind::Updated {
+                old_object: closed.object.clone(),
+                new_object: opened.object.clone(),
+            },
+        ),
+        CommitChange::Retracted { closed } => (
+            closed,
+            ChangeKind::Retracted {
+                old_object: closed.object.clone(),
+            },
+        ),
+    };
+    if !matches_pattern(fact, Some(pattern)) {
+        return None;
+    }
+    Some(ChangeEvent {
+        subject: fact.subject,
+        predicate: fact.predicate,
+        kind,
+        tx_id,
+    })
 }
 
 impl Default for InMemoryTripleStore {
@@ -1422,5 +1543,225 @@ mod tests {
         let results = s.query_open(EntityId(1), Predicate(0), Some(&external_pat));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].asserter, EntityId(2));
+    }
+
+    // ── Subscriptions ────────────────────────────────────────────────────────
+
+    use crate::change::{ChangeEvent, ChangeKind};
+
+    fn any_pattern() -> Pattern {
+        Pattern {
+            subject: Match::Any,
+            predicate: Match::Any,
+            object: Match::Any,
+            asserter: MatchAsserter::Any,
+        }
+    }
+
+    /// Drain all currently-available events from a subscription.
+    fn drain(sub: &crate::change::Subscription) -> Vec<ChangeEvent> {
+        let mut out = Vec::new();
+        while let Ok(Some(e)) = sub.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    #[test]
+    fn subscribe_delivers_asserted_event_on_commit() {
+        let s = InMemoryTripleStore::new();
+        let sub = s.subscribe(any_pattern());
+
+        let mut tx = s.new_transaction();
+        tx.assert_single(mk_fact(1, 1, 42));
+        let changes = tx.commit().unwrap();
+        let commit_tx_id = match &changes[0] {
+            CommitChange::Asserted { fact } => fact.tx_id,
+            _ => panic!(),
+        };
+
+        let event = sub.try_recv().unwrap().expect("expected one event");
+        assert_eq!(event.subject, EntityId(1));
+        assert_eq!(event.predicate, Predicate(0));
+        assert_eq!(event.tx_id, commit_tx_id);
+        match event.kind {
+            ChangeKind::Asserted { new_object } => assert_eq!(new_object, Term::Int(42)),
+            other => panic!("expected Asserted, got {:?}", other),
+        }
+        assert!(matches!(sub.try_recv(), Ok(None)));
+    }
+
+    #[test]
+    fn subscribe_delivers_updated_with_old_and_new_object() {
+        let clock = TickClock::new(100);
+        let s = InMemoryTripleStore::with_clock(clock.clone());
+        let sub = s.subscribe(any_pattern());
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 42));
+        tx1.commit().unwrap();
+        let _ = sub.try_recv().unwrap(); // discard the Asserted event
+
+        clock.set(200);
+        let mut tx2 = s.new_transaction();
+        tx2.assert_single(mk_fact(1, 1, 99));
+        tx2.commit().unwrap();
+
+        let event = sub.try_recv().unwrap().expect("expected supersession event");
+        match event.kind {
+            ChangeKind::Updated {
+                old_object,
+                new_object,
+            } => {
+                assert_eq!(old_object, Term::Int(42));
+                assert_eq!(new_object, Term::Int(99));
+            }
+            other => panic!("expected Updated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subscribe_delivers_retracted_with_old_object() {
+        let s = InMemoryTripleStore::new();
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 42));
+        tx1.commit().unwrap();
+
+        let sub = s.subscribe(any_pattern());
+
+        let mut tx2 = s.new_transaction();
+        tx2.retract_single(EntityId(1), Predicate(0), EntityId(1));
+        tx2.commit().unwrap();
+
+        let event = sub.try_recv().unwrap().expect("expected retract event");
+        match event.kind {
+            ChangeKind::Retracted { old_object } => assert_eq!(old_object, Term::Int(42)),
+            other => panic!("expected Retracted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subscribe_pattern_filters_by_subject() {
+        let s = InMemoryTripleStore::new();
+        let pat = Pattern {
+            subject: Match::Is(EntityId(2)),
+            predicate: Match::Any,
+            object: Match::Any,
+            asserter: MatchAsserter::Any,
+        };
+        let sub = s.subscribe(pat);
+
+        let mut tx = s.new_transaction();
+        tx.assert_single(mk_fact(1, 1, 10)); // does not match subject=2
+        tx.assert_single(mk_fact(2, 2, 20)); // matches
+        tx.commit().unwrap();
+
+        let event = sub.try_recv().unwrap().expect("expected one matching event");
+        assert_eq!(event.subject, EntityId(2));
+        assert!(
+            matches!(sub.try_recv(), Ok(None)),
+            "non-matching event must not deliver"
+        );
+    }
+
+    #[test]
+    fn unsubscribe_stops_delivery() {
+        let s = InMemoryTripleStore::new();
+        let sub = s.subscribe(any_pattern());
+
+        let mut tx1 = s.new_transaction();
+        tx1.assert_single(mk_fact(1, 1, 1));
+        tx1.commit().unwrap();
+        assert!(matches!(sub.try_recv(), Ok(Some(_))));
+
+        s.unsubscribe(sub.id());
+
+        let mut tx2 = s.new_transaction();
+        tx2.assert_single(mk_fact(2, 2, 2));
+        tx2.commit().unwrap();
+        // After unsubscribe the store dropped its sender, so the channel is
+        // closed once any buffered events have been drained.
+        assert_eq!(sub.try_recv(), Err(crate::change::ChannelClosed));
+    }
+
+    #[test]
+    fn unsubscribe_unknown_id_is_noop() {
+        let s = InMemoryTripleStore::new();
+        // Just must not panic.
+        s.unsubscribe(SubscriptionId(999));
+    }
+
+    #[test]
+    fn dropped_subscription_is_pruned_lazily() {
+        let s = InMemoryTripleStore::new();
+        let sub = s.subscribe(any_pattern());
+        assert_eq!(s.subscribers.read().len(), 1);
+
+        drop(sub);
+
+        // Pruning happens during the next dispatch with a matching change.
+        let mut tx = s.new_transaction();
+        tx.assert_single(mk_fact(1, 1, 1));
+        tx.commit().unwrap();
+
+        assert_eq!(
+            s.subscribers.read().len(),
+            0,
+            "dropped subscription should have been pruned during dispatch"
+        );
+    }
+
+    #[test]
+    fn multiple_subscribers_each_receive_matching_events() {
+        let s = InMemoryTripleStore::new();
+        let a = s.subscribe(any_pattern());
+        let b = s.subscribe(Pattern {
+            subject: Match::Is(EntityId(2)),
+            predicate: Match::Any,
+            object: Match::Any,
+            asserter: MatchAsserter::Any,
+        });
+
+        let mut tx = s.new_transaction();
+        tx.assert_single(mk_fact(1, 1, 10));
+        tx.assert_single(mk_fact(2, 2, 20));
+        tx.commit().unwrap();
+
+        let mut a_subjects: Vec<EntityId> = drain(&a).into_iter().map(|e| e.subject).collect();
+        a_subjects.sort();
+        assert_eq!(a_subjects, vec![EntityId(1), EntityId(2)]);
+
+        let b_events = drain(&b);
+        assert_eq!(b_events.len(), 1);
+        assert_eq!(b_events[0].subject, EntityId(2));
+    }
+
+    #[test]
+    fn empty_commit_does_not_dispatch() {
+        let s = InMemoryTripleStore::new();
+        let sub = s.subscribe(any_pattern());
+
+        let tx = s.new_transaction();
+        tx.commit().unwrap();
+        assert!(matches!(sub.try_recv(), Ok(None)));
+    }
+
+    #[test]
+    fn multiple_commits_deliver_separate_events() {
+        let s = InMemoryTripleStore::new();
+        let sub = s.subscribe(any_pattern());
+
+        for v in [1, 2, 3] {
+            let mut tx = s.new_transaction();
+            tx.assert_set(mk_fact(1, 1, v));
+            tx.commit().unwrap();
+        }
+
+        let received = drain(&sub);
+        assert_eq!(received.len(), 3);
+        let mut tx_ids: Vec<TxId> = received.iter().map(|e| e.tx_id).collect();
+        tx_ids.dedup();
+        assert_eq!(tx_ids.len(), 3, "each commit should carry a distinct tx_id");
     }
 }

@@ -18,6 +18,7 @@
 //! The in-memory implementation ([`in_memory_store`]) is the only backend in
 //! Phase 0. `InMemoryTripleStore` implements `TripleStore<StoredFact>`.
 
+pub mod change;
 pub mod fact;
 pub mod id;
 pub mod in_memory_store;
