@@ -312,10 +312,11 @@ impl Store {
 3. Call `self.backend.new_transaction()`, buffer one operation, commit.
 4. Propagate errors as `StoreError`.
 
-**Query methods** each:
+**Query methods** each return `Result<Vec<StoredFact>, StoreError>`:
 1. Resolve predicate metadata from `self.registry`.
-2. Call `ctx.can_read(subject, meta)`. If `false`, return `vec![]` silently
-   (PRD §3.5: "as if the predicate does not exist").
+2. Call `ctx.check_read(subject, meta)?` — propagates `AccessError` as
+   `StoreError::Access`. Callers can distinguish access denial from empty
+   results; silent `vec![]` was rejected because it conflates the two.
 3. Delegate to the corresponding `self.backend` query method.
 
 **Predicate-registry methods** (`declare_predicate`, `predicate`,
@@ -332,7 +333,7 @@ backend is not involved.
 
 **File:** `crates/triple-store/src/exec_context.rs` (new file)
 
-Implement the `ExecContext` enum, `AccessError` enum, and three check methods
+Implement the `ExecContext` enum, `AccessError` enum, and two check methods
 encoding the PRD §3.5 rules. Derive `Copy + Clone + Debug + PartialEq + Eq` on
 `ExecContext`; derive `Debug + PartialEq + Eq` on `AccessError`.
 
@@ -340,26 +341,36 @@ encoding the PRD §3.5 rules. Derive `Copy + Clone + Debug + PartialEq + Eq` on
 pub enum ExecContext { Entity(EntityId), System }
 
 pub enum AccessError {
-    Denied { predicate: Predicate, reason: &'static str },
+    Denied { predicate: PredicateMeta, reason: &'static str },
 }
 
 impl ExecContext {
-    pub fn check_internal_assert(&self, subject: EntityId) -> Result<(), AccessError>;
-    pub fn check_external_assert(&self, meta: PredicateMeta) -> Result<(), AccessError>;
-    pub fn can_read(&self, subject: EntityId, meta: PredicateMeta) -> bool;
+    pub fn check_assert(&self, subject: EntityId, meta: PredicateMeta) -> Result<(), AccessError>;
+    pub fn check_read(&self, subject: EntityId, meta: PredicateMeta) -> Result<(), AccessError>;
 }
 ```
 
+`check_assert` unifies what the original plan split into `check_internal_assert`
+and `check_external_assert`. Internal vs. external is a **fact property**
+(`subject == asserter`), not a separate assert operation: the same single-method
+check covers both cases. `System` always permits because it acts on behalf of
+the entity (producing internal facts); visibility does not gate System asserts.
+
+`AccessError::Denied` carries `PredicateMeta` rather than just `Predicate` so
+error messages and tests have access to visibility and cardinality without a
+second registry lookup.
+
 Include a `#[cfg(test)]` module covering at minimum:
-- `System` permits internal assert for any subject.
-- `Entity(1)` permits internal assert for subject 1.
-- `Entity(1)` denies internal assert for subject 2.
-- `Entity(x)` denies external assert on `Private` predicate.
-- `Entity(x)` denies external assert on `Shared` predicate.
-- `System` denies external assert on `Private` predicate.
-- Any context permits external assert on `Public` predicate.
-- `Private` predicate: only owner and `System` can read.
-- `Shared` predicate: any context can read.
+- `System` permits assert for any subject and any predicate visibility.
+- `Entity(1)` permits assert for subject 1 (any predicate visibility).
+- `Entity(1)` denies assert for subject 2 on `Private` predicate.
+- `Entity(1)` denies assert for subject 2 on `Shared` predicate.
+- `Entity(1)` permits assert for subject 2 on `Public` predicate.
+- Any context permits assert on `Public` predicate.
+- `System` permits read of any predicate for any subject.
+- `Entity(x)` permits read of any predicate on owned subject.
+- `Entity(x)` denies read of `Private` predicate on another subject.
+- `Entity(x)` permits read of `Shared` and `Public` predicates on any subject.
 
 ### Exercise B — `StoreError` and `Store` skeleton
 
@@ -387,27 +398,34 @@ With `From<AccessError> for StoreError` and `From<TxError> for StoreError`.
 
 ## PRD §3.5 Rules Reference
 
-### Internal assert
+### Assert (`check_assert`)
+
+Internal vs. external is a **derived fact property** (`subject == asserter`),
+not a separate operation. A single check covers both:
+
 ```
-Entity(caller) → permit iff caller == subject
-System         → always permit
+Entity(caller), caller == subject                       → permit (internal)
+Entity(caller), caller != subject, visibility == Public → permit (external)
+Entity(caller), caller != subject, otherwise            → deny
+System                                                  → always permit
 ```
 
-### External assert
-```
-visibility == Public → permit (any context, including System)
-otherwise            → deny, regardless of ctx
-```
+`System` always permits because it acts on behalf of the entity, producing
+facts where `asserter = subject` (internal facts). There is no "System external
+assert" scenario — System bypasses ownership, not visibility, and ownership is
+the only gate on internal asserts.
 
-`System` is denied for external asserts on non-`Public` predicates. `System`
-grants bypass for ownership checks, not visibility checks.
+### Read (`check_read`)
 
-### Read
 ```
 Private → permit iff ctx == Entity(subject) || ctx == System
 Shared  → always permit
 Public  → always permit
 ```
+
+Store query methods return `Result<Vec<StoredFact>, StoreError>`. An
+`AccessError` surfaces as `StoreError::Access`; callers can distinguish denial
+from genuinely empty results. Silent `vec![]` was rejected.
 
 ---
 
@@ -416,11 +434,12 @@ Public  → always permit
 After the exercises are complete:
 
 - All six `Store` mutation methods with access checks.
-- Three `Store` query methods with visibility filtering.
+- Three `Store` query methods returning `Result<Vec<StoredFact>, StoreError>`
+  with visibility filtering via `check_read`.
 - `lib.rs` updated to declare `exec_context` and `store` modules.
-- Tests covering: internal assert permitted/denied, external assert
-  permitted/denied, query visibility filtering, `System` bypass, retract-not-found
-  propagated as `StoreError::Transaction`.
+- Tests covering: assert permitted/denied (internal and external cases), query
+  access denial distinguished from empty results, `System` bypass on assert,
+  retract-not-found propagated as `StoreError::Transaction`.
 
 ---
 
@@ -441,6 +460,28 @@ After the exercises are complete:
 - `crates/triple-store/src/store.rs` — new file.
 - `lib.rs` updated.
 - All tests pass.
+
+---
+
+## Open Questions
+
+### System provenance
+
+When `System` asserts a fact on behalf of an entity, the stored fact has
+`asserter == subject`, making it structurally indistinguishable from a fact the
+entity asserted itself. The audit trail for System writes is lost.
+
+Options to consider (deferred):
+- Reserve a well-known `EntityId` for System (e.g. `EntityId(0)`) and use it as
+  `asserter` when `ExecContext::System` is active. The fact becomes external
+  (`asserter != subject`) but is committed without a visibility gate. Requires
+  a carve-out in `check_assert` or a distinct commit path.
+- Add an optional `system: bool` flag to `StoredFact` (breaks the clean
+  subject/asserter provenance model).
+- Accept the loss for now; `System` asserts are administrative and rare.
+
+This question should be resolved before exposing `Store` to untrusted callers or
+building audit tooling.
 
 ---
 

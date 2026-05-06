@@ -22,6 +22,7 @@
 //! Phase 0. `InMemoryTripleStore` implements `TripleStore<StoredFact>`.
 
 pub mod change;
+pub mod exec_context;
 pub mod fact;
 pub mod id;
 pub mod in_memory_store;
