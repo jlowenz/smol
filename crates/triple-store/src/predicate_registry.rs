@@ -87,7 +87,11 @@ impl PredicateRegistry {
         let id = self.interner.intern(name);
         self.ensure_slot(id);
 
-        let requested = PredicateMeta { id, visibility, cardinality };
+        let requested = PredicateMeta {
+            id,
+            visibility,
+            cardinality,
+        };
 
         match self.meta[id.0 as usize] {
             None => {
@@ -167,7 +171,9 @@ mod tests {
     #[test]
     fn declare_returns_handle_and_round_trips_meta() {
         let mut r = reg();
-        let id = r.declare("account.balance", Visibility::Private, Cardinality::Single).unwrap();
+        let id = r
+            .declare("account.balance", Visibility::Private, Cardinality::Single)
+            .unwrap();
         let m = r.meta(id);
         assert_eq!(m.id, id);
         assert_eq!(m.visibility, Visibility::Private);
@@ -177,34 +183,51 @@ mod tests {
     #[test]
     fn declare_same_meta_twice_is_idempotent() {
         let mut r = reg();
-        let id1 = r.declare("p", Visibility::Shared, Cardinality::Set).unwrap();
-        let id2 = r.declare("p", Visibility::Shared, Cardinality::Set).unwrap();
+        let id1 = r
+            .declare("p", Visibility::Shared, Cardinality::Set)
+            .unwrap();
+        let id2 = r
+            .declare("p", Visibility::Shared, Cardinality::Set)
+            .unwrap();
         assert_eq!(id1, id2);
     }
 
     #[test]
     fn declare_conflicting_visibility_errors() {
         let mut r = reg();
-        r.declare("p", Visibility::Private, Cardinality::Single).unwrap();
-        let err = r.declare("p", Visibility::Public, Cardinality::Single).unwrap_err();
+        r.declare("p", Visibility::Private, Cardinality::Single)
+            .unwrap();
+        let err = r
+            .declare("p", Visibility::Public, Cardinality::Single)
+            .unwrap_err();
         assert!(matches!(err, PredicateError::ConflictingDeclaration { name, .. } if name == "p"));
     }
 
     #[test]
     fn declare_conflicting_cardinality_errors() {
         let mut r = reg();
-        r.declare("p", Visibility::Private, Cardinality::Single).unwrap();
-        let err = r.declare("p", Visibility::Private, Cardinality::Set).unwrap_err();
+        r.declare("p", Visibility::Private, Cardinality::Single)
+            .unwrap();
+        let err = r
+            .declare("p", Visibility::Private, Cardinality::Set)
+            .unwrap_err();
         assert!(matches!(err, PredicateError::ConflictingDeclaration { .. }));
     }
 
     #[test]
     fn declare_conflicting_error_carries_both_existing_and_requested() {
         let mut r = reg();
-        r.declare("p", Visibility::Private, Cardinality::Single).unwrap();
+        r.declare("p", Visibility::Private, Cardinality::Single)
+            .unwrap();
         let id = r.lookup("p").unwrap();
-        let err = r.declare("p", Visibility::Public, Cardinality::Set).unwrap_err();
-        let PredicateError::ConflictingDeclaration { existing, requested, .. } = err;
+        let err = r
+            .declare("p", Visibility::Public, Cardinality::Set)
+            .unwrap_err();
+        let PredicateError::ConflictingDeclaration {
+            existing,
+            requested,
+            ..
+        } = err;
         assert_eq!(existing.id, id);
         assert_eq!(existing.visibility, Visibility::Private);
         assert_eq!(existing.cardinality, Cardinality::Single);
@@ -226,7 +249,9 @@ mod tests {
     #[test]
     fn intern_default_preserves_prior_declaration() {
         let mut r = reg();
-        let declared = r.declare("p", Visibility::Public, Cardinality::Set).unwrap();
+        let declared = r
+            .declare("p", Visibility::Public, Cardinality::Set)
+            .unwrap();
         let interned = r.intern_default("p");
         assert_eq!(declared, interned);
         assert_eq!(r.meta(declared).visibility, Visibility::Public);
@@ -252,7 +277,9 @@ mod tests {
     #[test]
     fn lookup_finds_declared_predicate() {
         let mut r = reg();
-        let id = r.declare("p", Visibility::Private, Cardinality::Single).unwrap();
+        let id = r
+            .declare("p", Visibility::Private, Cardinality::Single)
+            .unwrap();
         assert_eq!(r.lookup("p"), Some(id));
     }
 
@@ -266,7 +293,9 @@ mod tests {
     #[test]
     fn resolve_round_trips_declared_name() {
         let mut r = reg();
-        let id = r.declare("account.balance", Visibility::Private, Cardinality::Single).unwrap();
+        let id = r
+            .declare("account.balance", Visibility::Private, Cardinality::Single)
+            .unwrap();
         assert_eq!(r.resolve(id), Some("account.balance"));
     }
 

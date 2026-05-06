@@ -562,27 +562,35 @@ pub struct InMemoryTripleStore {
 impl InMemoryTripleStore {
     /// Construct with the default shard count (16) and `SystemClock`.
     pub fn new() -> Self {
-        Self { inner: Arc::new(Inner::new(DEFAULT_SHARD_COUNT, Arc::new(SystemClock))) }
+        Self {
+            inner: Arc::new(Inner::new(DEFAULT_SHARD_COUNT, Arc::new(SystemClock))),
+        }
     }
 
     /// Construct with the default shard count and an injected clock.
     ///
     /// Useful in tests that need deterministic commit timestamps.
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
-        Self { inner: Arc::new(Inner::new(DEFAULT_SHARD_COUNT, clock)) }
+        Self {
+            inner: Arc::new(Inner::new(DEFAULT_SHARD_COUNT, clock)),
+        }
     }
 
     /// Construct with an explicit shard count and `SystemClock`.
     ///
     /// Requires: `shards >= 1`.
     pub fn with_shards(shards: usize) -> Self {
-        Self { inner: Arc::new(Inner::new(shards, Arc::new(SystemClock))) }
+        Self {
+            inner: Arc::new(Inner::new(shards, Arc::new(SystemClock))),
+        }
     }
 }
 
 impl Clone for InMemoryTripleStore {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 
@@ -610,7 +618,9 @@ impl Queryable<StoredFact> for InMemoryTripleStore {
         valid_time: Timestamp,
         pattern: Option<&Pattern>,
     ) -> Vec<StoredFact> {
-        self.inner.storage.query_at(subject, predicate, tx_time, valid_time, pattern)
+        self.inner
+            .storage
+            .query_at(subject, predicate, tx_time, valid_time, pattern)
     }
 
     fn history(
@@ -626,7 +636,10 @@ impl Queryable<StoredFact> for InMemoryTripleStore {
 impl TripleStore<StoredFact> for InMemoryTripleStore {
     fn new_transaction(&self) -> Transaction<StoredFact> {
         let tx_id = TxId(self.inner.next_tx.fetch_add(1, Ordering::Relaxed));
-        Transaction::new(Arc::clone(&self.inner) as Arc<dyn Applier<StoredFact>>, tx_id)
+        Transaction::new(
+            Arc::clone(&self.inner) as Arc<dyn Applier<StoredFact>>,
+            tx_id,
+        )
     }
 
     fn now(&self) -> Timestamp {
@@ -636,7 +649,11 @@ impl TripleStore<StoredFact> for InMemoryTripleStore {
     fn subscribe(&self, pattern: Pattern) -> Subscription {
         let id = SubscriptionId(self.inner.next_subscription.fetch_add(1, Ordering::Relaxed));
         let (sender, receiver) = async_channel::unbounded();
-        self.inner.subscribers.write().push(Subscriber { id, pattern, sender });
+        self.inner.subscribers.write().push(Subscriber {
+            id,
+            pattern,
+            sender,
+        });
         Subscription::new(id, receiver)
     }
 
@@ -1490,7 +1507,10 @@ mod tests {
         tx2.assert_single(mk_fact(1, 1, 99));
         tx2.commit().unwrap();
 
-        let event = sub.try_recv().unwrap().expect("expected supersession event");
+        let event = sub
+            .try_recv()
+            .unwrap()
+            .expect("expected supersession event");
         match event.kind {
             ChangeKind::Updated {
                 old_object,
@@ -1540,7 +1560,10 @@ mod tests {
         tx.assert_single(mk_fact(2, 2, 20)); // matches
         tx.commit().unwrap();
 
-        let event = sub.try_recv().unwrap().expect("expected one matching event");
+        let event = sub
+            .try_recv()
+            .unwrap()
+            .expect("expected one matching event");
         assert_eq!(event.subject, EntityId(2));
         assert!(
             matches!(sub.try_recv(), Ok(None)),

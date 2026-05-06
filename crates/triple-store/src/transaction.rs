@@ -100,7 +100,11 @@ pub struct Transaction<TFact> {
 
 impl<TFact> Transaction<TFact> {
     pub(crate) fn new(applier: Arc<dyn Applier<TFact>>, tx_id: TxId) -> Self {
-        Self { applier, tx_id, ops: Vec::new() }
+        Self {
+            applier,
+            tx_id,
+            ops: Vec::new(),
+        }
     }
 
     // === Buffer assertions (infallible) ===
@@ -127,7 +131,8 @@ impl<TFact> Transaction<TFact> {
     /// Ensures: at commit, any prior asserted-open fact at
     ///   `(subject, predicate, asserter, index_key)` is superseded.
     pub fn assert_indexed(&mut self, fact: Fact, index_key: OrderingKey) {
-        self.ops.push(TentativeOp::AssertIndexed { fact, index_key });
+        self.ops
+            .push(TentativeOp::AssertIndexed { fact, index_key });
     }
 
     // === Buffer retractions (infallible) ===
@@ -137,13 +142,12 @@ impl<TFact> Transaction<TFact> {
     /// Ensures: at commit, the asserted-open fact at
     ///   `(subject, predicate, asserter)` has its `asserted` interval closed.
     ///   Returns `TxError::OpenFactNotFound` at commit if no such fact exists.
-    pub fn retract_single(
-        &mut self,
-        subject: EntityId,
-        predicate: Predicate,
-        asserter: EntityId,
-    ) {
-        self.ops.push(TentativeOp::RetractSingle { subject, predicate, asserter });
+    pub fn retract_single(&mut self, subject: EntityId, predicate: Predicate, asserter: EntityId) {
+        self.ops.push(TentativeOp::RetractSingle {
+            subject,
+            predicate,
+            asserter,
+        });
     }
 
     /// Buffer a `Set`-cardinality retraction.
@@ -154,7 +158,12 @@ impl<TFact> Transaction<TFact> {
         asserter: EntityId,
         object: Term,
     ) {
-        self.ops.push(TentativeOp::RetractSet { subject, predicate, asserter, object });
+        self.ops.push(TentativeOp::RetractSet {
+            subject,
+            predicate,
+            asserter,
+            object,
+        });
     }
 
     /// Buffer an `Indexed`-cardinality retraction.
