@@ -48,4 +48,20 @@ Query functions/change functions could be separate trait for consistent composit
   - query(...) -> Iterator (pass through to storage)
   - change handler fns... (pass through to storage)
 
-## Chunk 7
+## Chunk 10
+
+Ok. We need to step back again, here. Something still feels wrong. Duplicating APIs with concrete types to wrap another type with generic type parameters feels broken (what happened to DRY?) If Rust can't enable what we want, then (I'd argue) there is a serious design flaw in Rust (I'm frustrated!)... but before we go that far, let me examine and reiterate my mental model of the system - it's possible there's a non-Rust-familiar flaw in my thinking, though I think most typical architectures would support this model:
+
+- Storage<> models the raw fact storage, and is intended to be pluggable
+  - so a concrete implementation (InMemoryStorage<>) can be replaced by a DurableFileStorage<>
+  - this implies that Storage should be a dynamic trait?
+	- what is the alternative? that the parent concept/trait either embed the type or take a generic bounded type parameter?
+- TripleStore<> models the transactional storage and change observability; the architectural model here is that an implementation of TripleStore<> can just use a Storage<> implementation, and doesn't need to know the type directly. Is this a Rust anti-pattern? If not, then wouldn't boxed dyn traits be the way to go?
+- Store is a client facing concrete object that implements access control and predicate management (preferrably independently from the TripleStore implementation) and can somehow be configured with an appropriate TripleStore to provide the full Store API. 
+- Swapping implementations for these traits really shouldn't require refactoring. 
+
+I guess one question is how dynamic the configuration needs to be... It seems like we _only_ have 2 options: generic type parameters (exposing implementation types somewhere, and essentially forcing static declarations) OR otherwise boxed dyn traits (which limit trait definitions to being dyn-compatible, but allow the dynamic dispatch to fully decouple implementations). 
+
+So - to get the kind of flexibility and decoupling of concerns (I think) I'm aiming for... it seems like Storage<> and TripleStore<> should be made dyn-compatible?
+
+Am I missing another Rust-typical option to enable this flexibility? Or is the flexibility I'm aiming for ill-desired for some reason? What are the tradeoffs? 

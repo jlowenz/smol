@@ -32,6 +32,7 @@ pub mod predicate_registry;
 pub mod predicates;
 pub mod queryable;
 pub mod storage;
+pub mod store;
 pub mod term;
 pub mod time;
 pub mod transaction;
