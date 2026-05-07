@@ -60,6 +60,7 @@ pub(crate) struct Subscriber {
     pub(crate) id: SubscriptionId,
     pub(crate) pattern: Pattern,
     pub(crate) sender: Sender<ChangeEvent>,
+    pub(crate) filter: Option<Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync>>,
 }
 
 /// The only error the subscription API surfaces.

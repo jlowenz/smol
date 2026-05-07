@@ -58,7 +58,7 @@ const DEFAULT_CARDINALITY: Cardinality = Cardinality::Single;
 ///
 /// Owns a `PredicateInterner` internally; the interner is not exposed directly
 /// so that the registry remains the single policy-bearing entry point.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PredicateRegistry {
     interner: PredicateInterner,
     /// Parallel to the interner's dense id space. `None` for a slot means the

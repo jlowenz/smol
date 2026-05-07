@@ -373,13 +373,47 @@ cloned handles share a registry (`Arc<RwLock<PredicateRegistry>>`) or receive
 a frozen snapshot. This should be driven by a concrete multi-handle use case
 (e.g. the interpreter spawning worker contexts) rather than speculation.
 
+### Registry sharing model and dispatch-path performance
+
+The current design clones the full `PredicateRegistry` once per `subscribe`
+call. This has three compounding costs that may matter in a live programming
+environment:
+
+1. **O(N_subscribers) memory.** Each active subscription owns an independent
+   registry snapshot. With hundreds of subscribers and thousands of predicates,
+   this is non-trivial allocation.
+2. **Stale-by-default.** A subscriber whose snapshot predates a new
+   `declare` call silently suppresses events for that predicate. The only
+   recovery is `unsubscribe` + `subscribe`, which is an awkward polling
+   pattern — callers must know to listen for declaration events and then
+   re-subscribe. This is not what subscribers will expect.
+3. **Hot dispatch path.** Every event dispatched to every subscriber executes
+   the filter closure, which does a metadata lookup against the snapshot. With
+   many predicates and many concurrent subscriptions, this is a significant
+   fraction of dispatch cost.
+
+The natural upgrade is an **atomic registry handle** — `ArcSwap<PredicateRegistry>`
+(from the `arc-swap` crate, or hand-rolled with the same seqlock semantics).
+`Store` holds one `Arc<ArcSwap<PredicateRegistry>>`; filter closures clone the
+`Arc` (not the registry). Each dispatch calls `.load()` — a lock-free seqlock
+read returning the current snapshot — so all subscribers automatically see the
+latest declarations with no `RwLock` on the hot path. `declare` pays one
+clone-and-atomic-store. This also makes `clone_handle()` trivial: handles
+share the same `Arc<ArcSwap<...>>`.
+
+**Decision needed:** Is this worth doing before predicates and subscribers are
+numerous enough to measure? At minimum, the current `Clone`-based snapshot
+approach should not be treated as settled; the upgrade path to an atomic handle
+should be kept clear. Defer implementation until there is a concrete workload
+to benchmark against, but do not add new surface area (e.g. `clone_handle`)
+that bakes in the snapshot model.
+
 ### Stale filter snapshot on re-declare
 
-If a predicate is declared after a subscription is taken out, the subscriber's
-filter snapshot uses the old metadata. Re-declaring a predicate with identical
-metadata (idempotent) is harmless. Re-declaring with different metadata is a
-`PredicateError::ConflictingDeclaration`, so it can't happen silently. The
-practical risk is zero, but it is worth noting in the `Store::subscribe` doc.
+Subsumed by the registry sharing model question above. The `ConflictingDeclaration`
+guard means metadata cannot silently change; the practical concern is new
+predicates being invisible to existing subscribers, which is the staleness
+scenario described there.
 
 ### Bounded-channel backpressure (`TrySendError::Full`)
 

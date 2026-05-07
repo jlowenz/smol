@@ -266,6 +266,11 @@ impl Inner {
                     let Some(event) = build_event(change, tx_id, &sub.pattern) else {
                         continue;
                     };
+                    if let Some(ref f) = sub.filter {
+                        if !f(&event) {
+                            continue;
+                        }
+                    }
                     match sub.sender.try_send(event) {
                         Ok(()) => {}
                         Err(TrySendError::Closed(_)) => {
@@ -646,13 +651,18 @@ impl TripleStore<StoredFact> for InMemoryTripleStore {
         self.inner.clock.now()
     }
 
-    fn subscribe(&self, pattern: Pattern) -> Subscription {
+    fn subscribe(
+        &self,
+        pattern: Pattern,
+        filter: Option<Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync>>,
+    ) -> Subscription {
         let id = SubscriptionId(self.inner.next_subscription.fetch_add(1, Ordering::Relaxed));
         let (sender, receiver) = async_channel::unbounded();
         self.inner.subscribers.write().push(Subscriber {
             id,
             pattern,
             sender,
+            filter,
         });
         Subscription::new(id, receiver)
     }
@@ -1470,7 +1480,7 @@ mod tests {
     #[test]
     fn subscribe_delivers_asserted_event_on_commit() {
         let s = InMemoryTripleStore::new();
-        let sub = s.subscribe(any_pattern());
+        let sub = s.subscribe(any_pattern(), None);
 
         let mut tx = s.new_transaction();
         tx.assert_single(mk_fact(1, 1, 42));
@@ -1495,7 +1505,7 @@ mod tests {
     fn subscribe_delivers_updated_with_old_and_new_object() {
         let clock = TickClock::new(100);
         let s = InMemoryTripleStore::with_clock(clock.clone());
-        let sub = s.subscribe(any_pattern());
+        let sub = s.subscribe(any_pattern(), None);
 
         let mut tx1 = s.new_transaction();
         tx1.assert_single(mk_fact(1, 1, 42));
@@ -1531,7 +1541,7 @@ mod tests {
         tx1.assert_single(mk_fact(1, 1, 42));
         tx1.commit().unwrap();
 
-        let sub = s.subscribe(any_pattern());
+        let sub = s.subscribe(any_pattern(), None);
 
         let mut tx2 = s.new_transaction();
         tx2.retract_single(EntityId(1), Predicate(0), EntityId(1));
@@ -1553,7 +1563,7 @@ mod tests {
             object: Match::Any,
             asserter: MatchAsserter::Any,
         };
-        let sub = s.subscribe(pat);
+        let sub = s.subscribe(pat, None);
 
         let mut tx = s.new_transaction();
         tx.assert_single(mk_fact(1, 1, 10)); // does not match subject=2
@@ -1574,7 +1584,7 @@ mod tests {
     #[test]
     fn unsubscribe_stops_delivery() {
         let s = InMemoryTripleStore::new();
-        let sub = s.subscribe(any_pattern());
+        let sub = s.subscribe(any_pattern(), None);
 
         let mut tx1 = s.new_transaction();
         tx1.assert_single(mk_fact(1, 1, 1));
@@ -1601,7 +1611,7 @@ mod tests {
     #[test]
     fn dropped_subscription_is_pruned_lazily() {
         let s = InMemoryTripleStore::new();
-        let sub = s.subscribe(any_pattern());
+        let sub = s.subscribe(any_pattern(), None);
         assert_eq!(s.inner.subscribers.read().len(), 1);
 
         drop(sub);
@@ -1621,13 +1631,16 @@ mod tests {
     #[test]
     fn multiple_subscribers_each_receive_matching_events() {
         let s = InMemoryTripleStore::new();
-        let a = s.subscribe(any_pattern());
-        let b = s.subscribe(Pattern {
-            subject: Match::Is(EntityId(2)),
-            predicate: Match::Any,
-            object: Match::Any,
-            asserter: MatchAsserter::Any,
-        });
+        let a = s.subscribe(any_pattern(), None);
+        let b = s.subscribe(
+            Pattern {
+                subject: Match::Is(EntityId(2)),
+                predicate: Match::Any,
+                object: Match::Any,
+                asserter: MatchAsserter::Any,
+            },
+            None,
+        );
 
         let mut tx = s.new_transaction();
         tx.assert_single(mk_fact(1, 1, 10));
@@ -1644,9 +1657,39 @@ mod tests {
     }
 
     #[test]
+    fn filter_some_suppresses_non_matching_events() {
+        let s = InMemoryTripleStore::new();
+        let filter: Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync> =
+            Box::new(|event: &ChangeEvent| event.subject == EntityId(2));
+        let sub = s.subscribe(any_pattern(), Some(filter));
+
+        let mut tx = s.new_transaction();
+        tx.assert_single(mk_fact(1, 1, 10));
+        tx.assert_single(mk_fact(2, 2, 20));
+        tx.commit().unwrap();
+
+        let events = drain(&sub);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].subject, EntityId(2));
+    }
+
+    #[test]
+    fn filter_none_delivers_all_matching_events() {
+        let s = InMemoryTripleStore::new();
+        let sub = s.subscribe(any_pattern(), None);
+
+        let mut tx = s.new_transaction();
+        tx.assert_single(mk_fact(1, 1, 10));
+        tx.assert_single(mk_fact(2, 2, 20));
+        tx.commit().unwrap();
+
+        assert_eq!(drain(&sub).len(), 2);
+    }
+
+    #[test]
     fn empty_commit_does_not_dispatch() {
         let s = InMemoryTripleStore::new();
-        let sub = s.subscribe(any_pattern());
+        let sub = s.subscribe(any_pattern(), None);
 
         let tx = s.new_transaction();
         tx.commit().unwrap();
@@ -1656,7 +1699,7 @@ mod tests {
     #[test]
     fn multiple_commits_deliver_separate_events() {
         let s = InMemoryTripleStore::new();
-        let sub = s.subscribe(any_pattern());
+        let sub = s.subscribe(any_pattern(), None);
 
         for v in [1, 2, 3] {
             let mut tx = s.new_transaction();

@@ -6,7 +6,7 @@
 //! `StoredFact` yields a fully dyn-compatible trait
 //! (`Arc<dyn TripleStore<StoredFact>>`).
 
-use crate::change::Subscription;
+use crate::change::{ChangeEvent, Subscription};
 use crate::fact::BitemporalFact;
 use crate::id::{EntityId, SubscriptionId};
 use crate::pattern::{AsOf, Pattern};
@@ -38,10 +38,16 @@ pub trait TripleStore<TFact: BitemporalFact>: Queryable<TFact> + Send + Sync {
     /// The current time according to the store's clock.
     fn now(&self) -> Timestamp;
 
-    /// Register a pattern subscription.
+    /// Register a pattern subscription with an optional visibility filter.
     ///
     /// Ensures: returned `Subscription` id is unique within this store instance.
-    fn subscribe(&self, pattern: Pattern) -> Subscription;
+    ///   If `filter` is `Some(f)`, only events for which `f(event)` returns `true`
+    ///   are delivered. If `None`, all pattern-matching events are delivered.
+    fn subscribe(
+        &self,
+        pattern: Pattern,
+        filter: Option<Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync>>,
+    ) -> Subscription;
 
     /// Cancel a subscription. No-op if `id` is unknown.
     fn unsubscribe(&self, id: SubscriptionId);

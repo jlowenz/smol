@@ -10,7 +10,7 @@ use crate::term::{Predicate, SymbolId};
 
 /// Maps strings to compact `u32` handles. Concurrent `intern` calls require
 /// external synchronization (the type does not provide its own).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct StringInterner {
     by_string: HashMap<Arc<str>, u32>,
     by_id: Vec<Arc<str>>,
@@ -62,7 +62,7 @@ impl StringInterner {
 }
 
 /// Typed wrapper over `StringInterner` for predicate names.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PredicateInterner(StringInterner);
 
 impl PredicateInterner {
@@ -87,7 +87,7 @@ impl PredicateInterner {
 }
 
 /// Typed wrapper over `StringInterner` for symbol values.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SymbolInterner(StringInterner);
 
 impl SymbolInterner {

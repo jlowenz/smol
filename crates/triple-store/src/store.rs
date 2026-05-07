@@ -2,18 +2,18 @@
 
 use std::sync::Arc;
 
-use crate::change::Subscription;
+use crate::change::{ChangeEvent, Subscription};
 use crate::exec_context::{AccessError, ExecContext};
 use crate::fact::{Fact, StoredFact};
 use crate::id::{EntityId, SubscriptionId};
 use crate::in_memory_store::InMemoryTripleStore;
-use crate::pattern::Pattern;
+use crate::pattern::{AsOf, Pattern};
 use crate::predicate_registry::{PredicateError, PredicateMeta, PredicateRegistry, Visibility};
 use crate::predicates::{Cardinality, OrderingKey};
-use crate::queryable::Queryable;
+use crate::storage::CommitChange;
 use crate::term::{Predicate, Term};
 use crate::time::Timestamp;
-use crate::transaction::TxError;
+use crate::transaction::{Transaction, TxError};
 use crate::triple_store::TripleStore;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -105,13 +105,32 @@ impl Store {
         self.registry.resolve(id)
     }
 
+    // ── Clock ─────────────────────────────────────────────────────────────────
+
+    /// The current time according to the store's clock.
+    pub fn now(&self) -> Timestamp {
+        self.backend.now()
+    }
+
     // ── Subscriptions ─────────────────────────────────────────────────────────
 
-    /// Register a pattern subscription.
+    /// Register a visibility-filtered pattern subscription.
+    ///
+    /// Events are filtered by `ctx` before delivery: the subscriber receives
+    /// only events for facts that `ctx` could read via `query_open`. A registry
+    /// snapshot is taken at call time; predicates declared after this call will
+    /// be treated as `Visibility::Private` and suppressed. Re-subscribe after
+    /// new declarations if visibility of those predicates is required.
     ///
     /// Ensures: returned `Subscription` id is unique within this store instance.
-    pub fn subscribe(&self, pattern: Pattern) -> Subscription {
-        self.backend.subscribe(pattern)
+    pub fn subscribe(&self, ctx: ExecContext, pattern: Pattern) -> Subscription {
+        let registry = self.registry.clone();
+        let filter: Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync> =
+            Box::new(move |event: &ChangeEvent| {
+                let meta = registry.meta(event.predicate);
+                ctx.check_read(event.subject, meta).is_ok()
+            });
+        self.backend.subscribe(pattern, Some(filter))
     }
 
     /// Cancel a subscription. No-op if `id` is unknown.
@@ -233,6 +252,21 @@ impl Store {
         Ok(())
     }
 
+    // ── Transactions ─────────────────────────────────────────────────────────
+
+    /// Begin a multi-operation transaction.
+    ///
+    /// Ensures: returned transaction has an empty buffer and a unique `TxId`.
+    ///   The borrow checker prevents `Store::declare` from being called while
+    ///   the returned `StoreTransaction` is live.
+    pub fn begin(&self, ctx: ExecContext) -> StoreTransaction<'_> {
+        StoreTransaction {
+            store: self,
+            ctx,
+            tx: self.backend.new_transaction(),
+        }
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// All currently asserted-open facts at `(subject, predicate)`.
@@ -272,6 +306,27 @@ impl Store {
         Ok(self.backend.query_at(subject, predicate, tx_time, valid_time, pattern))
     }
 
+    /// Facts visible at the bitemporal point described by `as_of`, resolving
+    /// `None` fields against `self.now()`.
+    ///
+    /// Requires: `ctx` permits read on `subject` for `predicate`.
+    /// Ensures: equivalent to calling `query_at` with
+    ///   `tx_time = as_of.tx_time.unwrap_or_else(|| self.now())`
+    ///   `valid_time = as_of.valid_time.unwrap_or_else(|| self.now())`.
+    pub fn query_as_of(
+        &self,
+        ctx: &ExecContext,
+        subject: EntityId,
+        predicate: Predicate,
+        as_of: AsOf,
+        pattern: Option<&Pattern>,
+    ) -> Result<Vec<StoredFact>, StoreError> {
+        let now = self.backend.now();
+        let tx_time = as_of.tx_time.unwrap_or(now);
+        let valid_time = as_of.valid_time.unwrap_or(now);
+        self.query_at(ctx, subject, predicate, tx_time, valid_time, pattern)
+    }
+
     /// Every fact ever committed at `(subject, predicate)`, open and closed.
     ///
     /// Requires: `ctx` permits read on `subject` for `predicate`.
@@ -285,6 +340,126 @@ impl Store {
         let meta = self.registry.meta(predicate);
         ctx.check_read(subject, meta)?;
         Ok(self.backend.history(subject, predicate, pattern))
+    }
+}
+
+// ── StoreTransaction ──────────────────────────────────────────────────────────
+
+/// An access-checked, multi-operation transaction handle.
+///
+/// Obtained from `Store::begin`. Buffer methods check access eagerly and return
+/// `Err(AccessError)` on denial without touching the buffer; the transaction
+/// remains usable. Storage errors (e.g. `FactNotFound` on retract) surface only
+/// at `commit` time.
+pub struct StoreTransaction<'store> {
+    store: &'store Store,
+    ctx: ExecContext,
+    tx: Transaction<StoredFact>,
+}
+
+impl<'store> StoreTransaction<'store> {
+    /// Buffer a `Single`-cardinality assertion.
+    ///
+    /// Requires: `ctx` (captured at `begin`) permits assert on `fact.subject`
+    ///   for `fact.predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, the buffer
+    ///   is unchanged; the transaction remains usable.
+    pub fn assert_single(&mut self, fact: Fact) -> Result<(), StoreError> {
+        let meta = self.store.registry.meta(fact.predicate);
+        self.ctx.check_assert(fact.subject, meta)?;
+        self.tx.assert_single(fact);
+        Ok(())
+    }
+
+    /// Buffer a `Set`-cardinality assertion.
+    ///
+    /// Requires: `ctx` permits assert on `fact.subject` for `fact.predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
+    pub fn assert_set(&mut self, fact: Fact) -> Result<(), StoreError> {
+        let meta = self.store.registry.meta(fact.predicate);
+        self.ctx.check_assert(fact.subject, meta)?;
+        self.tx.assert_set(fact);
+        Ok(())
+    }
+
+    /// Buffer an `Indexed`-cardinality assertion.
+    ///
+    /// Requires: `ctx` permits assert on `fact.subject` for `fact.predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
+    pub fn assert_indexed(
+        &mut self,
+        fact: Fact,
+        index_key: OrderingKey,
+    ) -> Result<(), StoreError> {
+        let meta = self.store.registry.meta(fact.predicate);
+        self.ctx.check_assert(fact.subject, meta)?;
+        self.tx.assert_indexed(fact, index_key);
+        Ok(())
+    }
+
+    /// Buffer a `Single`-cardinality retraction.
+    ///
+    /// Requires: `ctx` permits assert on `subject` for `predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
+    ///   `StoreError::FactNotFound` is returned at `commit` time if no
+    ///   asserted-open fact exists; it cannot be detected at buffer time.
+    pub fn retract_single(
+        &mut self,
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
+    ) -> Result<(), StoreError> {
+        let meta = self.store.registry.meta(predicate);
+        self.ctx.check_assert(subject, meta)?;
+        self.tx.retract_single(subject, predicate, asserter);
+        Ok(())
+    }
+
+    /// Buffer a `Set`-cardinality retraction.
+    ///
+    /// Requires: `ctx` permits assert on `subject` for `predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
+    pub fn retract_set(
+        &mut self,
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
+        object: Term,
+    ) -> Result<(), StoreError> {
+        let meta = self.store.registry.meta(predicate);
+        self.ctx.check_assert(subject, meta)?;
+        self.tx.retract_set(subject, predicate, asserter, object);
+        Ok(())
+    }
+
+    /// Buffer an `Indexed`-cardinality retraction.
+    ///
+    /// Requires: `ctx` permits assert on `subject` for `predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
+    pub fn retract_indexed(
+        &mut self,
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
+        index_key: OrderingKey,
+    ) -> Result<(), StoreError> {
+        let meta = self.store.registry.meta(predicate);
+        self.ctx.check_assert(subject, meta)?;
+        self.tx.retract_indexed(subject, predicate, asserter, index_key);
+        Ok(())
+    }
+
+    /// Commit all buffered operations atomically.
+    ///
+    /// Ensures: all buffered ops applied or none (per shard); change events
+    ///   dispatched to matching subscribers before returning.
+    pub fn commit(self) -> Result<Vec<CommitChange<StoredFact>>, StoreError> {
+        self.tx.commit().map_err(Into::into)
+    }
+
+    /// Discard all buffered operations.
+    pub fn rollback(self) {
+        self.tx.rollback();
     }
 }
 
@@ -405,5 +580,165 @@ mod tests {
         let ctx = ExecContext::Entity(e(2));
         let err = store.retract_single(&ctx, e(1), prv, e(1)).unwrap_err();
         assert!(matches!(err, StoreError::AccessDenied { .. }));
+    }
+
+    // ── StoreTransaction ──────────────────────────────────────────────────────
+
+    #[test]
+    fn multi_op_commit_applies_all_buffered_ops() {
+        let (store, prv, shr, _) = store_3();
+        let sys = ExecContext::System;
+
+        let mut tx = store.begin(sys);
+        tx.assert_single(fact(e(1), prv, e(1))).unwrap();
+        tx.assert_single(fact(e(1), shr, e(1))).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(store.query_open(&sys, e(1), prv, None).unwrap().len(), 1);
+        assert_eq!(store.query_open(&sys, e(1), shr, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn denied_buffer_call_leaves_prior_buffered_ops_intact() {
+        let (store, prv, _, _) = store_3();
+        let ctx = ExecContext::Entity(e(1));
+
+        let mut tx = store.begin(ctx);
+        tx.assert_single(fact(e(1), prv, e(1))).unwrap();
+        assert!(tx.assert_single(fact(e(2), prv, e(1))).is_err()); // denied: external
+        tx.commit().unwrap();
+
+        let sys = ExecContext::System;
+        assert_eq!(store.query_open(&sys, e(1), prv, None).unwrap().len(), 1);
+        assert!(store.query_open(&sys, e(2), prv, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rollback_leaves_store_unchanged() {
+        let (store, prv, _, _) = store_3();
+        let sys = ExecContext::System;
+
+        let mut tx = store.begin(sys);
+        tx.assert_single(fact(e(1), prv, e(1))).unwrap();
+        tx.rollback();
+
+        assert!(store.query_open(&sys, e(1), prv, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn commit_fact_not_found_for_retract_without_prior() {
+        let (store, prv, _, _) = store_3();
+        let sys = ExecContext::System;
+
+        let mut tx = store.begin(sys);
+        tx.retract_single(e(1), prv, e(1)).unwrap(); // access OK; not-found deferred
+        let err = tx.commit().unwrap_err();
+        assert_eq!(err, StoreError::FactNotFound);
+    }
+
+    #[test]
+    fn mixed_assert_and_retract_in_one_transaction() {
+        let (store, prv, shr, _) = store_3();
+        let sys = ExecContext::System;
+
+        store.assert_single(&sys, fact(e(1), prv, e(1))).unwrap();
+
+        let mut tx = store.begin(sys);
+        tx.retract_single(e(1), prv, e(1)).unwrap();
+        tx.assert_single(fact(e(1), shr, e(1))).unwrap();
+        tx.commit().unwrap();
+
+        assert!(store.query_open(&sys, e(1), prv, None).unwrap().is_empty());
+        assert_eq!(store.query_open(&sys, e(1), shr, None).unwrap().len(), 1);
+    }
+
+    // ── query_as_of ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn query_as_of_access_controlled_and_resolves_none_to_now() {
+        use crate::pattern::AsOf;
+        let (store, prv, _, _) = store_3();
+        let sys = ExecContext::System;
+
+        store.assert_single(&sys, fact(e(1), prv, e(1))).unwrap();
+
+        let owner = ExecContext::Entity(e(1));
+        let results = store.query_as_of(&owner, e(1), prv, AsOf::default(), None).unwrap();
+        assert_eq!(results.len(), 1);
+
+        let other = ExecContext::Entity(e(2));
+        assert!(matches!(
+            store.query_as_of(&other, e(1), prv, AsOf::default(), None),
+            Err(StoreError::AccessDenied { .. })
+        ));
+    }
+
+    // ── Visibility-filtered subscriptions ─────────────────────────────────────
+
+    fn any_pattern() -> Pattern {
+        use crate::pattern::{Match, MatchAsserter};
+        Pattern {
+            subject: Match::Any,
+            predicate: Match::Any,
+            object: Match::Any,
+            asserter: MatchAsserter::Any,
+        }
+    }
+
+    fn drain(sub: &Subscription) -> Vec<crate::change::ChangeEvent> {
+        let mut out = Vec::new();
+        while let Ok(Some(e)) = sub.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    #[test]
+    fn entity_subscriber_suppresses_private_events_for_other_entity() {
+        let (store, prv, _, _) = store_3();
+        let ctx_1 = ExecContext::Entity(e(1));
+        let ctx_2 = ExecContext::Entity(e(2));
+
+        let sub = store.subscribe(ctx_2, any_pattern());
+        store.assert_single(&ctx_1, fact(e(1), prv, e(1))).unwrap();
+
+        assert!(drain(&sub).is_empty(), "entity(2) must not see entity(1)'s private events");
+    }
+
+    #[test]
+    fn entity_subscriber_receives_shared_and_public_events_for_other_entity() {
+        let (store, _, shr, pub_) = store_3();
+        let ctx_1 = ExecContext::Entity(e(1));
+        let ctx_2 = ExecContext::Entity(e(2));
+
+        let sub = store.subscribe(ctx_2, any_pattern());
+        store.assert_single(&ctx_1, fact(e(1), shr, e(1))).unwrap();
+        store.assert_single(&ctx_1, fact(e(1), pub_, e(1))).unwrap();
+
+        assert_eq!(drain(&sub).len(), 2);
+    }
+
+    #[test]
+    fn system_subscriber_receives_all_events() {
+        let (store, prv, shr, pub_) = store_3();
+        let sys = ExecContext::System;
+
+        let sub = store.subscribe(sys, any_pattern());
+        store.assert_single(&sys, fact(e(1), prv, e(1))).unwrap();
+        store.assert_single(&sys, fact(e(1), shr, e(1))).unwrap();
+        store.assert_single(&sys, fact(e(1), pub_, e(1))).unwrap();
+
+        assert_eq!(drain(&sub).len(), 3);
+    }
+
+    #[test]
+    fn entity_subscriber_receives_own_private_events() {
+        let (store, prv, _, _) = store_3();
+        let ctx_1 = ExecContext::Entity(e(1));
+
+        let sub = store.subscribe(ctx_1, any_pattern());
+        store.assert_single(&ctx_1, fact(e(1), prv, e(1))).unwrap();
+
+        assert_eq!(drain(&sub).len(), 1, "owner must receive their own private events");
     }
 }
