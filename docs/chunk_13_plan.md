@@ -16,35 +16,75 @@ interpreter model:
    within the store, shared across all handles.
 
 Both depend on moving from an owned `PredicateRegistry` to a live shared
-`Arc<RwLock<PredicateRegistry>>`. That change also resolves the subscription
+`Arc<ArcSwap<PredicateRegistry>>`. That change also resolves the subscription
 staleness open question from chunk 11.
 
 ---
 
 ## Architectural Decisions
 
-### Shared live registry: `Arc<RwLock<PredicateRegistry>>`
+### Shared live registry: `Arc<ArcSwap<PredicateRegistry>>`
+
+Registry reads occur on every event dispatch (once per subscriber per committed
+fact) and every query. Registry writes (`declare`) occur rarely — typically only
+during program startup. This is a strongly read-biased access pattern.
+
+`Arc<RwLock<PredicateRegistry>>` would acquire a read-lock on every filter
+invocation. Under high subscription counts or high commit frequency, this
+becomes a bottleneck on the dispatch path.
+
+`ArcSwap<PredicateRegistry>` (from the `arc-swap` crate) is designed for
+exactly this pattern: readers get a snapshot `Arc<PredicateRegistry>` via a
+single atomic load with no lock; writers replace the entire Arc atomically.
+Under the hood, `arc-swap` uses epoch-based reclamation so readers never block
+writers and vice versa.
 
 `Store.registry` changes from `PredicateRegistry` (owned) to
-`Arc<RwLock<PredicateRegistry>>` (shared). All handles produced by
-`clone_handle` share one registry instance.
+`Arc<ArcSwap<PredicateRegistry>>` (shared). All handles from `clone_handle`
+share one `ArcSwap` instance.
 
-Consequences:
+**Read path** (`meta`, `lookup`, `resolve`):
+```rust
+let guard = self.registry.load();  // atomic; no lock; returns Guard<Arc<...>>
+guard.meta(id)                     // read from snapshot; guard dropped at end of stmt
+```
 
-- `declare` becomes `&self` — the write lock provides interior mutability.
-  `&mut self` is no longer required to declare predicates, which aligns with
-  the rest of the `Store` API (every other method already takes `&self`).
-- `subscribe` filter closures capture `Arc::clone(&registry_arc)` instead of a
-  full `PredicateRegistry` clone. Each filter invocation acquires a read lock,
-  calls `meta`, and releases. This fixes the chunk 11 open question:
-  subscriptions now see live registry state rather than a snapshot taken at
-  subscribe time. Predicates declared after `subscribe` are visible immediately.
-- Memory: one `PredicateRegistry` per store group instead of one per
-  subscriber. For a store with hundreds of subscriptions and thousands of
-  predicates, this is a significant reduction.
-- Locking order: all call sites acquire `subscribers` lock (for dispatch) then
-  `registry` lock (for filter). `declare` acquires only the `registry` write
-  lock. No circular acquisition; no deadlock risk.
+**Write path** (`declare`): `declare` is serialised by a separate
+`Arc<Mutex<()>>` (`declare_lock`) shared across all handles. Without this,
+concurrent declares from two handles would race: each loads the current Arc,
+clones and modifies a copy, and stores — the last store wins, silently dropping
+the other's declaration. The mutex costs nothing on the read path.
+
+```rust
+pub fn declare(&self, name: &str, visibility: Visibility, cardinality: Cardinality)
+    -> Result<Predicate, PredicateError>
+{
+    let _guard = self.declare_lock.lock();          // serialise writers
+    let current: Arc<PredicateRegistry> = self.registry.load_full();
+    let mut next = (*current).clone();              // copy-on-write
+    let id = next.declare(name, visibility, cardinality)?;
+    self.registry.store(Arc::new(next));            // atomic swap
+    Ok(id)
+}
+```
+
+`declare` drops `&mut self` and becomes `&self`, consistent with the rest of
+the `Store` API.
+
+**Subscribe filter**: the closure captures `Arc::clone(&self.registry)` (the
+`ArcSwap` Arc). On each event:
+```rust
+let guard = registry.load();       // atomic; no lock
+let meta = guard.meta(event.predicate);
+ctx.check_read(event.subject, meta).is_ok()
+```
+
+This resolves all three problems identified in the chunk 11 open question:
+- Memory: one `PredicateRegistry` at a time (plus short-lived copies during
+  `declare`), not one clone per subscriber.
+- Staleness: each dispatch sees the current registry; predicates declared after
+  `subscribe` are visible immediately.
+- Performance: lock-free dispatch path regardless of subscription count.
 
 ### `StringInterner::resolve` returns `Option<Arc<str>>`
 
@@ -115,19 +155,34 @@ Update `Store::resolve` signature and any call sites / tests.
 
 ## Phase 2 — Shared Registry in `Store`
 
-**File:** `store.rs`
+**Files:** `Cargo.toml` (workspace), `crates/triple-store/Cargo.toml`, `store.rs`
+
+### Step 0 — Add `arc-swap` dependency
+
+In `Cargo.toml` (workspace):
+```toml
+arc-swap = "1"
+```
+
+In `crates/triple-store/Cargo.toml`:
+```toml
+arc-swap = { workspace = true }
+```
 
 ### Step 1 — Change `Store` struct
 
 ```rust
+use arc_swap::ArcSwap;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 pub struct Store {
     backend: Arc<dyn TripleStore<StoredFact>>,
-    registry: Arc<RwLock<PredicateRegistry>>,
+    registry: Arc<ArcSwap<PredicateRegistry>>,
+    declare_lock: Arc<Mutex<()>>,
     next_entity: Arc<AtomicU64>,
 }
 ```
-
-Add `use parking_lot::RwLock;` and `use std::sync::atomic::{AtomicU64, Ordering};`.
 
 ### Step 2 — Update constructors
 
@@ -136,7 +191,8 @@ impl Store {
     pub fn new(backend: Arc<dyn TripleStore<StoredFact>>) -> Self {
         Store {
             backend,
-            registry: Arc::new(RwLock::new(PredicateRegistry::new())),
+            registry: Arc::new(ArcSwap::from_pointee(PredicateRegistry::new())),
+            declare_lock: Arc::new(Mutex::new(())),
             next_entity: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -145,17 +201,17 @@ impl Store {
 
 ### Step 3 — Update registry methods
 
-`declare` changes from `&mut self` to `&self`:
+`declare` changes from `&mut self` to `&self` (see write-path sketch in
+Architectural Decisions above). `lookup`, `meta`, `resolve` use
+`self.registry.load()`:
 
 ```rust
-pub fn declare(&self, name: &str, visibility: Visibility, cardinality: Cardinality)
-    -> Result<Predicate, PredicateError>
-{
-    self.registry.write().declare(name, visibility, cardinality)
+pub fn meta(&self, id: Predicate) -> PredicateMeta {
+    self.registry.load().meta(id)
 }
 ```
 
-`lookup`, `meta` use `self.registry.read()`. `resolve` returns `Option<Arc<str>>`.
+`resolve` returns `Option<Arc<str>>` (from Phase 1).
 
 ### Step 4 — Update `subscribe` filter closure
 
@@ -164,25 +220,26 @@ pub fn subscribe(&self, ctx: ExecContext, pattern: Pattern) -> Subscription {
     let registry = Arc::clone(&self.registry);
     let filter: Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync> =
         Box::new(move |event: &ChangeEvent| {
-            let meta = registry.read().meta(event.predicate);
+            let meta = registry.load().meta(event.predicate);
             ctx.check_read(event.subject, meta).is_ok()
         });
     self.backend.subscribe(pattern, Some(filter))
 }
 ```
 
-The lock is acquired and released per event — no guard escapes the closure.
+`registry.load()` is an atomic load — no lock held during or after the call.
 
 ### Step 5 — Update `StoreTransaction`
 
 `StoreTransaction` holds `&'_ Store`. Its mutation methods call
-`self.store.registry.read().meta(...)`. Update all five method bodies and the
+`self.store.registry.load().meta(...)`. Update all method bodies and the
 `commit` path accordingly.
 
 ### Step 6 — Update query methods
 
 `query_open`, `query_at`, `query_as_of`, `history` each call
-`self.registry.meta(predicate)` — update to `self.registry.read().meta(predicate)`.
+`self.registry.meta(predicate)` — update to
+`self.registry.load().meta(predicate)`.
 
 ---
 
@@ -212,6 +269,7 @@ impl Store {
         Store {
             backend: Arc::clone(&self.backend),
             registry: Arc::clone(&self.registry),
+            declare_lock: Arc::clone(&self.declare_lock),
             next_entity: Arc::clone(&self.next_entity),
         }
     }
