@@ -1,13 +1,15 @@
 //! Predicate-level metadata: cardinality and the ordering key used by the
 //! Indexed cardinality. (`PredicateMeta` itself is added in a later phase.)
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 /// The supersession/disambiguation rule for asserts of a given predicate.
 ///
 /// Each predicate is declared with one cardinality. The store enforces the
 /// matching invariant on assert; the `FactStore` exposes one assert/retract
 /// method pair per cardinality. Cardinality always applies *within an asserter's
 /// virtual namespace*: cross-asserter conflicts are preserved regardless.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Cardinality {
     /// At most one open fact per `(subject, predicate, asserter)`.
     /// Asserting closes any prior open fact for that key.
@@ -83,6 +85,21 @@ impl Ord for OrderingKey {
 impl std::hash::Hash for OrderingKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.to_bits().hash(state);
+    }
+}
+
+// Serialize/deserialize as raw u64 bit pattern so NaN and -0.0 round-trip
+// with bit-exact identity regardless of the backing format.
+impl Serialize for OrderingKey {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(self.0.to_bits())
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderingKey {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let bits = u64::deserialize(d)?;
+        Ok(Self(f64::from_bits(bits)))
     }
 }
 

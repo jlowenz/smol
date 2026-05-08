@@ -7,6 +7,8 @@
 //! The `Layer` distinction (Internal vs External, PRD §2.3) is derived from
 //! `subject == asserter`; see `is_internal` / `is_external`.
 
+use serde::{Deserialize, Serialize};
+
 use crate::id::{EntityId, TxId};
 use crate::predicates::OrderingKey;
 use crate::term::{Predicate, Term};
@@ -27,7 +29,7 @@ pub trait BitemporalFact {
 /// `valid` is the interval during which the asserter claims this fact is true
 /// in the modeled domain. `None` means "open from commit time" — the store
 /// substitutes `Interval::new_open(commit_time)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fact {
     pub subject: EntityId,
     pub predicate: Predicate,
@@ -88,7 +90,7 @@ impl Fact {
 /// A fact is true at time `t` only when `asserted.contains(t) AND valid.contains(t)`.
 /// Asserted intervals for the same identity key never overlap — consecutive
 /// intervals meet at their shared boundary (`close.end == next.start`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredFact {
     pub subject: EntityId,
     pub predicate: Predicate,

@@ -2,21 +2,23 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::id::EntityId;
 use crate::time::Timestamp;
 
 /// Interned-symbol handle. The interner is owned by `Store` (Phase 2);
 /// in Phase 0 this is just an opaque ID.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SymbolId(pub u32);
 
 /// Interned-predicate handle. The registry is owned by `Store`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Predicate(pub u32);
 
 /// Closed primitive value union (PRD §2.4). Composite/user-defined values
 /// are deferred to v1+ via the `OpaqueValue` extension path.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Term {
     Int(i64),
     Float(f64),

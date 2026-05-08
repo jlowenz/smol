@@ -13,6 +13,8 @@ async-channel = "2"
 parking_lot = "0.12"
 thiserror = "2"
 proptest = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+bincode = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

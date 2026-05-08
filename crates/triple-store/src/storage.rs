@@ -9,6 +9,8 @@
 //! - **`supersede`**: prior open fact closed, replacement appended (`Updated`)
 //! - **`close`**: prior open fact closed, no replacement (`Retracted`)
 
+use serde::{Deserialize, Serialize};
+
 use crate::id::EntityId;
 use crate::term::Predicate;
 use crate::time::Timestamp;
@@ -17,7 +19,7 @@ use crate::time::Timestamp;
 ///
 /// Reported to subscribers via the change-event channel (PRD §3.4).
 /// Generic over `TFact` so the storage layer does not hard-code the fact type.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommitChange<TFact> {
     /// A new fact was asserted with no prior asserted-open fact at its key.
     Asserted { fact: TFact },

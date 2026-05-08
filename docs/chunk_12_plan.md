@@ -49,6 +49,49 @@ on the `serde` workspace dependency.
 without relying on `f64`'s `Serialize` (which uses IEEE semantics and could
 represent NaN inconsistently). Same treatment for `OrderingKey`.
 
+### Shared commit logic: `collapse_and_apply` + `dispatch_changes`
+
+The commit path in `Inner::apply` has two purely shared phases — collapsing ops
+and dispatching events — with the only divergence being the WAL write that
+`DurableInner` inserts between them. These are extracted as `pub(crate)` free
+functions in `in_memory_store.rs`:
+
+```rust
+pub(crate) fn collapse_and_apply(
+    tx_id: TxId,
+    ops: Vec<TentativeOp>,
+    clock: &dyn Clock,
+    storage: &InMemoryStorage,
+) -> Result<Vec<CommitChange<StoredFact>>, TxError>
+
+pub(crate) fn dispatch_changes(
+    tx_id: TxId,
+    changes: &[CommitChange<StoredFact>],
+    subscribers: &RwLock<Vec<Subscriber>>,
+)
+```
+
+`Inner::apply` becomes:
+```rust
+fn apply(&self, tx_id, ops) -> ... {
+    let changes = collapse_and_apply(tx_id, ops, &*self.clock, &self.storage)?;
+    dispatch_changes(tx_id, &changes, &self.subscribers);
+    Ok(changes)
+}
+```
+
+`DurableInner::apply` inserts its WAL write between the two shared calls:
+```rust
+fn apply(&self, tx_id, ops) -> ... {
+    let changes = collapse_and_apply(tx_id, ops, &*self.clock, &self.storage)?;
+    if !changes.is_empty() { /* WAL write */ }
+    dispatch_changes(tx_id, &changes, &self.subscribers);
+    Ok(changes)
+}
+```
+
+No code duplication. The WAL write — ~8 lines — is the only divergence.
+
 ### Standalone implementation: `DurableFileTripleStore` + `DurableInner`
 
 `DurableFileTripleStore` is a new type in a new file (`durable_file_store.rs`).
@@ -58,15 +101,12 @@ structure with the same fields as `Inner` (clock, `InMemoryStorage`,
 `next_tx`, `next_subscription`, `subscribers`) plus a `Mutex<BufWriter<File>>`
 for the log.
 
-`DurableInner` implements `Applier<StoredFact>`: it calls the same apply logic
-as `Inner` (first-pass collapse, second-pass apply, dispatch), then serialises
-and appends the resulting `CommitChange` batch before returning. The call order
-is apply → persist → return; the in-memory state is always ahead of or equal to
-the durable state (standard WAL guarantee).
-
-Code duplication with `Inner` is accepted at this stage. When the two
-implementations diverge further (e.g., for compaction or file-locking), the
-duplication will have been worth the independence.
+`DurableInner` implements `Applier<StoredFact>` via `collapse_and_apply` and
+`dispatch_changes`. The call order is apply → persist → dispatch → return; the
+in-memory state is always ahead of or equal to the durable state (standard WAL
+guarantee). If the WAL write fails after storage has been updated, the
+in-memory state diverges from the durable log for that session; this is
+accepted at this stage and noted in the doc comment on `apply`.
 
 ### fsync per commit
 
@@ -174,6 +214,23 @@ the serialization round-trip tests in Phase 3.
 
 ---
 
+## Phase 1.5 — Refactor `Inner` to expose shared commit logic
+
+**File touched:** `in_memory_store.rs`
+
+Before adding `DurableInner`, extract the two shared phases of `Inner::apply`
+into `pub(crate)` free functions so `durable_file_store.rs` can call them.
+
+1. Rename `Inner::dispatch` body → free function `dispatch_changes(tx_id,
+   changes, subscribers: &RwLock<Vec<Subscriber>>)`.
+2. Extract the collapse + apply body of `Inner::apply` → free function
+   `collapse_and_apply(tx_id, ops, clock, storage: &InMemoryStorage)`.
+3. Simplify `Applier<StoredFact> for Inner` to two lines: call
+   `collapse_and_apply`, then `dispatch_changes`.
+4. Make `InMemoryStorage::new` `pub(crate)` so `DurableInner` can construct one.
+
+---
+
 ## Phase 2 — `DurableFileTripleStore`
 
 **New file:** `crates/triple-store/src/durable_file_store.rs`
@@ -209,37 +266,35 @@ A helper `fn replay_storage(changes: &[CommitChange<StoredFact>], storage: &InMe
 
 The replay helper must be careful to use the stored timestamps directly rather than the clock.
 
-`DurableInner` implements `Applier<StoredFact>` with the same first-pass
-collapse and second-pass apply logic as `Inner`, plus a persistence step:
+`DurableInner` implements `Applier<StoredFact>` via the shared free functions,
+inserting the WAL write between them:
 
 ```rust
 fn apply(&self, tx_id: TxId, ops: Vec<TentativeOp>)
     -> Result<Vec<CommitChange<StoredFact>>, TxError>
 {
-    // --- same collapse + apply logic as Inner::apply ---
-    let changes = /* ... */;
+    let changes = collapse_and_apply(tx_id, ops, &*self.clock, &self.storage)?;
 
-    // --- persist ---
     if !changes.is_empty() {
-        let mut log = self.log.lock();
         let encoded = bincode::serialize(&changes)
             .map_err(|_| TxError::Internal("serialization failed"))?;
         let len = u32::try_from(encoded.len())
             .map_err(|_| TxError::Internal("record too large"))?;
+        let mut log = self.log.lock();
         log.write_all(&len.to_le_bytes())
-            .and_then(|_| log.write_all(&encoded))
-            .and_then(|_| log.flush())
+            .map_err(|_| TxError::Internal("log write failed"))?;
+        log.write_all(&encoded)
+            .map_err(|_| TxError::Internal("log write failed"))?;
+        log.flush()
             .map_err(|_| TxError::Internal("log write failed"))?;
         log.get_mut().sync_data()
             .map_err(|_| TxError::Internal("fsync failed"))?;
     }
 
-    self.dispatch(tx_id, &changes);
+    dispatch_changes(tx_id, &changes, &self.subscribers);
     Ok(changes)
 }
 ```
-
-The `dispatch` method is identical to `Inner::dispatch`.
 
 ### Step 2 — `DurableFileTripleStore`
 

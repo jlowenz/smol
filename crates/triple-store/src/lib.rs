@@ -18,10 +18,13 @@
 //!   provides `query_as_of` for `AsOf`-based bitemporal queries resolved
 //!   against the store's clock. `Arc<dyn TripleStore<StoredFact>>` is valid.
 //!
-//! The in-memory implementation ([`in_memory_store`]) is the only backend in
-//! Phase 0. `InMemoryTripleStore` implements `TripleStore<StoredFact>`.
+//! Two backends implement `TripleStore<StoredFact>`:
+//! - [`in_memory_store::InMemoryTripleStore`] — ephemeral, sharded in-memory store.
+//! - [`DurableFileTripleStore`] — append-only WAL-backed store that survives
+//!   process restarts.
 
 pub mod change;
+pub mod durable_file_store;
 pub mod exec_context;
 pub mod fact;
 pub mod id;
@@ -37,3 +40,5 @@ pub mod term;
 pub mod time;
 pub mod transaction;
 pub mod triple_store;
+
+pub use durable_file_store::DurableFileTripleStore;

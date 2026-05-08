@@ -48,7 +48,7 @@ pub struct InMemoryStorage {
 }
 
 impl InMemoryStorage {
-    fn new(shard_count: usize) -> Self {
+    pub(crate) fn new(shard_count: usize) -> Self {
         assert!(shard_count >= 1, "shard count must be >= 1");
         Self {
             shards: (0..shard_count).map(|_| Shard::default()).collect(),
@@ -225,6 +225,276 @@ impl Queryable<StoredFact> for InMemoryStorage {
     }
 }
 
+// ── Shared commit logic ───────────────────────────────────────────────────────
+
+/// Collapse duplicate ops within a transaction, apply them to `storage`, and
+/// return the resulting change set.
+///
+/// Requires: no identity key appears in both an assert and a retract in `ops`
+///   (checked via `debug_assert`).
+/// Ensures: returned changes reflect exactly the final committed state for each
+///   identity key touched by `ops`.
+pub(crate) fn collapse_and_apply(
+    tx_id: TxId,
+    ops: Vec<TentativeOp>,
+    clock: &dyn Clock,
+    storage: &InMemoryStorage,
+) -> Result<Vec<CommitChange<StoredFact>>, TxError> {
+    // ── First pass: collapse maps ─────────────────────────────────────
+    // For each cardinality, record the index of the last op per identity
+    // key. Only that op is applied; earlier ops for the same key are
+    // discarded (they were never observable, so committing them would
+    // create empty intervals).
+    let mut last_single: HashMap<(EntityId, Predicate, EntityId), usize> =
+        HashMap::with_capacity(ops.len());
+    let mut last_set: HashMap<(EntityId, Predicate, EntityId, Term), usize> =
+        HashMap::with_capacity(ops.len());
+    let mut last_indexed: HashMap<(EntityId, Predicate, EntityId, OrderingKey), usize> =
+        HashMap::with_capacity(ops.len());
+    let mut last_retract_single: HashMap<(EntityId, Predicate, EntityId), usize> =
+        HashMap::new();
+    let mut last_retract_set: HashMap<(EntityId, Predicate, EntityId, Term), usize> =
+        HashMap::new();
+    let mut last_retract_indexed: HashMap<(EntityId, Predicate, EntityId, OrderingKey), usize> =
+        HashMap::new();
+
+    for (i, op) in ops.iter().enumerate() {
+        match op {
+            TentativeOp::AssertSingle(f) => {
+                last_single.insert((f.subject, f.predicate, f.asserter), i);
+            }
+            TentativeOp::AssertSet(f) => {
+                last_set.insert((f.subject, f.predicate, f.asserter, f.object.clone()), i);
+            }
+            TentativeOp::AssertIndexed { fact: f, index_key } => {
+                last_indexed.insert((f.subject, f.predicate, f.asserter, *index_key), i);
+            }
+            TentativeOp::RetractSingle {
+                subject,
+                predicate,
+                asserter,
+            } => {
+                last_retract_single.insert((*subject, *predicate, *asserter), i);
+            }
+            TentativeOp::RetractSet {
+                subject,
+                predicate,
+                asserter,
+                object,
+            } => {
+                last_retract_set.insert((*subject, *predicate, *asserter, object.clone()), i);
+            }
+            TentativeOp::RetractIndexed {
+                subject,
+                predicate,
+                asserter,
+                index_key,
+            } => {
+                last_retract_indexed.insert((*subject, *predicate, *asserter, *index_key), i);
+            }
+        }
+    }
+
+    // Assert + retract of the same identity key in one tx is a precondition
+    // violation: two ops, one commit timestamp, same slot → undefined
+    // asserted-interval semantics.
+    #[cfg(debug_assertions)]
+    {
+        for key in last_single.keys() {
+            debug_assert!(
+                !last_retract_single.contains_key(key),
+                "assert and retract same Single key in one tx: {key:?}"
+            );
+        }
+        for key in last_set.keys() {
+            debug_assert!(
+                !last_retract_set.contains_key(key),
+                "assert and retract same Set key in one tx: {key:?}"
+            );
+        }
+        for key in last_indexed.keys() {
+            debug_assert!(
+                !last_retract_indexed.contains_key(key),
+                "assert and retract same Indexed key in one tx: {key:?}"
+            );
+        }
+    }
+
+    // Collect selected indices. No sort needed: selected ops have disjoint
+    // identity keys and share one commit timestamp, so application order
+    // has no semantic effect on assert operations. Retracts are also
+    // order-independent among themselves; the assert/retract precondition
+    // above eliminates the only case where order would matter.
+    let selected: Vec<usize> = last_single
+        .values()
+        .chain(last_set.values())
+        .chain(last_indexed.values())
+        .chain(last_retract_single.values())
+        .chain(last_retract_set.values())
+        .chain(last_retract_indexed.values())
+        .copied()
+        .collect();
+
+    // ── Second pass: apply ────────────────────────────────────────────
+    let commit_time = clock.now();
+    let mut changes = Vec::with_capacity(selected.len());
+
+    // Wrap ops in Option so each selected element can be moved out by
+    // index. The unwrap is safe: every index in `selected` came from
+    // enumerating this same `ops` slice.
+    let mut ops: Vec<Option<TentativeOp>> = ops.into_iter().map(Some).collect();
+
+    for op in selected.into_iter().map(|i| ops[i].take().unwrap()) {
+        match op {
+            TentativeOp::AssertSingle(fact) => {
+                let sf = fact.into_stored(commit_time, tx_id, None);
+                let change = match storage.supersede(
+                    sf.subject,
+                    sf.predicate,
+                    |f| f.asserter == sf.asserter,
+                    sf.clone(),
+                ) {
+                    Ok(closed) => CommitChange::Updated { closed, opened: sf },
+                    Err(StorageError::FactNotFound) => {
+                        storage.write(sf.subject, sf.predicate, sf.clone());
+                        CommitChange::Asserted { fact: sf }
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                changes.push(change);
+            }
+
+            TentativeOp::AssertSet(fact) => {
+                let sf = fact.into_stored(commit_time, tx_id, None);
+                // Set: idempotent on (subject, predicate, asserter, object).
+                // Read then write is non-atomic but acceptable in v0 since
+                // the Store API layer serialises writes per entity.
+                let already_open = storage.with_facts(sf.subject, sf.predicate, |facts| {
+                    facts.iter().any(|f| {
+                        f.asserted.is_open()
+                            && f.asserter == sf.asserter
+                            && f.object == sf.object
+                    })
+                });
+                if !already_open {
+                    storage.write(sf.subject, sf.predicate, sf.clone());
+                    changes.push(CommitChange::Asserted { fact: sf });
+                }
+            }
+
+            TentativeOp::AssertIndexed { fact, index_key } => {
+                let sf = fact.into_stored(commit_time, tx_id, Some(index_key));
+                let change = match storage.supersede(
+                    sf.subject,
+                    sf.predicate,
+                    |f| f.asserter == sf.asserter && f.index_key == Some(index_key),
+                    sf.clone(),
+                ) {
+                    Ok(closed) => CommitChange::Updated { closed, opened: sf },
+                    Err(StorageError::FactNotFound) => {
+                        storage.write(sf.subject, sf.predicate, sf.clone());
+                        CommitChange::Asserted { fact: sf }
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                changes.push(change);
+            }
+
+            TentativeOp::RetractSingle {
+                subject,
+                predicate,
+                asserter,
+            } => {
+                let closed = storage
+                    .close(subject, predicate, |f| f.asserter == asserter, commit_time)
+                    .map_err(TxError::from)?;
+                changes.push(CommitChange::Retracted { closed });
+            }
+
+            TentativeOp::RetractSet {
+                subject,
+                predicate,
+                asserter,
+                object,
+            } => {
+                let closed = storage
+                    .close(
+                        subject,
+                        predicate,
+                        |f| f.asserter == asserter && f.object == object,
+                        commit_time,
+                    )
+                    .map_err(TxError::from)?;
+                changes.push(CommitChange::Retracted { closed });
+            }
+
+            TentativeOp::RetractIndexed {
+                subject,
+                predicate,
+                asserter,
+                index_key,
+            } => {
+                let closed = storage
+                    .close(
+                        subject,
+                        predicate,
+                        |f| f.asserter == asserter && f.index_key == Some(index_key),
+                        commit_time,
+                    )
+                    .map_err(TxError::from)?;
+                changes.push(CommitChange::Retracted { closed });
+            }
+        }
+    }
+
+    Ok(changes)
+}
+
+/// Dispatch `changes` to all matching subscribers, pruning any whose channel
+/// has closed.
+pub(crate) fn dispatch_changes(
+    tx_id: TxId,
+    changes: &[CommitChange<StoredFact>],
+    subscribers: &RwLock<Vec<Subscriber>>,
+) {
+    if changes.is_empty() {
+        return;
+    }
+    let mut dead: Vec<SubscriptionId> = Vec::new();
+    {
+        let guard = subscribers.read();
+        if guard.is_empty() {
+            return;
+        }
+        for sub in guard.iter() {
+            for change in changes {
+                let Some(event) = build_event(change, tx_id, &sub.pattern) else {
+                    continue;
+                };
+                if let Some(ref f) = sub.filter {
+                    if !f(&event) {
+                        continue;
+                    }
+                }
+                match sub.sender.try_send(event) {
+                    Ok(()) => {}
+                    Err(TrySendError::Closed(_)) => {
+                        dead.push(sub.id);
+                        break;
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        // Bounded channel full: drop in v0 (PRD §5.3 deferred).
+                    }
+                }
+            }
+        }
+    }
+    if !dead.is_empty() {
+        let mut guard = subscribers.write();
+        guard.retain(|s| !dead.contains(&s.id));
+    }
+}
+
 // ── Inner ─────────────────────────────────────────────────────────────────────
 
 /// All mutable state for an in-memory store, held behind `Arc<Inner>`.
@@ -250,45 +520,6 @@ impl Inner {
             subscribers: RwLock::new(Vec::new()),
         }
     }
-
-    fn dispatch(&self, tx_id: TxId, changes: &[CommitChange<StoredFact>]) {
-        if changes.is_empty() {
-            return;
-        }
-        let mut dead: Vec<SubscriptionId> = Vec::new();
-        {
-            let guard = self.subscribers.read();
-            if guard.is_empty() {
-                return;
-            }
-            for sub in guard.iter() {
-                for change in changes {
-                    let Some(event) = build_event(change, tx_id, &sub.pattern) else {
-                        continue;
-                    };
-                    if let Some(ref f) = sub.filter {
-                        if !f(&event) {
-                            continue;
-                        }
-                    }
-                    match sub.sender.try_send(event) {
-                        Ok(()) => {}
-                        Err(TrySendError::Closed(_)) => {
-                            dead.push(sub.id);
-                            break;
-                        }
-                        Err(TrySendError::Full(_)) => {
-                            // Bounded channel full: drop in v0 (PRD §5.3 deferred).
-                        }
-                    }
-                }
-            }
-        }
-        if !dead.is_empty() {
-            let mut guard = self.subscribers.write();
-            guard.retain(|s| !dead.contains(&s.id));
-        }
-    }
 }
 
 impl Applier<StoredFact> for Inner {
@@ -297,217 +528,8 @@ impl Applier<StoredFact> for Inner {
         tx_id: TxId,
         ops: Vec<TentativeOp>,
     ) -> Result<Vec<CommitChange<StoredFact>>, TxError> {
-        // ── First pass: collapse maps ─────────────────────────────────────
-        // For each cardinality, record the index of the last op per identity
-        // key. Only that op is applied; earlier ops for the same key are
-        // discarded (they were never observable, so committing them would
-        // create empty intervals).
-        let mut last_single: HashMap<(EntityId, Predicate, EntityId), usize> =
-            HashMap::with_capacity(ops.len());
-        let mut last_set: HashMap<(EntityId, Predicate, EntityId, Term), usize> =
-            HashMap::with_capacity(ops.len());
-        let mut last_indexed: HashMap<(EntityId, Predicate, EntityId, OrderingKey), usize> =
-            HashMap::with_capacity(ops.len());
-        let mut last_retract_single: HashMap<(EntityId, Predicate, EntityId), usize> =
-            HashMap::new();
-        let mut last_retract_set: HashMap<(EntityId, Predicate, EntityId, Term), usize> =
-            HashMap::new();
-        let mut last_retract_indexed: HashMap<(EntityId, Predicate, EntityId, OrderingKey), usize> =
-            HashMap::new();
-
-        for (i, op) in ops.iter().enumerate() {
-            match op {
-                TentativeOp::AssertSingle(f) => {
-                    last_single.insert((f.subject, f.predicate, f.asserter), i);
-                }
-                TentativeOp::AssertSet(f) => {
-                    last_set.insert((f.subject, f.predicate, f.asserter, f.object.clone()), i);
-                }
-                TentativeOp::AssertIndexed { fact: f, index_key } => {
-                    last_indexed.insert((f.subject, f.predicate, f.asserter, *index_key), i);
-                }
-                TentativeOp::RetractSingle {
-                    subject,
-                    predicate,
-                    asserter,
-                } => {
-                    last_retract_single.insert((*subject, *predicate, *asserter), i);
-                }
-                TentativeOp::RetractSet {
-                    subject,
-                    predicate,
-                    asserter,
-                    object,
-                } => {
-                    last_retract_set.insert((*subject, *predicate, *asserter, object.clone()), i);
-                }
-                TentativeOp::RetractIndexed {
-                    subject,
-                    predicate,
-                    asserter,
-                    index_key,
-                } => {
-                    last_retract_indexed.insert((*subject, *predicate, *asserter, *index_key), i);
-                }
-            }
-        }
-
-        // Assert + retract of the same identity key in one tx is a precondition
-        // violation: two ops, one commit timestamp, same slot → undefined
-        // asserted-interval semantics.
-        #[cfg(debug_assertions)]
-        {
-            for key in last_single.keys() {
-                debug_assert!(
-                    !last_retract_single.contains_key(key),
-                    "assert and retract same Single key in one tx: {key:?}"
-                );
-            }
-            for key in last_set.keys() {
-                debug_assert!(
-                    !last_retract_set.contains_key(key),
-                    "assert and retract same Set key in one tx: {key:?}"
-                );
-            }
-            for key in last_indexed.keys() {
-                debug_assert!(
-                    !last_retract_indexed.contains_key(key),
-                    "assert and retract same Indexed key in one tx: {key:?}"
-                );
-            }
-        }
-
-        // Collect selected indices. No sort needed: selected ops have disjoint
-        // identity keys and share one commit timestamp, so application order
-        // has no semantic effect on assert operations. Retracts are also
-        // order-independent among themselves; the assert/retract precondition
-        // above eliminates the only case where order would matter.
-        let selected: Vec<usize> = last_single
-            .values()
-            .chain(last_set.values())
-            .chain(last_indexed.values())
-            .chain(last_retract_single.values())
-            .chain(last_retract_set.values())
-            .chain(last_retract_indexed.values())
-            .copied()
-            .collect();
-
-        // ── Second pass: apply ────────────────────────────────────────────
-        let commit_time = self.clock.now();
-        let mut changes = Vec::with_capacity(selected.len());
-
-        // Wrap ops in Option so each selected element can be moved out by
-        // index. The unwrap is safe: every index in `selected` came from
-        // enumerating this same `ops` slice.
-        let mut ops: Vec<Option<TentativeOp>> = ops.into_iter().map(Some).collect();
-
-        for op in selected.into_iter().map(|i| ops[i].take().unwrap()) {
-            match op {
-                TentativeOp::AssertSingle(fact) => {
-                    let sf = fact.into_stored(commit_time, tx_id, None);
-                    let change = match self.storage.supersede(
-                        sf.subject,
-                        sf.predicate,
-                        |f| f.asserter == sf.asserter,
-                        sf.clone(),
-                    ) {
-                        Ok(closed) => CommitChange::Updated { closed, opened: sf },
-                        Err(StorageError::FactNotFound) => {
-                            self.storage.write(sf.subject, sf.predicate, sf.clone());
-                            CommitChange::Asserted { fact: sf }
-                        }
-                        Err(e) => return Err(e.into()),
-                    };
-                    changes.push(change);
-                }
-
-                TentativeOp::AssertSet(fact) => {
-                    let sf = fact.into_stored(commit_time, tx_id, None);
-                    // Set: idempotent on (subject, predicate, asserter, object).
-                    // Read then write is non-atomic but acceptable in v0 since
-                    // the Store API layer serialises writes per entity.
-                    let already_open = self.storage.with_facts(sf.subject, sf.predicate, |facts| {
-                        facts.iter().any(|f| {
-                            f.asserted.is_open()
-                                && f.asserter == sf.asserter
-                                && f.object == sf.object
-                        })
-                    });
-                    if !already_open {
-                        self.storage.write(sf.subject, sf.predicate, sf.clone());
-                        changes.push(CommitChange::Asserted { fact: sf });
-                    }
-                }
-
-                TentativeOp::AssertIndexed { fact, index_key } => {
-                    let sf = fact.into_stored(commit_time, tx_id, Some(index_key));
-                    let change = match self.storage.supersede(
-                        sf.subject,
-                        sf.predicate,
-                        |f| f.asserter == sf.asserter && f.index_key == Some(index_key),
-                        sf.clone(),
-                    ) {
-                        Ok(closed) => CommitChange::Updated { closed, opened: sf },
-                        Err(StorageError::FactNotFound) => {
-                            self.storage.write(sf.subject, sf.predicate, sf.clone());
-                            CommitChange::Asserted { fact: sf }
-                        }
-                        Err(e) => return Err(e.into()),
-                    };
-                    changes.push(change);
-                }
-
-                TentativeOp::RetractSingle {
-                    subject,
-                    predicate,
-                    asserter,
-                } => {
-                    let closed = self
-                        .storage
-                        .close(subject, predicate, |f| f.asserter == asserter, commit_time)
-                        .map_err(TxError::from)?;
-                    changes.push(CommitChange::Retracted { closed });
-                }
-
-                TentativeOp::RetractSet {
-                    subject,
-                    predicate,
-                    asserter,
-                    object,
-                } => {
-                    let closed = self
-                        .storage
-                        .close(
-                            subject,
-                            predicate,
-                            |f| f.asserter == asserter && f.object == object,
-                            commit_time,
-                        )
-                        .map_err(TxError::from)?;
-                    changes.push(CommitChange::Retracted { closed });
-                }
-
-                TentativeOp::RetractIndexed {
-                    subject,
-                    predicate,
-                    asserter,
-                    index_key,
-                } => {
-                    let closed = self
-                        .storage
-                        .close(
-                            subject,
-                            predicate,
-                            |f| f.asserter == asserter && f.index_key == Some(index_key),
-                            commit_time,
-                        )
-                        .map_err(TxError::from)?;
-                    changes.push(CommitChange::Retracted { closed });
-                }
-            }
-        }
-
-        self.dispatch(tx_id, &changes);
+        let changes = collapse_and_apply(tx_id, ops, &*self.clock, &self.storage)?;
+        dispatch_changes(tx_id, &changes, &self.subscribers);
         Ok(changes)
     }
 }

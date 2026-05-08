@@ -2,8 +2,10 @@
 
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
+
 /// Nanoseconds since the UNIX epoch. `u64` range covers up to ~year 2554.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Timestamp(pub u64);
 
 impl Timestamp {
@@ -18,7 +20,7 @@ impl Timestamp {
 
 /// Half-open interval `[start, end)`. `end == None` means the interval is
 /// currently open (no known end).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interval {
     pub start: Timestamp,
     pub end: Option<Timestamp>,

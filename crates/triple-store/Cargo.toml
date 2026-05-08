@@ -9,9 +9,12 @@ publish.workspace = true
 [dependencies]
 async-channel = { workspace = true }
 parking_lot = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true
