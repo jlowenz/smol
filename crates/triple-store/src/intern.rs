@@ -40,9 +40,10 @@ impl StringInterner {
     /// Resolve a previously-issued id back to its string.
     ///
     /// Ensures: returns `Some(s)` iff `id` was issued by a prior `intern(s)`,
-    /// else `None`.
-    pub fn resolve(&self, id: u32) -> Option<&str> {
-        self.by_id.get(id as usize).map(|s| s.as_ref())
+    /// else `None`. Returns a cloned `Arc<str>` (atomic increment) so callers
+    /// are not lifetime-coupled to the interner.
+    pub fn resolve(&self, id: u32) -> Option<Arc<str>> {
+        self.by_id.get(id as usize).cloned()
     }
 
     /// Look up the id for an already-interned string without modifying the table.
@@ -77,7 +78,7 @@ impl PredicateInterner {
         Predicate(self.0.intern(name))
     }
 
-    pub fn resolve(&self, p: Predicate) -> Option<&str> {
+    pub fn resolve(&self, p: Predicate) -> Option<Arc<str>> {
         self.0.resolve(p.0)
     }
 
@@ -102,7 +103,7 @@ impl SymbolInterner {
         SymbolId(self.0.intern(name))
     }
 
-    pub fn resolve(&self, s: SymbolId) -> Option<&str> {
+    pub fn resolve(&self, s: SymbolId) -> Option<Arc<str>> {
         self.0.resolve(s.0)
     }
 
@@ -131,7 +132,7 @@ mod tests {
     fn resolve_round_trips() {
         let mut i = StringInterner::new();
         let id = i.intern("hello");
-        assert_eq!(i.resolve(id), Some("hello"));
+        assert_eq!(i.resolve(id).as_deref(), Some("hello"));
     }
 
     #[test]
@@ -146,7 +147,7 @@ mod tests {
     fn predicate_interner_is_typed() {
         let mut p = PredicateInterner::new();
         let id = p.intern("account.balance");
-        assert_eq!(p.resolve(id), Some("account.balance"));
+        assert_eq!(p.resolve(id).as_deref(), Some("account.balance"));
         assert_eq!(p.lookup("account.balance"), Some(id));
     }
 
@@ -154,7 +155,7 @@ mod tests {
     fn symbol_interner_is_typed() {
         let mut s = SymbolInterner::new();
         let id = s.intern("nil");
-        assert_eq!(s.resolve(id), Some("nil"));
+        assert_eq!(s.resolve(id).as_deref(), Some("nil"));
     }
 
     #[test]

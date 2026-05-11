@@ -1,6 +1,10 @@
 //! The client-facing interface to the bi-temporal triple store.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 
 use crate::change::{ChangeEvent, Subscription};
 use crate::exec_context::{AccessError, ExecContext};
@@ -47,17 +51,29 @@ impl From<TxError> for StoreError {
 
 /// Access-controlled façade over a `TripleStore<StoredFact>`.
 ///
-/// `Store` owns a `PredicateRegistry` and delegates all fact storage to an
-/// injected backend. Every mutation and query is gated by an `ExecContext`.
+/// `Store` delegates all fact storage to an injected backend. The predicate
+/// registry, entity ID counter, and backend are shared across all handles
+/// produced by `clone_handle`. Every mutation and query is gated by an
+/// `ExecContext`.
 pub struct Store {
     backend: Arc<dyn TripleStore<StoredFact>>,
-    registry: PredicateRegistry,
+    /// Shared live registry; readers pay one atomic load per access, no lock.
+    registry: Arc<ArcSwap<PredicateRegistry>>,
+    /// Serialises concurrent `declare` calls across all handles.
+    declare_lock: Arc<Mutex<()>>,
+    /// Monotonic entity ID counter; shared across all handles in a group.
+    next_entity: Arc<AtomicU64>,
 }
 
 impl Store {
     /// Requires: `backend` is a fully initialised `TripleStore<StoredFact>`.
     pub fn new(backend: Arc<dyn TripleStore<StoredFact>>) -> Self {
-        Store { backend, registry: PredicateRegistry::new() }
+        Store {
+            backend,
+            registry: Arc::new(ArcSwap::from_pointee(PredicateRegistry::new())),
+            declare_lock: Arc::new(Mutex::new(())),
+            next_entity: Arc::new(AtomicU64::new(1)),
+        }
     }
 
     /// Convenience constructor wrapping an `InMemoryTripleStore`.
@@ -73,21 +89,27 @@ impl Store {
     ///   cardinality must equal the values supplied here.
     /// Ensures: `Ok(id)` implies `self.meta(id).visibility == visibility` and
     ///   `self.meta(id).cardinality == cardinality`. Re-declaration with
-    ///   identical metadata is idempotent.
+    ///   identical metadata is idempotent. Safe to call from `&self`; a shared
+    ///   lock serialises concurrent declarations across all handles.
     pub fn declare(
-        &mut self,
+        &self,
         name: &str,
         visibility: Visibility,
         cardinality: Cardinality,
     ) -> Result<Predicate, PredicateError> {
-        self.registry.declare(name, visibility, cardinality)
+        let _guard = self.declare_lock.lock();
+        let current: Arc<PredicateRegistry> = self.registry.load_full();
+        let mut next = (*current).clone();
+        let id = next.declare(name, visibility, cardinality)?;
+        self.registry.store(Arc::new(next));
+        Ok(id)
     }
 
     /// Look up the handle for a previously-declared or interned predicate name.
     ///
     /// Ensures: `Some(id)` iff `name` is known to this registry; else `None`.
     pub fn lookup(&self, name: &str) -> Option<Predicate> {
-        self.registry.lookup(name)
+        self.registry.load().lookup(name)
     }
 
     /// Return metadata for a predicate.
@@ -95,14 +117,43 @@ impl Store {
     /// Ensures: never panics for any `Predicate` issued by this store. Unknown
     ///   predicates return `Visibility::Private` and `Cardinality::Single`.
     pub fn meta(&self, id: Predicate) -> PredicateMeta {
-        self.registry.meta(id)
+        self.registry.load().meta(id)
     }
 
     /// Resolve a predicate handle to its name.
     ///
     /// Ensures: `Some(name)` iff `id` was issued by this store; else `None`.
-    pub fn resolve(&self, id: Predicate) -> Option<&str> {
-        self.registry.resolve(id)
+    pub fn resolve(&self, id: Predicate) -> Option<Arc<str>> {
+        self.registry.load_full().resolve(id)
+    }
+
+    // ── Entity allocation ─────────────────────────────────────────────────────
+
+    /// Allocate a fresh, unique `EntityId` within this store group.
+    ///
+    /// Ensures: the returned id is distinct from all ids previously returned
+    ///   by any handle sharing this store's entity counter.
+    pub fn alloc_entity(&self) -> EntityId {
+        EntityId(self.next_entity.fetch_add(1, Ordering::Relaxed))
+    }
+
+    // ── Handle sharing ────────────────────────────────────────────────────────
+
+    /// Return a cheap handle to the same store.
+    ///
+    /// The returned handle shares the backend, predicate registry, declare
+    /// lock, and entity ID counter with `self`. Writes through either handle
+    /// are immediately visible through the other.
+    ///
+    /// Ensures: `clone_handle().alloc_entity()` returns an id distinct from
+    ///   all ids previously allocated through any handle in this group.
+    pub fn clone_handle(&self) -> Store {
+        Store {
+            backend: Arc::clone(&self.backend),
+            registry: Arc::clone(&self.registry),
+            declare_lock: Arc::clone(&self.declare_lock),
+            next_entity: Arc::clone(&self.next_entity),
+        }
     }
 
     // ── Clock ─────────────────────────────────────────────────────────────────
@@ -117,17 +168,16 @@ impl Store {
     /// Register a visibility-filtered pattern subscription.
     ///
     /// Events are filtered by `ctx` before delivery: the subscriber receives
-    /// only events for facts that `ctx` could read via `query_open`. A registry
-    /// snapshot is taken at call time; predicates declared after this call will
-    /// be treated as `Visibility::Private` and suppressed. Re-subscribe after
-    /// new declarations if visibility of those predicates is required.
+    /// only events for facts that `ctx` could read via `query_open`. The
+    /// filter captures a live reference to the shared registry; predicates
+    /// declared after this call are immediately visible to the filter.
     ///
     /// Ensures: returned `Subscription` id is unique within this store instance.
     pub fn subscribe(&self, ctx: ExecContext, pattern: Pattern) -> Subscription {
-        let registry = self.registry.clone();
+        let registry = Arc::clone(&self.registry);
         let filter: Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync> =
             Box::new(move |event: &ChangeEvent| {
-                let meta = registry.meta(event.predicate);
+                let meta = registry.load().meta(event.predicate);
                 ctx.check_read(event.subject, meta).is_ok()
             });
         self.backend.subscribe(pattern, Some(filter))
@@ -146,7 +196,7 @@ impl Store {
     /// Ensures: on `Ok(())`, any prior asserted-open fact at
     ///   `(subject, predicate, asserter)` is superseded; a new fact is opened.
     pub fn assert_single(&self, ctx: &ExecContext, fact: Fact) -> Result<(), StoreError> {
-        let meta = self.registry.meta(fact.predicate);
+        let meta = self.registry.load().meta(fact.predicate);
         ctx.check_assert(fact.subject, meta)?;
         let mut tx = self.backend.new_transaction();
         tx.assert_single(fact);
@@ -160,7 +210,7 @@ impl Store {
     /// Ensures: on `Ok(())`, the fact is committed; a duplicate
     ///   `(subject, predicate, asserter, object)` is a no-op.
     pub fn assert_set(&self, ctx: &ExecContext, fact: Fact) -> Result<(), StoreError> {
-        let meta = self.registry.meta(fact.predicate);
+        let meta = self.registry.load().meta(fact.predicate);
         ctx.check_assert(fact.subject, meta)?;
         let mut tx = self.backend.new_transaction();
         tx.assert_set(fact);
@@ -179,7 +229,7 @@ impl Store {
         fact: Fact,
         index_key: OrderingKey,
     ) -> Result<(), StoreError> {
-        let meta = self.registry.meta(fact.predicate);
+        let meta = self.registry.load().meta(fact.predicate);
         ctx.check_assert(fact.subject, meta)?;
         let mut tx = self.backend.new_transaction();
         tx.assert_indexed(fact, index_key);
@@ -200,7 +250,7 @@ impl Store {
         predicate: Predicate,
         asserter: EntityId,
     ) -> Result<(), StoreError> {
-        let meta = self.registry.meta(predicate);
+        let meta = self.registry.load().meta(predicate);
         ctx.check_assert(subject, meta)?;
         let mut tx = self.backend.new_transaction();
         tx.retract_single(subject, predicate, asserter);
@@ -222,7 +272,7 @@ impl Store {
         asserter: EntityId,
         object: Term,
     ) -> Result<(), StoreError> {
-        let meta = self.registry.meta(predicate);
+        let meta = self.registry.load().meta(predicate);
         ctx.check_assert(subject, meta)?;
         let mut tx = self.backend.new_transaction();
         tx.retract_set(subject, predicate, asserter, object);
@@ -244,7 +294,7 @@ impl Store {
         asserter: EntityId,
         index_key: OrderingKey,
     ) -> Result<(), StoreError> {
-        let meta = self.registry.meta(predicate);
+        let meta = self.registry.load().meta(predicate);
         ctx.check_assert(subject, meta)?;
         let mut tx = self.backend.new_transaction();
         tx.retract_indexed(subject, predicate, asserter, index_key);
@@ -257,8 +307,6 @@ impl Store {
     /// Begin a multi-operation transaction.
     ///
     /// Ensures: returned transaction has an empty buffer and a unique `TxId`.
-    ///   The borrow checker prevents `Store::declare` from being called while
-    ///   the returned `StoreTransaction` is live.
     pub fn begin(&self, ctx: ExecContext) -> StoreTransaction<'_> {
         StoreTransaction {
             store: self,
@@ -282,7 +330,7 @@ impl Store {
         predicate: Predicate,
         pattern: Option<&Pattern>,
     ) -> Result<Vec<StoredFact>, StoreError> {
-        let meta = self.registry.meta(predicate);
+        let meta = self.registry.load().meta(predicate);
         ctx.check_read(subject, meta)?;
         Ok(self.backend.query_open(subject, predicate, pattern))
     }
@@ -301,7 +349,7 @@ impl Store {
         valid_time: Timestamp,
         pattern: Option<&Pattern>,
     ) -> Result<Vec<StoredFact>, StoreError> {
-        let meta = self.registry.meta(predicate);
+        let meta = self.registry.load().meta(predicate);
         ctx.check_read(subject, meta)?;
         Ok(self.backend.query_at(subject, predicate, tx_time, valid_time, pattern))
     }
@@ -337,7 +385,7 @@ impl Store {
         predicate: Predicate,
         pattern: Option<&Pattern>,
     ) -> Result<Vec<StoredFact>, StoreError> {
-        let meta = self.registry.meta(predicate);
+        let meta = self.registry.load().meta(predicate);
         ctx.check_read(subject, meta)?;
         Ok(self.backend.history(subject, predicate, pattern))
     }
@@ -365,7 +413,7 @@ impl<'store> StoreTransaction<'store> {
     /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, the buffer
     ///   is unchanged; the transaction remains usable.
     pub fn assert_single(&mut self, fact: Fact) -> Result<(), StoreError> {
-        let meta = self.store.registry.meta(fact.predicate);
+        let meta = self.store.registry.load().meta(fact.predicate);
         self.ctx.check_assert(fact.subject, meta)?;
         self.tx.assert_single(fact);
         Ok(())
@@ -376,7 +424,7 @@ impl<'store> StoreTransaction<'store> {
     /// Requires: `ctx` permits assert on `fact.subject` for `fact.predicate`.
     /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
     pub fn assert_set(&mut self, fact: Fact) -> Result<(), StoreError> {
-        let meta = self.store.registry.meta(fact.predicate);
+        let meta = self.store.registry.load().meta(fact.predicate);
         self.ctx.check_assert(fact.subject, meta)?;
         self.tx.assert_set(fact);
         Ok(())
@@ -391,7 +439,7 @@ impl<'store> StoreTransaction<'store> {
         fact: Fact,
         index_key: OrderingKey,
     ) -> Result<(), StoreError> {
-        let meta = self.store.registry.meta(fact.predicate);
+        let meta = self.store.registry.load().meta(fact.predicate);
         self.ctx.check_assert(fact.subject, meta)?;
         self.tx.assert_indexed(fact, index_key);
         Ok(())
@@ -409,7 +457,7 @@ impl<'store> StoreTransaction<'store> {
         predicate: Predicate,
         asserter: EntityId,
     ) -> Result<(), StoreError> {
-        let meta = self.store.registry.meta(predicate);
+        let meta = self.store.registry.load().meta(predicate);
         self.ctx.check_assert(subject, meta)?;
         self.tx.retract_single(subject, predicate, asserter);
         Ok(())
@@ -426,7 +474,7 @@ impl<'store> StoreTransaction<'store> {
         asserter: EntityId,
         object: Term,
     ) -> Result<(), StoreError> {
-        let meta = self.store.registry.meta(predicate);
+        let meta = self.store.registry.load().meta(predicate);
         self.ctx.check_assert(subject, meta)?;
         self.tx.retract_set(subject, predicate, asserter, object);
         Ok(())
@@ -443,7 +491,7 @@ impl<'store> StoreTransaction<'store> {
         asserter: EntityId,
         index_key: OrderingKey,
     ) -> Result<(), StoreError> {
-        let meta = self.store.registry.meta(predicate);
+        let meta = self.store.registry.load().meta(predicate);
         self.ctx.check_assert(subject, meta)?;
         self.tx.retract_indexed(subject, predicate, asserter, index_key);
         Ok(())
@@ -482,7 +530,7 @@ mod tests {
     }
 
     fn store_3() -> (Store, Predicate, Predicate, Predicate) {
-        let mut store = Store::in_memory();
+        let store = Store::in_memory();
         let prv = store.declare("priv", Visibility::Private, Cardinality::Single).unwrap();
         let shr = store.declare("shared", Visibility::Shared, Cardinality::Single).unwrap();
         let pub_ = store.declare("public", Visibility::Public, Cardinality::Single).unwrap();
@@ -740,5 +788,67 @@ mod tests {
         store.assert_single(&ctx_1, fact(e(1), prv, e(1))).unwrap();
 
         assert_eq!(drain(&sub).len(), 1, "owner must receive their own private events");
+    }
+
+    // ── clone_handle ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn clone_handle_shares_backend() {
+        let (store_a, prv, _, _) = store_3();
+        let store_b = store_a.clone_handle();
+        let sys = ExecContext::System;
+
+        store_a.assert_single(&sys, fact(e(1), prv, e(1))).unwrap();
+        assert_eq!(store_b.query_open(&sys, e(1), prv, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clone_handle_shares_predicate_registry() {
+        let store_a = Store::in_memory();
+        let store_b = store_a.clone_handle();
+
+        let pred = store_a.declare("shared.pred", Visibility::Public, Cardinality::Single).unwrap();
+        assert_eq!(store_b.lookup("shared.pred"), Some(pred));
+        assert_eq!(store_b.meta(pred).visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn clone_handle_shares_entity_counter() {
+        let store_a = Store::in_memory();
+        let store_b = store_a.clone_handle();
+
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..3 {
+            ids.insert(store_a.alloc_entity());
+            ids.insert(store_b.alloc_entity());
+        }
+        assert_eq!(ids.len(), 6, "all 6 allocated entity ids must be distinct");
+    }
+
+    #[test]
+    fn declare_after_subscribe_is_visible_to_filter() {
+        let store = Store::in_memory();
+        let sys = ExecContext::System;
+
+        let sub = store.subscribe(sys, any_pattern());
+
+        // declare a new Public predicate *after* subscribe
+        let late_pred =
+            store.declare("late.predicate", Visibility::Public, Cardinality::Single).unwrap();
+
+        // assert a fact on it; the filter must see Public visibility and deliver the event
+        store.assert_single(&sys, fact(e(1), late_pred, e(1))).unwrap();
+
+        assert_eq!(drain(&sub).len(), 1, "filter must see the live registry");
+    }
+
+    #[test]
+    fn clone_handle_write_visible_immediately() {
+        let (store_a, prv, _, _) = store_3();
+        let store_b = store_a.clone_handle();
+        let sys = ExecContext::System;
+
+        store_b.assert_single(&sys, fact(e(10), prv, e(10))).unwrap();
+        assert_eq!(store_a.query_open(&sys, e(10), prv, None).unwrap().len(), 1);
     }
 }

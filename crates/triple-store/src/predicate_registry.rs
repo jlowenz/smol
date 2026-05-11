@@ -10,6 +10,8 @@
 //! declared otherwise. This is the most conservative choice: broader access and
 //! cardinality semantics must be opted into.
 
+use std::sync::Arc;
+
 use crate::intern::PredicateInterner;
 use crate::predicates::Cardinality;
 use crate::term::Predicate;
@@ -146,7 +148,7 @@ impl PredicateRegistry {
     /// Resolve a predicate handle to its name.
     ///
     /// Ensures: `Some(name)` iff `id` was issued by this registry; else `None`.
-    pub fn resolve(&self, id: Predicate) -> Option<&str> {
+    pub fn resolve(&self, id: Predicate) -> Option<Arc<str>> {
         self.interner.resolve(id)
     }
 
@@ -296,7 +298,7 @@ mod tests {
         let id = r
             .declare("account.balance", Visibility::Private, Cardinality::Single)
             .unwrap();
-        assert_eq!(r.resolve(id), Some("account.balance"));
+        assert_eq!(r.resolve(id).as_deref(), Some("account.balance"));
     }
 
     // ── Visibility ordering ───────────────────────────────────────────────────

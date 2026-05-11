@@ -9,6 +9,7 @@ authors = ["jlowens"]
 publish = false
 
 [workspace.dependencies]
+arc-swap = "1"
 async-channel = "2"
 parking_lot = "0.12"
 thiserror = "2"
