@@ -26,6 +26,7 @@ pub enum StoreError {
         predicate: PredicateMeta,
         reason: &'static str,
     },
+    DeclarationConflict(PredicateError),
     FactNotFound,
     Internal(&'static str),
 }
@@ -67,12 +68,16 @@ pub struct Store {
 
 impl Store {
     /// Requires: `backend` is a fully initialised `TripleStore<StoredFact>`.
+    /// Ensures: predicate registry and entity counter are seeded from any prior
+    ///   durable session via `recovered_registry` and `recovered_next_entity`.
     pub fn new(backend: Arc<dyn TripleStore<StoredFact>>) -> Self {
+        let initial_registry = backend.recovered_registry();
+        let next_entity = backend.recovered_next_entity();
         Store {
             backend,
-            registry: Arc::new(ArcSwap::from_pointee(PredicateRegistry::new())),
+            registry: Arc::new(ArcSwap::from_pointee(initial_registry)),
             declare_lock: Arc::new(Mutex::new(())),
-            next_entity: Arc::new(AtomicU64::new(1)),
+            next_entity: Arc::new(AtomicU64::new(next_entity)),
         }
     }
 
@@ -89,18 +94,27 @@ impl Store {
     ///   cardinality must equal the values supplied here.
     /// Ensures: `Ok(id)` implies `self.meta(id).visibility == visibility` and
     ///   `self.meta(id).cardinality == cardinality`. Re-declaration with
-    ///   identical metadata is idempotent. Safe to call from `&self`; a shared
+    ///   identical metadata is idempotent. The declaration is durable before
+    ///   it is published to readers: if persistence fails the `ArcSwap` is not
+    ///   updated and the error propagates. Safe to call from `&self`; a shared
     ///   lock serialises concurrent declarations across all handles.
     pub fn declare(
         &self,
         name: &str,
         visibility: Visibility,
         cardinality: Cardinality,
-    ) -> Result<Predicate, PredicateError> {
+    ) -> Result<Predicate, StoreError> {
         let _guard = self.declare_lock.lock();
         let current: Arc<PredicateRegistry> = self.registry.load_full();
         let mut next = (*current).clone();
-        let id = next.declare(name, visibility, cardinality)?;
+        // Validate metadata before any I/O; fail fast on conflict.
+        let id = next
+            .declare(name, visibility, cardinality)
+            .map_err(StoreError::DeclarationConflict)?;
+        // Persist; on failure the ArcSwap is NOT updated.
+        self.backend
+            .persist_declaration(name, visibility, cardinality)
+            .map_err(|_| StoreError::Internal("declaration persist failed"))?;
         self.registry.store(Arc::new(next));
         Ok(id)
     }

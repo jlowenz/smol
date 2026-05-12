@@ -6,11 +6,13 @@
 //!
 //! ```text
 //! [4-byte payload length, little-endian u32]
-//! [bincode-encoded Vec<CommitChange<StoredFact>>]
+//! [bincode-encoded WalRecord]
 //! ```
 //!
-//! Empty commits write no record. A truncated last record (crash mid-write)
-//! is detected and silently skipped; earlier records are intact and replayed.
+//! `WalRecord` is a tagged union; fact batches and predicate declarations are
+//! interleaved in commit order. Empty commits write no record. A truncated last
+//! record (crash mid-write) is detected and silently skipped; earlier records
+//! are intact and replayed.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
@@ -19,12 +21,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 
 use crate::change::{ChangeEvent, Subscriber, Subscription};
 use crate::fact::StoredFact;
 use crate::id::{EntityId, SubscriptionId, TxId};
 use crate::in_memory_store::{InMemoryStorage, collapse_and_apply, dispatch_changes};
 use crate::pattern::Pattern;
+use crate::predicate_registry::{PredicateRegistry, Visibility};
+use crate::predicates::Cardinality;
 use crate::queryable::Queryable;
 use crate::storage::{CommitChange, Storage};
 use crate::term::Predicate;
@@ -34,10 +39,35 @@ use crate::triple_store::TripleStore;
 
 const DEFAULT_SHARD_COUNT: usize = 16;
 
+// ── WAL record ────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+enum WalRecord {
+    FactBatch(Vec<CommitChange<StoredFact>>),
+    Declaration {
+        name: String,
+        visibility: Visibility,
+        cardinality: Cardinality,
+    },
+}
+
+fn write_wal_record(log: &mut BufWriter<File>, record: &WalRecord) -> io::Result<()> {
+    let encoded = bincode::serialize(record)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let len = u32::try_from(encoded.len())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    log.write_all(&len.to_le_bytes())?;
+    log.write_all(&encoded)?;
+    log.flush()?;
+    log.get_mut().sync_data()
+}
+
 // ── DurableInner ─────────────────────────────────────────────────────────────
 
 pub(crate) struct DurableInner {
     storage: InMemoryStorage,
+    recovered_registry: PredicateRegistry,
+    next_entity_start: u64,
     clock: Arc<dyn Clock>,
     next_tx: AtomicU64,
     next_subscription: AtomicU64,
@@ -53,6 +83,8 @@ impl DurableInner {
             .open(path)?;
         Ok(Self {
             storage: InMemoryStorage::new(DEFAULT_SHARD_COUNT),
+            recovered_registry: PredicateRegistry::new(),
+            next_entity_start: 1,
             clock,
             next_tx: AtomicU64::new(1),
             next_subscription: AtomicU64::new(1),
@@ -63,10 +95,12 @@ impl DurableInner {
 
     fn open(path: &Path, clock: Arc<dyn Clock>) -> io::Result<Self> {
         let storage = InMemoryStorage::new(DEFAULT_SHARD_COUNT);
-        let max_tx = replay_log(path, &storage)?;
+        let (max_tx, recovered_registry, max_entity) = replay_log(path, &storage)?;
         let file = OpenOptions::new().append(true).open(path)?;
         Ok(Self {
             storage,
+            recovered_registry,
+            next_entity_start: max_entity + 1,
             clock,
             next_tx: AtomicU64::new(max_tx + 1),
             next_subscription: AtomicU64::new(1),
@@ -96,20 +130,9 @@ impl Applier<StoredFact> for DurableInner {
         let changes = collapse_and_apply(tx_id, ops, &*self.clock, &self.storage)?;
 
         if !changes.is_empty() {
-            let encoded = bincode::serialize(&changes)
-                .map_err(|_| TxError::Internal("serialization failed"))?;
-            let len = u32::try_from(encoded.len())
-                .map_err(|_| TxError::Internal("record too large"))?;
-            let mut log = self.log.lock();
-            log.write_all(&len.to_le_bytes())
+            let record = WalRecord::FactBatch(changes.clone());
+            write_wal_record(&mut *self.log.lock(), &record)
                 .map_err(|_| TxError::Internal("log write failed"))?;
-            log.write_all(&encoded)
-                .map_err(|_| TxError::Internal("log write failed"))?;
-            log.flush()
-                .map_err(|_| TxError::Internal("log write failed"))?;
-            log.get_mut()
-                .sync_data()
-                .map_err(|_| TxError::Internal("fsync failed"))?;
         }
 
         dispatch_changes(tx_id, &changes, &self.subscribers);
@@ -119,9 +142,11 @@ impl Applier<StoredFact> for DurableInner {
 
 // ── WAL replay ────────────────────────────────────────────────────────────────
 
-fn replay_log(path: &Path, storage: &InMemoryStorage) -> io::Result<u64> {
+fn replay_log(path: &Path, storage: &InMemoryStorage) -> io::Result<(u64, PredicateRegistry, u64)> {
     let mut file = File::open(path)?;
     let mut max_tx = 0u64;
+    let mut max_entity = 0u64;
+    let mut registry = PredicateRegistry::new();
     loop {
         let mut len_buf = [0u8; 4];
         match file.read_exact(&mut len_buf) {
@@ -139,13 +164,32 @@ fn replay_log(path: &Path, storage: &InMemoryStorage) -> io::Result<u64> {
             }
             Err(e) => return Err(e),
         }
-        let changes: Vec<CommitChange<StoredFact>> = bincode::deserialize(&payload)
+        let record: WalRecord = bincode::deserialize(&payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        for change in &changes {
-            max_tx = max_tx.max(replay_change(change, storage));
+        match record {
+            WalRecord::FactBatch(changes) => {
+                for change in &changes {
+                    max_tx = max_tx.max(replay_change(change, storage));
+                    let (s, a) = entity_ids_in_change(change);
+                    max_entity = max_entity.max(s).max(a);
+                }
+            }
+            WalRecord::Declaration { name, visibility, cardinality } => {
+                registry
+                    .declare(&name, visibility, cardinality)
+                    .unwrap_or_else(|_| panic!("WAL corruption: conflicting declaration for {name}"));
+            }
         }
     }
-    Ok(max_tx)
+    Ok((max_tx, registry, max_entity))
+}
+
+fn entity_ids_in_change(change: &CommitChange<StoredFact>) -> (u64, u64) {
+    match change {
+        CommitChange::Asserted { fact } => (fact.subject.0, fact.asserter.0),
+        CommitChange::Updated { opened, .. } => (opened.subject.0, opened.asserter.0),
+        CommitChange::Retracted { closed } => (closed.subject.0, closed.asserter.0),
+    }
 }
 
 /// Apply one `CommitChange` to `storage` during WAL replay, using the stored
@@ -324,6 +368,28 @@ impl TripleStore<StoredFact> for DurableFileTripleStore {
     fn unsubscribe(&self, id: SubscriptionId) {
         self.inner.subscribers.write().retain(|s| s.id != id);
     }
+
+    fn persist_declaration(
+        &self,
+        name: &str,
+        visibility: Visibility,
+        cardinality: Cardinality,
+    ) -> io::Result<()> {
+        let record = WalRecord::Declaration {
+            name: name.to_owned(),
+            visibility,
+            cardinality,
+        };
+        write_wal_record(&mut *self.inner.log.lock(), &record)
+    }
+
+    fn recovered_registry(&self) -> PredicateRegistry {
+        self.inner.recovered_registry.clone()
+    }
+
+    fn recovered_next_entity(&self) -> u64 {
+        self.inner.next_entity_start
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -485,6 +551,161 @@ mod tests {
 
         let history = s2.history(EntityId(1), Predicate(0), None);
         assert_eq!(history.len(), 2, "full history must be preserved through replay");
+    }
+
+    // ── Declaration persistence tests ────────────────────────────────────────
+
+    #[test]
+    fn declare_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.wal");
+
+        {
+            let s = DurableFileTripleStore::create(&path).unwrap();
+            s.persist_declaration("account.balance", Visibility::Public, Cardinality::Single)
+                .unwrap();
+        }
+
+        let s2 = DurableFileTripleStore::open(&path).unwrap();
+        let reg = s2.recovered_registry();
+        let id = reg.lookup("account.balance").expect("declaration must survive reopen");
+        let meta = reg.meta(id);
+        assert_eq!(meta.visibility, Visibility::Public);
+        assert_eq!(meta.cardinality, Cardinality::Single);
+    }
+
+    #[test]
+    fn two_declarations_both_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.wal");
+
+        {
+            let s = DurableFileTripleStore::create(&path).unwrap();
+            s.persist_declaration("p", Visibility::Private, Cardinality::Single).unwrap();
+            s.persist_declaration("q", Visibility::Shared, Cardinality::Set).unwrap();
+        }
+
+        let s2 = DurableFileTripleStore::open(&path).unwrap();
+        let reg = s2.recovered_registry();
+
+        let p_id = reg.lookup("p").expect("p must survive reopen");
+        assert_eq!(reg.meta(p_id).visibility, Visibility::Private);
+        assert_eq!(reg.meta(p_id).cardinality, Cardinality::Single);
+
+        let q_id = reg.lookup("q").expect("q must survive reopen");
+        assert_eq!(reg.meta(q_id).visibility, Visibility::Shared);
+        assert_eq!(reg.meta(q_id).cardinality, Cardinality::Set);
+    }
+
+    #[test]
+    fn declaration_interleaved_with_facts_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.wal");
+
+        {
+            let s = DurableFileTripleStore::create(&path).unwrap();
+            s.persist_declaration("score", Visibility::Public, Cardinality::Single).unwrap();
+            // Intern "score" so Predicate(0) maps to it, then assert a fact.
+            let mut tx = s.new_transaction();
+            tx.assert_single(mk_fact(1, 1, 99));
+            tx.commit().unwrap();
+            s.persist_declaration("label", Visibility::Shared, Cardinality::Set).unwrap();
+        }
+
+        let s2 = DurableFileTripleStore::open(&path).unwrap();
+        let reg = s2.recovered_registry();
+        assert!(reg.lookup("score").is_some(), "score must survive reopen");
+        assert!(reg.lookup("label").is_some(), "label must survive reopen");
+
+        let facts = s2.query_open(EntityId(1), Predicate(0), None);
+        assert_eq!(facts.len(), 1, "fact must survive reopen alongside declarations");
+    }
+
+    #[test]
+    fn redeclare_identical_after_reopen_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.wal");
+
+        {
+            let s = DurableFileTripleStore::create(&path).unwrap();
+            s.persist_declaration("p", Visibility::Shared, Cardinality::Set).unwrap();
+        }
+
+        let s2 = DurableFileTripleStore::open(&path).unwrap();
+        let reg = s2.recovered_registry();
+        let id_before = reg.lookup("p").unwrap();
+
+        // Re-declare with identical metadata via a new Store — must be idempotent.
+        use crate::store::Store;
+        let store = Store::new(Arc::new(s2));
+        let id_after = store
+            .declare("p", Visibility::Shared, Cardinality::Set)
+            .expect("identical re-declaration must succeed");
+        assert_eq!(id_before, id_after);
+    }
+
+    #[test]
+    fn redeclare_conflicting_after_reopen_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.wal");
+
+        {
+            let s = DurableFileTripleStore::create(&path).unwrap();
+            s.persist_declaration("p", Visibility::Private, Cardinality::Single).unwrap();
+        }
+
+        let s2 = Arc::new(DurableFileTripleStore::open(&path).unwrap());
+        let store = crate::store::Store::new(s2 as Arc<dyn TripleStore<StoredFact>>);
+        let err = store
+            .declare("p", Visibility::Public, Cardinality::Single)
+            .unwrap_err();
+        assert!(matches!(err, crate::store::StoreError::DeclarationConflict(_)));
+    }
+
+    #[test]
+    fn entity_ids_do_not_collide_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.wal");
+
+        let (id1, id2) = {
+            let s = Arc::new(DurableFileTripleStore::create(&path).unwrap());
+            s.persist_declaration("p", Visibility::Public, Cardinality::Single).unwrap();
+            let store = crate::store::Store::new(Arc::clone(&s) as Arc<dyn TripleStore<StoredFact>>);
+            let e1 = store.alloc_entity();
+            let e2 = store.alloc_entity();
+            let ctx = crate::exec_context::ExecContext::System;
+            store
+                .assert_single(&ctx, crate::fact::Fact {
+                    subject: e1,
+                    predicate: Predicate(0),
+                    object: crate::term::Term::Int(1),
+                    asserter: e1,
+                    valid: None,
+                })
+                .unwrap();
+            store
+                .assert_single(&ctx, crate::fact::Fact {
+                    subject: e2,
+                    predicate: Predicate(0),
+                    object: crate::term::Term::Int(2),
+                    asserter: e2,
+                    valid: None,
+                })
+                .unwrap();
+            (e1, e2)
+        };
+
+        let s2 = Arc::new(DurableFileTripleStore::open(&path).unwrap());
+        let store2 = crate::store::Store::new(Arc::clone(&s2) as Arc<dyn TripleStore<StoredFact>>);
+        let e3 = store2.alloc_entity();
+
+        assert!(e3 > id1, "new entity id must exceed prior session ids");
+        assert!(e3 > id2, "new entity id must exceed prior session ids");
+
+        // Original facts are still queryable by their prior ids.
+        let ctx = crate::exec_context::ExecContext::System;
+        assert_eq!(store2.query_open(&ctx, id1, Predicate(0), None).unwrap().len(), 1);
+        assert_eq!(store2.query_open(&ctx, id2, Predicate(0), None).unwrap().len(), 1);
     }
 
     #[test]

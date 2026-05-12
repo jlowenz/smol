@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::intern::PredicateInterner;
 use crate::predicates::Cardinality;
 use crate::term::Predicate;
@@ -21,7 +23,7 @@ use crate::term::Predicate;
 /// Ordered from most restrictive to most permissive; `Ord` follows declaration
 /// order: `Private < Shared < Public`. This enables "at least this visible"
 /// comparisons with the standard `>=` operator.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Visibility {
     /// Writable and readable only by the owning entity.
     Private,

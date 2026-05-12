@@ -6,10 +6,14 @@
 //! `StoredFact` yields a fully dyn-compatible trait
 //! (`Arc<dyn TripleStore<StoredFact>>`).
 
+use std::io;
+
 use crate::change::{ChangeEvent, Subscription};
 use crate::fact::BitemporalFact;
 use crate::id::{EntityId, SubscriptionId};
 use crate::pattern::{AsOf, Pattern};
+use crate::predicate_registry::{PredicateRegistry, Visibility};
+use crate::predicates::Cardinality;
 use crate::queryable::Queryable;
 use crate::term::Predicate;
 use crate::time::Timestamp;
@@ -51,6 +55,37 @@ pub trait TripleStore<TFact: BitemporalFact>: Queryable<TFact> + Send + Sync {
 
     /// Cancel a subscription. No-op if `id` is unknown.
     fn unsubscribe(&self, id: SubscriptionId);
+
+    /// Persist a declaration record so it survives process restart.
+    ///
+    /// Requires: caller serialises concurrent declarations (e.g. holds a
+    ///   declare lock) before calling.
+    /// Ensures: on `Ok(())`, the declaration is durable. Default impl is a no-op.
+    fn persist_declaration(
+        &self,
+        _name: &str,
+        _visibility: Visibility,
+        _cardinality: Cardinality,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Return the `PredicateRegistry` recovered from a prior session.
+    ///
+    /// Ensures: returned registry contains exactly the declarations replayed
+    ///   from the WAL; empty for non-durable backends.
+    fn recovered_registry(&self) -> PredicateRegistry {
+        PredicateRegistry::new()
+    }
+
+    /// Return the first entity ID to use after recovering from a prior session.
+    ///
+    /// Ensures: returned value is strictly greater than every entity ID
+    ///   committed to the store in any prior session; returns 1 for non-durable
+    ///   backends.
+    fn recovered_next_entity(&self) -> u64 {
+        1
+    }
 
     /// Bitemporal point-in-time query, resolving `AsOf::None` fields against
     /// `self.now()`.
