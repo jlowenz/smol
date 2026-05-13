@@ -15,7 +15,12 @@ bincode = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "triple_store"
+harness = false
 
 [lints]
 workspace = true

@@ -16,6 +16,8 @@ thiserror = "2"
 proptest = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
