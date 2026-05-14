@@ -49,6 +49,14 @@ When a design decision involves tradeoffs (performance vs safety, simplicity
 vs expressiveness), the tradeoff is made explicit and parameterizable where
 possible, rather than hiding it behind a single forced choice.
 
+### P9: Syntax Serves the Model
+The surface language exists to express the system's core model — message
+passing, liveness, temporal state, and concurrent identity. Syntax choices are
+evaluated against whether they serve that model and the system's principles.
+Familiarity is a genuine asset; fidelity to any prior language is not a goal.
+When a syntax question arises, the right question is: "does this serve the
+model?" — not: "did Smalltalk (or any other language) do this?"
+
 ---
 
 ## Key Design Decisions
@@ -291,6 +299,65 @@ rustpython all succeed with this approach.
 Two weeks of real work will confirm or refute the language choice with evidence.
 
 **Principle**: P1 (implementation must support liveness from the start)
+
+---
+
+### D12: Surface Language Lineage — Relationship to Smalltalk
+
+**Decision**: Smalltalk's surface grammar (unary, binary, keyword message sends;
+blocks; cascades; `^` return) is adopted as the starting point for the surface
+language. It is not a specification to conform to. Divergences from Smalltalk are
+evaluated on their own merits against this system's principles — not justified by
+or blocked by Smalltalk precedent.
+
+**Alternatives considered**:
+- Design a new syntax from scratch: loses the well-tested "everything is a
+  message send" discipline, the familiarity it provides to those who know
+  Smalltalk, and the decades of ergonomic refinement in the three-level
+  precedence model.
+- Strict Smalltalk compliance: impossible given D2 (async by default), D3
+  (value/entity distinction), and D4 (triple store as state substrate). These
+  are not extensions to Smalltalk's execution model — they replace its core
+  assumptions.
+
+**Rationale**: Smalltalk's message-send syntax is a good notation for this
+system's interaction primitive, and its uniform grammar aligns with P2 and P9.
+But Smalltalk-80 rests on several assumptions this system explicitly rejects:
+
+1. **Synchronous sends** — D2 makes all sends conceptually asynchronous. The
+   syntax `anObject doSomething` is identical in both systems; the semantics
+   are not. In Smalltalk, the sender blocks. Here, it fires into the actor
+   substrate and either returns a future or is optimized to synchronous by the
+   runtime when reachability allows.
+
+2. **Mutable in-image objects** — Smalltalk objects live in a mutable image
+   with no persistent identity outside it. This system's entities have durable
+   identity in the triple store (D4) and a value/entity distinction (D3) that
+   Smalltalk does not have.
+
+3. **Single-image, cooperative green threads** — P4 targets multicore, isolated
+   actor concurrency. The execution model is different at every level.
+
+These divergences are not additions to Smalltalk; they are different semantics
+behind the same syntax. That is acceptable, but it must be named. This system
+is *inspired by* Smalltalk and borrows its surface grammar. It is not a
+Smalltalk implementation or a Smalltalk dialect.
+
+**Implication for syntax decisions**: When evaluating a proposed syntax
+addition or deviation, apply P9: does it serve the message-passing model and
+the system's observability and liveness goals? Smalltalk precedent is relevant
+evidence, not authority.
+
+**Known caution — arithmetic precedence**: Adding operator precedence (`*`
+binding tighter than `+`) would break the uniform binary message rule. It
+creates a two-tier system where some binary messages are semantically special,
+compromising P2 (conceptual simplicity) and P3 (opacity is the enemy — uniform
+message dispatch is inspectable; special-cased operators are not). User-defined
+operators would also receive different treatment than built-in ones. Any proposal
+to add arithmetic precedence must be evaluated against this structural cost, not
+on programmer familiarity alone.
+
+**Principle**: P2, P9
 
 ---
 

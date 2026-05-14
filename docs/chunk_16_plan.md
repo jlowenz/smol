@@ -92,15 +92,15 @@ choice for a value that must be usable as a `HashMap` key in environments.
 pub struct Block {
     pub params: Vec<Arc<str>>,
     pub body:   Vec<Stmt>,       // Stmt defined in ast.rs
-    pub env:    Env,             // captured lexical env (clone at block creation)
+    pub env:    Env,             // captured lexical env (shared frames)
 }
 ```
 
-Blocks capture the defining `Env` by clone. This is a bootstrap simplification:
-in a production interpreter, closures would share a heap-allocated environment
-cell to support mutation of captured variables. For this chunk, outer-variable
-mutation from within a block is not supported; only reading captures is needed
-to pass the test suite. Document this limitation explicitly.
+Blocks capture the defining `Env` by value, but because `Env` frames are
+heap-allocated (see Item 2), captured variables are shared — mutation in the
+outer scope is visible inside the block and vice versa. This is the correct
+Smalltalk closure semantics; the bootstrap does not need a separate "capture by
+clone" path.
 
 `Value` must be `Clone`. `Block` is heap-allocated via `Arc` so cloning a
 `Value::Block` is cheap.
@@ -109,11 +109,16 @@ to pass the test suite. Document this limitation explicitly.
 
 ## Item 2 — `Env` (`src/env.rs`)
 
-Lexical environments as a mutable frame stack.
+Lexical environments as a mutable frame stack. Frames are heap-allocated and
+reference-counted so that closures share the environment they close over rather
+than snapshotting it. This gives correct Smalltalk closure semantics: a block
+that reads or writes an outer variable sees live state, not a stale copy.
 
 ```rust
+type Frame = RefCell<HashMap<Arc<str>, Value>>;
+
 pub struct Env {
-    frames: Vec<HashMap<Arc<str>, Value>>,
+    frames: Vec<Arc<Frame>>,
 }
 
 impl Env {
@@ -125,8 +130,8 @@ impl Env {
     /// Ensures: binds `name` in the innermost frame.
     pub fn define(&mut self, name: Arc<str>, value: Value);
 
-    /// Walk from innermost to outermost; return the first binding found.
-    pub fn get(&self, name: &str) -> Option<&Value>;
+    /// Walk from innermost to outermost; return a clone of the first binding found.
+    pub fn get(&self, name: &str) -> Option<Value>;
 
     /// Walk from innermost to outermost; update the first binding found.
     /// Returns false if no binding exists (caller should treat as error).
@@ -134,7 +139,16 @@ impl Env {
 }
 ```
 
-`Env` is `Clone` so closures can snapshot it at definition time.
+`Env` is `Clone`: cloning copies the `Vec` of `Arc<Frame>` handles, so the
+cloned env shares the same live frames — exactly what a block needs when it
+captures its defining environment. `RefCell` enforces the Rust borrow rules at
+runtime; panics here indicate evaluator bugs (double borrow) rather than user
+errors.
+
+**Note:** `get` returns `Option<Value>` (a clone of the stored value) rather
+than a reference, because holding a `RefCell` borrow across further env
+operations would cause a runtime panic. `Value::Clone` is cheap for all
+variants (`Arc` for heap types, copy for scalars).
 
 ---
 
@@ -216,13 +230,18 @@ pub enum Token {
     Pipe,             // |
     LParen, RParen,
     LBracket, RBracket,
+    // Trivia (preserved, not consumed by grammar rules)
+    Comment(Arc<str>), // "..." — content without delimiters
     // Sentinel
     Eof,
 }
 ```
 
-Comments (`"..."`) are skipped during tokenization. Character literals
-(`$A`) are deferred.
+Comments (`"..."`) are **preserved** as `Token::Comment` rather than discarded.
+The parser skips `Comment` tokens in all grammar positions but does not lose
+them — they are collected for future AST trivia attachment (documentation
+extraction, tooling, moldable-development hooks). Character literals (`$A`) are
+deferred.
 
 ### Error handling
 
@@ -233,29 +252,54 @@ Comments (`"..."`) are skipped during tokenization. Character literals
 
 ## Item 5 — Parser (`src/parser.rs`)
 
-Recursive-descent parser following Smalltalk's three-level message precedence:
+Recursive-descent parser following Smalltalk's three-level message precedence.
+
+**Grammar notation note:** the three `*_level` rules are *precedence levels*, not
+expression categories. Each rule means "an expression at this precedence or
+higher." When no operator of the current level is present, the rule simply
+returns what the next level produced — the fallthrough is unconditional. This
+is the standard recursive-descent technique for operator precedence without a
+separate Pratt pass.
 
 ```
-program      ::= local_decl? stmt* EOF
-local_decl   ::= '|' IDENT* '|'
-stmt         ::= '^' expr '.'?
-              | IDENT ':=' expr '.'?
-              | expr '.'?
-expr         ::= keyword_expr
-keyword_expr ::= binary_expr (KEYWORD binary_expr)+ cascade?
-              | binary_expr cascade?
-cascade      ::= (';' message)+
-message      ::= KEYWORD binary_expr   (keyword part)
-              | BINOP unary_expr       (binary part)
-              | IDENT                  (unary part)
-binary_expr  ::= unary_expr (BINOP unary_expr)*
-unary_expr   ::= primary IDENT*
-primary      ::= literal
-              | IDENT
-              | '(' expr ')'
-              | '[' local_decl? (':' IDENT)* ('|' stmt*)? ']'
-literal      ::= INT | FLOAT | STR | SYMBOL | TRUE | FALSE | NIL
+program         ::= local_decl? stmt* EOF
+local_decl      ::= '|' IDENT* '|'
+stmt            ::= '^' expr '.'?
+                 |  IDENT ':=' expr '.'?
+                 |  expr '.'?
+expr            ::= keyword_level
+
+-- Keyword level: lowest precedence. Falls through to binary_level when no
+-- KEYWORD token follows.
+keyword_level   ::= binary_level (KEYWORD binary_level)+ cascade?
+                 |  binary_level cascade?
+
+-- A cascade continues the same receiver object.
+cascade         ::= (';' cascade_msg)+
+cascade_msg     ::= IDENT                          -- unary part
+                 |  BINOP unary_level              -- binary part
+                 |  (KEYWORD binary_level)+        -- keyword part
+
+-- Binary level: left-to-right, no precedence among operators. Each operand is
+-- a unary_level so that `3 factorial + 4 factorial` parses as
+-- `(3 factorial) + (4 factorial)`. Falls through to unary_level when no
+-- BINOP token follows.
+binary_level    ::= unary_level (BINOP unary_level)*
+
+-- Unary level: highest message precedence. Trailing IDENTs are unary sends,
+-- left-to-right. Falls through to primary when no IDENT follows.
+unary_level     ::= primary IDENT*
+
+primary         ::= literal
+                 |  IDENT
+                 |  '(' expr ')'
+                 |  block
+block           ::= '[' BLOCK_PARAM* local_decl? stmt* ']'
+literal         ::= INT | FLOAT | STR | SYMBOL | TRUE | FALSE | NIL
 ```
+
+BLOCK_PARAM is a dedicated token (`:name`) emitted by the lexer for block
+parameters. This avoids ambiguity with the local-decl `|` pipe.
 
 `ParseError` via `thiserror`, variants: `UnexpectedToken`, `UnexpectedEof`,
 `InvalidAssignTarget`.
@@ -263,8 +307,9 @@ literal      ::= INT | FLOAT | STR | SYMBOL | TRUE | FALSE | NIL
 **Key parsing notes:**
 
 - `KEYWORD` tokens (`at:`, `put:`, `ifTrue:ifFalse:`) are collected greedily
-  until the sequence ends. `obj at: 1 put: 2` is one three-part keyword send
-  with selector `at:put:`, not two separate sends.
+  until the sequence ends. `obj at: 1 put: 2` is one two-part keyword send
+  with selector `at:put:` (two keyword fragments, two arguments), not two
+  separate sends.
 - Assignment (`IDENT ':=' expr`) is detected by one-token lookahead: if the
   current token is an `Ident` and the next is `Assign`, parse as assignment.
   Otherwise parse as expression-statement.
@@ -330,13 +375,13 @@ Each `Value` variant handles its own selectors:
 
 | Receiver | Selectors |
 |---|---|
-| `Int` | `+` `-` `*` `/` `//` `\\` `<` `>` `<=` `>=` `=` `~=` `negated` `abs` `max:` `min:` `printString` `asFloat` `timesRepeat:` `to:do:` `to:by:do:` |
-| `Float` | `+` `-` `*` `/` `<` `>` `<=` `>=` `=` `~=` `negated` `abs` `truncated` `rounded` `ceiling` `floor` `printString` `asInt` |
-| `Bool` | `ifTrue:` `ifFalse:` `ifTrue:ifFalse:` `ifFalse:ifTrue:` `&` `\|` `not` `=` `printString` `and:` `or:` |
-| `Nil` | `isNil` `notNil` `ifNil:` `ifNotNil:` `ifNil:ifNotNil:` `printString` `=` |
-| `Str` | `size` `at:` `,` `=` `~=` `printString` `asSymbol` `reversed` `copyFrom:to:` `includesSubString:` |
-| `Symbol` | `=` `~=` `printString` `asString` `asSymbol` |
-| `Block` | `value` `value:` `value:value:` `value:value:value:` `whileTrue:` `whileFalse:` `whileTrue` `whileFalse` `on:do:` |
+| `Int` | `+` `-` `*` `/` `//` `\\` `<` `>` `<=` `>=` `=` `~=` `negated` `abs` `max:` `min:` `printString` `asFloat` `timesRepeat:` `to:do:` `to:by:do:` `yourself` |
+| `Float` | `+` `-` `*` `/` `<` `>` `<=` `>=` `=` `~=` `negated` `abs` `truncated` `rounded` `ceiling` `floor` `printString` `asInt` `yourself` |
+| `Bool` | `ifTrue:` `ifFalse:` `ifTrue:ifFalse:` `ifFalse:ifTrue:` `&` `\|` `not` `=` `printString` `and:` `or:` `yourself` |
+| `Nil` | `isNil` `notNil` `ifNil:` `ifNotNil:` `ifNil:ifNotNil:` `printString` `=` `yourself` |
+| `Str` | `size` `at:` `,` `=` `~=` `printString` `asSymbol` `reversed` `copyFrom:to:` `includesSubString:` `yourself` |
+| `Symbol` | `=` `~=` `printString` `asString` `asSymbol` `yourself` |
+| `Block` | `value` `value:` `value:value:` `value:value:value:` `whileTrue:` `whileFalse:` `whileTrue` `whileFalse` `on:do:` `yourself` |
 
 `Block` dispatch for `value`, `value:value:`, etc. creates a new frame, binds
 parameters, evaluates the body via `Evaluator::eval_program`, and catches
@@ -403,6 +448,38 @@ string representation. `Block` prints as `'a Block'`. `Nil` prints as `'nil'`.
 
 ---
 
+## Resolved Design Decisions (pre-implementation)
+
+- **Hand-written lexer and parser.** Chumsky was considered and rejected.
+  Smalltalk's three-level message precedence grammar is unambiguous and requires
+  no backtracking; a hand-written recursive-descent parser is the same size,
+  easier to debug, and gives full control over error messages and comment
+  preservation. If a formal grammar is needed later for tooling (LSP, formatter),
+  `tree-sitter` is the appropriate tool, not a parser combinator library.
+
+- **Comment preservation.** `Token::Comment(Arc<str>)` is emitted by the lexer
+  rather than discarded. The parser skips comment tokens in all grammar rules but
+  collects them for future AST trivia attachment. This is a one-way door: once
+  comments are lost at the token stream level, no later chunk can recover them for
+  documentation extraction or moldable-development tooling.
+
+- **`yourself` as universal built-in.** Every `Value` variant handles `yourself`
+  (returns `self`). This is the minimal cost to make cascade expressions usable.
+
+- **Float `printString` uses `{:?}`.** See open question below.
+
+- **`Env` frames are heap-allocated (`Arc<RefCell<Frame>>`).**  Closures share
+  live frames rather than cloning a snapshot, giving correct Smalltalk closure
+  semantics from chunk 16 onward. The bootstrap does not need a "read-only
+  captures" workaround.
+
+- **`i64` integer range is a known gap.** Literals and arithmetic silently wrap
+  on overflow. `LargeInt` support (via `num-bigint`) is deferred to chunk 17–18
+  and must be tracked there explicitly. The evaluator should not attempt to detect
+  or recover from overflow in chunk 16.
+
+---
+
 ## Open Questions
 
 ### Cascade evaluation and return value
@@ -432,9 +509,13 @@ and measurable.
 
 ### Float precision and `printString`
 
-`Float printString` must produce a round-trippable representation (use
-`ryu` or Rust's `{:?}` format which produces round-trippable output). Do not
-use `{}` (may lose precision). Decide and record the choice before implementing.
+**Resolved:** use Rust's `{:?}` format. Since Rust 1.0, `{:?}` on `f64` uses
+an algorithm equivalent to Grisu/Ryu and produces a shortest round-trippable
+decimal representation. The `ryu` crate offers a marginal speed advantage and
+guaranteed-shortest output, but the practical difference in output is nil for
+typical values, and adding the dependency is not justified at this stage. Do
+**not** use `{}` (lossy). Record as a known simplification; revisit only if
+byte-for-byte Smalltalk float compatibility is required.
 
 ### Error class hierarchy
 
