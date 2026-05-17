@@ -1,9 +1,13 @@
-use std::sync::Arc;
+use std::cell::{Cell, RefCell};
+use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
 
 use crate::ast::*;
+use crate::class::Method;
+use crate::class_registry::ClassRegistry;
 use crate::env::Env;
+use crate::object::Object;
 use crate::value::{Block, Value};
 
 #[derive(Debug, Error, Clone)]
@@ -25,9 +29,114 @@ pub enum EvalError {
     Return(Value),
 }
 
-pub struct Evaluator;
+pub struct Evaluator {
+    pub registry: Arc<ClassRegistry>,
+    method_stack: RefCell<Vec<Arc<Object>>>,
+    /// Depth of the active method stack. Maintained alongside `method_stack` so
+    /// the common case — no active method — can be tested with a plain `Cell`
+    /// read instead of a `RefCell` borrow.
+    method_depth: Cell<usize>,
+    // Total struct size: 8 + 32 + 8 = 48 bytes — fits in one cache line.
+}
+
+impl Default for Evaluator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Evaluator {
+    pub fn new() -> Self {
+        Self {
+            registry: Arc::new(ClassRegistry::new()),
+            method_stack: RefCell::new(Vec::new()),
+            method_depth: Cell::new(0),
+        }
+    }
+
+    // ── Method receiver stack ─────────────────────────────────────────────────
+
+    fn push_receiver(&self, obj: Arc<Object>) {
+        self.method_stack.borrow_mut().push(obj);
+        self.method_depth.set(self.method_depth.get() + 1);
+    }
+
+    fn pop_receiver(&self) {
+        self.method_stack.borrow_mut().pop();
+        self.method_depth.set(self.method_depth.get() - 1);
+    }
+
+    fn current_receiver(&self) -> Option<Arc<Object>> {
+        self.method_stack.borrow().last().cloned()
+    }
+
+    // ── Variable lookup & assignment ──────────────────────────────────────────
+
+    #[inline]
+    fn lookup_var(&self, name: &str, env: &Env) -> Option<Value> {
+        // Fast path: no active method context — skip the RefCell borrow entirely.
+        if self.method_depth.get() == 0 {
+            return env.get(name);
+        }
+        if let Some(recv) = self.current_receiver() {
+            // 1. local frame (params, method locals, self)
+            if let Some(v) = env.lookup_top_frame(name) {
+                return Some(v);
+            }
+            // 2. instance variables
+            if let Some(v) = recv.get_slot(name) {
+                return Some(v);
+            }
+            // 3. class variables
+            if let Some(owner) = recv.class.lookup_class_var_owner(name) {
+                if let Some(v) = owner.class_var_storage.borrow().get(name).cloned() {
+                    return Some(v);
+                }
+            }
+            // 4. outer env (globals)
+            env.lookup_outer_frames(name)
+        } else {
+            env.get(name)
+        }
+    }
+
+    /// Assign `value` to `name`, following the method-context lookup order, and
+    /// return the stored value for use as the statement's result.
+    ///
+    /// Requires: `value` is the fully-evaluated right-hand side.
+    /// Ensures: exactly one `Value::clone` is performed regardless of path.
+    #[inline]
+    fn assign_var(&self, name: &Arc<str>, value: Value, env: &mut Env) -> Result<Value, EvalError> {
+        if self.method_depth.get() > 0 {
+            if let Some(recv) = self.current_receiver() {
+                // Check ivar: `slots` is pre-populated with all ivar names as keys,
+                // so a HashMap lookup is sufficient — no Vec allocation needed.
+                if recv.slots.borrow().contains_key(name.as_ref()) {
+                    let ret = value.clone();
+                    recv.set_slot(name.clone(), value);
+                    return Ok(ret);
+                }
+                // Check if class var
+                if let Some(owner) = recv.class.lookup_class_var_owner(name.as_ref()) {
+                    let ret = value.clone();
+                    owner.class_var_storage.borrow_mut().insert(name.clone(), value);
+                    return Ok(ret);
+                }
+            }
+        }
+        // Default: update existing binding or create new local (one clone total).
+        env.update_or_define(name.clone(), value.clone());
+        Ok(value)
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    /// Evaluate a sequence of statements in `env`.
+    ///
+    /// Requires: `env` has at least one live frame.
+    /// Ensures: returns the value of the last statement, or `Value::Nil` if
+    ///   `stmts` is empty. `EvalError::Return` propagates to the caller; a
+    ///   method-frame caller should catch and unwrap it.
     /// Evaluate a sequence of statements in `env`.
     ///
     /// Requires: `env` has at least one live frame.
@@ -52,18 +161,28 @@ impl Evaluator {
 
     fn eval_stmt(&self, stmt: &Stmt, env: &mut Env) -> Result<Value, EvalError> {
         match stmt {
-            Stmt::LocalDecl(_) => Ok(Value::Nil), // already handled in eval_program
+            Stmt::LocalDecl(_) => Ok(Value::Nil), // already pre-bound in eval_program
             Stmt::Expr(e) => self.eval_expr(e, env),
             Stmt::Assign { name, value } => {
                 let v = self.eval_expr(value, env)?;
-                if !env.set(name.as_ref(), v.clone()) {
-                    env.define(name.clone(), v.clone());
-                }
-                Ok(v)
+                self.assign_var(name, v, env)
             }
             Stmt::Return(e) => {
                 let v = self.eval_expr(e, env)?;
                 Err(EvalError::Return(v))
+            }
+            Stmt::MethodDef(def) => {
+                let class = self.registry.get(&def.class_name).ok_or_else(|| {
+                    EvalError::UndefinedVariable(def.class_name.clone())
+                })?;
+                let method = Arc::new(Method {
+                    pattern: def.pattern.clone(),
+                    locals: def.locals.clone(),
+                    body: def.body.clone(),
+                });
+                let selector = def.pattern.selector();
+                class.methods.borrow_mut().insert(selector, method);
+                Ok(Value::Nil)
             }
         }
     }
@@ -71,8 +190,8 @@ impl Evaluator {
     pub fn eval_expr(&self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
         match expr {
             Expr::Lit(lit) => Ok(eval_literal(lit)),
-            Expr::Var(name) => env
-                .get(name.as_ref())
+            Expr::Var(name) => self
+                .lookup_var(name.as_ref(), env)
                 .ok_or_else(|| EvalError::UndefinedVariable(name.clone())),
             Expr::Send { receiver, message } => {
                 let recv = self.eval_expr(receiver, env)?;
@@ -105,7 +224,8 @@ impl Evaluator {
                 self.dispatch(recv, op.clone(), vec![arg_val], env)
             }
             Message::Keyword { parts } => {
-                let selector: Arc<str> = parts.iter().map(|(k, _)| k.as_ref()).collect::<String>().into();
+                let selector: Arc<str> =
+                    parts.iter().map(|(k, _)| k.as_ref()).collect::<String>().into();
                 let mut args = Vec::with_capacity(parts.len());
                 for (_, expr) in parts {
                     args.push(self.eval_expr(expr, env)?);
@@ -157,6 +277,67 @@ impl Evaluator {
             Err(e) => Err(e),
         }
     }
+
+    /// Invoke a user-defined method on a receiver object.
+    ///
+    /// Requires: `args.len() == method.pattern.params().len()`.
+    /// Ensures: method locals and `self` are bound in a fresh frame; the frame
+    ///   is cleaned up on return; `EvalError::Return` is caught and unwrapped.
+    pub fn invoke_method(
+        &self,
+        receiver: Arc<Object>,
+        method: Arc<Method>,
+        args: Vec<Value>,
+        env: &mut Env,
+    ) -> Result<Value, EvalError> {
+        let params = method.pattern.params();
+        if args.len() != params.len() {
+            return Err(EvalError::ArityMismatch {
+                expected: params.len(),
+                got: args.len(),
+            });
+        }
+        // Clone the outer env so the method sees globals, then push a method frame.
+        let mut method_env = env.clone();
+        method_env.push_frame();
+        // Bind self and params.
+        method_env.define(self_sym(), Value::Object(receiver.clone()));
+        for (param, val) in params.iter().zip(args.iter()) {
+            method_env.define(param.clone(), val.clone());
+        }
+        // Bind locals to nil.
+        for local in &method.locals {
+            method_env.define(local.clone(), Value::Nil);
+        }
+        self.push_receiver(receiver);
+        let result = self.eval_program(&method.body, &mut method_env);
+        self.pop_receiver();
+        method_env.pop_frame();
+        match result {
+            Ok(v) => Ok(v),
+            Err(EvalError::Return(v)) => Ok(v),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// After allocating a new object, send `initialize` if it is defined.
+    pub fn send_initialize(
+        &self,
+        obj: Arc<Object>,
+        env: &mut Env,
+    ) -> Result<Arc<Object>, EvalError> {
+        if let Some((method, _class)) = obj.class.lookup("initialize") {
+            self.invoke_method(obj.clone(), method, vec![], env)?;
+        }
+        Ok(obj)
+    }
+}
+
+/// Returns a pre-allocated `Arc<str>` for the identifier `"self"`.
+/// Allocated once per process via `OnceLock`; subsequent calls are a refcount bump.
+fn self_sym() -> Arc<str> {
+    static SELF: OnceLock<Arc<str>> = OnceLock::new();
+    SELF.get_or_init(|| Arc::from("self")).clone()
 }
 
 fn eval_literal(lit: &Literal) -> Value {
@@ -167,6 +348,7 @@ fn eval_literal(lit: &Literal) -> Value {
         Literal::Nil => Value::Nil,
         Literal::Str(s) => Value::Str(s.clone()),
         Literal::Symbol(s) => Value::Symbol(s.clone()),
+        Literal::LargeInt(n) => Value::LargeInt(n.clone()),
     }
 }
 
@@ -177,15 +359,17 @@ mod tests {
 
     fn eval(src: &str) -> Value {
         let prog = Parser::parse(src).expect("parse");
-        let ev = Evaluator;
+        let ev = Evaluator::new();
         let mut env = Env::new();
+        ev.registry.populate_env(&mut env);
         ev.eval_program(&prog.stmts, &mut env).expect("eval")
     }
 
     fn eval_err(src: &str) -> EvalError {
         let prog = Parser::parse(src).expect("parse");
-        let ev = Evaluator;
+        let ev = Evaluator::new();
         let mut env = Env::new();
+        ev.registry.populate_env(&mut env);
         ev.eval_program(&prog.stmts, &mut env).expect_err("expected error")
     }
 
@@ -293,5 +477,83 @@ mod tests {
     fn nil_is_nil() {
         assert_eq!(eval("nil isNil"), Value::Bool(true));
         assert_eq!(eval("42 isNil"), Value::Bool(false));
+    }
+
+    #[test]
+    fn class_definition_and_new() {
+        let src = r#"
+Object subclass: #Point instanceVariableNames: 'x y'.
+| p |
+p := Point new.
+p
+"#;
+        let v = eval(src);
+        // Should be an Object, displayed as "a Point"
+        assert_eq!(format!("{v}"), "a Point");
+    }
+
+    #[test]
+    fn method_def_and_call() {
+        let src = r#"
+Object subclass: #Counter instanceVariableNames: 'count'.
+Counter >> initialize [
+    count := 0
+]
+Counter >> increment [
+    count := count + 1
+]
+Counter >> count [
+    ^count
+]
+| c |
+c := Counter new.
+c increment.
+c increment.
+c increment.
+c count
+"#;
+        assert_eq!(eval(src), Value::Int(3));
+    }
+
+    #[test]
+    fn class_variable_shared() {
+        let src = r#"
+Object subclass: #Counted instanceVariableNames: '' classVariableNames: 'Total'.
+Counted >> initialize [
+    Total := (Total isNil) ifTrue: [1] ifFalse: [Total + 1]
+]
+Counted >> total [
+    ^Total
+]
+| a b |
+a := Counted new.
+b := Counted new.
+b total
+"#;
+        assert_eq!(eval(src), Value::Int(2));
+    }
+
+    #[test]
+    fn largeint_overflow_promotion() {
+        // i64::MAX + 1 should produce a LargeInt
+        let src = "9223372036854775807 + 1";
+        let v = eval(src);
+        assert!(matches!(v, Value::LargeInt(_)));
+    }
+
+    #[test]
+    fn largeint_literal() {
+        let src = "99999999999999999999 + 1";
+        let v = eval(src);
+        assert!(matches!(v, Value::LargeInt(_)));
+    }
+
+    #[test]
+    fn object_print_string() {
+        let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Foo new printString
+"#;
+        assert_eq!(eval(src), Value::Str(Arc::from("a Foo")));
     }
 }

@@ -14,23 +14,26 @@ pub enum Token {
     True,
     False,
     Nil,
+    /// Integer literal that overflows `i64`.
+    LargeInt(Arc<num_bigint::BigInt>),
     // Identifiers
     /// Starts with a letter; may contain letters, digits, `_`.
     Ident(Arc<str>),
     /// Identifier immediately followed by `:` (but not `:=`).
     Keyword(Arc<str>),
     // Operators / punctuation
-    /// Binary operator characters: `+ - * / < > <= >= = ~= , @ \ //`
+    /// Binary operator characters: `+ - * / < > <= >= = ~= , @ \ // >>`
     BinOp(Arc<str>),
-    Assign,    // :=
-    Caret,     // ^
-    Dot,       // .
-    Semi,      // ;
-    Pipe,      // |
-    LParen,    // (
-    RParen,    // )
-    LBracket,  // [
-    RBracket,  // ]
+    Assign,      // :=
+    ColonColon,  // ::
+    Caret,       // ^
+    Dot,         // .
+    Semi,        // ;
+    Pipe,        // |
+    LParen,      // (
+    RParen,      // )
+    LBracket,    // [
+    RBracket,    // ]
     /// Block parameter: `:name` inside `[...]`. The leading `:` is consumed by
     /// the lexer when it sees `:` followed by an alphabetic character and no `=`.
     BlockParam(Arc<str>),
@@ -184,7 +187,14 @@ impl<'src> Lexer<'src> {
                 return s.parse::<f64>().map(Token::Float).map_err(|_| LexError::InvalidNumber(start));
             }
         }
-        s.parse::<i64>().map(Token::Int).map_err(|_| LexError::InvalidNumber(start))
+        match s.parse::<i64>() {
+            Ok(n) => Ok(Token::Int(n)),
+            Err(_) => {
+                // Only overflows; the string contains only digits so BigInt parse can't fail.
+                let big: num_bigint::BigInt = s.parse().map_err(|_| LexError::InvalidNumber(start))?;
+                Ok(Token::LargeInt(Arc::new(big)))
+            }
+        }
     }
 
     fn read_ident_or_keyword(&mut self, first: char) -> Token {
@@ -218,10 +228,10 @@ impl<'src> Lexer<'src> {
     fn read_binop(&mut self, first: char) -> Token {
         let mut s = String::new();
         s.push(first);
-        // Multi-char operators: `<=`, `>=`, `~=`, `//`, `\\`, `~~`, `->`.
+        // Multi-char operators: `<=`, `>=`, `>>`, `~=`, `//`, `\\`, `~~`, `->`.
         if let Some(next) = self.peek_char() {
             let two: bool = match (first, next) {
-                ('<', '=') | ('>', '=') | ('~', '=') | ('/', '/') | ('\\', '\\')
+                ('<', '=') | ('>', '=') | ('>', '>') | ('~', '=') | ('/', '/') | ('\\', '\\')
                 | ('-', '>') | ('~', '~') => true,
                 _ => false,
             };
@@ -274,6 +284,9 @@ impl<'src> Lexer<'src> {
                 if self.peek_char() == Some('=') {
                     self.advance();
                     Ok(Token::Assign)
+                } else if self.peek_char() == Some(':') {
+                    self.advance();
+                    Ok(Token::ColonColon)
                 } else if self.peek_char().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
                     // Block parameter: `:name` inside `[...]`.
                     let first = self.advance().unwrap();
@@ -448,5 +461,20 @@ mod tests {
     fn assign_not_block_param() {
         // `:=` must remain Token::Assign, not BlockParam.
         assert_eq!(tok(":="), vec![Token::Assign, Token::Eof]);
+    }
+
+    #[test]
+    fn large_integer_literal() {
+        // A number that overflows i64::MAX
+        let big = "99999999999999999999";
+        let tokens = tok(big);
+        assert!(matches!(&tokens[0], Token::LargeInt(_)));
+    }
+
+    #[test]
+    fn colon_colon_token() {
+        let tokens = tok("::");
+        assert_eq!(tokens[0], Token::ColonColon);
+        assert_eq!(tokens[1], Token::Eof);
     }
 }

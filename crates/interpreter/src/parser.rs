@@ -81,11 +81,13 @@ impl Parser {
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut stmts = Vec::new();
-        // Optional top-level local declaration.
-        if self.peek() == &Token::Pipe {
-            stmts.push(self.parse_local_decl()?);
-        }
         while self.peek() != &Token::Eof {
+            // Allow local declarations (`| x y |`) anywhere at the statement level.
+            if self.peek() == &Token::Pipe {
+                stmts.push(self.parse_local_decl()?);
+                self.eat(&Token::Dot);
+                continue;
+            }
             stmts.push(self.parse_stmt()?);
             self.eat(&Token::Dot);
         }
@@ -110,6 +112,22 @@ impl Parser {
             let expr = self.parse_expr()?;
             return Ok(Stmt::Return(expr));
         }
+
+        // Method def: IDENT '>>' pattern '[' body ']'
+        // Lookahead: first token is Ident AND second non-comment token is BinOp(">>")
+        {
+            let is_method_def = matches!(self.tokens[self.pos], Token::Ident(_)) && {
+                let mut i = self.pos + 1;
+                while i < self.tokens.len() && matches!(self.tokens[i], Token::Comment(_)) {
+                    i += 1;
+                }
+                matches!(self.tokens.get(i), Some(Token::BinOp(op)) if op.as_ref() == ">>")
+            };
+            if is_method_def {
+                return self.parse_method_def();
+            }
+        }
+
         // Assignment: lookahead — Ident followed immediately by Assign.
         // We must look at raw tokens (pre-comment-skip) so we don't over-consume.
         {
@@ -138,6 +156,71 @@ impl Parser {
             }
         }
         Ok(Stmt::Expr(self.parse_expr()?))
+    }
+
+    fn parse_method_def(&mut self) -> Result<Stmt, ParseError> {
+        // Consume the class name ident
+        let class_name = match self.advance() {
+            Token::Ident(n) => n,
+            _ => unreachable!(),
+        };
+        // Consume '>>'
+        self.advance(); // BinOp(">>")
+
+        // Parse the method pattern
+        let pattern = match self.peek().clone() {
+            Token::Ident(sel) => {
+                self.advance();
+                MethodPattern::Unary(sel)
+            }
+            Token::BinOp(op) => {
+                self.advance();
+                let param = match self.expect("parameter name", |t| matches!(t, Token::Ident(_)))? {
+                    Token::Ident(n) => n,
+                    _ => unreachable!(),
+                };
+                MethodPattern::Binary { op, param }
+            }
+            Token::Keyword(_) => {
+                let mut parts = Vec::new();
+                while let Token::Keyword(kw) = self.peek().clone() {
+                    self.advance();
+                    let param = match self.expect("parameter name", |t| matches!(t, Token::Ident(_)))? {
+                        Token::Ident(n) => n,
+                        _ => unreachable!(),
+                    };
+                    parts.push((kw, param));
+                }
+                MethodPattern::Keyword { parts }
+            }
+            tok => {
+                return Err(ParseError::UnexpectedToken(tok, "method pattern"));
+            }
+        };
+
+        // Expect '['
+        self.expect("'[' to open method body", |t| t == &Token::LBracket)?;
+
+        // Optional local declaration inside method body
+        let mut locals = Vec::new();
+        if self.peek() == &Token::Pipe {
+            self.advance(); // consume '|'
+            while let Token::Ident(name) = self.peek().clone() {
+                locals.push(name);
+                self.advance();
+            }
+            self.expect("closing '|' for method locals", |t| t == &Token::Pipe)?;
+        }
+
+        // Statements until ']'
+        let mut body = Vec::new();
+        while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
+            body.push(self.parse_stmt()?);
+            self.eat(&Token::Dot);
+        }
+        self.expect("']'", |t| t == &Token::RBracket)?;
+
+        Ok(Stmt::MethodDef(MethodDef { class_name, pattern, locals, body }))
     }
 
     // ── Precedence levels ─────────────────────────────────────────────────────
@@ -272,6 +355,7 @@ impl Parser {
             Token::Nil => { self.advance(); Ok(Expr::Lit(Literal::Nil)) }
             Token::Str(s) => { self.advance(); Ok(Expr::Lit(Literal::Str(s))) }
             Token::Symbol(s) => { self.advance(); Ok(Expr::Lit(Literal::Symbol(s))) }
+            Token::LargeInt(n) => { self.advance(); Ok(Expr::Lit(Literal::LargeInt(n))) }
             Token::Ident(name) => { self.advance(); Ok(Expr::Var(name)) }
             Token::LParen => {
                 self.advance();
@@ -485,6 +569,86 @@ mod tests {
                 }
             }
             _ => panic!("expected binary send"),
+        }
+    }
+
+    #[test]
+    fn method_def_unary() {
+        let prog = parse("Counter >> increment [ count := count + 1 ]");
+        match &prog.stmts[0] {
+            Stmt::MethodDef(def) => {
+                assert_eq!(def.class_name.as_ref(), "Counter");
+                assert_eq!(def.pattern, MethodPattern::Unary(Arc::from("increment")));
+                assert!(def.locals.is_empty());
+            }
+            _ => panic!("expected MethodDef"),
+        }
+    }
+
+    #[test]
+    fn method_def_binary() {
+        let prog = parse("Vec >> + other [ ^self ]");
+        match &prog.stmts[0] {
+            Stmt::MethodDef(def) => {
+                assert_eq!(def.class_name.as_ref(), "Vec");
+                assert_eq!(
+                    def.pattern,
+                    MethodPattern::Binary { op: Arc::from("+"), param: Arc::from("other") }
+                );
+                assert_eq!(def.pattern.selector().as_ref(), "+");
+                assert_eq!(def.pattern.params(), vec![Arc::from("other")]);
+            }
+            _ => panic!("expected MethodDef"),
+        }
+    }
+
+    #[test]
+    fn method_def_keyword_single() {
+        let prog = parse("Counter >> incrementBy: n [ count := count + n ]");
+        match &prog.stmts[0] {
+            Stmt::MethodDef(def) => {
+                assert_eq!(def.class_name.as_ref(), "Counter");
+                assert_eq!(def.pattern.selector().as_ref(), "incrementBy:");
+                assert_eq!(def.pattern.params(), vec![Arc::from("n")]);
+            }
+            _ => panic!("expected MethodDef"),
+        }
+    }
+
+    #[test]
+    fn method_def_keyword_multi() {
+        let prog = parse("Coll >> at: i put: v [ ]");
+        match &prog.stmts[0] {
+            Stmt::MethodDef(def) => {
+                assert_eq!(def.pattern.selector().as_ref(), "at:put:");
+                assert_eq!(def.pattern.params(), vec![Arc::from("i"), Arc::from("v")]);
+            }
+            _ => panic!("expected MethodDef"),
+        }
+    }
+
+    #[test]
+    fn method_def_with_locals() {
+        let prog = parse("Foo >> bar [ | tmp | tmp := 1. ^tmp ]");
+        match &prog.stmts[0] {
+            Stmt::MethodDef(def) => {
+                assert_eq!(def.locals, vec![Arc::from("tmp")]);
+                assert_eq!(def.body.len(), 2); // Assign + Return
+            }
+            _ => panic!("expected MethodDef"),
+        }
+    }
+
+    #[test]
+    fn method_def_with_return() {
+        let prog = parse("Counter >> count [ ^count ]");
+        match &prog.stmts[0] {
+            Stmt::MethodDef(def) => {
+                assert_eq!(def.class_name.as_ref(), "Counter");
+                assert_eq!(def.body.len(), 1);
+                assert!(matches!(def.body[0], Stmt::Return(_)));
+            }
+            _ => panic!("expected MethodDef"),
         }
     }
 }

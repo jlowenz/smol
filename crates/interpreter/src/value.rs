@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
+use num_bigint::BigInt;
+
 use crate::ast::Stmt;
+use crate::class::Class;
 use crate::env::Env;
+use crate::object::Object;
 
 /// Runtime representation of every object in the language.
 ///
@@ -9,9 +13,6 @@ use crate::env::Env;
 /// conceptually they are objects that respond to messages. NaN-boxing and
 /// tagged-pointer schemes are deferred — they are performance optimisations
 /// that would obscure bootstrap semantics and require `unsafe`.
-///
-/// `i64` integer overflow is a known gap: literals and arithmetic wrap silently.
-/// `LargeInt` support is deferred to a later chunk.
 #[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
@@ -24,6 +25,12 @@ pub enum Value {
     Symbol(Arc<str>),
     Str(Arc<str>),
     Block(Arc<Block>),
+    /// Arbitrary-precision integer. Used when Int arithmetic overflows i64.
+    LargeInt(Arc<BigInt>),
+    /// A user-defined object instance.
+    Object(Arc<Object>),
+    /// A class object. Class names in the environment are bound to this variant.
+    Class(Arc<Class>),
 }
 
 /// A block (closure). Captures its defining environment via shared frames.
@@ -47,6 +54,11 @@ impl PartialEq for Value {
             (Value::Symbol(a), Value::Symbol(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Block(a), Value::Block(b)) => Arc::ptr_eq(a, b),
+            (Value::LargeInt(a), Value::LargeInt(b)) => a == b,
+            (Value::Int(a), Value::LargeInt(b)) => BigInt::from(*a) == **b,
+            (Value::LargeInt(a), Value::Int(b)) => **a == BigInt::from(*b),
+            (Value::Object(a), Value::Object(b)) => Arc::ptr_eq(a, b),
+            (Value::Class(a), Value::Class(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -64,6 +76,9 @@ impl std::hash::Hash for Value {
             Value::Nil => {}
             Value::Symbol(s) | Value::Str(s) => s.hash(state),
             Value::Block(b) => Arc::as_ptr(b).hash(state),
+            Value::LargeInt(b) => b.hash(state),
+            Value::Object(o) => Arc::as_ptr(o).hash(state),
+            Value::Class(c) => Arc::as_ptr(c).hash(state),
         }
     }
 }
@@ -79,12 +94,15 @@ impl std::fmt::Display for Value {
             Value::Symbol(s) => write!(f, "#{s}"),
             Value::Str(s) => write!(f, "'{s}'"),
             Value::Block(_) => write!(f, "a Block"),
+            Value::LargeInt(n) => write!(f, "{n}"),
+            Value::Object(o) => write!(f, "a {}", o.class.name),
+            Value::Class(c) => write!(f, "{}", c.name),
         }
     }
 }
 
 impl Value {
-    /// The kind name used in error messages.
+    /// Bootstrap kind tag used in error messages. Not the same as the class name.
     pub fn kind(&self) -> &'static str {
         match self {
             Value::Int(_) => "Int",
@@ -94,6 +112,9 @@ impl Value {
             Value::Symbol(_) => "Symbol",
             Value::Str(_) => "String",
             Value::Block(_) => "Block",
+            Value::LargeInt(_) => "LargeInt",
+            Value::Object(_) => "Object",
+            Value::Class(_) => "Class",
         }
     }
 }
@@ -118,5 +139,12 @@ mod tests {
     fn value_kind_names() {
         assert_eq!(Value::Int(0).kind(), "Int");
         assert_eq!(Value::Nil.kind(), "Nil");
+        assert_eq!(Value::LargeInt(Arc::new(BigInt::from(0))).kind(), "LargeInt");
+    }
+
+    #[test]
+    fn largeint_eq_int() {
+        assert_eq!(Value::Int(42), Value::LargeInt(Arc::new(BigInt::from(42))));
+        assert_eq!(Value::LargeInt(Arc::new(BigInt::from(42))), Value::Int(42));
     }
 }

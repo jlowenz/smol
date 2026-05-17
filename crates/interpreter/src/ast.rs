@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+pub use crate::class::{IndexedSlotKind, MethodPattern};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Int(i64),
@@ -8,6 +10,7 @@ pub enum Literal {
     Nil,
     Str(Arc<str>),
     Symbol(Arc<str>),
+    LargeInt(Arc<num_bigint::BigInt>),
 }
 
 /// A single message send. Three levels of precedence match Smalltalk's grammar.
@@ -60,6 +63,16 @@ pub enum Stmt {
     Return(Expr),
     /// `| x y z |` — declares temporaries, bound to nil in the current frame.
     LocalDecl(Vec<Arc<str>>),
+    /// `ClassName >> pattern [ locals? body ]`
+    MethodDef(MethodDef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MethodDef {
+    pub class_name: Arc<str>,
+    pub pattern: MethodPattern,
+    pub locals: Vec<Arc<str>>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
