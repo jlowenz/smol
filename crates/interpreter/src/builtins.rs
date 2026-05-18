@@ -1139,3 +1139,582 @@ fn handle_subclass(
     }
     Ok(Value::Class(new_class))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::Evaluator;
+    use crate::parser::Parser;
+
+    fn eval(src: &str) -> Value {
+        let prog = Parser::parse(src).expect("parse");
+        let ev = Evaluator::new();
+        let mut env = crate::env::Env::new();
+        ev.registry.populate_env(&mut env);
+        ev.eval_program(&prog.stmts, &mut env).expect("eval")
+    }
+
+    fn eval_err(src: &str) -> crate::eval::EvalError {
+        let prog = Parser::parse(src).expect("parse");
+        let ev = Evaluator::new();
+        let mut env = crate::env::Env::new();
+        ev.registry.populate_env(&mut env);
+        ev.eval_program(&prog.stmts, &mut env).expect_err("expected error")
+    }
+
+    // ── Float ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn float_arithmetic() {
+        assert_eq!(eval("1.5 + 0.5"), Value::Float(2.0));
+        assert_eq!(eval("3.0 - 1.0"), Value::Float(2.0));
+        assert_eq!(eval("2.0 * 3.0"), Value::Float(6.0));
+        assert_eq!(eval("6.0 / 2.0"), Value::Float(3.0));
+        // Int coercion for rhs
+        assert_eq!(eval("2.0 + 1"), Value::Float(3.0));
+        assert_eq!(eval("2.0 * 3"), Value::Float(6.0));
+    }
+
+    #[test]
+    fn float_comparisons() {
+        assert_eq!(eval("1.0 < 2.0"), Value::Bool(true));
+        assert_eq!(eval("2.0 > 1.0"), Value::Bool(true));
+        assert_eq!(eval("1.0 <= 1.0"), Value::Bool(true));
+        assert_eq!(eval("2.0 >= 2.0"), Value::Bool(true));
+        assert_eq!(eval("1.5 = 1.5"), Value::Bool(true));
+        assert_eq!(eval("1.5 ~= 2.5"), Value::Bool(true));
+    }
+
+    #[test]
+    fn float_unary() {
+        assert_eq!(eval("-3.7 negated"), Value::Float(3.7));
+        assert_eq!(eval("-3.7 abs"), Value::Float(3.7));
+        assert_eq!(eval("3.9 truncated"), Value::Int(3));
+        assert_eq!(eval("3.5 rounded"), Value::Int(4));
+        assert_eq!(eval("3.1 ceiling"), Value::Int(4));
+        assert_eq!(eval("3.9 floor"), Value::Int(3));
+        assert_eq!(eval("3.9 asInt"), Value::Int(3));
+    }
+
+    #[test]
+    fn float_print_string() {
+        assert_eq!(eval("3.14 printString"), Value::Str(Arc::from("3.14")));
+    }
+
+    // ── LargeInt ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn largeint_arithmetic() {
+        let big = "99999999999999999999";
+        assert!(matches!(eval(&format!("{big} + 1")), Value::LargeInt(_)));
+        assert!(matches!(eval(&format!("{big} - 1")), Value::LargeInt(_)));
+        assert!(matches!(eval(&format!("{big} * 2")), Value::LargeInt(_)));
+        // division that normalises back to Int
+        assert_eq!(eval(&format!("{big} / {big}")), Value::Int(1));
+    }
+
+    #[test]
+    fn largeint_floor_ops() {
+        let big = "99999999999999999999";
+        assert!(matches!(eval(&format!("{big} // 3")), Value::LargeInt(_)));
+        // modulo result may normalise to Int when the remainder fits in i64
+        assert!(matches!(eval(&format!("{big} \\\\ 7")), Value::Int(_) | Value::LargeInt(_)));
+    }
+
+    #[test]
+    fn largeint_comparisons() {
+        let big = "99999999999999999999";
+        assert_eq!(eval(&format!("{big} < ({big} + 1)")), Value::Bool(true));
+        assert_eq!(eval(&format!("{big} > 1")), Value::Bool(true));
+        assert_eq!(eval(&format!("{big} <= {big}")), Value::Bool(true));
+        assert_eq!(eval(&format!("{big} >= {big}")), Value::Bool(true));
+        assert_eq!(eval(&format!("{big} = {big}")), Value::Bool(true));
+        assert_eq!(eval(&format!("{big} ~= 1")), Value::Bool(true));
+    }
+
+    #[test]
+    fn largeint_unary() {
+        let big = "99999999999999999999";
+        assert!(matches!(eval(&format!("{big} negated")), Value::LargeInt(_)));
+        assert!(matches!(eval(&format!("{big} abs")), Value::LargeInt(_)));
+        assert!(matches!(eval(&format!("{big} printString")), Value::Str(_)));
+        assert!(matches!(eval(&format!("{big} asFloat")), Value::Float(_)));
+    }
+
+    #[test]
+    fn largeint_division_by_zero() {
+        let big = "99999999999999999999";
+        assert!(matches!(eval_err(&format!("{big} / 0")), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_err(&format!("{big} // 0")), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_err(&format!("{big} \\\\ 0")), crate::eval::EvalError::TypeError(_)));
+    }
+
+    // ── Int extensions ───────────────────────────────────────────────────────
+
+    #[test]
+    fn int_negated_and_abs() {
+        assert_eq!(eval("5 negated"), Value::Int(-5));
+        assert_eq!(eval("-5 abs"), Value::Int(5));
+        // abs of i64::MIN promotes to BigInt (no positive i64 representation)
+        assert!(matches!(eval("-9223372036854775808 abs"), Value::LargeInt(_)));
+    }
+
+    #[test]
+    fn int_max_min() {
+        assert_eq!(eval("3 max: 5"), Value::Int(5));
+        assert_eq!(eval("3 min: 5"), Value::Int(3));
+    }
+
+    #[test]
+    fn int_as_float() {
+        assert_eq!(eval("3 asFloat"), Value::Float(3.0));
+    }
+
+    #[test]
+    fn int_floor_division_semantics() {
+        assert_eq!(eval("7 // 2"), Value::Int(3));
+        // Negative numerator floors toward negative infinity
+        assert_eq!(eval("-7 // 2"), Value::Int(-4));
+        assert_eq!(eval("-7 \\\\ 2"), Value::Int(1));
+    }
+
+    #[test]
+    fn int_to_by_do() {
+        assert_eq!(
+            eval("| s | s := 0. 1 to: 10 by: 3 do: [:i | s := s + i]. s"),
+            Value::Int(22) // 1+4+7+10
+        );
+        // Descending
+        assert_eq!(
+            eval("| s | s := 0. 5 to: 1 by: -1 do: [:i | s := s + i]. s"),
+            Value::Int(15)
+        );
+    }
+
+    #[test]
+    fn int_to_by_do_zero_step_errors() {
+        assert!(matches!(
+            eval_err("1 to: 5 by: 0 do: [:i | i]"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+    }
+
+    #[test]
+    fn int_division_by_zero_errors() {
+        assert!(matches!(eval_err("5 / 0"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_err("5 // 0"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_err("5 \\\\ 0"), crate::eval::EvalError::TypeError(_)));
+    }
+
+    // ── Bool ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bool_if_false_branch() {
+        assert_eq!(eval("false ifFalse: ['no']"), Value::Str(Arc::from("no")));
+        assert_eq!(eval("true ifFalse: ['no']"), Value::Nil);
+        assert_eq!(eval("true ifTrue: ['yes']"), Value::Str(Arc::from("yes")));
+        assert_eq!(eval("false ifTrue: ['yes']"), Value::Nil);
+    }
+
+    #[test]
+    fn bool_if_false_if_true() {
+        assert_eq!(
+            eval("false ifFalse: ['no'] ifTrue: ['yes']"),
+            Value::Str(Arc::from("no"))
+        );
+        assert_eq!(
+            eval("true ifFalse: ['no'] ifTrue: ['yes']"),
+            Value::Str(Arc::from("yes"))
+        );
+    }
+
+    #[test]
+    fn bool_ampersand() {
+        // `|` is Token::Pipe (reserved for local-var syntax), so only `&` can be tested here
+        assert_eq!(eval("true & true"), Value::Bool(true));
+        assert_eq!(eval("true & false"), Value::Bool(false));
+    }
+
+    #[test]
+    fn bool_and_colon_short_circuits() {
+        assert_eq!(eval("false and: [true]"), Value::Bool(false));
+        assert_eq!(eval("true and: [true]"), Value::Bool(true));
+    }
+
+    #[test]
+    fn bool_or_colon_short_circuits() {
+        assert_eq!(eval("true or: [false]"), Value::Bool(true));
+        assert_eq!(eval("false or: [false]"), Value::Bool(false));
+    }
+
+    #[test]
+    fn bool_not() {
+        assert_eq!(eval("true not"), Value::Bool(false));
+        assert_eq!(eval("false not"), Value::Bool(true));
+    }
+
+    #[test]
+    fn bool_eq() {
+        assert_eq!(eval("true = true"), Value::Bool(true));
+        assert_eq!(eval("true ~= false"), Value::Bool(true));
+    }
+
+    #[test]
+    fn bool_print_string() {
+        assert_eq!(eval("true printString"), Value::Str(Arc::from("true")));
+        assert_eq!(eval("false printString"), Value::Str(Arc::from("false")));
+    }
+
+    // ── Nil ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn nil_if_nil() {
+        assert_eq!(eval("nil ifNil: ['was nil']"), Value::Str(Arc::from("was nil")));
+        assert_eq!(eval("nil ifNotNil: ['not nil']"), Value::Nil);
+    }
+
+    #[test]
+    fn nil_if_nil_if_not_nil() {
+        assert_eq!(
+            eval("nil ifNil: ['nil'] ifNotNil: ['nope']"),
+            Value::Str(Arc::from("nil"))
+        );
+        assert_eq!(
+            eval("nil ifNotNil: ['nope'] ifNil: ['nil']"),
+            Value::Str(Arc::from("nil"))
+        );
+    }
+
+    #[test]
+    fn nil_eq() {
+        assert_eq!(eval("nil = nil"), Value::Bool(true));
+        assert_eq!(eval("nil = 1"), Value::Bool(false));
+        assert_eq!(eval("nil ~= 1"), Value::Bool(true));
+    }
+
+    #[test]
+    fn nil_print_string() {
+        assert_eq!(eval("nil printString"), Value::Str(Arc::from("nil")));
+    }
+
+    // ── String ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn string_size() {
+        assert_eq!(eval("'hello' size"), Value::Int(5));
+        assert_eq!(eval("'' size"), Value::Int(0));
+    }
+
+    #[test]
+    fn string_at() {
+        assert_eq!(eval("'abc' at: 1"), Value::Str(Arc::from("a")));
+        assert_eq!(eval("'abc' at: 3"), Value::Str(Arc::from("c")));
+    }
+
+    #[test]
+    fn string_eq() {
+        assert_eq!(eval("'hi' = 'hi'"), Value::Bool(true));
+        assert_eq!(eval("'hi' ~= 'bye'"), Value::Bool(true));
+    }
+
+    #[test]
+    fn string_print_string() {
+        assert_eq!(eval("'abc' printString"), Value::Str(Arc::from("'abc'")));
+    }
+
+    #[test]
+    fn string_as_symbol() {
+        assert_eq!(eval("'foo' asSymbol"), Value::Symbol(Arc::from("foo")));
+    }
+
+    #[test]
+    fn string_reversed() {
+        assert_eq!(eval("'abc' reversed"), Value::Str(Arc::from("cba")));
+    }
+
+    #[test]
+    fn string_copy_from_to() {
+        assert_eq!(eval("'hello' copyFrom: 2 to: 4"), Value::Str(Arc::from("ell")));
+    }
+
+    #[test]
+    fn string_includes_sub_string() {
+        assert_eq!(eval("'hello' includesSubString: 'ell'"), Value::Bool(true));
+        assert_eq!(eval("'hello' includesSubString: 'xyz'"), Value::Bool(false));
+    }
+
+    // ── Symbol ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn symbol_eq() {
+        assert_eq!(eval("#foo = #foo"), Value::Bool(true));
+        assert_eq!(eval("#foo ~= #bar"), Value::Bool(true));
+    }
+
+    #[test]
+    fn symbol_print_string() {
+        assert_eq!(eval("#hello printString"), Value::Str(Arc::from("#hello")));
+    }
+
+    #[test]
+    fn symbol_as_string_and_symbol() {
+        assert_eq!(eval("#foo asString"), Value::Str(Arc::from("foo")));
+        assert_eq!(eval("#foo asSymbol"), Value::Symbol(Arc::from("foo")));
+    }
+
+    // ── Block ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn block_value_no_arg() {
+        assert_eq!(eval("[42] value"), Value::Int(42));
+    }
+
+    #[test]
+    fn block_value_two_args() {
+        assert_eq!(eval("[:a :b | a + b] value: 3 value: 4"), Value::Int(7));
+    }
+
+    #[test]
+    fn block_value_three_args() {
+        assert_eq!(eval("[:a :b :c | a + b + c] value: 1 value: 2 value: 3"), Value::Int(6));
+    }
+
+    #[test]
+    fn block_while_false() {
+        assert_eq!(
+            eval("| n | n := 0. [n >= 3] whileFalse: [n := n + 1]. n"),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn block_while_true_no_body() {
+        assert_eq!(
+            eval("| n | n := 0. [n := n + 1. n < 3] whileTrue. n"),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn block_while_false_no_body() {
+        assert_eq!(
+            eval("| n | n := 0. [n := n + 1. n >= 3] whileFalse. n"),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn block_on_do_catches_error() {
+        // `Error` class is not defined in the bootstrap; use `Object` (always in scope).
+        // The condition class is ignored by `on:do:` — any value works.
+        assert_eq!(
+            eval("[1 unknownMsg] on: Object do: [:e | 'caught']"),
+            Value::Str(Arc::from("caught"))
+        );
+    }
+
+    #[test]
+    fn block_on_do_passes_through_on_success() {
+        assert_eq!(eval("[42] on: Object do: [:e | 0]"), Value::Int(42));
+    }
+
+    // ── Object primitives ─────────────────────────────────────────────────────
+
+    #[test]
+    fn object_eq_identity() {
+        let src = r#"
+Object subclass: #Marker instanceVariableNames: ''.
+| a b |
+a := Marker new.
+b := Marker new.
+a = a
+"#;
+        assert_eq!(eval(src), Value::Bool(true));
+    }
+
+    #[test]
+    fn object_not_eq_different_instances() {
+        let src = r#"
+Object subclass: #Dot instanceVariableNames: ''.
+| a b |
+a := Dot new.
+b := Dot new.
+a ~= b
+"#;
+        assert_eq!(eval(src), Value::Bool(true));
+    }
+
+    #[test]
+    fn object_class_message() {
+        let src = r#"
+Object subclass: #Cat instanceVariableNames: ''.
+Cat new class name
+"#;
+        assert_eq!(eval(src), Value::Str(Arc::from("Cat")));
+    }
+
+    #[test]
+    fn object_is_kind_of() {
+        let src = r#"
+Object subclass: #Vehicle instanceVariableNames: ''.
+Vehicle subclass: #Car instanceVariableNames: ''.
+| c |
+c := Car new.
+c isKindOf: Car
+"#;
+        assert_eq!(eval(src), Value::Bool(true));
+    }
+
+    #[test]
+    fn object_is_kind_of_superclass() {
+        let src = r#"
+Object subclass: #Shape instanceVariableNames: ''.
+Shape subclass: #Circle instanceVariableNames: ''.
+| c |
+c := Circle new.
+c isKindOf: Shape
+"#;
+        assert_eq!(eval(src), Value::Bool(true));
+    }
+
+    #[test]
+    fn object_responds_to() {
+        let src = r#"
+Object subclass: #Robot instanceVariableNames: ''.
+Robot >> beep [ ^'beep' ]
+| r |
+r := Robot new.
+r respondsTo: #beep
+"#;
+        assert_eq!(eval(src), Value::Bool(true));
+    }
+
+    #[test]
+    fn object_is_nil_and_not_nil() {
+        let src = r#"
+Object subclass: #Thing instanceVariableNames: ''.
+| t |
+t := Thing new.
+t isNil
+"#;
+        assert_eq!(eval(src), Value::Bool(false));
+        let src2 = r#"
+Object subclass: #Thing2 instanceVariableNames: ''.
+| t |
+t := Thing2 new.
+t notNil
+"#;
+        assert_eq!(eval(src2), Value::Bool(true));
+    }
+
+    // ── Universal yourself / isNil / notNil ──────────────────────────────────
+
+    #[test]
+    fn universal_is_nil_not_nil() {
+        assert_eq!(eval("1.5 isNil"), Value::Bool(false));
+        assert_eq!(eval("'hi' isNil"), Value::Bool(false));
+        assert_eq!(eval("#sym isNil"), Value::Bool(false));
+        assert_eq!(eval("true isNil"), Value::Bool(false));
+        assert_eq!(eval("1 notNil"), Value::Bool(true));
+        assert_eq!(eval("nil notNil"), Value::Bool(false));
+    }
+
+    #[test]
+    fn universal_yourself_on_various() {
+        assert_eq!(eval("3.14 yourself"), Value::Float(3.14));
+        assert_eq!(eval("'hi' yourself"), Value::Str(Arc::from("hi")));
+        assert_eq!(eval("nil yourself"), Value::Nil);
+        assert_eq!(eval("true yourself"), Value::Bool(true));
+    }
+
+    // ── Namespace ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn namespace_name_message() {
+        assert_eq!(eval("Kernel name"), Value::Symbol(Arc::from("Kernel")));
+    }
+
+    #[test]
+    fn namespace_print_string_message() {
+        assert_eq!(
+            eval("Kernel printString"),
+            Value::Str(Arc::from("Namespace(Kernel)"))
+        );
+    }
+
+    // ── Class-side ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn class_name_and_print_string() {
+        let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Foo name
+"#;
+        assert_eq!(eval(src), Value::Str(Arc::from("Foo")));
+        let src2 = r#"
+Object subclass: #Bar instanceVariableNames: ''.
+Bar printString
+"#;
+        assert_eq!(eval(src2), Value::Str(Arc::from("Bar")));
+    }
+
+    #[test]
+    fn class_new_with_indexed() {
+        let src = r#"
+Object subclass: #ByteBuf instanceVariableNames: '' indexedSlots: #byte.
+ByteBuf new: 8
+"#;
+        let v = eval(src);
+        assert!(matches!(v, Value::Object(_)));
+    }
+
+    // ── Error cases ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn mnu_for_unknown_float_selector() {
+        assert!(matches!(
+            eval_err("1.5 unknownMsg"),
+            crate::eval::EvalError::MessageNotUnderstood { .. }
+        ));
+    }
+
+    #[test]
+    fn mnu_for_unknown_bool_selector() {
+        assert!(matches!(
+            eval_err("true unknownMsg"),
+            crate::eval::EvalError::MessageNotUnderstood { .. }
+        ));
+    }
+
+    #[test]
+    fn mnu_for_unknown_nil_selector() {
+        assert!(matches!(
+            eval_err("nil unknownMsg"),
+            crate::eval::EvalError::MessageNotUnderstood { .. }
+        ));
+    }
+
+    #[test]
+    fn mnu_for_unknown_string_selector() {
+        assert!(matches!(
+            eval_err("'hi' unknownMsg"),
+            crate::eval::EvalError::MessageNotUnderstood { .. }
+        ));
+    }
+
+    #[test]
+    fn mnu_for_unknown_symbol_selector() {
+        assert!(matches!(
+            eval_err("#foo unknownMsg"),
+            crate::eval::EvalError::MessageNotUnderstood { .. }
+        ));
+    }
+
+    #[test]
+    fn mnu_for_unknown_largeint_selector() {
+        assert!(matches!(
+            eval_err("99999999999999999999 unknownMsg"),
+            crate::eval::EvalError::MessageNotUnderstood { .. }
+        ));
+    }
+}

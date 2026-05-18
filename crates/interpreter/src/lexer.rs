@@ -313,7 +313,17 @@ impl<'src> Lexer<'src> {
             ']' => Ok(Token::RBracket),
             c if c.is_ascii_digit() => self.read_number(c, start),
             c if c.is_alphabetic() || c == '_' => Ok(self.read_ident_or_keyword(c)),
-            '+' | '*' | '/' | '\\' | '<' | '>' | '=' | '~' | '@' | ',' | '-' | '&' => {
+            '-' => {
+                // A `-` immediately followed by a digit (no whitespace) is a negative
+                // number literal, per ANSI Smalltalk. The sign is folded into the token
+                // so `Int(-3)`, `Float(-1.5)`, etc. are produced directly.
+                if self.peek_char().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    self.read_number('-', start)
+                } else {
+                    Ok(self.read_binop('-'))
+                }
+            }
+            '+' | '*' | '/' | '\\' | '<' | '>' | '=' | '~' | '@' | ',' | '&' => {
                 Ok(self.read_binop(c))
             }
             c => Err(LexError::UnexpectedChar(c, start)),
@@ -358,6 +368,43 @@ mod tests {
     #[test]
     fn float_with_exponent() {
         assert_eq!(tok("1.5e2"), vec![Token::Float(150.0), Token::Eof]);
+    }
+
+    #[test]
+    fn negative_integer_literal() {
+        assert_eq!(tok("-42"), vec![Token::Int(-42), Token::Eof]);
+    }
+
+    #[test]
+    fn negative_float_literal() {
+        assert_eq!(tok("-3.14"), vec![Token::Float(-3.14), Token::Eof]);
+    }
+
+    #[test]
+    fn negative_large_integer_literal() {
+        use num_bigint::BigInt;
+        use std::str::FromStr;
+        let big = BigInt::from_str("-99999999999999999999").unwrap();
+        assert_eq!(tok("-99999999999999999999"), vec![Token::LargeInt(Arc::new(big)), Token::Eof]);
+    }
+
+    #[test]
+    fn minus_with_space_stays_binop() {
+        // `- 3` (space between) → BinOp, positive literal
+        assert_eq!(tok("- 3"), vec![binop("-"), Token::Int(3), Token::Eof]);
+    }
+
+    #[test]
+    fn binary_minus_in_expression() {
+        // `x - 3` → binary subtract; `x -3` → binary subtract (space before -, none after)
+        assert_eq!(
+            tok("x - 3"),
+            vec![ident("x"), binop("-"), Token::Int(3), Token::Eof]
+        );
+        assert_eq!(
+            tok("x -3"),
+            vec![ident("x"), Token::Int(-3), Token::Eof]
+        );
     }
 
     #[test]

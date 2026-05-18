@@ -134,3 +134,78 @@ impl Subscription {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::id::{SubscriptionId, TxId};
+    use crate::term::Term;
+
+    fn make_event() -> ChangeEvent {
+        ChangeEvent {
+            subject: crate::id::EntityId(1),
+            predicate: Predicate(1),
+            kind: ChangeKind::Asserted { new_object: Term::Int(42) },
+            tx_id: TxId(1),
+        }
+    }
+
+    fn make_subscription() -> (Subscription, async_channel::Sender<ChangeEvent>) {
+        let (tx, rx) = async_channel::unbounded();
+        let sub = Subscription::new(SubscriptionId(0), rx);
+        (sub, tx)
+    }
+
+    #[test]
+    fn channel_closed_display() {
+        assert_eq!(ChannelClosed.to_string(), "change-event channel closed");
+    }
+
+    #[test]
+    fn channel_closed_is_error() {
+        let e: &dyn std::error::Error = &ChannelClosed;
+        assert_eq!(e.to_string(), "change-event channel closed");
+    }
+
+    #[test]
+    fn try_recv_empty_channel_returns_none() {
+        let (sub, _tx) = make_subscription();
+        assert_eq!(sub.try_recv(), Ok(None));
+    }
+
+    #[test]
+    fn try_recv_closed_channel_returns_error() {
+        let (sub, tx) = make_subscription();
+        drop(tx);
+        assert_eq!(sub.try_recv(), Err(ChannelClosed));
+    }
+
+    #[test]
+    fn try_recv_delivers_sent_event() {
+        let (sub, tx) = make_subscription();
+        let event = make_event();
+        tx.try_send(event.clone()).unwrap();
+        assert_eq!(sub.try_recv(), Ok(Some(event)));
+    }
+
+    #[test]
+    fn recv_blocking_delivers_event() {
+        let (sub, tx) = make_subscription();
+        let event = make_event();
+        tx.try_send(event.clone()).unwrap();
+        assert_eq!(sub.recv_blocking(), Ok(event));
+    }
+
+    #[test]
+    fn recv_blocking_closed_returns_error() {
+        let (sub, tx) = make_subscription();
+        drop(tx);
+        assert_eq!(sub.recv_blocking(), Err(ChannelClosed));
+    }
+
+    #[test]
+    fn subscription_id_accessor() {
+        let (sub, _tx) = make_subscription();
+        assert_eq!(sub.id(), SubscriptionId(0));
+    }
+}

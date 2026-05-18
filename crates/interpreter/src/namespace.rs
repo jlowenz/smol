@@ -74,3 +74,69 @@ impl std::fmt::Debug for Namespace {
         write!(f, "Namespace({})", self.qualified_name())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::class::Class;
+
+    fn bare_class(name: &str) -> Arc<Class> {
+        Arc::new(Class {
+            name: Arc::from(name),
+            superclass: None,
+            own_instance_vars: vec![],
+            own_class_vars: vec![],
+            class_var_storage: std::cell::RefCell::new(HashMap::new()),
+            indexed_slot_kind: None,
+            methods: std::cell::RefCell::new(HashMap::new()),
+            class_methods: std::cell::RefCell::new(HashMap::new()),
+        })
+    }
+
+    #[test]
+    fn lookup_sub_found_and_missing() {
+        let parent = Arc::new(Namespace::new(Arc::from("Parent"), None));
+        let child = Arc::new(Namespace::new(Arc::from("Child"), Some(parent.clone())));
+        parent.register_sub(child);
+        assert!(parent.lookup_sub("Child").is_some());
+        assert!(parent.lookup_sub("Missing").is_none());
+    }
+
+    #[test]
+    fn qualified_name_with_parent_chain() {
+        let root = Arc::new(Namespace::new(Arc::from("Kernel"), None));
+        let child = Arc::new(Namespace::new(Arc::from("Collections"), Some(root)));
+        assert_eq!(child.qualified_name(), "Kernel::Collections");
+    }
+
+    #[test]
+    fn lookup_class_via_import() {
+        let ns_a = Arc::new(Namespace::new(Arc::from("A"), None));
+        let ns_b = Arc::new(Namespace::new(Arc::from("B"), None));
+        ns_b.register(bare_class("Widget"));
+        assert!(ns_a.lookup_class("Widget").is_none());
+        ns_a.add_import(ns_b);
+        assert!(ns_a.lookup_class("Widget").is_some());
+    }
+
+    #[test]
+    fn own_class_shadows_import() {
+        let ns_a = Arc::new(Namespace::new(Arc::from("A"), None));
+        let ns_b = Arc::new(Namespace::new(Arc::from("B"), None));
+        ns_b.register(bare_class("Foo"));
+        ns_a.register(bare_class("Foo"));
+        ns_a.add_import(ns_b);
+        let found = ns_a.lookup_class("Foo").unwrap();
+        // own class is returned (not the import)
+        assert!(Arc::ptr_eq(&found, &ns_a.classes.borrow()["Foo"]));
+    }
+
+    #[test]
+    fn debug_includes_qualified_name() {
+        let ns = Arc::new(Namespace::new(Arc::from("Kernel"), None));
+        assert!(format!("{ns:?}").contains("Kernel"));
+    }
+}
