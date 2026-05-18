@@ -5,6 +5,7 @@ use num_bigint::BigInt;
 use crate::ast::Stmt;
 use crate::class::Class;
 use crate::env::Env;
+use crate::namespace::Namespace;
 use crate::object::Object;
 
 /// Runtime representation of every object in the language.
@@ -31,6 +32,8 @@ pub enum Value {
     Object(Arc<Object>),
     /// A class object. Class names in the environment are bound to this variant.
     Class(Arc<Class>),
+    /// A namespace object. Namespace names in the environment are bound to this variant.
+    Namespace(Arc<Namespace>),
 }
 
 /// A block (closure). Captures its defining environment via shared frames.
@@ -59,6 +62,7 @@ impl PartialEq for Value {
             (Value::LargeInt(a), Value::Int(b)) => **a == BigInt::from(*b),
             (Value::Object(a), Value::Object(b)) => Arc::ptr_eq(a, b),
             (Value::Class(a), Value::Class(b)) => Arc::ptr_eq(a, b),
+            (Value::Namespace(a), Value::Namespace(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -79,6 +83,7 @@ impl std::hash::Hash for Value {
             Value::LargeInt(b) => b.hash(state),
             Value::Object(o) => Arc::as_ptr(o).hash(state),
             Value::Class(c) => Arc::as_ptr(c).hash(state),
+            Value::Namespace(ns) => Arc::as_ptr(ns).hash(state),
         }
     }
 }
@@ -97,6 +102,7 @@ impl std::fmt::Display for Value {
             Value::LargeInt(n) => write!(f, "{n}"),
             Value::Object(o) => write!(f, "a {}", o.class.name),
             Value::Class(c) => write!(f, "{}", c.name),
+            Value::Namespace(ns) => write!(f, "Namespace({})", ns.name),
         }
     }
 }
@@ -115,6 +121,7 @@ impl Value {
             Value::LargeInt(_) => "LargeInt",
             Value::Object(_) => "Object",
             Value::Class(_) => "Class",
+            Value::Namespace(_) => "Namespace",
         }
     }
 }

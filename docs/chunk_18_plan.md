@@ -110,11 +110,12 @@ Dispatch for `Value::Class(class)` in `dispatch_class` (builtins.rs):
    `self → Value::Class(class)` (not an object instance).
 3. Fall through to built-in `new`, `new:`, `name`, `printString`.
 
-`invoke_class_method` is the class-side analogue of `invoke_method`:
+`invoke_class_method` is the class-side analogue of `invoke_method`. Both
+reuse the same `method_stack: RefCell<Vec<SelfBinding>>` (see below) — no
+separate class-side stack is needed since classes are objects and the
+distinction is only which method dict to search and what `self` denotes.
 
-- Push a `ClassMethodContext { class: Arc<Class>, defining_class: Arc<Class> }`
-  onto a separate `class_method_stack` (or reuse `method_stack` with a
-  `SelfBinding` enum — see below).
+- Push a `SelfBinding::ClassSide` frame onto `method_stack`.
 - Bind `self → Value::Class(class)` in the method frame.
 - Variable lookup in a class-side method:
   1. Local frame.
@@ -122,7 +123,8 @@ Dispatch for `Value::Class(class)` in `dispatch_class` (builtins.rs):
      vars — there is no instance).
   3. Outer env (globals / class names).
 
-**`SelfBinding` enum** (alternative to two stacks):
+**`SelfBinding` enum** — unified self representation for both instance- and
+class-side methods:
 
 ```rust
 enum SelfBinding {
@@ -194,24 +196,45 @@ in its method frame with `self = Value::Class(class)`. The built-in `new` /
 ```rust
 pub struct Namespace {
     pub name: Arc<str>,
-    /// Classes registered in this namespace.
+    /// Parent namespace — used for constructing fully-qualified names only.
+    /// Parent items are NOT implicitly in scope; callers must import explicitly.
+    pub parent: Option<Arc<Namespace>>,
+    /// Nested namespaces accessible via `::` chaining (e.g. `Kernel::Collections`).
+    sub_namespaces: RefCell<HashMap<Arc<str>, Arc<Namespace>>>,
+    /// Classes registered directly in this namespace.
     classes: RefCell<HashMap<Arc<str>, Arc<Class>>>,
-    /// Namespaces whose exports are visible here (import list).
+    /// Explicit imports — the only additional names visible here beyond own classes.
+    /// Parent namespace items are NOT included unless explicitly imported.
     imports: RefCell<Vec<Arc<Namespace>>>,
 }
 
 impl Namespace {
-    pub fn new(name: Arc<str>) -> Self;
+    pub fn new(name: Arc<str>, parent: Option<Arc<Namespace>>) -> Self;
     pub fn register(&self, class: Arc<Class>);
-    /// Look up a class by name in this namespace, then in imports.
+    pub fn register_sub(&self, ns: Arc<Namespace>);
+    /// Look up a class by simple name: own classes first, then imports (in order).
+    /// Does NOT search the parent namespace.
     pub fn lookup_class(&self, name: &str) -> Option<Arc<Class>>;
+    /// Look up a sub-namespace by name.
+    pub fn lookup_sub(&self, name: &str) -> Option<Arc<Namespace>>;
+    /// Fully-qualified name (e.g. `Kernel::Collections`), built from parent chain.
+    pub fn qualified_name(&self) -> String;
 }
 ```
 
-**`ClassRegistry` becomes a thin wrapper** over the `Kernel` namespace:
-`ClassRegistry::register` and `ClassRegistry::get` delegate to the `Kernel`
-namespace. The registry holds `Arc<Namespace>` for each named namespace and
-exposes a `get_namespace(name)` lookup.
+**Import discipline**: the search path for `lookup_class` is `own classes ∪
+imports` only. A parent namespace's classes are NOT implicitly in scope inside
+a child namespace — callers must add explicit imports. This prevents invisible
+coupling across namespace boundaries.
+
+**`ClassRegistry` is simplified to a namespace registry**: its existing flat
+class table becomes the `Kernel` namespace's class dict. The registry now
+holds `namespaces: HashMap<Arc<str>, Arc<Namespace>>` keyed by name, with
+`Kernel` as the initial entry. Class lookup always goes through
+`Namespace::lookup_class`; the registry no longer exposes direct class
+lookups. `ClassRegistry::get` and `ClassRegistry::register` are removed;
+callers use `registry.kernel().lookup_class(name)` and
+`registry.kernel().register(class)` respectively.
 
 **Bootstrap sequence** (in `ClassRegistry::new` / `Evaluator::new`):
 
@@ -241,22 +264,41 @@ the global env.
 **`::` resolution** in `parse_primary`:
 
 ```
-ns_ref  ::= IDENT '::' IDENT
+ns_ref  ::= IDENT ('::' IDENT)+
 ```
 
-When `parse_primary` sees `Token::Ident(ns) Token::ColonColon Token::Ident(class)`,
-parse as `Expr::NamespaceRef { namespace: ns, name: class }`.
+When `parse_primary` sees `Token::Ident` followed by `Token::ColonColon`,
+consume all `IDENT '::' IDENT` segments left-associatively into a path.
+Produce `Expr::NamespaceRef { namespace_path: Vec<Arc<str>>, name: Arc<str> }`
+where `namespace_path` holds all but the last segment and `name` holds the
+final identifier. Example: `Kernel::Collections::Sorted` →
+`namespace_path = ["Kernel", "Collections"], name = "Sorted"`.
 
 Evaluation of `Expr::NamespaceRef`:
 
-1. Look up `namespace` in env → expect `Value::Namespace(ns_obj)`.
-2. Call `ns_obj.lookup_class(name)` → `Value::Class(...)`.
-3. Error if namespace or class is not found.
+1. Look up `namespace_path[0]` in env → expect `Value::Namespace(ns)`.
+2. For each remaining segment in `namespace_path`, call `ns.lookup_sub(segment)`
+   → the next `Arc<Namespace>`. Error if any segment is not found.
+3. Call `ns.lookup_class(name)` → `Value::Class(...)`.
+4. Error if the final class is not found.
 
 Namespace-scoped `subclass:` — when `handle_subclass` registers the new class,
-it checks the current namespace context. The evaluator carries
-`active_namespace: Arc<Namespace>` (default: `Kernel`). A `Namespace do: [...]`
-block sets the active namespace for its body.
+it uses the evaluator's current `active_namespace` (default: `Kernel`). The
+primary mechanism for scoping class definitions is the `Namespace do: [...]`
+block:
+
+```smalltalk
+MyLib do: [
+    Object subclass: #Foo [ ... ].
+    Foo subclass: #Bar [ ... ].
+]
+```
+
+A `namespace:` keyword on `subclass:` itself (e.g.
+`Object subclass: #Foo namespace: MyLib [...]`) would also be natural but
+requires the optional/named-keyword dispatch design (a separate language
+design task). This is **deferred**; `Namespace do: [...]` is the chunk 18
+mechanism.
 
 ---
 
@@ -267,7 +309,11 @@ block sets the active namespace for its body.
 ```rust
 pub struct Namespace {
     pub name: Arc<str>,
+    /// Parent for qualified-name construction only; NOT an implicit search scope.
+    pub parent: Option<Arc<Namespace>>,
+    sub_namespaces: RefCell<HashMap<Arc<str>, Arc<Namespace>>>,
     classes: RefCell<HashMap<Arc<str>, Arc<Class>>>,
+    /// Explicit imports only — parent namespace NOT implicitly included.
     imports: RefCell<Vec<Arc<Namespace>>>,
 }
 ```
@@ -278,8 +324,9 @@ pub struct Namespace {
 pub enum Expr {
     // existing ...
     Super,
-    /// `ns::ClassName` — resolved at eval time.
-    NamespaceRef { namespace: Arc<str>, name: Arc<str> },
+    /// `A::B::C` — namespace_path gives the chain of namespace names, name is
+    /// the final class. Supports arbitrary depth; resolved at eval time.
+    NamespaceRef { namespace_path: Vec<Arc<str>>, name: Arc<str> },
 }
 
 pub struct MethodDef {
@@ -326,10 +373,25 @@ Add `class_methods: RefCell<HashMap<Arc<str>, Arc<Method>>>` to `Class`.
 
 ### `src/class_registry.rs`
 
-Hold `Arc<Namespace>` per namespace name in addition to the existing flat
-class table (which becomes `Kernel`'s class dict). Add
-`get_namespace(name) -> Option<Arc<Namespace>>` and
-`register_namespace(ns: Arc<Namespace>)`.
+Refactor to a namespace registry. The existing flat class table is removed;
+classes now live in `Kernel`'s class dict. Replace `classes: HashMap<Arc<str>,
+Arc<Class>>` with `namespaces: HashMap<Arc<str>, Arc<Namespace>>`. Public API:
+
+```rust
+impl ClassRegistry {
+    pub fn kernel(&self) -> Arc<Namespace>;
+    pub fn get_namespace(&self, name: &str) -> Option<Arc<Namespace>>;
+    pub fn register_namespace(&self, ns: Arc<Namespace>);
+    /// Convenience: populate env with all class names from all namespaces.
+    pub fn populate_env(&self, env: &mut Env);
+    /// Returns the root Object class (via Kernel lookup).
+    pub fn object_class(&self) -> Arc<Class>;
+}
+```
+
+`ClassRegistry::get` and `ClassRegistry::register` (direct class access) are
+removed. All class lookups go through `registry.kernel().lookup_class(name)`
+or `registry.get_namespace(ns).lookup_class(name)`.
 
 ### `src/lexer.rs`
 
@@ -355,7 +417,7 @@ alongside the existing `"true"` / `"false"` / `"nil"` cases.
 - `eval_expr` special-cases `Expr::Send` where receiver is `Expr::Super`.
 - `assign_var` checks `SelfBinding::Instance` for ivar writes; skips ivar
   check on `SelfBinding::ClassSide`.
-- `invoke_class_method` added alongside `invoke_method`.
+- `invoke_class_method` added alongside `invoke_method`; both push to the shared `method_stack`.
 - `Stmt::MethodDef` with `is_class_side = true` → install in `class_methods`.
 - `Evaluator` carries `active_namespace: RefCell<Arc<Namespace>>`.
 
@@ -444,3 +506,26 @@ A `RefCell<Arc<Namespace>>` on `Evaluator` makes the active namespace a
 global (per-evaluator) mutable cell. For the single-threaded bootstrap this
 is fine. In a concurrent future the active namespace would move to a per-fiber
 or per-method-frame slot. This is recorded as a known future migration point.
+
+### Optional and order-independent keyword arguments
+
+`subclass:` already carries several keywords and will grow (`namespace:`,
+potentially `instanceVariables:`, `classVariables:`, etc.). In standard
+Smalltalk, the full keyword string is the selector, so all keywords are
+required and ordered — optional params require combinatorial overloads.
+
+Two concerns are separable:
+- **Ordering**: a tooling/ergonomics problem. An editor/class browser can
+  reorder, complete, and enforce signatures. Not a language problem.
+- **Optionality**: a language problem. Options in rough order of complexity:
+  1. **Multiple overloads** — explicit, no dispatch change; breaks down beyond 3–4 combinations.
+  2. **`with:` options dict** — `subclass: #Foo with: { #namespace → MyLib }` —
+     order-independent by nature; loses keyword syntax; no dispatch change needed.
+  3. **CL/Python-style `&key`** — methods declare required + optional params;
+     dispatch matches by required-keyword set; unspecified optional params get
+     defaults. Best long-term ergonomics; requires changing the dispatch model
+     (selector identity is no longer the full concatenated keyword string).
+
+Decision: **deferred to a dedicated design chunk.** Chunk 18 uses
+`Namespace do: [...]` for namespace scoping, avoiding the need for a
+`namespace:` keyword on `subclass:` for now.

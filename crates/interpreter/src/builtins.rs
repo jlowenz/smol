@@ -8,6 +8,7 @@ use num_traits::Zero;
 use crate::class::{Class, IndexedSlotKind};
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
+use crate::namespace::Namespace;
 use crate::object::Object;
 use crate::value::{Block, Value};
 
@@ -45,6 +46,7 @@ pub fn dispatch(
         Value::LargeInt(n) => dispatch_largeint(ev, n, &selector, args, env),
         Value::Object(obj) => dispatch_object_value(ev, obj, selector, args, env),
         Value::Class(class) => dispatch_class(ev, class, selector, args, env),
+        Value::Namespace(ns) => dispatch_namespace(ev, ns, selector, args, env),
     }
 }
 
@@ -849,8 +851,8 @@ fn dispatch_object_value(
     env: &mut Env,
 ) -> Result<Value, EvalError> {
     // Look up user-defined method.
-    if let Some((method, _class)) = obj.class.lookup(&selector) {
-        return ev.invoke_method(obj.clone(), method, args, env);
+    if let Some((method, def_class)) = obj.class.lookup(&selector) {
+        return ev.invoke_method(obj.clone(), def_class, method, args, env);
     }
     // Fall back to primitive Object methods.
     dispatch_object_primitive(obj, &selector, args)
@@ -932,6 +934,42 @@ fn is_kind_of(class: &Arc<Class>, target: &Arc<Class>) -> bool {
     }
 }
 
+// ── Namespace ─────────────────────────────────────────────────────────────────
+
+fn dispatch_namespace(
+    ev: &Evaluator,
+    ns: Arc<Namespace>,
+    selector: Arc<str>,
+    mut args: Vec<Value>,
+    env: &mut Env,
+) -> Result<Value, EvalError> {
+    match selector.as_ref() {
+        "do:" => {
+            expect_arity(&selector, 1, args.len())?;
+            let block = match args.remove(0) {
+                Value::Block(b) => b,
+                other => return Err(EvalError::TypeError(format!(
+                    "do: requires a Block, got {}",
+                    other.kind()
+                ))),
+            };
+            ev.with_namespace(ns, |ev| ev.eval_block(&block, vec![], env))
+        }
+        "name" => {
+            expect_arity(&selector, 0, args.len())?;
+            Ok(Value::Symbol(ns.name.clone()))
+        }
+        "printString" => {
+            expect_arity(&selector, 0, args.len())?;
+            Ok(Value::Str(Arc::from(format!("Namespace({})", ns.name).as_str())))
+        }
+        _ => Err(EvalError::MessageNotUnderstood {
+            receiver_kind: "Namespace",
+            selector,
+        }),
+    }
+}
+
 // ── Class (class-side dispatch) ───────────────────────────────────────────────
 
 fn dispatch_class(
@@ -941,6 +979,11 @@ fn dispatch_class(
     mut args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
+    // Check user-defined class-side methods BEFORE built-ins.
+    if let Some((method, def_class)) = class.lookup_class_method(&selector) {
+        return ev.invoke_class_method(class, def_class, method, args, env);
+    }
+
     match selector.as_ref() {
         "new" => {
             expect_arity(&selector, 0, args.len())?;
@@ -1081,10 +1124,18 @@ fn handle_subclass(
         class_var_storage: RefCell::new(class_var_storage),
         indexed_slot_kind,
         methods: RefCell::new(HashMap::new()),
+        class_methods: RefCell::new(HashMap::new()),
     });
 
-    ev.registry.register(new_class.clone());
-    // Bind in the global (root) frame so the name is immediately visible everywhere.
-    env.define_global(name, Value::Class(new_class.clone()));
+    let active_ns = ev.active_namespace();
+    active_ns.register(new_class.clone());
+    // Kernel classes get a global binding so they're always in scope by simple name.
+    // Non-Kernel classes are scoped to the current frame (e.g. inside `Namespace do: [...]`);
+    // outside that scope they are only reachable via `Ns::ClassName`.
+    if Arc::ptr_eq(&active_ns, &ev.registry.kernel()) {
+        env.define_global(name, Value::Class(new_class.clone()));
+    } else {
+        env.define(name, Value::Class(new_class.clone()));
+    }
     Ok(Value::Class(new_class))
 }

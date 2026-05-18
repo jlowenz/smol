@@ -14,6 +14,8 @@ pub enum Token {
     True,
     False,
     Nil,
+    // super
+    Super,
     /// Integer literal that overflows `i64`.
     LargeInt(Arc<num_bigint::BigInt>),
     // Identifiers
@@ -207,11 +209,11 @@ impl<'src> Lexer<'src> {
         {
             s.push(self.advance().unwrap());
         }
-        // Keyword: identifier immediately followed by `:` but not `:=`.
+        // Keyword: identifier immediately followed by `:` but not `:=` or `::`.
         if self.peek_char() == Some(':') {
             let rest = &self.src[self.pos..];
             let second = rest.chars().nth(1);
-            if second != Some('=') {
+            if second != Some('=') && second != Some(':') {
                 self.advance(); // consume `:`
                 s.push(':');
                 return Token::Keyword(Arc::from(s.as_str()));
@@ -221,6 +223,7 @@ impl<'src> Lexer<'src> {
             "true" => Token::True,
             "false" => Token::False,
             "nil" => Token::Nil,
+            "super" => Token::Super,
             _ => Token::Ident(Arc::from(s.as_str())),
         }
     }

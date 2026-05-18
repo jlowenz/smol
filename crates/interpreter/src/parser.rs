@@ -113,15 +113,19 @@ impl Parser {
             return Ok(Stmt::Return(expr));
         }
 
-        // Method def: IDENT '>>' pattern '[' body ']'
-        // Lookahead: first token is Ident AND second non-comment token is BinOp(">>")
+        // Method def lookahead: IDENT '>>' (instance-side) or IDENT Ident("class") '>>' (class-side)
         {
             let is_method_def = matches!(self.tokens[self.pos], Token::Ident(_)) && {
                 let mut i = self.pos + 1;
                 while i < self.tokens.len() && matches!(self.tokens[i], Token::Comment(_)) {
                     i += 1;
                 }
-                matches!(self.tokens.get(i), Some(Token::BinOp(op)) if op.as_ref() == ">>")
+                // instance-side: IDENT >>
+                let direct_arrow = matches!(self.tokens.get(i), Some(Token::BinOp(op)) if op.as_ref() == ">>");
+                // class-side: IDENT Ident("class") >>
+                let class_side_arrow = matches!(self.tokens.get(i), Some(Token::Ident(s)) if s.as_ref() == "class")
+                    && matches!(self.tokens.get(i + 1), Some(Token::BinOp(op)) if op.as_ref() == ">>");
+                direct_arrow || class_side_arrow
             };
             if is_method_def {
                 return self.parse_method_def();
@@ -164,6 +168,12 @@ impl Parser {
             Token::Ident(n) => n,
             _ => unreachable!(),
         };
+        // Detect class-side: `IDENT "class" >>`
+        let is_class_side = matches!(self.peek(), Token::Ident(s) if s.as_ref() == "class")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::BinOp(op)) if op.as_ref() == ">>");
+        if is_class_side {
+            self.advance(); // consume "class"
+        }
         // Consume '>>'
         self.advance(); // BinOp(">>")
 
@@ -220,7 +230,7 @@ impl Parser {
         }
         self.expect("']'", |t| t == &Token::RBracket)?;
 
-        Ok(Stmt::MethodDef(MethodDef { class_name, pattern, locals, body }))
+        Ok(Stmt::MethodDef(MethodDef { class_name, pattern, locals, body, is_class_side }))
     }
 
     // ── Precedence levels ─────────────────────────────────────────────────────
@@ -353,10 +363,30 @@ impl Parser {
             Token::True => { self.advance(); Ok(Expr::Lit(Literal::Bool(true))) }
             Token::False => { self.advance(); Ok(Expr::Lit(Literal::Bool(false))) }
             Token::Nil => { self.advance(); Ok(Expr::Lit(Literal::Nil)) }
+            Token::Super => { self.advance(); Ok(Expr::Super) }
             Token::Str(s) => { self.advance(); Ok(Expr::Lit(Literal::Str(s))) }
             Token::Symbol(s) => { self.advance(); Ok(Expr::Lit(Literal::Symbol(s))) }
             Token::LargeInt(n) => { self.advance(); Ok(Expr::Lit(Literal::LargeInt(n))) }
-            Token::Ident(name) => { self.advance(); Ok(Expr::Var(name)) }
+            Token::Ident(name) => {
+                self.advance();
+                // Check for `::` namespace resolution chain.
+                if self.peek() == &Token::ColonColon {
+                    let mut path = vec![name];
+                    while self.peek() == &Token::ColonColon {
+                        self.advance(); // consume ::
+                        match self.peek().clone() {
+                            Token::Ident(next) => {
+                                self.advance();
+                                path.push(next);
+                            }
+                            tok => return Err(ParseError::UnexpectedToken(tok, "identifier after ::")),
+                        }
+                    }
+                    let name = path.pop().unwrap();
+                    return Ok(Expr::NamespaceRef { namespace_path: path, name });
+                }
+                Ok(Expr::Var(name))
+            }
             Token::LParen => {
                 self.advance();
                 let expr = self.parse_expr()?;

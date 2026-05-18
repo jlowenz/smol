@@ -75,6 +75,8 @@ pub struct Class {
     /// `None` means no indexed region.
     pub indexed_slot_kind: Option<IndexedSlotKind>,
     pub methods: RefCell<HashMap<Arc<str>, Arc<Method>>>,
+    /// Methods defined on the class side (`ClassName class >> selector`).
+    pub class_methods: RefCell<HashMap<Arc<str>, Arc<Method>>>,
 }
 
 impl Class {
@@ -97,6 +99,19 @@ impl Class {
         }
         if let Some(sc) = &self.superclass {
             return sc.lookup(selector);
+        }
+        None
+    }
+
+    /// Look up a class-side method by selector, walking the superclass chain.
+    ///
+    /// Returns the method and the `Arc<Class>` it was found in (needed for `super` dispatch).
+    pub fn lookup_class_method(self: &Arc<Self>, selector: &str) -> Option<(Arc<Method>, Arc<Class>)> {
+        if let Some(m) = self.class_methods.borrow().get(selector) {
+            return Some((m.clone(), self.clone()));
+        }
+        if let Some(sc) = &self.superclass {
+            return sc.lookup_class_method(selector);
         }
         None
     }

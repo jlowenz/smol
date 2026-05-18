@@ -50,6 +50,14 @@ pub enum Expr {
         receiver: Box<Expr>,
         messages: Vec<Message>,
     },
+    /// Receiver for super sends. Only valid as the receiver of a message send.
+    Super,
+    /// `A::B::C` — namespace_path is the chain of namespace names, name is the final class.
+    /// Resolved at eval time.
+    NamespaceRef {
+        namespace_path: Vec<Arc<str>>,
+        name: Arc<str>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +81,8 @@ pub struct MethodDef {
     pub pattern: MethodPattern,
     pub locals: Vec<Arc<str>>,
     pub body: Vec<Stmt>,
+    /// True for `Foo class >> selector` definitions.
+    pub is_class_side: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
