@@ -11,7 +11,11 @@ pub enum Literal {
     Str(Arc<str>),
     Symbol(Arc<str>),
     LargeInt(Arc<num_bigint::BigInt>),
+    /// Nested `#(...)` array literal. Evaluated by `eval_expr` (not `eval_literal`)
+    /// because constructing an Array object requires the evaluator and environment.
+    Array(Vec<Literal>),
 }
+
 
 /// A single message send. Three levels of precedence match Smalltalk's grammar.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +62,8 @@ pub enum Expr {
         namespace_path: Vec<Arc<str>>,
         name: Arc<str>,
     },
+    /// `#(elem0 elem1 ...)` — array literal with recursively-evaluated elements.
+    ArrayLiteral(Vec<Literal>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

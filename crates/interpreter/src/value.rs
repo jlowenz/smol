@@ -45,6 +45,11 @@ pub struct Block {
     /// Captured lexical environment. Because `Env` frames are
     /// `Arc<RefCell<Frame>>`, this is a live shared reference, not a snapshot.
     pub env: Env,
+    /// Method-stack depth of the frame a `^`-return inside this block should
+    /// target. Equal to the method depth at the block's creation site, so that
+    /// non-local returns propagate past intermediate method calls and are caught
+    /// by the correct `invoke_method` frame.
+    pub home_depth: usize,
 }
 
 impl PartialEq for Value {
@@ -180,6 +185,7 @@ mod tests {
             locals: vec![],
             body: vec![],
             env: Env::new(),
+            home_depth: 0,
         }));
         assert_eq!(Value::Float(1.0).kind(), "Float");
         assert_eq!(Value::Bool(true).kind(), "Bool");
@@ -217,6 +223,7 @@ mod tests {
             locals: vec![],
             body: vec![],
             env: Env::new(),
+            home_depth: 0,
         }));
         assert_eq!(format!("{block}"), "a Block");
     }
@@ -236,9 +243,9 @@ mod tests {
 
     #[test]
     fn eq_block_uses_pointer_identity() {
-        let b = Arc::new(Block { params: vec![], locals: vec![], body: vec![], env: Env::new() });
+        let b = Arc::new(Block { params: vec![], locals: vec![], body: vec![], env: Env::new(), home_depth: 0 });
         assert_eq!(Value::Block(b.clone()), Value::Block(b.clone()));
-        let b2 = Arc::new(Block { params: vec![], locals: vec![], body: vec![], env: Env::new() });
+        let b2 = Arc::new(Block { params: vec![], locals: vec![], body: vec![], env: Env::new(), home_depth: 0 });
         assert_ne!(Value::Block(b), Value::Block(b2));
     }
 
@@ -274,7 +281,7 @@ mod tests {
         map.insert(Value::Class(class.clone()), 8);
         map.insert(Value::Object(Arc::new(Object::new(class))), 9);
         map.insert(Value::Namespace(Arc::new(Namespace::new(Arc::from("N"), None))), 10);
-        let b = Arc::new(Block { params: vec![], locals: vec![], body: vec![], env: Env::new() });
+        let b = Arc::new(Block { params: vec![], locals: vec![], body: vec![], env: Env::new(), home_depth: 0 });
         map.insert(Value::Block(b), 11);
         assert_eq!(map.len(), 11);
     }

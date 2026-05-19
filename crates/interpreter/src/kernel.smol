@@ -1,0 +1,352 @@
+"Array — fixed-size indexed collection of pointer slots."
+Object subclass: #Array
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #pointer.
+
+Array class >> new: n [ ^super new: n ]
+
+Array >> at: i       [ ^self _primAt: i ]
+Array >> at: i put: v [ self _primAt: i put: v. ^v ]
+Array >> size        [ ^self _primSize ]
+Array >> isEmpty     [ ^self _primSize = 0 ]
+Array >> notEmpty    [ ^self _primSize > 0 ]
+Array >> first       [ ^self _primAt: 0 ]
+Array >> last        [ ^self _primAt: self _primSize - 1 ]
+
+Array >> do: aBlock [
+    | i |
+    i := 0.
+    [i < self _primSize] whileTrue: [
+        aBlock value: (self _primAt: i).
+        i := i + 1
+    ]
+]
+
+Array >> collect: aBlock [
+    | result i |
+    result := Array new: self _primSize.
+    i := 0.
+    [i < self _primSize] whileTrue: [
+        result _primAt: i put: (aBlock value: (self _primAt: i)).
+        i := i + 1
+    ].
+    ^result
+]
+
+Array >> select: aBlock [
+    | result |
+    result := OrderedCollection new.
+    self do: [:each | (aBlock value: each) ifTrue: [result add: each]].
+    ^result
+]
+
+Array >> reject: aBlock [
+    | result |
+    result := OrderedCollection new.
+    self do: [:each | (aBlock value: each) ifFalse: [result add: each]].
+    ^result
+]
+
+Array >> detect: aBlock [
+    self do: [:each | (aBlock value: each) ifTrue: [^each]].
+    self error: 'detect: no element satisfies the condition'
+]
+
+Array >> detect: aBlock ifNone: noneBlock [
+    self do: [:each | (aBlock value: each) ifTrue: [^each]].
+    ^noneBlock value
+]
+
+Array >> inject: init into: aBlock [
+    | acc |
+    acc := init.
+    self do: [:each | acc := aBlock value: acc value: each].
+    ^acc
+]
+
+Array >> includes: v [
+    self do: [:each | each = v ifTrue: [^true]].
+    ^false
+]
+
+Array >> copyFrom: start to: stop [
+    | result i |
+    result := Array new: stop - start + 1.
+    i := 0.
+    [start + i <= stop] whileTrue: [
+        result _primAt: i put: (self _primAt: start + i).
+        i := i + 1
+    ].
+    ^result
+]
+
+Array >> = other [
+    | n i |
+    self class = other class ifFalse: [^false].
+    n := self _primSize.
+    n = other _primSize ifFalse: [^false].
+    i := 0.
+    [i < n] whileTrue: [
+        (self _primAt: i) = (other _primAt: i) ifFalse: [^false].
+        i := i + 1
+    ].
+    ^true
+]
+
+Array >> ~= other [ ^(self = other) not ]
+
+Array >> printString [
+    | s i |
+    s := '('.
+    i := 0.
+    [i < self _primSize] whileTrue: [
+        s := s , (self _primAt: i) printString , ' '.
+        i := i + 1
+    ].
+    ^s , ')'
+]
+
+"ByteArray — fixed-size indexed collection of byte (0..255) slots."
+Object subclass: #ByteArray
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #byte.
+
+ByteArray >> at: i       [ ^self _primAt: i ]
+ByteArray >> at: i put: v [ self _primAt: i put: v. ^v ]
+ByteArray >> size        [ ^self _primSize ]
+ByteArray >> isEmpty     [ ^self _primSize = 0 ]
+ByteArray >> notEmpty    [ ^self _primSize > 0 ]
+
+ByteArray >> do: aBlock [
+    | i |
+    i := 0.
+    [i < self _primSize] whileTrue: [
+        aBlock value: (self _primAt: i).
+        i := i + 1
+    ]
+]
+
+ByteArray >> copyFrom: start to: stop [
+    | result i |
+    result := ByteArray new: stop - start + 1.
+    i := 0.
+    [start + i <= stop] whileTrue: [
+        result _primAt: i put: (self _primAt: start + i).
+        i := i + 1
+    ].
+    ^result
+]
+
+ByteArray >> asString [ ^self _primAsString ]
+
+ByteArray >> printString [
+    | s i |
+    s := '('.
+    i := 0.
+    [i < self _primSize] whileTrue: [
+        s := s , (self _primAt: i) printString , ' '.
+        i := i + 1
+    ].
+    ^s , ')'
+]
+
+"OrderedCollection — growable sequence backed by an Array."
+Object subclass: #OrderedCollection
+    instanceVariableNames: 'storage size'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+OrderedCollection class >> new [
+    | oc |
+    oc := super new.
+    oc pvtInit.
+    ^oc
+]
+
+OrderedCollection >> pvtInit [
+    storage := Array new: 8.
+    size := 0
+]
+
+OrderedCollection >> size        [ ^size ]
+OrderedCollection >> isEmpty     [ ^size = 0 ]
+OrderedCollection >> notEmpty    [ ^size > 0 ]
+OrderedCollection >> first       [ ^self at: 0 ]
+OrderedCollection >> last        [ ^self at: size - 1 ]
+
+OrderedCollection >> at: i [
+    (i < 0 or: [i >= size]) ifTrue: [self error: 'at: index out of bounds'].
+    ^storage _primAt: i
+]
+
+OrderedCollection >> at: i put: v [
+    (i < 0 or: [i >= size]) ifTrue: [self error: 'at:put: index out of bounds'].
+    storage _primAt: i put: v.
+    ^v
+]
+
+OrderedCollection >> add: v [
+    size >= storage _primSize ifTrue: [self pvtGrow].
+    storage _primAt: size put: v.
+    size := size + 1.
+    ^v
+]
+
+OrderedCollection >> addLast: v [ ^self add: v ]
+
+OrderedCollection >> addFirst: v [
+    | i |
+    size >= storage _primSize ifTrue: [self pvtGrow].
+    i := size.
+    [i > 0] whileTrue: [
+        storage _primAt: i put: (storage _primAt: i - 1).
+        i := i - 1
+    ].
+    storage _primAt: 0 put: v.
+    size := size + 1.
+    ^v
+]
+
+OrderedCollection >> removeFirst [
+    | v i |
+    size = 0 ifTrue: [self error: 'removeFirst: collection is empty'].
+    v := storage _primAt: 0.
+    i := 1.
+    [i < size] whileTrue: [
+        storage _primAt: i - 1 put: (storage _primAt: i).
+        i := i + 1
+    ].
+    size := size - 1.
+    ^v
+]
+
+OrderedCollection >> removeLast [
+    | v |
+    size = 0 ifTrue: [self error: 'removeLast: collection is empty'].
+    v := storage _primAt: size - 1.
+    size := size - 1.
+    ^v
+]
+
+OrderedCollection >> remove: v ifAbsent: aBlock [
+    | i j |
+    i := 0.
+    [i < size] whileTrue: [
+        (storage _primAt: i) = v ifTrue: [
+            j := i + 1.
+            [j < size] whileTrue: [
+                storage _primAt: j - 1 put: (storage _primAt: j).
+                j := j + 1
+            ].
+            size := size - 1.
+            ^v
+        ].
+        i := i + 1
+    ].
+    ^aBlock value
+]
+
+OrderedCollection >> do: aBlock [
+    | i |
+    i := 0.
+    [i < size] whileTrue: [
+        aBlock value: (storage _primAt: i).
+        i := i + 1
+    ]
+]
+
+OrderedCollection >> collect: aBlock [
+    | result i |
+    result := OrderedCollection new.
+    i := 0.
+    [i < size] whileTrue: [
+        result add: (aBlock value: (storage _primAt: i)).
+        i := i + 1
+    ].
+    ^result
+]
+
+OrderedCollection >> select: aBlock [
+    | result |
+    result := OrderedCollection new.
+    self do: [:each | (aBlock value: each) ifTrue: [result add: each]].
+    ^result
+]
+
+OrderedCollection >> reject: aBlock [
+    | result |
+    result := OrderedCollection new.
+    self do: [:each | (aBlock value: each) ifFalse: [result add: each]].
+    ^result
+]
+
+OrderedCollection >> detect: aBlock [
+    self do: [:each | (aBlock value: each) ifTrue: [^each]].
+    self error: 'detect: no element satisfies the condition'
+]
+
+OrderedCollection >> detect: aBlock ifNone: noneBlock [
+    self do: [:each | (aBlock value: each) ifTrue: [^each]].
+    ^noneBlock value
+]
+
+OrderedCollection >> inject: init into: aBlock [
+    | acc |
+    acc := init.
+    self do: [:each | acc := aBlock value: acc value: each].
+    ^acc
+]
+
+OrderedCollection >> includes: v [
+    self do: [:each | each = v ifTrue: [^true]].
+    ^false
+]
+
+OrderedCollection >> copyFrom: start to: stop [
+    | result i |
+    result := OrderedCollection new.
+    i := start.
+    [i <= stop] whileTrue: [
+        result add: (self at: i).
+        i := i + 1
+    ].
+    ^result
+]
+
+OrderedCollection >> = other [
+    | i |
+    self class = other class ifFalse: [^false].
+    size = other size ifFalse: [^false].
+    i := 0.
+    [i < size] whileTrue: [
+        (self at: i) = (other at: i) ifFalse: [^false].
+        i := i + 1
+    ].
+    ^true
+]
+
+OrderedCollection >> ~= other [ ^(self = other) not ]
+
+OrderedCollection >> printString [
+    | s i |
+    s := 'OrderedCollection ('.
+    i := 0.
+    [i < size] whileTrue: [
+        s := s , (storage _primAt: i) printString , ' '.
+        i := i + 1
+    ].
+    ^s , ')'
+]
+
+OrderedCollection >> pvtGrow [
+    | newStorage i |
+    newStorage := Array new: storage _primSize * 2.
+    i := 0.
+    [i < size] whileTrue: [
+        newStorage _primAt: i put: (storage _primAt: i).
+        i := i + 1
+    ].
+    storage := newStorage
+]

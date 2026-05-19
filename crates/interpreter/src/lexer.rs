@@ -39,6 +39,8 @@ pub enum Token {
     /// Block parameter: `:name` inside `[...]`. The leading `:` is consumed by
     /// the lexer when it sees `:` followed by an alphabetic character and no `=`.
     BlockParam(Arc<str>),
+    /// `#(` — opening delimiter of an array literal.
+    ArrayLiteralOpen,
     // Trivia — preserved for future AST attachment; skipped by the parser.
     /// Contents of a `"..."` comment, without delimiters.
     Comment(Arc<str>),
@@ -279,7 +281,10 @@ impl<'src> Lexer<'src> {
                         }
                         Ok(Token::Symbol(Arc::from(s.as_str())))
                     }
-                    // #( array literal — deferred; treat # as BinOp for now.
+                    Some('(') => {
+                        self.advance();
+                        Ok(Token::ArrayLiteralOpen)
+                    }
                     _ => Ok(self.read_binop('#')),
                 }
             }

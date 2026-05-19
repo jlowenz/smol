@@ -394,8 +394,44 @@ impl Parser {
                 Ok(expr)
             }
             Token::LBracket => self.parse_block(),
+            Token::ArrayLiteralOpen => {
+                self.advance();
+                Ok(Expr::ArrayLiteral(self.parse_array_literal_elements()?))
+            }
             Token::Eof => Err(ParseError::UnexpectedEof("expression")),
             tok => Err(ParseError::UnexpectedToken(tok, "expression")),
+        }
+    }
+
+    /// Parse the element list of an array literal up to (but not consuming) `)`.
+    ///
+    /// Requires: the opening `#(` has already been consumed.
+    /// Ensures: returns all `Literal` elements found before `)`.
+    fn parse_array_literal_elements(&mut self) -> Result<Vec<Literal>, ParseError> {
+        let mut elements = Vec::new();
+        while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
+            elements.push(self.parse_literal_element()?);
+        }
+        self.expect("')' to close array literal", |t| t == &Token::RParen)?;
+        Ok(elements)
+    }
+
+    fn parse_literal_element(&mut self) -> Result<Literal, ParseError> {
+        let tok = self.peek().clone();
+        match tok {
+            Token::Int(n) =>     { self.advance(); Ok(Literal::Int(n)) }
+            Token::Float(f) =>   { self.advance(); Ok(Literal::Float(f)) }
+            Token::True =>       { self.advance(); Ok(Literal::Bool(true)) }
+            Token::False =>      { self.advance(); Ok(Literal::Bool(false)) }
+            Token::Nil =>        { self.advance(); Ok(Literal::Nil) }
+            Token::Str(s) =>     { self.advance(); Ok(Literal::Str(s)) }
+            Token::Symbol(s) =>  { self.advance(); Ok(Literal::Symbol(s)) }
+            Token::LargeInt(n) =>{ self.advance(); Ok(Literal::LargeInt(n)) }
+            Token::ArrayLiteralOpen => {
+                self.advance();
+                Ok(Literal::Array(self.parse_array_literal_elements()?))
+            }
+            tok => Err(ParseError::UnexpectedToken(tok, "literal element in array literal")),
         }
     }
 

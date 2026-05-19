@@ -830,7 +830,7 @@ fn dispatch_block(
             let handler = as_block(args.remove(0), sel)?;
             match ev.eval_block(&blk, vec![], env) {
                 Ok(v) => Ok(v),
-                Err(EvalError::Return(v)) => Err(EvalError::Return(v)),
+                Err(EvalError::Return(v, d)) => Err(EvalError::Return(v, d)),
                 Err(e) => {
                     let msg = Value::Str(Arc::from(e.to_string().as_str()));
                     ev.eval_block(&handler, vec![msg], env)
@@ -863,6 +863,7 @@ fn dispatch_object_primitive(
     sel: &Arc<str>,
     mut args: Vec<Value>,
 ) -> Result<Value, EvalError> {
+    use crate::object::IndexedStorage;
     match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;
@@ -915,6 +916,130 @@ fn dispatch_object_primitive(
                 }
             };
             Ok(Value::Bool(obj.class.lookup(&sym).is_some()))
+        }
+        "_primAt:" => {
+            expect_arity(sel, 1, args.len())?;
+            let n = as_int(args.remove(0), sel)?;
+            let indexed = obj.indexed.as_ref().ok_or_else(|| {
+                EvalError::TypeError(format!("{sel}: receiver has no indexed storage"))
+            })?;
+            match indexed {
+                IndexedStorage::Pointer(slots) => {
+                    let borrow = slots.borrow();
+                    if n < 0 || n as usize >= borrow.len() {
+                        return Err(EvalError::TypeError(format!(
+                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                        )));
+                    }
+                    Ok(borrow[n as usize].clone())
+                }
+                IndexedStorage::Byte(bytes) => {
+                    let borrow = bytes.borrow();
+                    if n < 0 || n as usize >= borrow.len() {
+                        return Err(EvalError::TypeError(format!(
+                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                        )));
+                    }
+                    Ok(Value::Int(borrow[n as usize] as i64))
+                }
+                IndexedStorage::Float64(floats) => {
+                    let borrow = floats.borrow();
+                    if n < 0 || n as usize >= borrow.len() {
+                        return Err(EvalError::TypeError(format!(
+                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                        )));
+                    }
+                    Ok(Value::Float(borrow[n as usize]))
+                }
+            }
+        }
+        "_primAt:put:" => {
+            expect_arity(sel, 2, args.len())?;
+            let n = as_int(args.remove(0), sel)?;
+            let v = args.remove(0);
+            let indexed = obj.indexed.as_ref().ok_or_else(|| {
+                EvalError::TypeError(format!("{sel}: receiver has no indexed storage"))
+            })?;
+            match indexed {
+                IndexedStorage::Pointer(slots) => {
+                    let mut borrow = slots.borrow_mut();
+                    if n < 0 || n as usize >= borrow.len() {
+                        return Err(EvalError::TypeError(format!(
+                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                        )));
+                    }
+                    borrow[n as usize] = v.clone();
+                    Ok(v)
+                }
+                IndexedStorage::Byte(bytes) => {
+                    let b = match &v {
+                        Value::Int(i) if *i >= 0 && *i <= 255 => *i as u8,
+                        Value::Int(i) => return Err(EvalError::TypeError(format!(
+                            "{sel}: byte value {i} out of range 0..=255"
+                        ))),
+                        _ => return Err(EvalError::TypeError(format!(
+                            "{sel}: Byte storage requires Int argument in 0..=255"
+                        ))),
+                    };
+                    let mut borrow = bytes.borrow_mut();
+                    if n < 0 || n as usize >= borrow.len() {
+                        return Err(EvalError::TypeError(format!(
+                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                        )));
+                    }
+                    borrow[n as usize] = b;
+                    Ok(v)
+                }
+                IndexedStorage::Float64(floats) => {
+                    let f = match &v {
+                        Value::Float(f) => *f,
+                        Value::Int(i) => *i as f64,
+                        _ => return Err(EvalError::TypeError(format!(
+                            "{sel}: Float64 storage requires Float or Int argument"
+                        ))),
+                    };
+                    let mut borrow = floats.borrow_mut();
+                    if n < 0 || n as usize >= borrow.len() {
+                        return Err(EvalError::TypeError(format!(
+                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                        )));
+                    }
+                    borrow[n as usize] = f;
+                    Ok(v)
+                }
+            }
+        }
+        "_primSize" => {
+            expect_arity(sel, 0, args.len())?;
+            let indexed = obj.indexed.as_ref().ok_or_else(|| {
+                EvalError::TypeError(format!("{sel}: receiver has no indexed storage"))
+            })?;
+            let len = match indexed {
+                IndexedStorage::Pointer(slots) => slots.borrow().len(),
+                IndexedStorage::Byte(bytes) => bytes.borrow().len(),
+                IndexedStorage::Float64(floats) => floats.borrow().len(),
+            };
+            Ok(Value::Int(len as i64))
+        }
+        "_primAsString" => {
+            expect_arity(sel, 0, args.len())?;
+            match obj.indexed.as_ref().ok_or_else(|| {
+                EvalError::TypeError(format!("{sel}: receiver has no indexed storage"))
+            })? {
+                IndexedStorage::Byte(bytes) => {
+                    let s = String::from_utf8_lossy(&bytes.borrow()).into_owned();
+                    Ok(Value::Str(Arc::from(s.as_str())))
+                }
+                _ => Err(EvalError::TypeError(format!("{sel}: requires Byte indexed storage"))),
+            }
+        }
+        "error:" => {
+            expect_arity(sel, 1, args.len())?;
+            let msg = match args.remove(0) {
+                Value::Str(s) => s.to_string(),
+                other => format!("error: argument was {}", other.kind()),
+            };
+            Err(EvalError::TypeError(msg))
         }
         _ => Err(EvalError::MessageNotUnderstood {
             receiver_kind: "Object",
@@ -976,15 +1101,38 @@ fn dispatch_class(
     ev: &Evaluator,
     class: Arc<Class>,
     selector: Arc<str>,
-    mut args: Vec<Value>,
+    args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
     // Check user-defined class-side methods BEFORE built-ins.
     if let Some((method, def_class)) = class.lookup_class_method(&selector) {
         return ev.invoke_class_method(class, def_class, method, args, env);
     }
+    dispatch_class_builtin(ev, class, selector, args, env)
+}
 
+/// Built-in class-side dispatch that bypasses user-defined class methods.
+///
+/// Called directly from `dispatch_class` (after the user-method check) and from
+/// `send_super` when a class-side super send finds no user-defined method in the
+/// superclass chain — allowing `super new` / `super new:` to reach Rust primitives
+/// without triggering the receiver class's own `new` override.
+pub(crate) fn dispatch_class_builtin(
+    ev: &Evaluator,
+    class: Arc<Class>,
+    selector: Arc<str>,
+    mut args: Vec<Value>,
+    env: &mut Env,
+) -> Result<Value, EvalError> {
     match selector.as_ref() {
+        "=" => {
+            expect_arity(&selector, 1, args.len())?;
+            Ok(Value::Bool(Value::Class(class) == args[0]))
+        }
+        "~=" => {
+            expect_arity(&selector, 1, args.len())?;
+            Ok(Value::Bool(Value::Class(class) != args[0]))
+        }
         "new" => {
             expect_arity(&selector, 0, args.len())?;
             let obj = if class.indexed_slot_kind.is_some() {
@@ -1716,5 +1864,142 @@ ByteBuf new: 8
             eval_err("99999999999999999999 unknownMsg"),
             crate::eval::EvalError::MessageNotUnderstood { .. }
         ));
+    }
+
+    // ── _primAt: / _primAt:put: / _primSize / _primAsString / error: ──────────
+
+    fn eval_no_kernel(src: &str) -> Value {
+        let prog = Parser::parse(src).expect("parse");
+        let ev = Evaluator::new_without_kernel();
+        let mut env = crate::env::Env::new();
+        ev.registry.populate_env(&mut env);
+        ev.eval_program(&prog.stmts, &mut env).expect("eval")
+    }
+
+    fn eval_no_kernel_err(src: &str) -> crate::eval::EvalError {
+        let prog = Parser::parse(src).expect("parse");
+        let ev = Evaluator::new_without_kernel();
+        let mut env = crate::env::Env::new();
+        ev.registry.populate_env(&mut env);
+        ev.eval_program(&prog.stmts, &mut env).expect_err("expected error")
+    }
+
+    #[test]
+    fn prim_at_pointer_reads() {
+        let src = r#"
+Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+| a |
+a := Arr new: 3.
+a _primAt: 0
+"#;
+        assert_eq!(eval_no_kernel(src), Value::Nil);
+    }
+
+    #[test]
+    fn prim_at_put_and_at_roundtrip() {
+        let src = r#"
+Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+| a |
+a := Arr new: 3.
+a _primAt: 1 put: 42.
+a _primAt: 1
+"#;
+        assert_eq!(eval_no_kernel(src), Value::Int(42));
+    }
+
+    #[test]
+    fn prim_size_returns_length() {
+        let src = r#"
+Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+(Arr new: 5) _primSize
+"#;
+        assert_eq!(eval_no_kernel(src), Value::Int(5));
+    }
+
+    #[test]
+    fn prim_at_byte_returns_int() {
+        let src = r#"
+Object subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
+| b |
+b := BA new: 4.
+b _primAt: 0
+"#;
+        assert_eq!(eval_no_kernel(src), Value::Int(0));
+    }
+
+    #[test]
+    fn prim_at_put_byte_stores_and_reads() {
+        let src = r#"
+Object subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
+| b |
+b := BA new: 4.
+b _primAt: 2 put: 200.
+b _primAt: 2
+"#;
+        assert_eq!(eval_no_kernel(src), Value::Int(200));
+    }
+
+    #[test]
+    fn prim_as_string_returns_utf8() {
+        let src = r#"
+Object subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
+| b |
+b := BA new: 5.
+b _primAt: 0 put: 104.
+b _primAt: 1 put: 101.
+b _primAt: 2 put: 108.
+b _primAt: 3 put: 108.
+b _primAt: 4 put: 111.
+b _primAsString
+"#;
+        assert_eq!(eval_no_kernel(src), Value::Str(Arc::from("hello")));
+    }
+
+    #[test]
+    fn prim_at_bounds_error() {
+        let src = r#"
+Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+(Arr new: 3) _primAt: 3
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn prim_at_negative_index_error() {
+        let src = r#"
+Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+(Arr new: 3) _primAt: -1
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn prim_at_put_byte_out_of_range_error() {
+        let src = r#"
+Object subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
+(BA new: 2) _primAt: 0 put: 256
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn prim_at_no_indexed_storage_error() {
+        let src = r#"
+Object subclass: #Plain instanceVariableNames: ''.
+Plain new _primAt: 0
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn error_colon_raises_type_error() {
+        let src = r#"
+Object subclass: #Thing instanceVariableNames: ''.
+Thing new error: 'boom'
+"#;
+        match eval_no_kernel_err(src) {
+            crate::eval::EvalError::TypeError(msg) => assert!(msg.contains("boom")),
+            e => panic!("expected TypeError, got {e:?}"),
+        }
     }
 }

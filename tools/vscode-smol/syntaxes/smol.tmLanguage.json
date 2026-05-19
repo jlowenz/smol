@@ -1,0 +1,147 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Smol",
+  "scopeName": "source.smol",
+  "fileTypes": ["smol"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#symbol" },
+    { "include": "#array-literal" },
+    { "include": "#number" },
+    { "include": "#constant" },
+    { "include": "#return" },
+    { "include": "#assignment" },
+    { "include": "#namespace-op" },
+    { "include": "#method-def-op" },
+    { "include": "#block-param" },
+    { "include": "#class-def-keyword" },
+    { "include": "#keyword-message" },
+    { "include": "#binary-operator" },
+    { "include": "#class-name" },
+    { "include": "#self-super" },
+    { "include": "#identifier" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.block.smol",
+      "begin": "\"",
+      "end": "\""
+    },
+    "string": {
+      "name": "string.quoted.single.smol",
+      "begin": "'",
+      "end": "'(?!')",
+      "patterns": [
+        { "name": "constant.character.escape.smol", "match": "''" }
+      ]
+    },
+    "symbol": {
+      "patterns": [
+        {
+          "name": "constant.other.symbol.smol",
+          "begin": "#'",
+          "end": "'(?!')",
+          "patterns": [
+            { "name": "constant.character.escape.smol", "match": "''" }
+          ]
+        },
+        {
+          "name": "constant.other.symbol.smol",
+          "match": "#[a-zA-Z_][a-zA-Z0-9_:]*"
+        }
+      ]
+    },
+    "array-literal": {
+      "name": "meta.array-literal.smol",
+      "begin": "#\\(",
+      "beginCaptures": { "0": { "name": "punctuation.definition.array.begin.smol" } },
+      "end": "\\)",
+      "endCaptures": { "0": { "name": "punctuation.definition.array.end.smol" } },
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#string" },
+        { "include": "#symbol" },
+        { "include": "#array-literal" },
+        { "include": "#number" },
+        { "include": "#constant" }
+      ]
+    },
+    "number": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.smol",
+          "match": "-?[0-9]+\\.[0-9]+([eE][+-]?[0-9]+)?"
+        },
+        {
+          "name": "constant.numeric.integer.smol",
+          "match": "-?[0-9]+"
+        }
+      ]
+    },
+    "constant": {
+      "patterns": [
+        { "name": "constant.language.boolean.smol", "match": "\\b(true|false)\\b" },
+        { "name": "constant.language.nil.smol",     "match": "\\bnil\\b" }
+      ]
+    },
+    "return": {
+      "name": "keyword.control.return.smol",
+      "match": "\\^"
+    },
+    "assignment": {
+      "name": "keyword.operator.assignment.smol",
+      "match": ":="
+    },
+    "namespace-op": {
+      "name": "keyword.operator.namespace.smol",
+      "match": "::"
+    },
+    "method-def-op": {
+      "name": "keyword.operator.method-def.smol",
+      "match": ">>"
+    },
+    "block-param": {
+      "name": "variable.parameter.smol",
+      "match": ":[a-zA-Z_][a-zA-Z0-9_]*"
+    },
+    "class-def-keyword": {
+      "name": "keyword.other.class-def.smol",
+      "match": "\\b(subclass:|instanceVariableNames:|classVariableNames:|indexedSlots:)\\b"
+    },
+    "keyword-message": {
+      "name": "entity.name.function.smol",
+      "match": "[a-zA-Z_][a-zA-Z0-9_]*:"
+    },
+    "binary-operator": {
+      "name": "keyword.operator.smol",
+      "match": "<=|>=|~=|//|\\\\\\\\|~~|->|[+\\-*/<>=~@,&|]"
+    },
+    "class-name": {
+      "name": "entity.name.type.class.smol",
+      "match": "\\b[A-Z][a-zA-Z0-9_]*\\b"
+    },
+    "self-super": {
+      "patterns": [
+        { "name": "variable.language.self.smol",  "match": "\\bself\\b" },
+        { "name": "variable.language.super.smol", "match": "\\bsuper\\b" }
+      ]
+    },
+    "identifier": {
+      "name": "variable.other.smol",
+      "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b"
+    },
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.terminator.statement.smol",  "match": "\\." },
+        { "name": "punctuation.separator.cascade.smol",     "match": ";" },
+        { "name": "punctuation.definition.locals.smol",     "match": "\\|" },
+        { "name": "punctuation.definition.block.begin.smol","match": "\\[" },
+        { "name": "punctuation.definition.block.end.smol",  "match": "\\]" },
+        { "name": "punctuation.section.parens.begin.smol",  "match": "\\(" },
+        { "name": "punctuation.section.parens.end.smol",    "match": "\\)" }
+      ]
+    }
+  }
+}

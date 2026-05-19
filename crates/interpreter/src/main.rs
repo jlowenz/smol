@@ -31,7 +31,7 @@ fn main() {
                 Ok(prog) => {
                     match ev.eval_program(&prog.stmts, &mut env) {
                         Ok(val) => println!("{val}"),
-                        Err(interpreter::eval::EvalError::Return(val)) => println!("{val}"),
+                        Err(interpreter::eval::EvalError::Return(val, _)) => println!("{val}"),
                         Err(e) => println!("error: {e}"),
                     }
                     break;

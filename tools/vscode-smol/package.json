@@ -1,0 +1,26 @@
+{
+  "name": "smol-language",
+  "displayName": "Smol Language",
+  "description": "Syntax highlighting for the Smol programming language",
+  "version": "0.0.1",
+  "publisher": "jlowens",
+  "engines": { "vscode": "^1.70.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "smol",
+        "aliases": ["Smol", "smol"],
+        "extensions": [".smol"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "smol",
+        "scopeName": "source.smol",
+        "path": "./syntaxes/smol.tmLanguage.json"
+      }
+    ]
+  }
+}

@@ -8,7 +8,8 @@ use crate::class::{Class, Method};
 use crate::class_registry::ClassRegistry;
 use crate::env::Env;
 use crate::namespace::Namespace;
-use crate::object::Object;
+use crate::object::{IndexedStorage, Object};
+use crate::parser::Parser;
 use crate::value::{Block, Value};
 
 #[derive(Debug, Error, Clone)]
@@ -24,10 +25,11 @@ pub enum EvalError {
     ArityMismatch { expected: usize, got: usize },
     #[error("type error: {0}")]
     TypeError(String),
-    /// Non-local `^`-return. Propagates up the call stack until caught by the
-    /// enclosing method frame. Not an error condition; handled by eval_program.
+    /// Non-local `^`-return carrying the value and the method-stack depth of the
+    /// frame that should catch it. Only the `invoke_method` / `invoke_class_method`
+    /// whose depth matches will unwrap this; all others propagate it unchanged.
     #[error("non-local return")]
-    Return(Value),
+    Return(Value, usize),
 }
 
 /// The self-binding for the currently-executing method frame.
@@ -50,6 +52,11 @@ pub struct Evaluator {
     /// Note: this is a per-evaluator (single-threaded) cell. Future multi-fiber
     /// execution will need to move this to a per-frame or per-fiber slot.
     active_namespace: RefCell<Arc<Namespace>>,
+    /// The method-stack depth that the innermost active `eval_block` invocation
+    /// should target with a `^`-return. `None` when not inside any `eval_block`
+    /// (i.e., evaluating a method body directly). Saved and restored by each
+    /// `eval_block` call so nesting is handled correctly.
+    current_block_home: Cell<Option<usize>>,
 }
 
 impl Default for Evaluator {
@@ -59,7 +66,26 @@ impl Default for Evaluator {
 }
 
 impl Evaluator {
+    /// Create an evaluator and load `kernel.smol`, defining `Array`, `ByteArray`,
+    /// and `OrderedCollection` in the Kernel namespace.
+    ///
+    /// Ensures: after construction, `ev.registry.populate_env(&mut env)` exposes
+    ///   all kernel classes in `env`. A broken `kernel.smol` is a programmer error
+    ///   and panics immediately.
     pub fn new() -> Self {
+        let ev = Self::new_without_kernel();
+        let mut bootstrap_env = Env::new();
+        ev.registry.populate_env(&mut bootstrap_env);
+        let src = include_str!("kernel.smol");
+        let prog = Parser::parse(src).expect("kernel.smol: parse error");
+        ev.eval_program(&prog.stmts, &mut bootstrap_env)
+            .expect("kernel.smol: eval error");
+        ev
+    }
+
+    /// Create an evaluator without loading `kernel.smol`. Intended for low-level
+    /// primitive tests that do not require the kernel collection classes.
+    pub fn new_without_kernel() -> Self {
         let registry = Arc::new(ClassRegistry::new());
         let kernel = registry.kernel();
         Self {
@@ -67,6 +93,7 @@ impl Evaluator {
             method_stack: RefCell::new(Vec::new()),
             method_depth: Cell::new(0),
             active_namespace: RefCell::new(kernel),
+            current_block_home: Cell::new(None),
         }
     }
 
@@ -231,7 +258,12 @@ impl Evaluator {
             }
             Stmt::Return(e) => {
                 let v = self.eval_expr(e, env)?;
-                Err(EvalError::Return(v))
+                // Target the home method for this return. Inside eval_block the home
+                // is the depth of the method that defined the block; at the method body
+                // level current_block_home is None so we use the current method depth.
+                let depth = self.current_block_home.get()
+                    .unwrap_or_else(|| self.method_depth.get());
+                Err(EvalError::Return(v, depth))
             }
             Stmt::MethodDef(def) => {
                 // Look up the class from env first (covers non-Kernel namespace classes).
@@ -276,11 +308,17 @@ impl Evaluator {
                 self.send(recv, message, env)
             }
             Expr::Block { params, locals, body } => {
+                // Blocks inherit the home depth of their creation context: the same method
+                // that an enclosing block targets, or the current method depth if no block
+                // context is active. This ensures nested blocks all point to the right frame.
+                let home_depth = self.current_block_home.get()
+                    .unwrap_or_else(|| self.method_depth.get());
                 Ok(Value::Block(Arc::new(Block {
                     params: params.clone(),
                     locals: locals.clone(),
                     body: body.clone(),
                     env: env.clone(),
+                    home_depth,
                 })))
             }
             Expr::Cascade { receiver, messages } => {
@@ -294,6 +332,33 @@ impl Evaluator {
             Expr::NamespaceRef { namespace_path, name } => {
                 self.eval_namespace_ref(namespace_path, name, env)
             }
+            Expr::ArrayLiteral(elements) => {
+                self.eval_array_literal(elements, env)
+            }
+        }
+    }
+
+    fn eval_array_literal(&self, elements: &[Literal], env: &mut Env) -> Result<Value, EvalError> {
+        let array_class = self.registry.kernel()
+            .lookup_class("Array")
+            .ok_or_else(|| EvalError::UndefinedVariable(Arc::from("Array")))?;
+        let obj = Arc::new(Object::new_with_indexed(array_class, elements.len()));
+        for (i, elem) in elements.iter().enumerate() {
+            let v = self.eval_literal_as_value(elem, env)?;
+            if let Some(IndexedStorage::Pointer(slots)) = obj.indexed.as_ref() {
+                slots.borrow_mut()[i] = v;
+            }
+        }
+        Ok(Value::Object(obj))
+    }
+
+    /// Evaluate a `Literal` into a runtime `Value`. For `Literal::Array` this
+    /// requires the evaluator and environment to construct the `Array` object;
+    /// all other variants are pure data and do not need either.
+    fn eval_literal_as_value(&self, lit: &Literal, env: &mut Env) -> Result<Value, EvalError> {
+        match lit {
+            Literal::Array(elems) => self.eval_array_literal(elems, env),
+            _ => Ok(eval_literal(lit)),
         }
     }
 
@@ -368,10 +433,10 @@ impl Evaluator {
                     Some((method, def_class)) => {
                         self.invoke_class_method(class, def_class, method, args, env)
                     }
-                    None => Err(EvalError::MessageNotUnderstood {
-                        receiver_kind: "Class",
-                        selector,
-                    }),
+                    // No user-defined super method; fall through to built-in class
+                    // dispatch so `super new` / `super new:` reach the Rust primitives
+                    // without re-entering the receiver's own `new` override.
+                    None => crate::builtins::dispatch_class_builtin(self, class, selector, args, env),
                 }
             }
             None => Err(EvalError::TypeError("super used outside method context".into())),
@@ -424,7 +489,11 @@ impl Evaluator {
     }
 
     /// Evaluate a `Block` value by sending it `value` / `value:` etc.
-    /// Creates a new frame, binds params, runs the body, catches `^`-returns.
+    ///
+    /// Sets `current_block_home` to the block's `home_depth` so that any `^`
+    /// inside the block targets the correct enclosing method frame. Does NOT
+    /// catch `EvalError::Return` — it propagates to `invoke_method` / `invoke_class_method`
+    /// of the frame whose depth matches the Return's target.
     pub fn eval_block(
         &self,
         block: &Block,
@@ -437,7 +506,9 @@ impl Evaluator {
                 got: args.len(),
             });
         }
-        // Work in the block's captured environment.
+        let prev_home = self.current_block_home.get();
+        self.current_block_home.set(Some(block.home_depth));
+
         let mut block_env = block.env.clone();
         block_env.push_frame();
         for name in &block.locals {
@@ -448,18 +519,16 @@ impl Evaluator {
         }
         let result = self.eval_program(&block.body, &mut block_env);
         block_env.pop_frame();
-        match result {
-            Ok(v) => Ok(v),
-            Err(EvalError::Return(v)) => Ok(v),
-            Err(e) => Err(e),
-        }
+        self.current_block_home.set(prev_home);
+        result
     }
 
     /// Invoke a user-defined method on a receiver object.
     ///
     /// Requires: `args.len() == method.pattern.params().len()`.
     /// Ensures: method locals and `self` are bound in a fresh frame; the frame
-    ///   is cleaned up on return; `EvalError::Return` is caught and unwrapped.
+    ///   is cleaned up on return; `EvalError::Return` whose depth matches this
+    ///   frame is caught and unwrapped; Returns targeting an outer frame propagate.
     pub fn invoke_method(
         &self,
         receiver: Arc<Object>,
@@ -488,12 +557,18 @@ impl Evaluator {
             receiver: receiver.clone(),
             defining_class,
         });
+        let my_depth = self.method_depth.get();
+        // A method body is not a block: reset current_block_home so that ^-returns
+        // inside this body target this frame (not the block home of a caller).
+        let prev_home = self.current_block_home.get();
+        self.current_block_home.set(None);
         let result = self.eval_program(&method.body, &mut method_env);
+        self.current_block_home.set(prev_home);
         self.pop_self();
         method_env.pop_frame();
         match result {
             Ok(v) => Ok(v),
-            Err(EvalError::Return(v)) => Ok(v),
+            Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
             Err(e) => Err(e),
         }
     }
@@ -501,7 +576,8 @@ impl Evaluator {
     /// Invoke a user-defined class-side method.
     ///
     /// Requires: `args.len() == method.pattern.params().len()`.
-    /// Ensures: `self` is bound to `Value::Class(class)` in the method frame.
+    /// Ensures: `self` is bound to `Value::Class(class)` in the method frame;
+    ///   `EvalError::Return` whose depth matches this frame is caught and unwrapped.
     pub fn invoke_class_method(
         &self,
         class: Arc<Class>,
@@ -530,12 +606,16 @@ impl Evaluator {
             class: class.clone(),
             defining_class,
         });
+        let my_depth = self.method_depth.get();
+        let prev_home = self.current_block_home.get();
+        self.current_block_home.set(None);
         let result = self.eval_program(&method.body, &mut method_env);
+        self.current_block_home.set(prev_home);
         self.pop_self();
         method_env.pop_frame();
         match result {
             Ok(v) => Ok(v),
-            Err(EvalError::Return(v)) => Ok(v),
+            Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
             Err(e) => Err(e),
         }
     }
@@ -569,6 +649,9 @@ fn eval_literal(lit: &Literal) -> Value {
         Literal::Str(s) => Value::Str(s.clone()),
         Literal::Symbol(s) => Value::Symbol(s.clone()),
         Literal::LargeInt(n) => Value::LargeInt(n.clone()),
+        // Array literals are always reached via Expr::ArrayLiteral -> eval_array_literal,
+        // never via this path. Reaching here is an evaluator bug.
+        Literal::Array(_) => unreachable!("Literal::Array must be evaluated via eval_array_literal"),
     }
 }
 
@@ -874,5 +957,424 @@ result
             &mut env,
         ).expect("namespace ref");
         assert_eq!(via_ns, Value::Str(Arc::from("a Widget")));
+    }
+
+    // ── Kernel loading ────────────────────────────────────────────────────────
+
+    #[test]
+    fn kernel_load_does_not_panic() {
+        let _ev = Evaluator::new();
+    }
+
+    #[test]
+    fn kernel_classes_in_env() {
+        let ev = Evaluator::new();
+        let mut env = Env::new();
+        ev.registry.populate_env(&mut env);
+        assert!(matches!(env.get("Array"), Some(Value::Class(_))));
+        assert!(matches!(env.get("ByteArray"), Some(Value::Class(_))));
+        assert!(matches!(env.get("OrderedCollection"), Some(Value::Class(_))));
+    }
+
+    // ── Array protocol ────────────────────────────────────────────────────────
+
+    #[test]
+    fn array_new_size_and_at() {
+        assert_eq!(eval("(Array new: 3) size"), Value::Int(3));
+        assert_eq!(eval("| a | a := Array new: 3. a at: 0"), Value::Nil);
+    }
+
+    #[test]
+    fn array_at_put_and_at() {
+        assert_eq!(
+            eval("| a | a := Array new: 3. a at: 1 put: 99. a at: 1"),
+            Value::Int(99)
+        );
+    }
+
+    #[test]
+    fn array_is_empty_not_empty() {
+        assert_eq!(eval("(Array new: 0) isEmpty"), Value::Bool(true));
+        assert_eq!(eval("(Array new: 2) notEmpty"), Value::Bool(true));
+    }
+
+    #[test]
+    fn array_first_last() {
+        assert_eq!(
+            eval("| a | a := Array new: 3. a at: 0 put: 10. a at: 2 put: 30. a first"),
+            Value::Int(10)
+        );
+        assert_eq!(
+            eval("| a | a := Array new: 3. a at: 0 put: 10. a at: 2 put: 30. a last"),
+            Value::Int(30)
+        );
+    }
+
+    #[test]
+    fn array_do_iterates() {
+        assert_eq!(
+            eval("| a s | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. s := 0. a do: [:e | s := s + e]. s"),
+            Value::Int(6)
+        );
+    }
+
+    #[test]
+    fn array_collect_maps() {
+        let src = "| a r | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. r := a collect: [:e | e * 2]. r at: 2";
+        assert_eq!(eval(src), Value::Int(6));
+    }
+
+    #[test]
+    fn array_select_returns_ordered_collection() {
+        let src = "| a r | a := Array new: 4. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a at: 3 put: 4. r := a select: [:e | e > 2]. r size";
+        assert_eq!(eval(src), Value::Int(2));
+    }
+
+    #[test]
+    fn array_reject_returns_ordered_collection() {
+        let src = "| a r | a := Array new: 4. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a at: 3 put: 4. r := a reject: [:e | e > 2]. r size";
+        assert_eq!(eval(src), Value::Int(2));
+    }
+
+    #[test]
+    fn array_detect() {
+        let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 5. a at: 2 put: 3. a detect: [:e | e > 4]";
+        assert_eq!(eval(src), Value::Int(5));
+    }
+
+    #[test]
+    fn array_detect_if_none() {
+        let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a detect: [:e | e > 10] ifNone: [99]";
+        assert_eq!(eval(src), Value::Int(99));
+    }
+
+    #[test]
+    fn array_inject_into_sum() {
+        let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a inject: 0 into: [:acc :e | acc + e]";
+        assert_eq!(eval(src), Value::Int(6));
+    }
+
+    #[test]
+    fn array_includes() {
+        let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a includes: 2";
+        assert_eq!(eval(src), Value::Bool(true));
+        let src2 = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a includes: 9";
+        assert_eq!(eval(src2), Value::Bool(false));
+    }
+
+    #[test]
+    fn array_copy_from_to() {
+        let src = "| a r | a := Array new: 5. 0 to: 4 do: [:i | a at: i put: i]. r := a copyFrom: 1 to: 3. r size";
+        assert_eq!(eval(src), Value::Int(3));
+        let src2 = "| a r | a := Array new: 5. 0 to: 4 do: [:i | a at: i put: i]. r := a copyFrom: 1 to: 3. r at: 0";
+        assert_eq!(eval(src2), Value::Int(1));
+    }
+
+    #[test]
+    fn array_equality() {
+        let src = "| a b | a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2. b := Array new: 2. b at: 0 put: 1. b at: 1 put: 2. a = b";
+        assert_eq!(eval(src), Value::Bool(true));
+        let src2 = "| a b | a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2. b := Array new: 2. b at: 0 put: 1. b at: 1 put: 9. a = b";
+        assert_eq!(eval(src2), Value::Bool(false));
+    }
+
+    #[test]
+    fn array_print_string() {
+        let src = "| a | a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2. a printString";
+        assert_eq!(eval(src), Value::Str(Arc::from("(1 2 )")));
+    }
+
+    // ── ByteArray protocol ────────────────────────────────────────────────────
+
+    #[test]
+    fn bytearray_new_size_at_put() {
+        assert_eq!(eval("(ByteArray new: 4) size"), Value::Int(4));
+        let src = "| b | b := ByteArray new: 4. b at: 0 put: 65. b at: 0";
+        assert_eq!(eval(src), Value::Int(65));
+    }
+
+    #[test]
+    fn bytearray_is_empty() {
+        assert_eq!(eval("(ByteArray new: 0) isEmpty"), Value::Bool(true));
+        assert_eq!(eval("(ByteArray new: 1) notEmpty"), Value::Bool(true));
+    }
+
+    #[test]
+    fn bytearray_as_string() {
+        let src = "| b | b := ByteArray new: 3. b at: 0 put: 65. b at: 1 put: 66. b at: 2 put: 67. b asString";
+        assert_eq!(eval(src), Value::Str(Arc::from("ABC")));
+    }
+
+    #[test]
+    fn bytearray_do() {
+        let src = "| b s | b := ByteArray new: 3. b at: 0 put: 10. b at: 1 put: 20. b at: 2 put: 30. s := 0. b do: [:e | s := s + e]. s";
+        assert_eq!(eval(src), Value::Int(60));
+    }
+
+    #[test]
+    fn bytearray_copy_from_to() {
+        let src = "| b r | b := ByteArray new: 5. 0 to: 4 do: [:i | b at: i put: i * 10]. r := b copyFrom: 1 to: 3. r size";
+        assert_eq!(eval(src), Value::Int(3));
+        let src2 = "| b r | b := ByteArray new: 5. 0 to: 4 do: [:i | b at: i put: i * 10]. r := b copyFrom: 1 to: 3. r at: 0";
+        assert_eq!(eval(src2), Value::Int(10));
+    }
+
+    // ── OrderedCollection protocol ────────────────────────────────────────────
+
+    #[test]
+    fn oc_new_is_empty() {
+        assert_eq!(eval("OrderedCollection new isEmpty"), Value::Bool(true));
+        assert_eq!(eval("OrderedCollection new size"), Value::Int(0));
+    }
+
+    #[test]
+    fn oc_add_and_size() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc size";
+        assert_eq!(eval(src), Value::Int(3));
+    }
+
+    #[test]
+    fn oc_at() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc at: 1";
+        assert_eq!(eval(src), Value::Int(20));
+    }
+
+    #[test]
+    fn oc_first_last() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc first";
+        assert_eq!(eval(src), Value::Int(10));
+        let src2 = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc last";
+        assert_eq!(eval(src2), Value::Int(30));
+    }
+
+    #[test]
+    fn oc_add_first_prepends() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 2. oc add: 3. oc addFirst: 1. oc at: 0";
+        assert_eq!(eval(src), Value::Int(1));
+    }
+
+    #[test]
+    fn oc_remove_first() {
+        let src = "| oc v | oc := OrderedCollection new. oc add: 10. oc add: 20. v := oc removeFirst. v";
+        assert_eq!(eval(src), Value::Int(10));
+        let src2 = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc removeFirst. oc size";
+        assert_eq!(eval(src2), Value::Int(1));
+    }
+
+    #[test]
+    fn oc_remove_last() {
+        let src = "| oc v | oc := OrderedCollection new. oc add: 10. oc add: 20. v := oc removeLast. v";
+        assert_eq!(eval(src), Value::Int(20));
+        let src2 = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc removeLast. oc size";
+        assert_eq!(eval(src2), Value::Int(1));
+    }
+
+    #[test]
+    fn oc_remove_if_absent() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc remove: 2 ifAbsent: [0]. oc size";
+        assert_eq!(eval(src), Value::Int(2));
+        let src2 = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc remove: 9 ifAbsent: [99]";
+        assert_eq!(eval(src2), Value::Int(99));
+    }
+
+    #[test]
+    fn oc_do_iterates() {
+        let src = "| oc s | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. s := 0. oc do: [:e | s := s + e]. s";
+        assert_eq!(eval(src), Value::Int(6));
+    }
+
+    #[test]
+    fn oc_collect_maps() {
+        let src = "| oc r | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. r := oc collect: [:e | e * 10]. r at: 1";
+        assert_eq!(eval(src), Value::Int(20));
+    }
+
+    #[test]
+    fn oc_select_filters() {
+        let src = "| oc r | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc add: 4. r := oc select: [:e | e > 2]. r size";
+        assert_eq!(eval(src), Value::Int(2));
+    }
+
+    #[test]
+    fn oc_reject_filters() {
+        let src = "| oc r | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc add: 4. r := oc reject: [:e | e > 2]. r size";
+        assert_eq!(eval(src), Value::Int(2));
+    }
+
+    #[test]
+    fn oc_detect() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 5. oc add: 3. oc detect: [:e | e > 4]";
+        assert_eq!(eval(src), Value::Int(5));
+    }
+
+    #[test]
+    fn oc_detect_if_none() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc detect: [:e | e > 10] ifNone: [42]";
+        assert_eq!(eval(src), Value::Int(42));
+    }
+
+    #[test]
+    fn oc_inject_into_sum() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc inject: 0 into: [:acc :e | acc + e]";
+        assert_eq!(eval(src), Value::Int(6));
+    }
+
+    #[test]
+    fn oc_includes() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc includes: 2";
+        assert_eq!(eval(src), Value::Bool(true));
+        let src2 = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc includes: 9";
+        assert_eq!(eval(src2), Value::Bool(false));
+    }
+
+    #[test]
+    fn oc_copy_from_to() {
+        let src = "| oc r | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. r := oc copyFrom: 0 to: 1. r size";
+        assert_eq!(eval(src), Value::Int(2));
+        let src2 = "| oc r | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. r := oc copyFrom: 0 to: 1. r at: 0";
+        assert_eq!(eval(src2), Value::Int(10));
+    }
+
+    #[test]
+    fn oc_equality() {
+        let src = "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 1. a = b";
+        assert_eq!(eval(src), Value::Bool(true));
+        let src2 = "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 2. a = b";
+        assert_eq!(eval(src2), Value::Bool(false));
+    }
+
+    #[test]
+    fn oc_not_equal() {
+        let src = "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 2. a ~= b";
+        assert_eq!(eval(src), Value::Bool(true));
+    }
+
+    #[test]
+    fn oc_print_string() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc printString";
+        assert_eq!(eval(src), Value::Str(Arc::from("OrderedCollection (1 2 )")));
+    }
+
+    #[test]
+    fn oc_growth_trigger() {
+        // Add more than initial capacity of 8 to force pvtGrow.
+        let src = "| oc | oc := OrderedCollection new. 1 to: 12 do: [:i | oc add: i]. oc size";
+        assert_eq!(eval(src), Value::Int(12));
+        let src2 = "| oc | oc := OrderedCollection new. 1 to: 12 do: [:i | oc add: i]. oc at: 11";
+        assert_eq!(eval(src2), Value::Int(12));
+    }
+
+    #[test]
+    fn oc_remove_first_empty_errors() {
+        let src = "OrderedCollection new removeFirst";
+        assert!(matches!(eval_err(src), EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn oc_remove_last_empty_errors() {
+        let src = "OrderedCollection new removeLast";
+        assert!(matches!(eval_err(src), EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn oc_at_out_of_bounds_errors() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc at: 5";
+        assert!(matches!(eval_err(src), EvalError::TypeError(_)));
+    }
+
+    // ── Nested array literals ─────────────────────────────────────────────────
+
+    #[test]
+    fn array_literal_basic() {
+        assert_eq!(eval("#(1 2 3) size"), Value::Int(3));
+        assert_eq!(eval("#(1 2 3) at: 1"), Value::Int(2));
+    }
+
+    #[test]
+    fn array_literal_empty() {
+        assert_eq!(eval("#() isEmpty"), Value::Bool(true));
+    }
+
+    #[test]
+    fn array_literal_nested() {
+        assert_eq!(eval("#(#(0 1) #(2 3)) size"), Value::Int(2));
+        let src = "(#(#(0 1) #(2 3)) at: 0) at: 1";
+        assert_eq!(eval(src), Value::Int(1));
+    }
+
+    #[test]
+    fn array_literal_mixed_types() {
+        assert_eq!(eval("#(1 'hello' true nil) at: 1"), Value::Str(Arc::from("hello")));
+        assert_eq!(eval("#(1 'hello' true nil) at: 2"), Value::Bool(true));
+        assert_eq!(eval("#(1 'hello' true nil) at: 3"), Value::Nil);
+    }
+
+    #[test]
+    fn array_literal_symbols() {
+        assert_eq!(eval("#(#foo #bar) at: 0"), Value::Symbol(Arc::from("foo")));
+    }
+
+    #[test]
+    fn array_literal_passed_to_do() {
+        let src = "| s | s := 0. #(1 2 3 4) do: [:e | s := s + e]. s";
+        assert_eq!(eval(src), Value::Int(10));
+    }
+
+    #[test]
+    fn array_literal_non_literal_token_is_parse_error() {
+        let result = crate::parser::Parser::parse("#(1 + 2)");
+        assert!(result.is_err());
+    }
+
+    // ── Integration tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn oc_as_queue() {
+        let src = r#"
+| q |
+q := OrderedCollection new.
+q add: 'a'.
+q add: 'b'.
+q add: 'c'.
+q removeFirst , (q removeFirst) , (q removeFirst)
+"#;
+        assert_eq!(eval(src), Value::Str(Arc::from("abc")));
+    }
+
+    #[test]
+    fn collect_then_inject() {
+        let src = r#"
+| oc |
+oc := OrderedCollection new.
+1 to: 5 do: [:i | oc add: i].
+(oc collect: [:e | e * e]) inject: 0 into: [:acc :e | acc + e]
+"#;
+        assert_eq!(eval(src), Value::Int(55)); // 1+4+9+16+25
+    }
+
+    #[test]
+    fn user_subclass_of_array() {
+        let src = r#"
+Array subclass: #Stack instanceVariableNames: '' indexedSlots: #pointer.
+Stack >> push: v [ self _primAt: 0 put: v ]
+Stack >> top   [ ^self _primAt: 0 ]
+| s |
+s := Stack new: 1.
+s push: 42.
+s top
+"#;
+        assert_eq!(eval(src), Value::Int(42));
+    }
+
+    #[test]
+    fn nested_array_literal_with_do() {
+        let src = r#"
+| outer s |
+outer := #(#(1 2) #(3 4)).
+s := 0.
+outer do: [:row | row do: [:e | s := s + e]].
+s
+"#;
+        assert_eq!(eval(src), Value::Int(10));
     }
 }
