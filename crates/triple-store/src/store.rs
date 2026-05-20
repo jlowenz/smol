@@ -865,4 +865,255 @@ mod tests {
         store_b.assert_single(&sys, fact(e(10), prv, e(10))).unwrap();
         assert_eq!(store_a.query_open(&sys, e(10), prv, None).unwrap().len(), 1);
     }
+
+    // ── now / resolve ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn now_returns_a_timestamp() {
+        let store = Store::in_memory();
+        let t = store.now();
+        // Two successive calls must be non-decreasing.
+        let t2 = store.now();
+        assert!(t2 >= t);
+    }
+
+    #[test]
+    fn resolve_known_predicate_returns_name() {
+        let store = Store::in_memory();
+        let pred = store.declare("my.predicate", Visibility::Public, Cardinality::Single).unwrap();
+        let name = store.resolve(pred).unwrap();
+        assert_eq!(name.as_ref(), "my.predicate");
+    }
+
+    #[test]
+    fn resolve_unknown_predicate_returns_none() {
+        let store = Store::in_memory();
+        // A Predicate id not issued by this store has no name.
+        let ghost = Predicate(99_999);
+        assert!(store.resolve(ghost).is_none());
+    }
+
+    // ── declare conflict ──────────────────────────────────────────────────────
+
+    #[test]
+    fn declare_conflict_returns_declaration_conflict() {
+        let store = Store::in_memory();
+        store.declare("pred", Visibility::Public, Cardinality::Single).unwrap();
+        let err = store.declare("pred", Visibility::Private, Cardinality::Single).unwrap_err();
+        assert!(matches!(err, StoreError::DeclarationConflict(_)));
+    }
+
+    // ── history ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn history_returns_open_and_closed_facts() {
+        let (store, prv, _, _) = store_3();
+        let sys = ExecContext::System;
+
+        // First assert creates an open fact with object 0.
+        store.assert_single(&sys, fact(e(1), prv, e(1))).unwrap();
+        // Second assert on the same Single key supersedes the first (closes it)
+        // and opens a new fact with object 1.
+        let mut f2 = fact(e(1), prv, e(1));
+        f2.object = Term::Int(1);
+        store.assert_single(&sys, f2).unwrap();
+
+        let history = store.history(&sys, e(1), prv, None).unwrap();
+        assert_eq!(history.len(), 2, "both the superseded and current fact must appear");
+    }
+
+    #[test]
+    fn history_access_denied_for_other_entity() {
+        let (store, prv, _, _) = store_3();
+        let sys = ExecContext::System;
+        store.assert_single(&sys, fact(e(1), prv, e(1))).unwrap();
+
+        let other = ExecContext::Entity(e(2));
+        assert!(matches!(
+            store.history(&other, e(1), prv, None),
+            Err(StoreError::AccessDenied { .. })
+        ));
+    }
+
+    // ── Set cardinality ───────────────────────────────────────────────────────
+
+    #[test]
+    fn assert_set_and_retract_set_roundtrip() {
+        let store = Store::in_memory();
+        let set_pred =
+            store.declare("tags", Visibility::Public, Cardinality::Set).unwrap();
+        let sys = ExecContext::System;
+        let subject = e(1);
+        let asserter = e(1);
+
+        let f =
+            Fact { subject, predicate: set_pred, object: Term::Int(42), asserter, valid: None };
+        store.assert_set(&sys, f.clone()).unwrap();
+        assert_eq!(store.query_open(&sys, subject, set_pred, None).unwrap().len(), 1);
+
+        store.retract_set(&sys, subject, set_pred, asserter, Term::Int(42)).unwrap();
+        assert!(store.query_open(&sys, subject, set_pred, None).unwrap().is_empty());
+    }
+
+    // ── Indexed cardinality ───────────────────────────────────────────────────
+
+    #[test]
+    fn assert_indexed_and_retract_indexed_roundtrip() {
+        use crate::predicates::OrderingKey;
+        let store = Store::in_memory();
+        let idx_pred =
+            store.declare("items", Visibility::Public, Cardinality::Indexed).unwrap();
+        let sys = ExecContext::System;
+        let subject = e(1);
+        let asserter = e(1);
+        let key = OrderingKey::new(1.0).unwrap();
+
+        let f =
+            Fact { subject, predicate: idx_pred, object: Term::Int(7), asserter, valid: None };
+        store.assert_indexed(&sys, f, key).unwrap();
+        assert_eq!(store.query_open(&sys, subject, idx_pred, None).unwrap().len(), 1);
+
+        store.retract_indexed(&sys, subject, idx_pred, asserter, key).unwrap();
+        assert!(store.query_open(&sys, subject, idx_pred, None).unwrap().is_empty());
+    }
+
+    // ── query_at with explicit timestamps ─────────────────────────────────────
+
+    #[test]
+    fn query_at_returns_fact_visible_at_current_time() {
+        let (store, prv, _, _) = store_3();
+        let sys = ExecContext::System;
+
+        store.assert_single(&sys, fact(e(1), prv, e(1))).unwrap();
+        let now = store.now();
+
+        let results = store.query_at(&sys, e(1), prv, now, now, None).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn query_at_access_denied_for_other_entity() {
+        let (store, prv, _, _) = store_3();
+        let sys = ExecContext::System;
+        store.assert_single(&sys, fact(e(1), prv, e(1))).unwrap();
+        let now = store.now();
+
+        let other = ExecContext::Entity(e(2));
+        assert!(matches!(
+            store.query_at(&other, e(1), prv, now, now, None),
+            Err(StoreError::AccessDenied { .. })
+        ));
+    }
+
+    // ── StoreTransaction Set / Indexed ops ────────────────────────────────────
+
+    #[test]
+    fn store_tx_set_assert_and_retract() {
+        let store = Store::in_memory();
+        let set_pred =
+            store.declare("items", Visibility::Public, Cardinality::Set).unwrap();
+        let sys = ExecContext::System;
+        let subject = e(1);
+        let asserter = e(1);
+
+        let f =
+            Fact { subject, predicate: set_pred, object: Term::Int(1), asserter, valid: None };
+
+        let mut tx = store.begin(sys);
+        tx.assert_set(f).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(store.query_open(&sys, subject, set_pred, None).unwrap().len(), 1);
+
+        let f2 =
+            Fact { subject, predicate: set_pred, object: Term::Int(1), asserter, valid: None };
+        let mut tx2 = store.begin(sys);
+        tx2.retract_set(subject, set_pred, asserter, f2.object).unwrap();
+        tx2.commit().unwrap();
+        assert!(store.query_open(&sys, subject, set_pred, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_tx_indexed_assert_and_retract() {
+        use crate::predicates::OrderingKey;
+        let store = Store::in_memory();
+        let idx_pred =
+            store.declare("ranked", Visibility::Public, Cardinality::Indexed).unwrap();
+        let sys = ExecContext::System;
+        let subject = e(1);
+        let asserter = e(1);
+        let key = OrderingKey::new(0.5).unwrap();
+
+        let f =
+            Fact { subject, predicate: idx_pred, object: Term::Int(99), asserter, valid: None };
+
+        let mut tx = store.begin(sys);
+        tx.assert_indexed(f, key).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(store.query_open(&sys, subject, idx_pred, None).unwrap().len(), 1);
+
+        let mut tx2 = store.begin(sys);
+        tx2.retract_indexed(subject, idx_pred, asserter, key).unwrap();
+        tx2.commit().unwrap();
+        assert!(store.query_open(&sys, subject, idx_pred, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_tx_denied_set_buffer_call_leaves_buffer_intact() {
+        let store = Store::in_memory();
+        let set_pred =
+            store.declare("tags", Visibility::Private, Cardinality::Set).unwrap();
+        let ctx = ExecContext::Entity(e(1));
+
+        let f_own = Fact {
+            subject: e(1),
+            predicate: set_pred,
+            object: Term::Int(1),
+            asserter: e(1),
+            valid: None,
+        };
+        let f_other = Fact {
+            subject: e(2),
+            predicate: set_pred,
+            object: Term::Int(2),
+            asserter: e(1),
+            valid: None,
+        };
+
+        let mut tx = store.begin(ctx);
+        tx.assert_set(f_own).unwrap();
+        assert!(tx.assert_set(f_other).is_err()); // denied: external private
+        tx.commit().unwrap();
+
+        let sys = ExecContext::System;
+        assert_eq!(store.query_open(&sys, e(1), set_pred, None).unwrap().len(), 1);
+        assert!(store.query_open(&sys, e(2), set_pred, None).unwrap().is_empty());
+    }
+
+    // ── unsubscribe ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn unsubscribe_through_store_stops_delivery() {
+        use crate::pattern::{Match, MatchAsserter};
+        let (store, prv, _, _) = store_3();
+        let sys = ExecContext::System;
+        let pattern = Pattern {
+            subject: Match::Any,
+            predicate: Match::Any,
+            object: Match::Any,
+            asserter: MatchAsserter::Any,
+        };
+
+        let sub = store.subscribe(sys, pattern);
+        let id = sub.id();
+        store.unsubscribe(id);
+
+        // After the subscription is cancelled, no new events arrive.
+        // The channel may be closed or empty; either way no events should come through.
+        store.assert_single(&sys, fact(e(1), prv, e(1))).unwrap();
+        // try_recv returns either Ok(None) (empty) or Err(ChannelClosed); no event.
+        match sub.try_recv() {
+            Ok(None) | Err(_) => {} // expected: no events delivered
+            Ok(Some(ev)) => panic!("unexpected event after unsubscribe: {ev:?}"),
+        }
+    }
 }

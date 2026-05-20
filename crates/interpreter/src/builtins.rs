@@ -128,7 +128,7 @@ fn dispatch_int(
                     None => Ok(normalize_bigint(BigInt::from(n) + BigInt::from(m))),
                 },
                 Value::LargeInt(m) => Ok(normalize_bigint(BigInt::from(n) + (*m).clone())),
-                _ => Err(EvalError::TypeError(format!("+: argument must be Int or LargeInt"))),
+                _ => Err(EvalError::TypeError("+: argument must be Int or LargeInt".into())),
             }
         }
         "-" => {
@@ -140,7 +140,7 @@ fn dispatch_int(
                     None => Ok(normalize_bigint(BigInt::from(n) - BigInt::from(m))),
                 },
                 Value::LargeInt(m) => Ok(normalize_bigint(BigInt::from(n) - (*m).clone())),
-                _ => Err(EvalError::TypeError(format!("-: argument must be Int or LargeInt"))),
+                _ => Err(EvalError::TypeError("-: argument must be Int or LargeInt".into())),
             }
         }
         "*" => {
@@ -152,7 +152,7 @@ fn dispatch_int(
                     None => Ok(normalize_bigint(BigInt::from(n) * BigInt::from(m))),
                 },
                 Value::LargeInt(m) => Ok(normalize_bigint(BigInt::from(n) * (*m).clone())),
-                _ => Err(EvalError::TypeError(format!("*: argument must be Int or LargeInt"))),
+                _ => Err(EvalError::TypeError("*: argument must be Int or LargeInt".into())),
             }
         }
         "/" => {
@@ -166,7 +166,7 @@ fn dispatch_int(
                     if d.is_zero() { return Err(EvalError::TypeError("division by zero".into())); }
                     Ok(normalize_bigint(BigInt::from(n) / (*d).clone()))
                 }
-                _ => Err(EvalError::TypeError(format!("/: argument must be Int or LargeInt"))),
+                _ => Err(EvalError::TypeError("/: argument must be Int or LargeInt".into())),
             }
         }
         "//" => {
@@ -181,7 +181,7 @@ fn dispatch_int(
                     if d.is_zero() { return Err(EvalError::TypeError("division by zero".into())); }
                     Ok(normalize_bigint(bigint_floor_div(BigInt::from(n), &d)))
                 }
-                _ => Err(EvalError::TypeError(format!("//: argument must be Int or LargeInt"))),
+                _ => Err(EvalError::TypeError("//: argument must be Int or LargeInt".into())),
             }
         }
         "\\\\" => {
@@ -196,7 +196,7 @@ fn dispatch_int(
                     if d.is_zero() { return Err(EvalError::TypeError("division by zero".into())); }
                     Ok(normalize_bigint(bigint_floor_rem(BigInt::from(n), &d)))
                 }
-                _ => Err(EvalError::TypeError(format!("\\\\: argument must be Int or LargeInt"))),
+                _ => Err(EvalError::TypeError("\\\\: argument must be Int or LargeInt".into())),
             }
         }
         "<" => {
@@ -873,21 +873,9 @@ fn dispatch_object_primitive(
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(Value::Object(obj) != args.remove(0)))
         }
-        "yourself" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Object(obj))
-        }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from(format!("a {}", obj.class.name).as_str())))
-        }
-        "isNil" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Bool(false))
-        }
-        "notNil" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Bool(true))
         }
         "class" => {
             expect_arity(sel, 0, args.len())?;
@@ -1768,6 +1756,7 @@ t notNil
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn universal_yourself_on_various() {
         assert_eq!(eval("3.14 yourself"), Value::Float(3.14));
         assert_eq!(eval("'hi' yourself"), Value::Str(Arc::from("hi")));
@@ -2001,5 +1990,486 @@ Thing new error: 'boom'
             crate::eval::EvalError::TypeError(msg) => assert!(msg.contains("boom")),
             e => panic!("expected TypeError, got {e:?}"),
         }
+    }
+
+    // ── String edge cases ─────────────────────────────────────────────────────
+
+    #[test]
+    fn string_at_out_of_bounds() {
+        assert!(matches!(
+            eval_err("'abc' at: 10"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+    }
+
+    // ── Block whileTrue:/whileFalse: non-Bool errors ──────────────────────────
+
+    #[test]
+    fn block_while_true_colon_non_bool_condition_errors() {
+        assert!(matches!(
+            eval_err("[1] whileTrue: []"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+    }
+
+    #[test]
+    fn block_while_false_colon_non_bool_condition_errors() {
+        assert!(matches!(
+            eval_err("[1] whileFalse: []"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+    }
+
+    #[test]
+    fn block_while_true_no_arg_non_bool_errors() {
+        assert!(matches!(
+            eval_err("[1] whileTrue"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+    }
+
+    #[test]
+    fn block_while_false_no_arg_non_bool_errors() {
+        assert!(matches!(
+            eval_err("[1] whileFalse"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+    }
+
+    // ── _primAt:put: edge cases ───────────────────────────────────────────────
+
+    #[test]
+    fn prim_at_put_byte_storage_non_int_arg_errors() {
+        let src = r#"
+| ba |
+ba := ByteArray new: 2.
+ba _primAt: 0 put: 'x'
+"#;
+        assert!(matches!(eval_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn prim_at_put_float64_storage_and_int_coerce() {
+        let src = r#"
+Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+| a |
+a := FA new: 2.
+a _primAt: 0 put: 3.
+a _primAt: 1 put: 1.5.
+a _primAt: 0
+"#;
+        assert_eq!(eval_no_kernel(src), Value::Float(3.0));
+    }
+
+    #[test]
+    fn prim_at_put_float64_wrong_type_errors() {
+        let src = r#"
+Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+| a |
+a := FA new: 2.
+a _primAt: 0 put: 'bad'
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn prim_as_string_on_non_byte_storage_errors() {
+        let src = r#"
+Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+| a |
+a := FA new: 2.
+a _primAsString
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    // ── Int op LargeInt promotion ─────────────────────────────────────────────
+
+    #[test]
+    fn int_arithmetic_with_largeint_arg() {
+        let big = "99999999999999999999";
+        // Int + LargeInt
+        let v = eval(&format!("1 + {big}"));
+        assert!(matches!(v, Value::LargeInt(_)));
+        // Int - LargeInt
+        let v = eval(&format!("1 - {big}"));
+        assert!(matches!(v, Value::LargeInt(_)));
+        // Int * LargeInt
+        let v = eval(&format!("1 * {big}"));
+        assert!(matches!(v, Value::LargeInt(_)));
+        // Int / LargeInt (small / huge → 0 via BigInt)
+        let v = eval(&format!("10 / {big}"));
+        assert_eq!(v, Value::Int(0));
+        // Int // LargeInt
+        let v = eval(&format!("10 // {big}"));
+        assert_eq!(v, Value::Int(0));
+        // Int \\ LargeInt
+        let v = eval(&format!("10 \\\\ {big}"));
+        assert_eq!(v, Value::Int(10));
+    }
+
+    #[test]
+    fn int_mul_overflow_promotes_to_bigint() {
+        // i64::MAX * 2 overflows i64; should yield a LargeInt.
+        let v = eval("9223372036854775807 * 2");
+        assert!(matches!(v, Value::LargeInt(_)));
+    }
+
+    #[test]
+    fn int_negated_min_promotes_to_bigint() {
+        // i64::MIN has no positive i64 representation.
+        let v = eval("-9223372036854775808 negated");
+        assert!(matches!(v, Value::LargeInt(_)));
+    }
+
+    // ── Type errors in helper functions ───────────────────────────────────────
+
+    #[test]
+    fn as_int_type_error() {
+        // as_int is called when an Int is expected but another type is given.
+        assert!(matches!(eval_err("1 < 'hello'"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_err("1 > true"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_err("1 max: 'x'"), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn as_block_type_error() {
+        // as_block is called when a Block is expected but another type is given.
+        assert!(matches!(eval_err("[true] whileTrue: 'notABlock'"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_err("[true] whileFalse: 42"), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn bigint_from_value_type_error() {
+        // bigint_from_value is called for LargeInt arithmetic; wrong type should TypeError.
+        assert!(matches!(
+            eval_err("99999999999999999999 + 'bad'"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+    }
+
+    // ── Int arithmetic type errors ────────────────────────────────────────────
+
+    #[test]
+    fn int_arithmetic_type_errors() {
+        for op in ["+", "-", "*", "/", "//", "\\\\"] {
+            let src = format!("1 {op} 'bad'");
+            assert!(
+                matches!(eval_err(&src), crate::eval::EvalError::TypeError(_)),
+                "op {op}: expected TypeError"
+            );
+        }
+    }
+
+    // ── Float type error ──────────────────────────────────────────────────────
+
+    #[test]
+    fn float_arithmetic_type_error() {
+        assert!(matches!(eval_err("1.5 + 'bad'"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_err("1.5 < nil"), crate::eval::EvalError::TypeError(_)));
+    }
+
+    // ── Bool type errors ──────────────────────────────────────────────────────
+
+    #[test]
+    fn bool_pipe_operator() {
+        assert_eq!(eval("true | false"), Value::Bool(true));
+        assert_eq!(eval("false | false"), Value::Bool(false));
+        assert_eq!(eval("false | true"), Value::Bool(true));
+    }
+
+    #[test]
+    fn bool_pipe_type_error() {
+        assert!(matches!(eval_err("true | 1"), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn bool_ampersand_type_error() {
+        assert!(matches!(eval_err("true & 1"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_err("true & nil"), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn bool_and_colon_non_bool_block_result_errors() {
+        assert!(matches!(eval_err("true and: [1]"), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn bool_or_colon_non_bool_block_result_errors() {
+        assert!(matches!(eval_err("false or: [1]"), crate::eval::EvalError::TypeError(_)));
+    }
+
+    // ── String type errors ────────────────────────────────────────────────────
+
+    #[test]
+    fn string_concat_type_error() {
+        assert!(matches!(eval_err("'hello' , 42"), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn string_includes_type_error() {
+        assert!(matches!(
+            eval_err("'hello' includesSubString: 1"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+    }
+
+    // ── Block on:do: pass-through for non-local return ────────────────────────
+
+    #[test]
+    fn block_on_do_passes_through_non_local_return() {
+        let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Foo >> test [
+    [^42] on: nil do: [:e | 'caught'].
+]
+Foo new test
+"#;
+        assert_eq!(eval(src), Value::Int(42));
+    }
+
+    #[test]
+    fn block_mnu() {
+        assert!(matches!(
+            eval_err("[] unknownBlockMsg"),
+            crate::eval::EvalError::MessageNotUnderstood { .. }
+        ));
+    }
+
+    // ── Object primitive paths ────────────────────────────────────────────────
+
+    #[test]
+    fn object_is_kind_of_returns_false_for_unrelated_class() {
+        let src = r#"
+Object subclass: #Dog instanceVariableNames: ''.
+Object subclass: #Cat instanceVariableNames: ''.
+Dog new isKindOf: Cat
+"#;
+        assert_eq!(eval(src), Value::Bool(false));
+    }
+
+    #[test]
+    fn object_is_kind_of_non_class_arg_errors() {
+        let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Foo new isKindOf: 'notAClass'
+"#;
+        assert!(matches!(eval_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn object_responds_to_non_symbol_arg_errors() {
+        let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Foo new respondsTo: 42
+"#;
+        assert!(matches!(eval_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn object_mnu() {
+        let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Foo new completelyUnknownMessage
+"#;
+        assert!(matches!(eval_err(src), crate::eval::EvalError::MessageNotUnderstood { .. }));
+    }
+
+    #[test]
+    fn object_error_colon_non_string_arg() {
+        let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Foo new error: 42
+"#;
+        assert!(matches!(eval_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn class_new_indexed_via_plain_new() {
+        // `new` (no size) on an indexed class creates a zero-size indexed object.
+        let src = r#"
+Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+FA new _primSize
+"#;
+        assert_eq!(eval_no_kernel(src), Value::Int(0));
+    }
+
+    #[test]
+    fn class_new_without_indexed_slots_errors() {
+        let src = r#"
+Object subclass: #Plain instanceVariableNames: ''.
+Plain new: 3
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn class_not_equal() {
+        assert_eq!(eval("Array ~= ByteArray"), Value::Bool(true));
+        assert_eq!(eval("Array ~= Array"), Value::Bool(false));
+    }
+
+    #[test]
+    fn class_mnu() {
+        assert!(matches!(
+            eval_err("Array unknownClassMsg"),
+            crate::eval::EvalError::MessageNotUnderstood { .. }
+        ));
+    }
+
+    #[test]
+    fn namespace_do_non_block_arg_errors() {
+        assert!(matches!(eval_err("Kernel do: 1"), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn namespace_mnu() {
+        assert!(matches!(
+            eval_err("Kernel unknownNsMsg"),
+            crate::eval::EvalError::MessageNotUnderstood { .. }
+        ));
+    }
+
+    // ── _primAt: bounds for Byte and Float64 storage ──────────────────────────
+
+    #[test]
+    fn prim_at_byte_storage_out_of_bounds() {
+        let src = r#"
+Object subclass: #BA instanceVariableNames: '' classVariableNames: '' indexedSlots: #byte.
+| a |
+a := BA new: 3.
+a _primAt: 5
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn prim_at_float64_storage_out_of_bounds() {
+        let src = r#"
+Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+| a |
+a := FA new: 3.
+a _primAt: 5
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    // ── _primAt:put: no storage, bounds errors ────────────────────────────────
+
+    #[test]
+    fn prim_at_put_no_indexed_storage_error() {
+        let src = r#"
+Object subclass: #Plain instanceVariableNames: ''.
+Plain new _primAt: 0 put: 1
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn prim_at_put_pointer_bounds_error() {
+        let src = r#"
+Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+| a |
+a := Arr new: 2.
+a _primAt: 5 put: 42
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn prim_at_put_byte_bounds_error() {
+        let src = r#"
+Object subclass: #BA instanceVariableNames: '' classVariableNames: '' indexedSlots: #byte.
+| a |
+a := BA new: 2.
+a _primAt: 5 put: 100
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn prim_at_put_float64_bounds_error() {
+        let src = r#"
+Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+| a |
+a := FA new: 2.
+a _primAt: 5 put: 1.0
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    // ── _primSize and _primAsString edge cases ────────────────────────────────
+
+    #[test]
+    fn prim_size_float64_storage() {
+        let src = r#"
+Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+| a |
+a := FA new: 4.
+a _primSize
+"#;
+        assert_eq!(eval_no_kernel(src), Value::Int(4));
+    }
+
+    #[test]
+    fn prim_as_string_no_indexed_storage_errors() {
+        let src = r#"
+Object subclass: #Plain instanceVariableNames: ''.
+Plain new _primAsString
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    // ── error: with non-String arg ────────────────────────────────────────────
+
+    #[test]
+    fn object_error_colon_non_string() {
+        // `error: <non-String>` should format a TypeError using other.kind()
+        let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Foo new error: 42
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    // ── handle_subclass error paths ───────────────────────────────────────────
+
+    #[test]
+    fn subclass_bad_class_name_type_errors() {
+        let src = r#"Object subclass: 'notASymbol' instanceVariableNames: ''."#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn subclass_bad_ivar_names_type_errors() {
+        let src = r#"Object subclass: #Foo instanceVariableNames: 42."#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn subclass_bad_class_var_names_type_errors() {
+        let src = r#"Object subclass: #Foo instanceVariableNames: '' classVariableNames: 42."#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn subclass_bad_indexed_slots_type_errors() {
+        let src = r#"Object subclass: #Foo instanceVariableNames: '' classVariableNames: '' indexedSlots: 'notASymbol'."#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn subclass_unknown_indexed_kind_errors() {
+        let src = r#"Object subclass: #Foo instanceVariableNames: '' classVariableNames: '' indexedSlots: #badKind."#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+    }
+
+    #[test]
+    fn subclass_ivar_overlap_with_superclass_errors() {
+        let src = r#"
+Object subclass: #A instanceVariableNames: 'x'.
+A subclass: #B instanceVariableNames: 'x'.
+"#;
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
     }
 }

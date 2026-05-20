@@ -19,6 +19,9 @@
 
 use async_channel::{Receiver, Sender, TryRecvError};
 
+/// Visibility filter applied to events before delivery to a subscriber.
+pub(crate) type EventFilter = Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync>;
+
 use crate::id::{SubscriptionId, TxId};
 use crate::pattern::Pattern;
 use crate::term::{Predicate, Term};
@@ -60,7 +63,7 @@ pub(crate) struct Subscriber {
     pub(crate) id: SubscriptionId,
     pub(crate) pattern: Pattern,
     pub(crate) sender: Sender<ChangeEvent>,
-    pub(crate) filter: Option<Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync>>,
+    pub(crate) filter: Option<EventFilter>,
 }
 
 /// The only error the subscription API surfaces.

@@ -52,10 +52,8 @@ enum WalRecord {
 }
 
 fn write_wal_record(log: &mut BufWriter<File>, record: &WalRecord) -> io::Result<()> {
-    let encoded = bincode::serialize(record)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let len = u32::try_from(encoded.len())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let encoded = bincode::serialize(record).map_err(io::Error::other)?;
+    let len = u32::try_from(encoded.len()).map_err(io::Error::other)?;
     log.write_all(&len.to_le_bytes())?;
     log.write_all(&encoded)?;
     log.flush()?;
@@ -131,7 +129,7 @@ impl Applier<StoredFact> for DurableInner {
 
         if !changes.is_empty() {
             let record = WalRecord::FactBatch(changes.clone());
-            write_wal_record(&mut *self.log.lock(), &record)
+            write_wal_record(&mut self.log.lock(), &record)
                 .map_err(|_| TxError::Internal("log write failed"))?;
         }
 
@@ -380,7 +378,7 @@ impl TripleStore<StoredFact> for DurableFileTripleStore {
             visibility,
             cardinality,
         };
-        write_wal_record(&mut *self.inner.log.lock(), &record)
+        write_wal_record(&mut self.inner.log.lock(), &record)
     }
 
     fn recovered_registry(&self) -> PredicateRegistry {

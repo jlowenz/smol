@@ -167,4 +167,42 @@ mod tests {
         // Both happen to be u32(0), but they live in different typed namespaces.
         assert_eq!(pid.0, sid.0);
     }
+
+    #[test]
+    fn string_interner_len_and_is_empty() {
+        let mut i = StringInterner::new();
+        assert!(i.is_empty());
+        assert_eq!(i.len(), 0);
+
+        i.intern("a");
+        assert!(!i.is_empty());
+        assert_eq!(i.len(), 1);
+
+        i.intern("b");
+        assert_eq!(i.len(), 2);
+
+        // Re-interning an existing string does not grow the interner.
+        i.intern("a");
+        assert_eq!(i.len(), 2);
+    }
+
+    #[test]
+    fn string_interner_default_is_empty() {
+        let i = StringInterner::default();
+        assert!(i.is_empty());
+    }
+
+    #[test]
+    fn predicate_interner_default_is_usable() {
+        let mut p = PredicateInterner::default();
+        let id = p.intern("x");
+        assert_eq!(p.resolve(id).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn symbol_interner_default_is_usable() {
+        let mut s = SymbolInterner::default();
+        let id = s.intern("x");
+        assert_eq!(s.resolve(id).as_deref(), Some("x"));
+    }
 }

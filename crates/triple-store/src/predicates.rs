@@ -145,4 +145,70 @@ mod tests {
         assert_eq!(m, OrderingKey::new(0.5).unwrap());
         assert!(a < m && m < b);
     }
+
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn as_f64_returns_inner_value() {
+        let k = OrderingKey::new(3.14).unwrap();
+        assert_eq!(k.as_f64(), 3.14);
+
+        let neg = OrderingKey::new(-42.0).unwrap();
+        assert_eq!(neg.as_f64(), -42.0);
+    }
+
+    #[test]
+    fn partial_ord_delegates_to_ord() {
+        use std::cmp::Ordering;
+        let a = OrderingKey::new(1.0).unwrap();
+        let b = OrderingKey::new(2.0).unwrap();
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(b.partial_cmp(&a), Some(Ordering::Greater));
+        assert_eq!(a.partial_cmp(&a), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn hash_of_equal_keys_is_equal() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let a = OrderingKey::new(1.5).unwrap();
+        let b = OrderingKey::new(1.5).unwrap();
+        assert_eq!(a, b);
+
+        let hash_of = |k: OrderingKey| {
+            let mut h = DefaultHasher::new();
+            k.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_of(a), hash_of(b));
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn serde_roundtrip_finite_value() {
+        let k = OrderingKey::new(2.718).unwrap();
+        let encoded = bincode::serialize(&k).unwrap();
+        let decoded: OrderingKey = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(k, decoded);
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_negative_zero_bit_pattern() {
+        let neg_zero = OrderingKey::new(-0.0).unwrap();
+        let pos_zero = OrderingKey::new(0.0).unwrap();
+        // Bit patterns differ; serialization must preserve them.
+        let encoded = bincode::serialize(&neg_zero).unwrap();
+        let decoded: OrderingKey = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(neg_zero, decoded);
+        assert_ne!(decoded, pos_zero);
+    }
+
+    #[test]
+    fn cardinality_serde_roundtrip() {
+        for c in [Cardinality::Single, Cardinality::Set, Cardinality::Indexed] {
+            let encoded = bincode::serialize(&c).unwrap();
+            let decoded: Cardinality = bincode::deserialize(&encoded).unwrap();
+            assert_eq!(c, decoded);
+        }
+    }
 }

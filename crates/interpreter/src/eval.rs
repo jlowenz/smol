@@ -158,10 +158,10 @@ impl Evaluator {
                     return Some(v);
                 }
                 // 3. class variables
-                if let Some(owner) = receiver.class.lookup_class_var_owner(name) {
-                    if let Some(v) = owner.class_var_storage.borrow().get(name).cloned() {
-                        return Some(v);
-                    }
+                if let Some(owner) = receiver.class.lookup_class_var_owner(name)
+                    && let Some(v) = owner.class_var_storage.borrow().get(name).cloned()
+                {
+                    return Some(v);
                 }
                 // 4. outer env (globals)
                 env.lookup_outer_frames(name)
@@ -172,10 +172,10 @@ impl Evaluator {
                     return Some(v);
                 }
                 // 2. class variables (no instance variables — class-side has none)
-                if let Some(owner) = class.lookup_class_var_owner(name) {
-                    if let Some(v) = owner.class_var_storage.borrow().get(name).cloned() {
-                        return Some(v);
-                    }
+                if let Some(owner) = class.lookup_class_var_owner(name)
+                    && let Some(v) = owner.class_var_storage.borrow().get(name).cloned()
+                {
+                    return Some(v);
                 }
                 // 3. outer env (globals)
                 env.lookup_outer_frames(name)
@@ -1377,4 +1377,11 @@ s
 "#;
         assert_eq!(eval(src), Value::Int(10));
     }
+
+    #[test]
+    fn block_with_locals() {
+        let prog = "b := [:i | | a | a := 42. a := a + i. a]. (b value: 42) printString.";
+        assert_eq!(eval(prog), Value::Str(Arc::from("84")));
+    }
+
 }

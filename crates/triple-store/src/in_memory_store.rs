@@ -134,20 +134,14 @@ fn matches_pattern(fact: &StoredFact, pattern: Option<&Pattern>) -> bool {
     let Some(pat) = pattern else {
         return true;
     };
-    if let Match::Is(s) = &pat.subject {
-        if fact.subject != *s {
-            return false;
-        }
+    if let Match::Is(s) = &pat.subject && fact.subject != *s {
+        return false;
     }
-    if let Match::Is(p) = &pat.predicate {
-        if fact.predicate != *p {
-            return false;
-        }
+    if let Match::Is(p) = &pat.predicate && fact.predicate != *p {
+        return false;
     }
-    if let Match::Is(o) = &pat.object {
-        if fact.object != *o {
-            return false;
-        }
+    if let Match::Is(o) = &pat.object && fact.object != *o {
+        return false;
     }
     match &pat.asserter {
         MatchAsserter::Any => {}
@@ -471,10 +465,8 @@ pub(crate) fn dispatch_changes(
                 let Some(event) = build_event(change, tx_id, &sub.pattern) else {
                     continue;
                 };
-                if let Some(ref f) = sub.filter {
-                    if !f(&event) {
-                        continue;
-                    }
+                if sub.filter.as_deref().is_some_and(|f| !f(&event)) {
+                    continue;
                 }
                 match sub.sender.try_send(event) {
                     Ok(()) => {}

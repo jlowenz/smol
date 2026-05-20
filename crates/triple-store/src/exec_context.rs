@@ -33,7 +33,7 @@ impl ExecContext {
             ExecContext::Entity(_) if predicate.visibility == Visibility::Public => Ok(()),
             // An external entity cannot assert another shared/private predicate
             ExecContext::Entity(_) => Err(AccessError::Denied {
-                predicate: predicate,
+                predicate,
                 reason: "Cannot assert a non-public predicate on another entity.",
             }),
         }
@@ -53,7 +53,7 @@ impl ExecContext {
             ExecContext::Entity(_) if predicate.visibility >= Visibility::Shared => Ok(()),
             // An external entity cannot read a private predicate
             ExecContext::Entity(_) => Err(AccessError::Denied {
-                predicate: predicate,
+                predicate,
                 reason: "Cannot read a private predicate on another entity.",
             }),
         }

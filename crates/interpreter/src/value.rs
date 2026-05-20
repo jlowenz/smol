@@ -268,6 +268,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::mutable_key_type)]
     fn hash_does_not_panic() {
         let mut map: HashMap<Value, i32> = HashMap::new();
         map.insert(Value::Int(1), 1);

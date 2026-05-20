@@ -8,7 +8,7 @@
 
 use std::io;
 
-use crate::change::{ChangeEvent, Subscription};
+use crate::change::{EventFilter, Subscription};
 use crate::fact::BitemporalFact;
 use crate::id::{EntityId, SubscriptionId};
 use crate::pattern::{AsOf, Pattern};
@@ -50,7 +50,7 @@ pub trait TripleStore<TFact: BitemporalFact>: Queryable<TFact> + Send + Sync {
     fn subscribe(
         &self,
         pattern: Pattern,
-        filter: Option<Box<dyn Fn(&ChangeEvent) -> bool + Send + Sync>>,
+        filter: Option<EventFilter>,
     ) -> Subscription;
 
     /// Cancel a subscription. No-op if `id` is unknown.

@@ -235,11 +235,11 @@ impl<'src> Lexer<'src> {
         s.push(first);
         // Multi-char operators: `<=`, `>=`, `>>`, `~=`, `//`, `\\`, `~~`, `->`.
         if let Some(next) = self.peek_char() {
-            let two: bool = match (first, next) {
+            let two = matches!(
+                (first, next),
                 ('<', '=') | ('>', '=') | ('>', '>') | ('~', '=') | ('/', '/') | ('\\', '\\')
-                | ('-', '>') | ('~', '~') => true,
-                _ => false,
-            };
+                | ('-', '>') | ('~', '~')
+            );
             if two {
                 s.push(self.advance().unwrap());
             }
@@ -366,6 +366,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn float_literal() {
         assert_eq!(tok("3.14"), vec![Token::Float(3.14), Token::Eof]);
     }
@@ -381,6 +382,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn negative_float_literal() {
         assert_eq!(tok("-3.14"), vec![Token::Float(-3.14), Token::Eof]);
     }

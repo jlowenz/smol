@@ -15,18 +15,28 @@ pub enum ParseError {
     UnexpectedEof(&'static str),
     #[error("invalid assignment target")]
     InvalidAssignTarget,
+    /// `^` inside a block that has no enclosing method. Non-local returns
+    /// require a method frame to return to; without one the return has nowhere
+    /// to go and is always a programming error.
+    #[error("`^` (non-local return) inside a block requires an enclosing method")]
+    NonLocalReturnOutsideMethod,
 }
 
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     comments: Vec<Arc<str>>,
+    /// True while parsing a method body. Lets `^` inside nested blocks pass.
+    in_method: bool,
+    /// True while parsing any block body. Combined with `in_method` to detect
+    /// orphaned non-local returns at parse time.
+    in_block: bool,
 }
 
 impl Parser {
     pub fn parse(src: &str) -> Result<Program, ParseError> {
         let tokens = Lexer::tokenize(src)?;
-        let mut p = Parser { tokens, pos: 0, comments: Vec::new() };
+        let mut p = Parser { tokens, pos: 0, comments: Vec::new(), in_method: false, in_block: false };
         p.parse_program()
     }
 
@@ -106,9 +116,12 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
-        // `^` return
+        // `^` non-local return
         if self.peek() == &Token::Caret {
             self.advance();
+            if self.in_block && !self.in_method {
+                return Err(ParseError::NonLocalReturnOutsideMethod);
+            }
             let expr = self.parse_expr()?;
             return Ok(Stmt::Return(expr));
         }
@@ -222,12 +235,18 @@ impl Parser {
             self.expect("closing '|' for method locals", |t| t == &Token::Pipe)?;
         }
 
-        // Statements until ']'
+        // Statements until ']' — `^` is valid here and in any nested blocks.
+        let prev_in_method = self.in_method;
+        let prev_in_block = self.in_block;
+        self.in_method = true;
+        self.in_block = false;
         let mut body = Vec::new();
         while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
             body.push(self.parse_stmt()?);
             self.eat(&Token::Dot);
         }
+        self.in_method = prev_in_method;
+        self.in_block = prev_in_block;
         self.expect("']'", |t| t == &Token::RBracket)?;
 
         Ok(Stmt::MethodDef(MethodDef { class_name, pattern, locals, body, is_class_side }))
@@ -316,8 +335,15 @@ impl Parser {
 
     fn parse_binary_level(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_unary_level()?;
-        while let Token::BinOp(op) = self.peek().clone() {
-            self.advance();
+        loop {
+            // `Token::Pipe` is also valid as the binary `|` operator in expression
+            // position; the local-decl uses of `|` are consumed before this level
+            // is reached (in `parse_program` and `parse_block`).
+            let op: Arc<str> = match self.peek().clone() {
+                Token::BinOp(op) => { self.advance(); op }
+                Token::Pipe => { self.advance(); Arc::from("|") }
+                _ => break,
+            };
             let right = self.parse_unary_level()?;
             left = Expr::Send {
                 receiver: Box::new(left),
@@ -457,11 +483,14 @@ impl Parser {
             }
             self.expect("closing '|' for locals", |t| t == &Token::Pipe)?;
         }
+        let prev_in_block = self.in_block;
+        self.in_block = true;
         let mut body = Vec::new();
         while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
             body.push(self.parse_stmt()?);
             self.eat(&Token::Dot);
         }
+        self.in_block = prev_in_block;
         self.expect("']'", |t| t == &Token::RBracket)?;
         Ok(Expr::Block { params, locals, body })
     }
@@ -504,6 +533,21 @@ mod tests {
             Expr::Send {
                 receiver: Box::new(Expr::Lit(Literal::Int(3))),
                 message: Message::Unary(Arc::from("negated")),
+            }
+        );
+    }
+
+    #[test]
+    fn pipe_parsed_as_binary_send() {
+        // `|` in expression position is a binary message, not a local-decl delimiter.
+        assert_eq!(
+            expr("true | false"),
+            Expr::Send {
+                receiver: Box::new(Expr::Lit(Literal::Bool(true))),
+                message: Message::Binary {
+                    op: Arc::from("|"),
+                    arg: Box::new(Expr::Lit(Literal::Bool(false))),
+                },
             }
         );
     }
@@ -716,5 +760,244 @@ mod tests {
             }
             _ => panic!("expected MethodDef"),
         }
+    }
+    // ── Non-local return validation ───────────────────────────────────────────
+
+    #[test]
+    fn caret_in_toplevel_block_is_parse_error() {
+        let err = Parser::parse("[^42] value").unwrap_err();
+        assert_eq!(err, ParseError::NonLocalReturnOutsideMethod);
+    }
+
+    #[test]
+    fn caret_in_nested_toplevel_block_is_parse_error() {
+        let err = Parser::parse("[[^42]] value value").unwrap_err();
+        assert_eq!(err, ParseError::NonLocalReturnOutsideMethod);
+    }
+
+    #[test]
+    fn caret_inside_method_block_is_valid() {
+        // `^` inside a block that's inside a method body is a legitimate
+        // non-local return targeting the method frame.
+        let prog = parse("Foo >> run [ [^42] value ]");
+        assert!(matches!(prog.stmts[0], Stmt::MethodDef(_)));
+    }
+
+    #[test]
+    fn caret_directly_in_method_body_is_valid() {
+        let prog = parse("Foo >> count [ ^count ]");
+        assert!(matches!(prog.stmts[0], Stmt::MethodDef(_)));
+    }
+
+    // ── Primary literal variants ──────────────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn float_literal() {
+        assert_eq!(expr("3.14"), Expr::Lit(Literal::Float(3.14)));
+    }
+
+    #[test]
+    fn bool_and_nil_literals() {
+        assert_eq!(expr("true"), Expr::Lit(Literal::Bool(true)));
+        assert_eq!(expr("false"), Expr::Lit(Literal::Bool(false)));
+        assert_eq!(expr("nil"), Expr::Lit(Literal::Nil));
+    }
+
+    #[test]
+    fn super_keyword_parsed() {
+        assert_eq!(expr("super"), Expr::Super);
+    }
+
+    #[test]
+    fn parenthesized_expression() {
+        assert_eq!(expr("(42)"), Expr::Lit(Literal::Int(42)));
+    }
+
+    // ── Namespace resolution ──────────────────────────────────────────────────
+
+    #[test]
+    fn namespace_ref_single_level() {
+        let e = expr("A::B");
+        assert_eq!(e, Expr::NamespaceRef { namespace_path: vec![Arc::from("A")], name: Arc::from("B") });
+    }
+
+    #[test]
+    fn namespace_ref_deep_path() {
+        let e = expr("A::B::C");
+        assert_eq!(
+            e,
+            Expr::NamespaceRef {
+                namespace_path: vec![Arc::from("A"), Arc::from("B")],
+                name: Arc::from("C"),
+            }
+        );
+    }
+
+    #[test]
+    fn unexpected_token_after_colons_is_error() {
+        let err = Parser::parse("A:: 123").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken(_, "identifier after ::")));
+    }
+
+    // ── Array literals ────────────────────────────────────────────────────────
+
+    #[test]
+    fn array_literal_empty_in_parser() {
+        let e = expr("#()");
+        assert_eq!(e, Expr::ArrayLiteral(vec![]));
+    }
+
+    #[test]
+    fn array_literal_bool_and_nil_elements() {
+        let e = expr("#(true false nil)");
+        assert_eq!(
+            e,
+            Expr::ArrayLiteral(vec![
+                Literal::Bool(true),
+                Literal::Bool(false),
+                Literal::Nil,
+            ])
+        );
+    }
+
+    #[test]
+    fn array_literal_nested() {
+        let e = expr("#(#(1 2) 3)");
+        assert_eq!(
+            e,
+            Expr::ArrayLiteral(vec![
+                Literal::Array(vec![Literal::Int(1), Literal::Int(2)]),
+                Literal::Int(3),
+            ])
+        );
+    }
+
+    #[test]
+    fn array_literal_invalid_element_is_error() {
+        // `[` is not a valid literal element inside an array literal.
+        let err = Parser::parse("#([])").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken(_, "literal element in array literal")));
+    }
+
+    // ── Error cases ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn unexpected_eof_as_primary_is_error() {
+        let err = Parser::parse("(").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedEof(_)));
+    }
+
+    #[test]
+    fn unexpected_token_as_primary_is_error() {
+        // `]` is not a valid start of a primary expression.
+        let err = Parser::parse("]").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken(_, "expression")));
+    }
+
+    #[test]
+    fn method_def_with_comment_between_class_and_arrow() {
+        let prog = parse("Counter \"note\" >> inc [ ]");
+        assert!(matches!(prog.stmts[0], Stmt::MethodDef(_)));
+    }
+
+    // ── expect() EOF and UnexpectedToken paths ────────────────────────────────
+
+    #[test]
+    fn unclosed_array_literal_gives_unexpected_eof() {
+        // `expect("')' to close array literal")` receives EOF.
+        let err = Parser::parse("#(1 2").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedEof(_)));
+    }
+
+    #[test]
+    fn unclosed_paren_with_extra_token_gives_unexpected_token() {
+        // `expect("')'")` receives `3` instead.
+        let err = Parser::parse("(1 + 2 3)").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken(_, _)));
+    }
+
+    // ── Assignment comment lookahead (lines 143-145) ──────────────────────────
+
+    #[test]
+    fn assignment_with_comment_between_ident_and_assign() {
+        // Comment token between variable and `:=` is skipped during lookahead.
+        let prog = parse("x \"a note\" := 5");
+        assert!(matches!(prog.stmts[0], Stmt::Assign { .. }));
+    }
+
+    // ── Method def invalid pattern (lines 206-207) ────────────────────────────
+
+    #[test]
+    fn method_def_invalid_pattern_errors() {
+        let err = Parser::parse("Foo >> 123 [ ]").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken(_, "method pattern")));
+    }
+
+    // ── Cascade binary and keyword messages (lines 300-311) ───────────────────
+
+    #[test]
+    fn cascade_binary_message() {
+        let e = expr("3 yourself; + 1");
+        assert!(matches!(e, Expr::Cascade { .. }));
+    }
+
+    #[test]
+    fn cascade_keyword_message() {
+        let e = expr("3 yourself; max: 5");
+        assert!(matches!(e, Expr::Cascade { .. }));
+    }
+
+    #[test]
+    fn cascade_invalid_message_after_semi_errors() {
+        // `123` after `;` is not a valid cascade message.
+        let err = Parser::parse("3 printString; 123").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken(_, "cascade message")));
+    }
+
+    #[test]
+    fn cascade_non_send_before_semi_errors() {
+        // Bare literal before `;` is not a message send.
+        let err = Parser::parse("3; + 1").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedToken(Token::Semi, _)));
+    }
+
+    // ── Unary level: comment in assign lookahead (lines 339-340, 344) ─────────
+
+    #[test]
+    fn unary_level_skips_comment_in_assign_lookahead() {
+        // `3 factorial` is parsed as a unary send; `x "note" := 5` is a separate
+        // assignment statement.  The comment between `x` and `:=` exercises the
+        // comment-skip loop inside the assign-lookahead check (lines 339-340, 344).
+        let prog = parse("3 factorial x \"a note\" := 5");
+        assert_eq!(prog.stmts.len(), 2);
+        assert!(matches!(prog.stmts[0], Stmt::Expr(_)));
+        assert!(matches!(prog.stmts[1], Stmt::Assign { .. }));
+    }
+
+    // ── Array literal: Float and LargeInt elements (lines 423, 429) ───────────
+
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn array_literal_float_elements() {
+        let e = expr("#(1.5 3.14)");
+        assert_eq!(
+            e,
+            Expr::ArrayLiteral(vec![Literal::Float(1.5), Literal::Float(3.14)])
+        );
+    }
+
+    #[test]
+    fn array_literal_largeint_element() {
+        use num_bigint::BigInt;
+        use std::str::FromStr;
+        use std::sync::Arc;
+        let e = expr("#(99999999999999999999)");
+        assert_eq!(
+            e,
+            Expr::ArrayLiteral(vec![Literal::LargeInt(
+                Arc::new(BigInt::from_str("99999999999999999999").unwrap())
+            )])
+        );
     }
 }
