@@ -25,6 +25,11 @@ pub enum EvalError {
     ArityMismatch { expected: usize, got: usize },
     #[error("type error: {0}")]
     TypeError(String),
+    /// Smol-raised signal (from `_primSignal:` / `Error signal:`). Carries a
+    /// clean message string, distinct from `TypeError` so `on:do:` can surface
+    /// it without the "type error: " prefix.
+    #[error("signal: {0}")]
+    Signal(Arc<str>),
     /// Non-local `^`-return carrying the value and the method-stack depth of the
     /// frame that should catch it. Only the `invoke_method` / `invoke_class_method`
     /// whose depth matches will unwrap this; all others propagate it unchanged.
@@ -1079,6 +1084,27 @@ result
     }
 
     #[test]
+    fn array_not_equal() {
+        let src = "| a b | a := Array new: 1. b := Array new: 1. a at: 0 put: 1. b at: 0 put: 2. a ~= b";
+        assert_eq!(eval(src), Value::Bool(true));
+        let src2 = "| a b | a := Array new: 1. b := Array new: 1. a at: 0 put: 5. b at: 0 put: 5. a ~= b";
+        assert_eq!(eval(src2), Value::Bool(false));
+    }
+
+    #[test]
+    fn array_eq_class_mismatch() {
+        // Array vs OrderedCollection should be unequal even if content looks similar
+        let src = "| a oc | a := Array new: 0. oc := OrderedCollection new. a = oc";
+        assert_eq!(eval(src), Value::Bool(false));
+    }
+
+    #[test]
+    fn array_detect_no_match_signals() {
+        let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a detect: [:e | e > 10]";
+        assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    }
+
+    #[test]
     fn array_print_string() {
         let src = "| a | a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2. a printString";
         assert_eq!(eval(src), Value::Str(Arc::from("(1 2 )")));
@@ -1097,6 +1123,12 @@ result
     fn bytearray_is_empty() {
         assert_eq!(eval("(ByteArray new: 0) isEmpty"), Value::Bool(true));
         assert_eq!(eval("(ByteArray new: 1) notEmpty"), Value::Bool(true));
+    }
+
+    #[test]
+    fn bytearray_print_string() {
+        let src = "| b | b := ByteArray new: 2. b at: 0 put: 65. b at: 1 put: 66. b printString";
+        assert_eq!(eval(src), Value::Str(Arc::from("(65 66 )")));
     }
 
     #[test]
@@ -1125,6 +1157,7 @@ result
     fn oc_new_is_empty() {
         assert_eq!(eval("OrderedCollection new isEmpty"), Value::Bool(true));
         assert_eq!(eval("OrderedCollection new size"), Value::Int(0));
+        assert_eq!(eval("OrderedCollection new notEmpty"), Value::Bool(false));
     }
 
     #[test]
@@ -1236,11 +1269,41 @@ result
     }
 
     #[test]
+    fn oc_at_put() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc at: 0 put: 99. oc at: 0";
+        assert_eq!(eval(src), Value::Int(99));
+    }
+
+    #[test]
+    fn oc_at_put_out_of_bounds_signals() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc at: 5 put: 99";
+        assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    }
+
+    #[test]
+    fn oc_detect_no_match_signals() {
+        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc detect: [:e | e > 10]";
+        assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    }
+
+    #[test]
     fn oc_equality() {
         let src = "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 1. a = b";
         assert_eq!(eval(src), Value::Bool(true));
         let src2 = "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 2. a = b";
         assert_eq!(eval(src2), Value::Bool(false));
+    }
+
+    #[test]
+    fn oc_eq_size_mismatch() {
+        let src = "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. a = b";
+        assert_eq!(eval(src), Value::Bool(false));
+    }
+
+    #[test]
+    fn oc_eq_class_mismatch() {
+        let src = "| oc a | oc := OrderedCollection new. a := Array new: 0. oc = a";
+        assert_eq!(eval(src), Value::Bool(false));
     }
 
     #[test]
@@ -1267,19 +1330,19 @@ result
     #[test]
     fn oc_remove_first_empty_errors() {
         let src = "OrderedCollection new removeFirst";
-        assert!(matches!(eval_err(src), EvalError::TypeError(_)));
+        assert!(matches!(eval_err(src), EvalError::Signal(_)));
     }
 
     #[test]
     fn oc_remove_last_empty_errors() {
         let src = "OrderedCollection new removeLast";
-        assert!(matches!(eval_err(src), EvalError::TypeError(_)));
+        assert!(matches!(eval_err(src), EvalError::Signal(_)));
     }
 
     #[test]
     fn oc_at_out_of_bounds_errors() {
         let src = "| oc | oc := OrderedCollection new. oc add: 1. oc at: 5";
-        assert!(matches!(eval_err(src), EvalError::TypeError(_)));
+        assert!(matches!(eval_err(src), EvalError::Signal(_)));
     }
 
     // ── Nested array literals ─────────────────────────────────────────────────
@@ -1382,6 +1445,381 @@ s
     fn block_with_locals() {
         let prog = "b := [:i | | a | a := 42. a := a + i. a]. (b value: 42) printString.";
         assert_eq!(eval(prog), Value::Str(Arc::from("84")));
+    }
+
+    // ── Signal / Error ────────────────────────────────────────────────────────
+
+    #[test]
+    fn error_signal_raises_signal() {
+        let src = "Error signal: 'boom'";
+        assert!(matches!(eval_err(src), EvalError::Signal(m) if m.as_ref() == "boom"));
+    }
+
+    #[test]
+    fn error_message_roundtrips() {
+        let src = r#"
+| e |
+e := Error new.
+e pvtSetMessage: 'hello'.
+e message
+"#;
+        assert_eq!(eval(src), Value::Str(Arc::from("hello")));
+    }
+
+    #[test]
+    fn error_messagetext_alias() {
+        let src = r#"
+| e |
+e := Error new.
+e pvtSetMessage: 'world'.
+e messageText
+"#;
+        assert_eq!(eval(src), Value::Str(Arc::from("world")));
+    }
+
+    #[test]
+    fn on_do_catches_signal() {
+        let src = "[Error signal: 'oops'] on: Error do: [:e | e]";
+        assert_eq!(eval(src), Value::Str(Arc::from("oops")));
+    }
+
+    #[test]
+    fn object_error_colon_delegates_to_error_signal() {
+        let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Foo new error: 'bad'
+"#;
+        assert!(matches!(eval_err(src), EvalError::Signal(m) if m.as_ref() == "bad"));
+    }
+
+    #[test]
+    fn on_do_catches_error_colon() {
+        let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+[Foo new error: 'caught me'] on: Error do: [:e | e]
+"#;
+        assert_eq!(eval(src), Value::Str(Arc::from("caught me")));
+    }
+
+    // ── _primHash ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hash_delegates_to_prim_hash_for_primitives() {
+        assert_eq!(eval("42 hash"), Value::Int(42));
+        assert_eq!(eval("'hello' hash"), eval("'hello' _primHash"));
+        assert_eq!(eval("#foo hash"), eval("#foo _primHash"));
+    }
+
+    #[test]
+    fn hash_overridable_on_object() {
+        let src = r#"
+Object subclass: #Point instanceVariableNames: 'x y'.
+Point class >> x: anX y: aY [
+    | p |
+    p := self new.
+    p pvtX: anX y: aY.
+    ^p
+]
+Point >> pvtX: anX y: aY [ x := anX. y := aY ]
+Point >> x [ ^x ]
+Point >> y [ ^y ]
+Point >> = other [
+    self class = other class ifFalse: [^false].
+    ^x = other x and: [y = other y]
+]
+Point >> hash [ ^(x hash * 31) + y hash ]
+| d |
+d := Dictionary new.
+d at: (Point x: 1 y: 2) put: 'origin-ish'.
+d at: (Point x: 1 y: 2)
+"#;
+        assert_eq!(eval(src), Value::Str(Arc::from("origin-ish")));
+    }
+
+    #[test]
+    fn prim_hash_int_returns_self() {
+        assert_eq!(eval("42 _primHash"), Value::Int(42));
+        assert_eq!(eval("0 _primHash"), Value::Int(0));
+    }
+
+    #[test]
+    fn prim_hash_str_equal_strings_equal_hash() {
+        let src = "'hello' _primHash = 'hello' _primHash";
+        assert_eq!(eval(src), Value::Bool(true));
+    }
+
+    #[test]
+    fn prim_hash_str_different_strings_differ() {
+        let src = "'hello' _primHash = 'world' _primHash";
+        assert_eq!(eval(src), Value::Bool(false));
+    }
+
+    #[test]
+    fn prim_hash_symbol_and_str_same_content_equal_hash() {
+        // Both Str and Symbol use FNV-1a over the same bytes → equal hashes
+        let src = "#foo _primHash = 'foo' _primHash";
+        assert_eq!(eval(src), Value::Bool(true));
+    }
+
+    #[test]
+    fn prim_hash_two_distinct_objects_differ() {
+        let src = r#"
+Object subclass: #Pt instanceVariableNames: ''.
+| a b |
+a := Pt new. b := Pt new.
+a _primHash = b _primHash
+"#;
+        // Pointer-based: two distinct heap objects almost certainly differ.
+        // (Not guaranteed, but extremely unlikely to collide.)
+        assert_eq!(eval(src), Value::Bool(false));
+    }
+
+    // ── Association ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn association_key_value() {
+        let src = "| a | a := Association key: 'x' value: 42. a key";
+        assert_eq!(eval(src), Value::Str(Arc::from("x")));
+        let src2 = "| a | a := Association key: 'x' value: 42. a value";
+        assert_eq!(eval(src2), Value::Int(42));
+    }
+
+    #[test]
+    fn association_arrow_syntax() {
+        let src = "| a | a := 'k' -> 99. a key";
+        assert_eq!(eval(src), Value::Str(Arc::from("k")));
+        let src2 = "| a | a := 'k' -> 99. a value";
+        assert_eq!(eval(src2), Value::Int(99));
+    }
+
+    #[test]
+    fn association_value_mutator() {
+        let src = "| a | a := 'k' -> 1. a value: 2. a value";
+        assert_eq!(eval(src), Value::Int(2));
+    }
+
+    #[test]
+    fn association_equality_by_key() {
+        let src = "('x' -> 1) = ('x' -> 2)";
+        assert_eq!(eval(src), Value::Bool(true));
+        let src2 = "('x' -> 1) = ('y' -> 1)";
+        assert_eq!(eval(src2), Value::Bool(false));
+    }
+
+    #[test]
+    fn association_print_string() {
+        let src = "('x' -> 42) printString";
+        assert_eq!(eval(src), Value::Str(Arc::from("'x' -> 42")));
+    }
+
+    // ── Dictionary ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dict_new_is_empty() {
+        assert_eq!(eval("Dictionary new isEmpty"), Value::Bool(true));
+        assert_eq!(eval("Dictionary new size"), Value::Int(0));
+        assert_eq!(eval("Dictionary new notEmpty"), Value::Bool(false));
+        let src = "| d | d := Dictionary new. d at: 'k' put: 1. d notEmpty";
+        assert_eq!(eval(src), Value::Bool(true));
+    }
+
+    #[test]
+    fn dict_at_put_and_at() {
+        let src = "| d | d := Dictionary new. d at: 'a' put: 1. d at: 'a'";
+        assert_eq!(eval(src), Value::Int(1));
+    }
+
+    #[test]
+    fn dict_at_missing_key_signals() {
+        let src = "Dictionary new at: 'missing'";
+        assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    }
+
+    #[test]
+    fn dict_at_if_absent() {
+        let src = "| d | d := Dictionary new. d at: 'x' ifAbsent: [99]";
+        assert_eq!(eval(src), Value::Int(99));
+        let src2 = "| d | d := Dictionary new. d at: 'x' put: 7. d at: 'x' ifAbsent: [99]";
+        assert_eq!(eval(src2), Value::Int(7));
+    }
+
+    #[test]
+    fn dict_includes_key() {
+        let src = "| d | d := Dictionary new. d at: 'k' put: 0. d includesKey: 'k'";
+        assert_eq!(eval(src), Value::Bool(true));
+        let src2 = "| d | d := Dictionary new. d includesKey: 'k'";
+        assert_eq!(eval(src2), Value::Bool(false));
+    }
+
+    #[test]
+    fn dict_at_put_updates_existing() {
+        let src = "| d | d := Dictionary new. d at: 'k' put: 1. d at: 'k' put: 2. d at: 'k'";
+        assert_eq!(eval(src), Value::Int(2));
+        // size should still be 1
+        let src2 = "| d | d := Dictionary new. d at: 'k' put: 1. d at: 'k' put: 2. d size";
+        assert_eq!(eval(src2), Value::Int(1));
+    }
+
+    #[test]
+    fn dict_remove_key_if_absent() {
+        let src = "| d | d := Dictionary new. d at: 'k' put: 42. d removeKey: 'k' ifAbsent: [0]";
+        assert_eq!(eval(src), Value::Int(42));
+        let src2 = "| d | d := Dictionary new. d at: 'k' put: 42. d removeKey: 'k' ifAbsent: [0]. d size";
+        assert_eq!(eval(src2), Value::Int(0));
+        let src3 = "| d | d := Dictionary new. d removeKey: 'missing' ifAbsent: [99]";
+        assert_eq!(eval(src3), Value::Int(99));
+    }
+
+    #[test]
+    fn dict_do_iterates_values() {
+        let src = r#"
+| d s |
+d := Dictionary new.
+d at: 'a' put: 1.
+d at: 'b' put: 2.
+d at: 'c' put: 3.
+s := 0.
+d do: [:v | s := s + v].
+s
+"#;
+        assert_eq!(eval(src), Value::Int(6));
+    }
+
+    #[test]
+    fn dict_keys_do() {
+        let src = r#"
+| d r |
+d := Dictionary new.
+d at: 'x' put: 0.
+r := OrderedCollection new.
+d keysDo: [:k | r add: k].
+r size
+"#;
+        assert_eq!(eval(src), Value::Int(1));
+    }
+
+    #[test]
+    fn dict_associations_do() {
+        let src = r#"
+| d pairs |
+d := Dictionary new.
+d at: 'k' put: 7.
+pairs := OrderedCollection new.
+d associationsDo: [:assoc | pairs add: assoc value].
+pairs at: 0
+"#;
+        assert_eq!(eval(src), Value::Int(7));
+    }
+
+    #[test]
+    fn dict_keys_and_values() {
+        let src = "| d | d := Dictionary new. d at: 'a' put: 1. d keys size";
+        assert_eq!(eval(src), Value::Int(1));
+        let src2 = "| d | d := Dictionary new. d at: 'a' put: 99. d values at: 0";
+        assert_eq!(eval(src2), Value::Int(99));
+    }
+
+    #[test]
+    fn dict_equality() {
+        let src = r#"
+| a b |
+a := Dictionary new. a at: 'x' put: 1.
+b := Dictionary new. b at: 'x' put: 1.
+a = b
+"#;
+        assert_eq!(eval(src), Value::Bool(true));
+        let src2 = r#"
+| a b |
+a := Dictionary new. a at: 'x' put: 1.
+b := Dictionary new. b at: 'x' put: 2.
+a = b
+"#;
+        assert_eq!(eval(src2), Value::Bool(false));
+    }
+
+    #[test]
+    fn dict_eq_size_mismatch() {
+        let src = r#"
+| a b |
+a := Dictionary new. a at: 'x' put: 1.
+b := Dictionary new.
+a = b
+"#;
+        assert_eq!(eval(src), Value::Bool(false));
+    }
+
+    #[test]
+    fn dict_eq_class_mismatch() {
+        let src = "Dictionary new = OrderedCollection new";
+        assert_eq!(eval(src), Value::Bool(false));
+    }
+
+    #[test]
+    fn dict_eq_key_absent_in_other() {
+        // a has 'x', b has 'y' — same size but different keys
+        let src = r#"
+| a b |
+a := Dictionary new. a at: 'x' put: 1.
+b := Dictionary new. b at: 'y' put: 1.
+a = b
+"#;
+        assert_eq!(eval(src), Value::Bool(false));
+    }
+
+    #[test]
+    fn dict_remove_preserves_other_keys() {
+        let src = r#"
+| d |
+d := Dictionary new.
+d at: 'a' put: 1.
+d at: 'b' put: 2.
+d at: 'c' put: 3.
+d removeKey: 'b' ifAbsent: [0].
+(d includesKey: 'a') & (d includesKey: 'c') & ((d includesKey: 'b') not)
+"#;
+        assert_eq!(eval(src), Value::Bool(true));
+    }
+
+    #[test]
+    fn dict_print_string() {
+        let src = "| d | d := Dictionary new. d at: 'k' put: 1. d printString";
+        // Exact order may vary, but should contain the association
+        let v = eval(src);
+        if let Value::Str(s) = v {
+            assert!(s.contains("'k' -> 1"));
+        } else {
+            panic!("expected Str");
+        }
+    }
+
+    #[test]
+    fn dict_growth_beyond_initial_capacity() {
+        let src = r#"
+| d |
+d := Dictionary new.
+1 to: 12 do: [:i | d at: i put: i * i].
+d size
+"#;
+        assert_eq!(eval(src), Value::Int(12));
+        let src2 = r#"
+| d |
+d := Dictionary new.
+1 to: 12 do: [:i | d at: i put: i * i].
+d at: 7
+"#;
+        assert_eq!(eval(src2), Value::Int(49));
+    }
+
+    #[test]
+    fn dict_int_keys() {
+        let src = "| d | d := Dictionary new. d at: 1 put: 'one'. d at: 1";
+        assert_eq!(eval(src), Value::Str(Arc::from("one")));
+    }
+
+    #[test]
+    fn dict_symbol_keys() {
+        let src = "| d | d := Dictionary new. d at: #foo put: 42. d at: #foo";
+        assert_eq!(eval(src), Value::Int(42));
     }
 
 }

@@ -350,3 +350,224 @@ OrderedCollection >> pvtGrow [
     ].
     storage := newStorage
 ]
+
+"Error — thin wrapper over _primSignal: that makes signaling a message send."
+Object subclass: #Error
+    instanceVariableNames: 'message'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Error class >> signal: aString [
+    | e |
+    e := self new.
+    e pvtSetMessage: aString.
+    e signal
+]
+
+Error >> pvtSetMessage: s [ message := s ]
+Error >> message    [ ^message ]
+Error >> messageText [ ^message ]
+Error >> signal     [ self _primSignal: message ]
+
+"Override Object >> error: to delegate to Error so it raises Signal."
+Object >> error: aString [ Error signal: aString ]
+
+"Default hash delegates to _primHash (identity-based pointer hash).
+ Subclasses that override = for value equality must also override hash
+ to maintain the invariant: a = b → a hash = b hash."
+Object >> hash [ ^self _primHash ]
+
+"Association — immutable key / mutable value pair."
+Object subclass: #Association
+    instanceVariableNames: 'key value'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Association class >> key: k value: v [
+    | a |
+    a := self new.
+    a pvtKey: k value: v.
+    ^a
+]
+
+Association >> pvtKey: k value: v [ key := k. value := v ]
+Association >> key              [ ^key ]
+Association >> value            [ ^value ]
+Association >> value: v         [ value := v ]
+Association >> = other [
+    self class = other class ifFalse: [^false].
+    ^key = other key
+]
+Association >> printString [
+    ^key printString , ' -> ' , value printString
+]
+
+"Dictionary — open-addressing hash map over a flat Array of Association slots.
+ Initial capacity 8; rehashes at 75% load by doubling."
+Object subclass: #Dictionary
+    instanceVariableNames: 'table size'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Dictionary class >> new [
+    | d |
+    d := super new.
+    d pvtInit.
+    ^d
+]
+
+Dictionary >> pvtInit [
+    table := Array new: 8.
+    size := 0
+]
+
+"Returns the slot index for key — nil slot means absent, matching slot means present."
+Dictionary >> pvtSlotFor: key [
+    | cap h i slot |
+    cap := table _primSize.
+    h := key hash \\ cap.
+    h < 0 ifTrue: [h := h + cap].
+    i := h.
+    [true] whileTrue: [
+        slot := table _primAt: i.
+        (slot isNil or: [slot key = key]) ifTrue: [^i].
+        i := (i + 1) \\ cap
+    ]
+]
+
+Dictionary >> at: key put: value [
+    | i slot |
+    (size * 4) >= (table _primSize * 3) ifTrue: [self pvtRehash].
+    i := self pvtSlotFor: key.
+    slot := table _primAt: i.
+    slot isNil
+        ifTrue: [
+            table _primAt: i put: (Association key: key value: value).
+            size := size + 1]
+        ifFalse: [slot value: value].
+    ^value
+]
+
+Dictionary >> at: key [
+    ^self at: key ifAbsent: [Error signal: 'key not found']
+]
+
+Dictionary >> at: key ifAbsent: aBlock [
+    | i slot |
+    i := self pvtSlotFor: key.
+    slot := table _primAt: i.
+    slot isNil ifTrue: [^aBlock value].
+    ^slot value
+]
+
+Dictionary >> includesKey: key [
+    | slot |
+    slot := table _primAt: (self pvtSlotFor: key).
+    ^slot notNil
+]
+
+"Removes key; returns value if present, block result if absent.
+ Uses full-table rebuild to preserve open-addressing invariants."
+Dictionary >> removeKey: key ifAbsent: aBlock [
+    | i slot removedValue oldTable oldSize s |
+    i := self pvtSlotFor: key.
+    slot := table _primAt: i.
+    slot isNil ifTrue: [^aBlock value].
+    removedValue := slot value.
+    oldTable := table.
+    oldSize := oldTable _primSize.
+    table := Array new: oldSize.
+    size := 0.
+    i := 0.
+    [i < oldSize] whileTrue: [
+        s := oldTable _primAt: i.
+        (s notNil and: [s key ~= key]) ifTrue: [self at: s key put: s value].
+        i := i + 1
+    ].
+    ^removedValue
+]
+
+Dictionary >> size     [ ^size ]
+Dictionary >> isEmpty  [ ^size = 0 ]
+Dictionary >> notEmpty [ ^size > 0 ]
+
+Dictionary >> do: aBlock [
+    | i cap slot |
+    cap := table _primSize.
+    i := 0.
+    [i < cap] whileTrue: [
+        slot := table _primAt: i.
+        slot isNil ifFalse: [aBlock value: slot value].
+        i := i + 1
+    ]
+]
+
+Dictionary >> keysDo: aBlock [
+    | i cap slot |
+    cap := table _primSize.
+    i := 0.
+    [i < cap] whileTrue: [
+        slot := table _primAt: i.
+        slot isNil ifFalse: [aBlock value: slot key].
+        i := i + 1
+    ]
+]
+
+Dictionary >> associationsDo: aBlock [
+    | i cap slot |
+    cap := table _primSize.
+    i := 0.
+    [i < cap] whileTrue: [
+        slot := table _primAt: i.
+        slot isNil ifFalse: [aBlock value: slot].
+        i := i + 1
+    ]
+]
+
+Dictionary >> keys [
+    | result |
+    result := OrderedCollection new.
+    self keysDo: [:k | result add: k].
+    ^result
+]
+
+Dictionary >> values [
+    | result |
+    result := OrderedCollection new.
+    self do: [:v | result add: v].
+    ^result
+]
+
+Dictionary >> = other [
+    | ok |
+    self class = other class ifFalse: [^false].
+    size = other size ifFalse: [^false].
+    ok := true.
+    self associationsDo: [:assoc |
+        (other at: assoc key ifAbsent: [ok := false. nil]) = assoc value
+            ifFalse: [ok := false]
+    ].
+    ^ok
+]
+
+Dictionary >> printString [
+    | s |
+    s := 'Dictionary ('.
+    self associationsDo: [:assoc |
+        s := s , assoc printString , ' '
+    ].
+    ^s , ')'
+]
+
+Dictionary >> pvtRehash [
+    | old i slot |
+    old := table.
+    table := Array new: old _primSize * 2.
+    size := 0.
+    i := 0.
+    [i < old _primSize] whileTrue: [
+        slot := old _primAt: i.
+        slot isNil ifFalse: [self at: slot key put: slot value].
+        i := i + 1
+    ]
+]

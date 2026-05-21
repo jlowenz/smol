@@ -34,6 +34,36 @@ pub fn dispatch(
         expect_arity(&selector, 0, args.len())?;
         return Ok(Value::Bool(!matches!(recv, Value::Nil)));
     }
+    // `_primHash` is universal — handled here so all value kinds are covered.
+    if selector.as_ref() == "_primHash" {
+        expect_arity(&selector, 0, args.len())?;
+        return Ok(Value::Int(hash_value(&recv)));
+    }
+    // `hash` is universal for non-Object types (primitive values don't route through
+    // Object method lookup). For Value::Object the type-specific dispatch runs instead,
+    // which will find the user-defined `hash` override (or the default `Object >> hash`).
+    if selector.as_ref() == "hash" && !matches!(recv, Value::Object(_)) {
+        expect_arity(&selector, 0, args.len())?;
+        return Ok(Value::Int(hash_value(&recv)));
+    }
+    // `->` is universal — any receiver can create an Association.
+    // Implemented in Rust so primitive values (String, Int, …) work without an
+    // Object-inherited method dispatch path.
+    if selector.as_ref() == "->" {
+        expect_arity(&selector, 1, args.len())?;
+        let value = args.into_iter().next().unwrap();
+        let assoc_class = ev.registry.kernel()
+            .lookup_class("Association")
+            .ok_or_else(|| EvalError::TypeError(
+                "'->': Association not yet defined in kernel".into()
+            ))?;
+        return ev.dispatch(
+            Value::Class(assoc_class),
+            Arc::from("key:value:"),
+            vec![recv, value],
+            env,
+        );
+    }
 
     match recv {
         Value::Int(n) => dispatch_int(ev, n, &selector, args, env),
@@ -107,6 +137,61 @@ fn bigint_floor_rem(n: BigInt, d: &BigInt) -> BigInt {
     use num_traits::Signed;
     let r = &n % d;
     if !r.is_zero() && r.is_negative() != d.is_negative() { r + d } else { r }
+}
+
+// ── Hashing helpers ───────────────────────────────────────────────────────────
+
+/// MurmurHash3 bit-mixer — avalanches bits to reduce clustering from
+/// pointer-aligned addresses.
+fn fmix64(mut k: u64) -> u64 {
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xff51afd7ed558ccd);
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xc4ceb9fe1a85ec53);
+    k ^= k >> 33;
+    k
+}
+
+/// FNV-1a over the UTF-8 bytes of a string.
+fn fnv1a_hash(s: &str) -> i64 {
+    let mut h: u64 = 14695981039346656037;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h as i64
+}
+
+/// Returns a stable hash for any `Value`. Used by `_primHash`.
+///
+/// - Strings / Symbols: FNV-1a over bytes (content-based, value-equal strings hash equal).
+/// - Integers: the value itself (or low 64 bits for LargeInt).
+/// - Float: bit-pattern of the `f64`.
+/// - Bool / Nil: fixed constants.
+/// - Object / Class / Block / Namespace: `fmix64` of the heap pointer (identity hash).
+fn hash_value(v: &Value) -> i64 {
+    match v {
+        Value::Int(n) => *n,
+        Value::Float(f) => f.to_bits() as i64,
+        Value::Str(s) => fnv1a_hash(s),
+        Value::Symbol(s) => fnv1a_hash(s),
+        Value::Bool(b) => if *b { 1 } else { 0 },
+        Value::Nil => 0,
+        Value::LargeInt(n) => {
+            use num_bigint::Sign;
+            let (sign, bytes) = n.to_bytes_le();
+            let mut h: u64 = 0;
+            for (i, &b) in bytes.iter().take(8).enumerate() {
+                h |= (b as u64) << (i * 8);
+            }
+            if sign == Sign::Minus { h = h.wrapping_neg(); }
+            h as i64
+        }
+        Value::Object(obj) => fmix64(Arc::as_ptr(obj) as usize as u64) as i64,
+        Value::Class(c) => fmix64(Arc::as_ptr(c) as usize as u64) as i64,
+        Value::Block(b) => fmix64(Arc::as_ptr(b) as usize as u64) as i64,
+        Value::Namespace(ns) => fmix64(Arc::as_ptr(ns) as usize as u64) as i64,
+    }
 }
 
 // ── Int ───────────────────────────────────────────────────────────────────────
@@ -826,11 +911,14 @@ fn dispatch_block(
         }
         "on:do:" => {
             expect_arity(sel, 2, args.len())?;
-            let _condition = args.remove(0); // only #Error recognised; ignore class for now
+            let _condition = args.remove(0); // class-filtered dispatch deferred to chunk 21+
             let handler = as_block(args.remove(0), sel)?;
             match ev.eval_block(&blk, vec![], env) {
                 Ok(v) => Ok(v),
                 Err(EvalError::Return(v, d)) => Err(EvalError::Return(v, d)),
+                Err(EvalError::Signal(msg)) => {
+                    ev.eval_block(&handler, vec![Value::Str(msg.clone())], env)
+                }
                 Err(e) => {
                     let msg = Value::Str(Arc::from(e.to_string().as_str()));
                     ev.eval_block(&handler, vec![msg], env)
@@ -1021,13 +1109,21 @@ fn dispatch_object_primitive(
                 _ => Err(EvalError::TypeError(format!("{sel}: requires Byte indexed storage"))),
             }
         }
+        "_primSignal:" => {
+            expect_arity(sel, 1, args.len())?;
+            let msg = match args.remove(0) {
+                Value::Str(s) => s,
+                other => Arc::from(format!("{other}").as_str()),
+            };
+            Err(EvalError::Signal(msg))
+        }
         "error:" => {
             expect_arity(sel, 1, args.len())?;
             let msg = match args.remove(0) {
-                Value::Str(s) => s.to_string(),
-                other => format!("error: argument was {}", other.kind()),
+                Value::Str(s) => s,
+                other => Arc::from(format!("error: argument was {}", other.kind()).as_str()),
             };
-            Err(EvalError::TypeError(msg))
+            Err(EvalError::Signal(msg))
         }
         _ => Err(EvalError::MessageNotUnderstood {
             receiver_kind: "Object",
@@ -1981,14 +2077,14 @@ Plain new _primAt: 0
     }
 
     #[test]
-    fn error_colon_raises_type_error() {
+    fn error_colon_raises_signal() {
         let src = r#"
 Object subclass: #Thing instanceVariableNames: ''.
 Thing new error: 'boom'
 "#;
         match eval_no_kernel_err(src) {
-            crate::eval::EvalError::TypeError(msg) => assert!(msg.contains("boom")),
-            e => panic!("expected TypeError, got {e:?}"),
+            crate::eval::EvalError::Signal(msg) => assert!(msg.contains("boom")),
+            e => panic!("expected Signal, got {e:?}"),
         }
     }
 
@@ -2281,7 +2377,7 @@ Foo new completelyUnknownMessage
 Object subclass: #Foo instanceVariableNames: ''.
 Foo new error: 42
 "#;
-        assert!(matches!(eval_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_err(src), crate::eval::EvalError::Signal(_)));
     }
 
     #[test]
@@ -2424,12 +2520,12 @@ Plain new _primAsString
 
     #[test]
     fn object_error_colon_non_string() {
-        // `error: <non-String>` should format a TypeError using other.kind()
+        // `error: <non-String>` raises Signal with a formatted message
         let src = r#"
 Object subclass: #Foo instanceVariableNames: ''.
 Foo new error: 42
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::Signal(_)));
     }
 
     // ── handle_subclass error paths ───────────────────────────────────────────

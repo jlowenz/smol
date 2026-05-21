@@ -1,4 +1,9 @@
 # My Reviews (Claude can ignore these)
+## Chunk 21 (async)
+- It looks like we are adding a Value of kind "Entity" to the system... this is not quite what I had in mind. In general, is there a reason that Objects are not entities _by default_ and we need to tag objects intended to be Values with a trait to opt out of the async actor paradigm? This would help to reduce friction between objects, entities, and values and also promote the _default_ use of asynchrony. This flips some things around a bit in the current chunk design.
+- From this viewpoint, I'm not sure that futures can wait... that is part of the reason I did not want to put this off any longer. I.e. to make existing code functional in the async-everywhere paradigm, we need to handle the asynchronous data flow correctly. What options do we have here? This seems like something the multi-threaded evaluator needs to handle for us... i.e. when it encounters the implicit future in a message send (as receiver) it needs to implicitly wait in the current context until a value is ready and then wake up once a value is ready. One challenge may be detecting when a future should _not_ be allowed? Unless the data flow model _can just work_ without needing this distinction?
+- Can you say more about the "request/response" pattern? This is not necessarily relevant in the integrated futures scenario, right? Although, I suppose this _could_ still be a useful pattern some objects could utilize (maybe with a Trait-based interface)?
+- 
 ## Chunk 2
 - in assert_single(), we clone() the given fact. Why not express ownership here and avoid the clone by moving to the entries buffer? The PendingFact is essentially a temporary object more/less, so this seems reasonable? Let me know if I'm missing drawback/benefits of this approach.
 - also in assert_single(), we agreed to update the tentative buffer to distinguish commands (e.g. assert vs retract vs...?)

@@ -24,6 +24,38 @@ The triple store PRD is found in `docs/triple_store_PRD.md`.
 - **Naming collision awareness.** This project's name `smol` overlaps with the `smol` async runtime ecosystem (and `async-channel` originates from it). When searching external Rust references, qualify as "smol-rs runtime" vs. this project. Using `async-channel` does *not* couple us to the smol runtime — it works under any executor.
 - **Reproducible builds.** Toolchain pinned via `rust-toolchain.toml`. `Cargo.lock` is committed (this project will be a binary/runtime long-term). Cross-platform (macOS dev, Linux/Windows targets) is in scope; `.gitattributes` normalizes line endings to LF.
 
+## Interpreter — kernel.smol test coverage
+
+`kernel.smol` is loaded as an embedded string at runtime; llvm-cov instruments
+Rust source only, so `just cov` numbers say nothing about Smol kernel code coverage.
+
+**Interim process (until tooling exists):** whenever kernel.smol is extended, do a
+manual method-by-method audit — every method body should be exercised by at least
+one Rust test in `eval.rs`, including both branches of every conditional. Ask
+Claude Code to do the audit explicitly; it has done this successfully as of chunk 20.
+
+**Planned tooling (recorded here so it survives session boundaries):**
+
+1. *AST span tracking* — add `Span { start: usize, end: usize }` to `Expr` / `Stmt`
+   nodes so the evaluator knows the byte offset of every expression it executes.
+   A `CoverageCollector` (opt-in via evaluator flag) records touched spans;
+   a post-run report maps them back to source lines of any `.smol` file.
+   This directly supports the project's "observable" goal and is the right fix
+   for the latent coverage gap. Estimated scope: one dedicated chunk.
+
+2. *Smol testing framework (SUnit-style)* — a `TestCase` class with `assert:`,
+   `assert:equals:`, `deny:`, `should:raise:`, `setUp` / `tearDown`, and a
+   runner that discovers all `TestCase` subclasses and reports results.
+   Once this exists, kernel tests can migrate from Rust into Smol, which
+   exercises the language under its own weight and is the idiomatic Smalltalk
+   approach. The span-based coverage collector makes it possible to measure
+   coverage even when tests are written in Smol. Estimated scope: one chunk,
+   after the actor model MVP (chunk 21) stabilises the language enough to
+   write a non-trivial Smol program.
+
+Neither item blocks ongoing chunk work; both should be scheduled before the
+kernel grows significantly beyond its current size.
+
 ## Preferences and Rules
 
 I will add to this list as the project proceeds, but may also ask you to add things here as well. If something seems like it should be a preference or rule, please suggest putting it here. 

@@ -1,35 +1,49 @@
-# Chunk 20: Exceptions, Dictionary, and Stream Protocol
+# Chunk 20: Signals, Dictionary, and Actor Prerequisites
 
-## Status
+## Status — COMPLETE
 
-Chunk 19 delivered Array, ByteArray, and OrderedCollection in Smol, proper non-local
+Chunk 20 delivered `EvalError::Signal`, `_primSignal:`, `_primHash` (universal),
+`Error`, `Association`, `->` (universal Rust primitive), and `Dictionary` with full
+open-addressing hash map. 362 interpreter tests pass; workspace line coverage 95%.
+
+**Implementation note:** `Object >> ->` was implemented as a universal Rust handler
+in `dispatch()` (like `yourself`) rather than as a Smol method on Object, so that
+primitive value types (String, Int, Symbol, etc.) work as receivers without requiring
+a new `SelfBinding::Primitive` dispatch path.
+
+Previous state: Chunk 19 delivered Array, ByteArray, and OrderedCollection in Smol, proper non-local
 returns (depth-tagged `EvalError::Return`), nested array literals, and five Rust
 primitives. 241 interpreter tests pass; workspace line coverage 91%.
 
+**Scope note:** This chunk was revised from its original form (which also included
+`Float64Array`, `species`, `ReadStream`, and `WriteStream`) to focus on the
+prerequisites that unblock chunk 21's async actor model MVP — the most
+architecturally novel and highest-risk component of the system. The deferred items
+have no ordering dependency on the actor model and will land in chunk 22.
+
 **Delivers:**
 
-1. A minimal exception hierarchy (`Error` class) and `signal` / `signal:` in Smol,
-   wiring up the existing `on:do:` block handler.
-2. `Dictionary` — an identity-keyed hash map implemented in Smol over a flat
-   `Array` of association pairs, with open-addressing or a simple bucket strategy.
-3. `Association` — `key → value` pair used internally by `Dictionary` and as a
-   general-purpose tuple.
-4. `ReadStream` and `WriteStream` over `SequenceableCollection` — cursor-based
-   access to `Array`, `ByteArray`, and `OrderedCollection`.
-5. `Float64Array` — the indexed-float collection protocol deferred from chunk 19.
-6. `species` hook on collection classes — allows `collect:` and `copyFrom:to:` to
-   return the same concrete type as the receiver rather than always `OrderedCollection`
-   or `Array`.
+1. `EvalError::Signal` — a new Rust error variant for Smol-raised conditions,
+   distinct from `TypeError`.
+2. `_primSignal:` and `_primHash` — two Rust primitives on `Object`.
+3. `Error` class in Smol — thin wrapper that makes signaling a message send rather
+   than a Rust escape hatch.
+4. `Association` — `key → value` pair used by `Dictionary` and as a general-purpose
+   tuple.
+5. `Dictionary` — open-addressing hash map implemented in Smol over a flat `Array`
+   of `Association` pairs; needed by chunk 21 for entity registries and dispatch tables.
 
 **Explicitly deferred:**
 
-- `Set` — straightforward once `Dictionary` exists; chunk 21.
-- Brace array syntax `{expr. expr}` (dynamic construction) — chunk 21.
-- Traits / mixin composition — requires a separate design chunk.
-- Actor model and entity identity — chunk 21+.
-- Triple store integration — chunk 21+.
-- Full exception hierarchy (`Exception`, `resume`, `retry`, `ensure:`) — chunk 21.
+- `Float64Array` — no actor model dependency; chunk 22.
+- `species` hook on collection classes — no actor model dependency; chunk 22.
+- `ReadStream` / `WriteStream` — no actor model dependency; chunk 22.
+- `Set` — straightforward once `Dictionary` exists; chunk 22.
+- Brace array syntax `{expr. expr}` — chunk 22.
+- Full exception hierarchy (`Exception`, `resume`, `retry`, `ensure:`) — chunk 21
+  will clarify what the actor error model needs; full hierarchy chunk 22+.
 - `asUtf8String` (strict, error on invalid bytes) — deferred; `asString` stays lossy.
+- Traits / mixin composition — requires a separate design chunk.
 
 ---
 
@@ -41,7 +55,7 @@ The goal is a minimal but honest exception hook. `on:do:` already dispatches any
 `EvalError` to the handler block; what is missing is the ability for Smol code to
 deliberately raise a condition.
 
-Two Rust primitives are added:
+One Rust primitive is added:
 
 | Primitive | Semantics |
 |---|---|
@@ -56,7 +70,9 @@ Signal(Arc<str>),
 
 `Signal` propagates identically to `TypeError` through `eval_block` and
 `invoke_method`, but carries a clean message string that `on:do:` can present
-to the handler without the `"type error: "` prefix.
+to the handler without the `"type error: "` prefix. Chunk 21 will extend the
+actor scheduler to treat unhandled `Signal` as an entity-termination event (fault
+isolation) rather than a process-wide panic.
 
 In kernel.smol, `Error` is a thin Smol class:
 
@@ -100,7 +116,7 @@ for the basic case.
 
 A class-check argument (the first arg to `on:do:`) is currently ignored. This chunk
 does **not** add class-filtered dispatch — that requires a proper `Exception`
-hierarchy and is deferred to chunk 21.
+hierarchy and is deferred pending the actor error model design in chunk 21.
 
 ### Association
 
@@ -193,117 +209,6 @@ Dictionary >> = other [ ... ]
 
 Rehashing copies all live associations into a new double-sized table.
 
-### Float64Array
-
-```smalltalk
-Object subclass: #Float64Array
-    instanceVariableNames: ''
-    classVariableNames: ''
-    indexedSlots: #float64.
-
-Float64Array >> at: i       [ ^self _primAt: i ]
-Float64Array >> at: i put: v [ self _primAt: i put: v. ^v ]
-Float64Array >> size        [ ^self _primSize ]
-Float64Array >> isEmpty     [ ^self _primSize = 0 ]
-Float64Array >> notEmpty    [ ^self _primSize > 0 ]
-
-Float64Array >> do: aBlock [
-    | i |
-    i := 0.
-    [i < self _primSize] whileTrue: [
-        aBlock value: (self _primAt: i).
-        i := i + 1
-    ]
-]
-```
-
-`_primAt:put:` on `Float64` storage already coerces `Int` to `Float` (implemented
-in chunk 19). No new Rust is needed.
-
-### `species` hook
-
-`collect:` and `copyFrom:to:` on `Array` currently return `Array`; on
-`OrderedCollection` they return `OrderedCollection`. Adding `species` makes this
-explicit and extensible:
-
-```smalltalk
-Array >> species [ ^Array ]
-OrderedCollection >> species [ ^OrderedCollection ]
-
-Array >> collect: aBlock [
-    | result i |
-    result := self species new: self _primSize.
-    ...
-]
-```
-
-User subclasses that override `species` get correct return types from inherited
-collection methods for free.
-
-### Stream protocol
-
-```smalltalk
-Object subclass: #ReadStream
-    instanceVariableNames: 'collection position limit'
-    classVariableNames: ''
-    indexedSlots: #none.
-
-ReadStream class >> on: aCollection [
-    | s |
-    s := self new.
-    s pvtOn: aCollection from: 0 to: aCollection size - 1.
-    ^s
-]
-
-ReadStream class >> on: aCollection from: start to: stop [ ... ]
-
-ReadStream >> pvtOn: c from: s to: e [
-    collection := c. position := s. limit := e
-]
-
-ReadStream >> next         [ ... "returns element at position, advances" ]
-ReadStream >> next: n      [ ... "returns Array of n elements" ]
-ReadStream >> peek         [ ... ]
-ReadStream >> atEnd        [ ^position > limit ]
-ReadStream >> position     [ ^position ]
-ReadStream >> position: n  [ position := n ]
-ReadStream >> reset        [ position := 0 ]
-ReadStream >> do: aBlock   [ [self atEnd] whileFalse: [aBlock value: self next] ]
-ReadStream >> upToEnd      [ ... "returns remaining elements as Array" ]
-```
-
-```smalltalk
-Object subclass: #WriteStream
-    instanceVariableNames: 'collection position'
-    classVariableNames: ''
-    indexedSlots: #none.
-
-WriteStream class >> on: aCollection [ ... ]
-WriteStream class >> with: aCollection [ ... "starts after last element" ]
-
-WriteStream >> nextPut: v      [ collection at: position put: v. position := position + 1. ^v ]
-WriteStream >> nextPutAll: c   [ c do: [:e | self nextPut: e] ]
-WriteStream >> position        [ ^position ]
-WriteStream >> reset           [ position := 0 ]
-WriteStream >> contents        [ ^collection copyFrom: 0 to: position - 1 ]
-```
-
-`WriteStream on: (Array new: n)` is the idiomatic buffer builder. No growable
-`WriteStream` in this chunk — that requires a more complex `collection` swap, deferred.
-
----
-
-## New Rust surface
-
-| Addition | Location | Notes |
-|---|---|---|
-| `EvalError::Signal(Arc<str>)` | `eval.rs` | New error variant for Smol-raised signals |
-| `_primSignal: aString` | `dispatch_object_primitive` | Raises `EvalError::Signal` |
-| `_primHash` | `dispatch_object_primitive` | Returns stable `Int` hash of receiver |
-
-`error:` on Object moves from Rust (`dispatch_object_primitive`) to Smol delegation
-(`Error signal: aString`). The old Rust arm is removed.
-
 ### `_primHash` design
 
 Returned as `Value::Int(hash as i64)`. The hash is not cryptographic; stability
@@ -316,7 +221,6 @@ Implementation in Rust:
 ```rust
 "_primHash" => {
     expect_arity(sel, 0, args.len())?;
-    // identity hash: rotate pointer bits for better distribution
     let addr = Arc::as_ptr(&obj) as usize;
     Ok(Value::Int(fmix64(addr as u64) as i64))
 }
@@ -324,8 +228,8 @@ Implementation in Rust:
 
 `_primHash` on primitive values (`Int`, `Str`, etc.) is handled in their respective
 dispatch functions using the same scheme as `Value::Hash` (FNV-1a for strings,
-numeric value for ints). It needs to be added to the universal dispatch in
-`dispatch()` before routing to type-specific handlers.
+numeric value for ints). It is added to the universal dispatch in `dispatch()` before
+routing to type-specific handlers.
 
 ---
 
@@ -345,12 +249,19 @@ numeric value for ints). It needs to be added to the universal dispatch in
 
 ### `src/kernel.smol`
 
-- Add `Error`, `Association`, `Dictionary`, `Float64Array`, `ReadStream`,
-  `WriteStream`.
-- Add `species` to `Array` and `OrderedCollection`.
-- Rewrite `Array >> collect:` and `Array >> copyFrom:to:` to use `self species`.
+- Add `Error`, `Association`, `Dictionary`.
 - Add `Object >> ->` for `Association` construction.
 - Replace Rust `error:` with Smol delegation to `Error`.
+
+---
+
+## New Rust surface
+
+| Addition | Location | Notes |
+|---|---|---|
+| `EvalError::Signal(Arc<str>)` | `eval.rs` | New error variant for Smol-raised signals |
+| `_primSignal: aString` | `dispatch_object_primitive` | Raises `EvalError::Signal` |
+| `_primHash` | `dispatch_object_primitive` + universal `dispatch()` | Returns stable `Int` hash of receiver |
 
 ---
 
@@ -363,6 +274,7 @@ numeric value for ints). It needs to be added to the universal dispatch in
 | `Error class >> signal: s` | Creates instance, signals with message `s` |
 | `signal` | Raises `EvalError::Signal(message)` |
 | `message` | Returns the message string |
+| `messageText` | Alias for `message` |
 
 ### Association
 
@@ -393,58 +305,22 @@ numeric value for ints). It needs to be added to the universal dispatch in
 | `= other` | — | Same keys and values |
 | `printString` | — | `'Dictionary (k->v ...)'` |
 
-### Float64Array
-
-| Selector | Ensures |
-|---|---|
-| `at: i` | `Float` at 0-based index |
-| `at: i put: v` | Stores `Float` (or `Int` coerced); returns `v` |
-| `size`, `isEmpty`, `notEmpty`, `do:` | As Array |
-
-### ReadStream
-
-| Selector | Ensures |
-|---|---|
-| `ReadStream class >> on: c` | Stream over full collection |
-| `next` | Next element; `Error signal:` if `atEnd` |
-| `peek` | Next element without advancing |
-| `atEnd` | True if no more elements |
-| `position` / `position: n` | Read/set cursor |
-| `reset` | Rewind to 0 |
-| `do: blk` | Iterate remaining elements |
-| `upToEnd` | `Array` of remaining elements |
-
-### WriteStream
-
-| Selector | Ensures |
-|---|---|
-| `WriteStream class >> on: c` | Stream starting at index 0 |
-| `nextPut: v` | Stores `v` at current position, advances; returns `v` |
-| `nextPutAll: c` | Appends all elements of `c` |
-| `position` / `reset` | Read cursor / rewind |
-| `contents` | `Array` from 0 to `position - 1` |
-
 ---
 
 ## Implementation order
 
 1. **`EvalError::Signal`, `_primSignal:`** — new error variant and primitive. Tests:
-   `Error signal: '...'` raises the error; `on:do:` catches it; message text round-trips.
+   `Error signal: '...'` raises the error; `on:do:` catches it; message text
+   round-trips; `error:` on Object delegates correctly.
 2. **`_primHash`** — universal hash primitive. Tests: integers hash to themselves (mod);
-   strings with same content hash equally; objects hash by identity.
-3. **`Error`, `Association` in kernel.smol** — `Object >> ->` convenience. Tests:
+   strings with same content hash equally; objects hash by identity (two distinct
+   objects get different hashes).
+3. **`Error`, `Association`** in kernel.smol — `Object >> ->` convenience. Tests:
    `'x' -> 42` produces an `Association`; `error:` delegates to `Error signal:`.
-4. **`Dictionary`** — full protocol including rehash. Tests: at:put:/at: round-trip;
-   missing key error; at:ifAbsent:; removeKey:ifAbsent:; growth beyond initial capacity;
-   keys/values/associationsDo:.
-5. **`Float64Array`** — trivial given existing Float64 storage primitives. Tests:
-   at:put:/at: with Float and Int coercion; do:.
-6. **`species`** — add to Array and OrderedCollection; update collect:/copyFrom:to:.
-   Tests: `(Array new: 3) collect: [:e | e]` returns an Array; user subclass with
-   overridden `species` returns correct type.
-7. **`ReadStream` / `WriteStream`** — full protocol. Tests: read all elements; peek
-   without advancing; atEnd; WriteStream round-trip via contents; nextPutAll:.
-8. **Coverage check** — `just cov`; no file below 80%.
+4. **`Dictionary`** — full protocol including rehash. Tests: `at:put:` / `at:`
+   round-trip; missing key error; `at:ifAbsent:`; `removeKey:ifAbsent:`; growth
+   beyond initial capacity; `keys` / `values` / `associationsDo:`.
+5. **Coverage check** — `just cov`; no file below 80%.
 
 ---
 
@@ -452,7 +328,7 @@ numeric value for ints). It needs to be added to the universal dispatch in
 
 ### Dictionary key equality
 
-The current `=` on objects is identity (pointer equality). For `Dict at: 'hello'`
+The current `=` on objects is identity (pointer equality). For `dict at: 'hello'`
 to find a key stored as `'hello'`, string equality must be value-based — which it
 already is for `Value::Str`. Symbols, integers, and floats are also value-equal.
 Objects use identity equality, which is the correct default.
@@ -460,15 +336,10 @@ Objects use identity equality, which is the correct default.
 No change needed; the existing `Value::PartialEq` impl is already correct for
 dictionary use.
 
-### Growable WriteStream
+### Pointer-based hash stability across chunk 21
 
-`WriteStream nextPut:` beyond the backing collection's size needs either a bounds
-check + error, or silent growth. This chunk raises `Error signal:` on overflow;
-a growable variant (backed by `OrderedCollection`) is deferred to chunk 21.
-
-### `ensure:` / `ifCurtailed:`
-
-Exception cleanup handlers are deferred. The missing piece is a way to guarantee
-execution even when a signal propagates. Chunk 21 will add `EvalError::Signal`
-as a proper catchable that `on:do:` can filter by class, which is the prerequisite
-for `ensure:`.
+Chunk 21 will clone values crossing entity boundaries. If a `Value::Object` is
+cloned before being stored as a dictionary key, the pointer-based hash will differ
+from a fresh clone of the same object. This is expected behavior (object identity
+is pointer identity) and is acceptable; it is documented here so chunk 21 can note
+the implication for cross-entity dictionary use.
