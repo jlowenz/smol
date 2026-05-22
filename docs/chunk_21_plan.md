@@ -7,99 +7,217 @@ Chunk 20 delivers `EvalError::Signal`, `_primHash`, `Error`, `Association`, and
 and a sufficient exception primitive. The triple store crate is complete and idle.
 
 This chunk implements the first proof of the system's core design thesis:
-**entities as isolated, asynchronously-messaged processes**. It is intentionally
-a minimum viable slice: enough to prove that sync-inside/async-outside works as a
-Rust runtime model, enough to catch design errors before more infrastructure is
-layered on top, and narrow enough to complete in one chunk.
+**all objects are actors; all message sends are conceptually asynchronous** (D2,
+D4). It is intentionally a minimum viable slice: enough to prove that the async-
+everywhere model works as a Rust runtime, enough to catch design errors before
+more infrastructure is layered on top, and narrow enough to complete in one chunk.
 
 **Delivers:**
 
-1. `Value::Entity(EntityHandle)` — entity references as first-class values,
-   distinct from passive `Value::Object`.
-2. `EntityState` — per-entity isolated instance variables and a mailbox.
-3. `Envelope` — a queued message: selector, arguments, optional reply channel.
-4. `Scheduler` — cooperative round-robin driver; `run_until_quiescent` for tests,
-   `run` event loop for programs.
-5. `Entity subclass:` syntax — declares an entity class; instances are created with
-   `spawn` rather than `new`.
-6. Async dispatch — sending any message to a `Value::Entity` queues an `Envelope`
-   rather than dispatching directly.
-7. Sync self-send — messages sent within an entity's own handler context dispatch
-   synchronously (no queuing, no deadlock).
-8. Error isolation — an unhandled `EvalError::Signal` (or any non-Return error)
-   inside an entity's message handler terminates that entity and logs the fault;
-   all other entities continue running.
-9. `_primSpawn` — Rust primitive on entity classes that creates an `EntityState`,
-   registers it with the scheduler, and returns the `Value::Entity` handle.
-10. `_primSelf` — allows an entity method to obtain its own `Value::Entity` handle
-    for passing as a callback reference.
+1. `Value subclass:` — new language-level declaration for passive data objects
+   (opt-out from actor semantics); existing kernel types migrated to it.
+2. `Object subclass:` now creates actor entities by default.
+3. `Value::Entity(EntityHandle)` — entity references as first-class values.
+4. `Value::Future(FutureHandle)` — lazy future references; forwarded without
+   resolution; resolved only when a message is dispatched to the value.
+5. `EntityState` — per-entity isolated instance variables, a mailbox, and an
+   OS thread running the entity's message loop.
+6. `Envelope` — a queued message: selector, arguments, reply sender.
+7. `FutureState` — shared state between the entity that produces a result and
+   any entity waiting to consume it (`Mutex<Option<Value>> + Condvar`).
+8. `Object class >> new` — on actor classes creates an `EntityState`, spawns
+   its OS thread, queues `initialize`, and returns `Value::Entity`.
+9. Async dispatch — sending any message to a `Value::Entity` enqueues an
+   `Envelope` and returns `Value::Future` immediately.
+10. Future resolution — dispatching a message to a `Value::Future` receiver
+    blocks the calling entity's OS thread (condvar wait) until the future
+    resolves, then dispatches to the resolved value.
+11. Sync self-send — messages sent to `self` within an entity's own handler
+    dispatch synchronously (no envelope, no future, no deadlock).
+12. Error isolation — an unhandled error in an entity's message handler
+    terminates that entity; all other entities continue running.
+13. Multi-threaded execution — each entity runs on its own OS thread; true
+    multi-core parallelism from the first chunk.
 
 **Explicitly deferred:**
 
-- Implicit futures / `await` — chunk 23+; async sends are fire-and-forget for now.
-- Request-response pattern — the `reply:` mechanism is stubbed (the optional
-  `oneshot` channel in `Envelope` is allocated but not exposed to Smol yet).
+- Promise pipelining (forwarding messages to unresolved futures without
+  blocking) — the current model resolves at point of dispatch; message
+  forwarding/buffering to an unresolved future is a future chunk.
+- Green thread pool (N threads for M entities) — current model is one OS
+  thread per entity; documented as the upgrade path to a work-stealing pool.
+- Sync optimization via escape analysis — D2 notes synchronous execution is
+  an optimization; the runtime does not yet perform it.
 - Triple store as entity state — chunk 22; entity state is instance variables here.
-- Per-entity garbage collection — chunk 23+; `Arc` reference counting is used now.
-- Ownership / escape analysis for cross-entity value sharing — chunk 23+.
-- Named entity registry (global lookup by symbol) — chunk 22; uses `Dictionary`.
-- `Float64Array`, `species`, `ReadStream`, `WriteStream` — chunk 22 (from chunk 20).
+- Per-entity GC — chunk 23+; `Arc` reference counting is used now.
+- Named entity registry — chunk 22.
+- `Float64Array`, `species`, `ReadStream`, `WriteStream` — chunk 22.
 - Full `Exception` hierarchy, `ensure:`, `retry` — chunk 22.
-- Preemptive scheduling, time-sliced execution — future VM work.
+- Preemptive scheduling, time-sliced execution — VM work.
+- Blocks across entity boundaries — blocked with error for now (same as
+  before; correct model deferred).
 
 ---
 
-## Design decisions
+## Design Decisions
 
-### The Value / Entity distinction
+### Actor-by-Default (D2, D3)
 
-The fundamental divide in the system is:
+The fundamental realization of D2 ("asynchronous by default") is that
+`Object subclass:` creates an actor entity, not a passive object. There is no
+`Entity subclass:` syntax — the distinction comes from the base class:
 
-| | Value | Entity |
-|---|---|---|
-| Identity | Structural (content equality) | Nominal (pointer / handle identity) |
-| Mutability | Immutable or locally mutated | Mutable, history-bearing (eventually) |
-| Concurrency | Synchronous always | Asynchronous by default |
-| Shareable | Freely; copy is identity | By handle; no shared ivar access |
+| Base class | Kind | Message send result | Thread |
+|---|---|---|---|
+| `Object subclass:` | Actor entity | `Value::Future` | One OS thread per instance |
+| `Value subclass:` | Passive value | `Value` (direct) | None; dispatches on caller's thread |
 
-In Rust, `Value` grows one new variant:
+This inverts the current opt-in model. Passive value semantics require an
+explicit declaration via `Value subclass:`. Actors are the default because D2
+states that sequential execution is an optimization of concurrent semantics,
+not the other way around. An opt-in model would result in most code defaulting
+to the familiar Smalltalk object model, making actors a specialty feature rather
+than the foundation.
 
-```rust
-Value::Entity(EntityHandle)
+The correct cut for kernel types is **mutability under identity**, not
+collection vs. non-collection:
+
+- **Value (immutable or identity-free)**: `Array` (fixed-size indexed storage),
+  `ByteArray`, `Association`, `Error`, `Boolean`/`True`/`False`, `String`.
+  These migrate to `Value subclass:` in this chunk; existing test behavior is
+  fully preserved since value dispatch is identical to today's synchronous
+  dispatch.
+
+- **Entity (mutable, identity-bearing)**: `OrderedCollection`, `Dictionary`.
+  These remain `Object subclass:` and become actor entities: an
+  `OrderedCollection` is "the same collection" as elements are added and
+  removed over time, which is exactly the definition of persistent identity.
+  Existing tests that use these types will require the entity thread machinery
+  running; their behavioral contracts (correct sizes, correct contents) are
+  preserved — only the execution mechanism changes.
+
+**Behavioral transparency**: from the programmer's perspective, code written
+for a value class and code written for an actor class look identical — both use
+standard message-send syntax. The difference is in what the system does under
+the hood: synchronous dispatch vs. enqueue + future. This is the expression
+of P7 (minimal ceremony) and P4 (concurrency is structural).
+
+### Value::Future — Lazy, Forwarded by Reference
+
+`Value::Future(FutureHandle)` is returned immediately on any actor message send.
+It is not resolved eagerly. The rule is:
+
+> **Resolution is required only at the point where a message is dispatched to
+> the future's value.** All other operations — assignment, passing as argument
+> into another envelope — propagate the future reference by `Arc::clone`.
+
+Concretely:
+
+```smalltalk
+r1 := entityA compute: 42.          "r1 = Value::Future; no blocking"
+entityB transform: r1.              "r1 forwarded as-is into envelope; no blocking"
+result := r1 + 1.                   "r1 must resolve before '+' dispatches; blocks here"
 ```
 
-where `EntityHandle` is:
+This enables natural fan-out: multiple async sends can be fired before any
+suspension occurs. Resolution happens only when the caller needs to inspect
+or use the value.
+
+`FutureHandle` is `Arc<FutureState>`:
 
 ```rust
-#[derive(Clone)]
-pub struct EntityHandle(Arc<EntityState>);
+pub struct FutureState {
+    pub inner: Mutex<FutureInner>,
+    pub condvar: Condvar,
+}
+
+pub struct FutureInner {
+    pub value: Option<Value>,
+}
 ```
 
-`EntityHandle::ptr_eq` compares `Arc` pointer addresses; this is entity identity.
-`Value::Entity` equality is pointer equality (two entity refs are `=` iff they
-wrap the same `Arc`).
+`FutureHandle::wait()` acquires the lock and condvar-waits until `value` is
+`Some`. The producing entity calls `FutureHandle::resolve(value)` at the end
+of its message handler, which sets `value` and calls `condvar.notify_all()`.
 
-### EntityState
+**Forwarding across entity boundaries**: when `Value::Future` appears in the
+arguments of an `Envelope`, it is `Arc::clone`d — the receiving entity gets a
+live reference to the same `FutureState`. If the receiving entity eventually
+dispatches a message to that argument, it will block at that point if not yet
+resolved. This is the first step toward promise pipelining; full message
+forwarding/buffering is deferred.
+
+**Note — precluding nothing**: the eventual model (D2, "synchronous is an
+optimization") may include futures that buffer messages sent to them before
+resolution, dispatching to the resolved value upon resolution. The current
+`FutureState` design does not support this yet, but the `Arc`-shared structure
+does not preclude it. The upgrade path is to add a `Vec<Envelope>` buffer to
+`FutureState` and drain it on resolve.
+
+### Multi-Threaded Execution from the Start (P4, D10)
+
+Each entity instance spawns one OS thread. The thread runs the entity's message
+loop: pop envelope, dispatch synchronously on the entity's thread, resolve the
+reply future with the return value, repeat. The thread parks on a condvar when
+the mailbox is empty.
+
+This gives true multi-core parallelism immediately. Two entities process
+messages concurrently on separate cores with no additional configuration.
+
+**Why not a cooperative single-threaded scheduler**: a cooperative scheduler
+would prevent entity A from progressing while entity B runs. With implicit
+futures and blocking resolution (`FutureHandle::wait()`), entity A's thread
+can block waiting for entity B's result while entity B's thread makes progress.
+A single-threaded cooperative scheduler cannot express this without coroutine
+infrastructure (explicit continuations or green threads).
+
+**Why not a green-thread pool immediately**: for the MVP with small entity
+counts (tens in tests), one OS thread per entity is correct, simple to
+implement, and does not preclude the upgrade. The documented upgrade path is:
+
+1. Replace OS threads with green threads (stackful coroutines via a library
+   such as `may`). No changes to the evaluator required — green threads have
+   their own Rust call stack, so `eval_expr` stays synchronous.
+2. Introduce a work-stealing thread pool (N OS threads for M green-thread
+   entities), equivalent to the BEAM scheduler model.
+3. The `FutureHandle::wait()` call becomes a green-thread park rather than an
+   OS-thread block; the evaluator code is unchanged.
+
+The Rust evaluator (`eval_expr`) stays synchronous throughout this evolution.
+When the custom VM arrives, per-entity green-thread stacks are replaced by
+explicit VM stack data structures; the thread-pool scheduler is unchanged.
+
+### Sync Self-Send
+
+Messages sent to `self` within an entity's own message handler must dispatch
+synchronously. Queuing a self-send would require the entity's own thread to
+wait on a future while also being the thread that would process it —
+deadlock. A thread-local `CURRENT_ENTITY: Option<EntityId>` is set before
+dispatching an envelope. If the target entity's ID matches `CURRENT_ENTITY`,
+dispatch falls through to direct synchronous invocation (same path as value
+dispatch). No programmer annotation required.
+
+### Entity State
 
 ```rust
 pub struct EntityState {
     pub id: EntityId,                       // monotonic u64, assigned at spawn
-    pub class: Arc<ClassDef>,               // the entity's class
-    pub ivars: Mutex<Vec<Value>>,           // instance variable slots
-    pub mailbox: Mutex<VecDeque<Envelope>>, // pending messages
-    pub status: Mutex<EntityStatus>,        // Running | Faulted(String) | Terminated
+    pub class: Arc<ClassDef>,
+    pub ivars: Mutex<Vec<Value>>,           // locked during handler dispatch only
+    pub mailbox: Mutex<VecDeque<Envelope>>,
+    pub mailbox_condvar: Condvar,           // entity thread parks here when empty
+    pub status: Mutex<EntityStatus>,
 }
 
 pub enum EntityStatus {
     Running,
-    Faulted(String),   // last error message; entity will accept no further messages
-    Terminated,        // clean shutdown (future)
+    Faulted(String),
+    Terminated,
 }
 ```
 
-`ivars` and `mailbox` use separate `Mutex` locks to avoid deadlock: the ivar lock
-is held only during method dispatch (inside the entity's own scheduler turn),
-never while sending to another entity.
+`ivars` and `mailbox` use separate locks. The ivar lock is held only during
+dispatch of a single envelope; it is never held while waiting on a `FutureHandle`.
 
 ### Envelope
 
@@ -107,358 +225,309 @@ never while sending to another entity.
 pub struct Envelope {
     pub selector: Arc<str>,
     pub args: Vec<Value>,
-    pub reply: Option<oneshot::Sender<Value>>, // unused in this chunk; allocated for future
+    pub reply: FutureHandle,  // always present; entity resolves it at handler end
 }
 ```
 
-Arguments are deep-cloned at send time (see "Cross-entity value safety" below).
+Every send allocates a `FutureHandle` pair. The sender holds the `FutureHandle`
+for the caller; the entity holds the same `Arc` to resolve it. Fire-and-forget
+semantics emerge naturally when the caller stores the future in a variable and
+never dispatches a message to it — the future is allocated but `wait()` is
+never called.
 
-### Scheduler
+### Cross-Entity Value Safety
 
-The scheduler is a simple cooperative, single-threaded driver for this chunk.
-Multi-threaded work-stealing is a later concern (once the design is validated).
+Arguments in an `Envelope` follow these rules at send time:
 
-```rust
-pub struct Scheduler {
-    entities: Vec<EntityHandle>,   // registration order; round-robin
-    next: usize,
-}
+| Value kind | Action |
+|---|---|
+| `Int`, `Float`, `Bool`, `Nil`, `Symbol`, `LargeInt` | `Clone` (copy) |
+| `Str(Arc<str>)` | `Arc::clone` (immutable, safe to share) |
+| `Object(Arc<ObjectData>)` where `is_actor: false` | Deep-clone (new `ObjectData` with recursively cloned ivars) |
+| `Array`, `ByteArray`, `OrderedCollection` (value class instances) | Deep-clone |
+| `Entity(EntityHandle)` | `Arc::clone` (entity references are intentionally shared) |
+| `Future(FutureHandle)` | `Arc::clone` (forwarded by reference; no resolution) |
+| `Block` | Error: `'blocks may not cross entity boundaries'` |
 
-impl Scheduler {
-    /// Process all pending messages across all entities, round-robin,
-    /// until no entity has any pending messages.
-    /// Requires: called from a context that holds no entity ivar locks.
-    /// Ensures: on return, all mailboxes are empty (or all remaining entities
-    ///          are Faulted).
-    pub fn run_until_quiescent(&mut self, interp: &mut Interpreter);
+### Error Isolation
 
-    /// Run indefinitely, blocking until no work is available, then sleeping.
-    /// Used by the program entry point.
-    pub fn run(&mut self, interp: &mut Interpreter);
-
-    /// Register a newly spawned entity.
-    pub fn register(&mut self, handle: EntityHandle);
-}
-```
-
-Each turn: pick the next entity with a non-empty mailbox, pop one `Envelope`,
-dispatch synchronously using the entity's `class` and `ivars`. Any error other
-than `EvalError::Return` sets the entity's status to `Faulted` and logs the fault;
-the turn ends and the scheduler moves to the next entity.
-
-`run_until_quiescent` is the test harness entry point. It loops until a full
-round-trip through all registered entities finds no pending messages.
-
-### Entity class declaration
-
-In Smol, an entity class is declared by subclassing `Entity` rather than `Object`:
-
-```smalltalk
-Entity subclass: #Counter
-    instanceVariableNames: 'count'
-    classVariableNames: ''
-    indexedSlots: #none.
-
-Counter >> initialize [ count := 0 ]
-Counter >> increment  [ count := count + 1 ]
-Counter >> decrement  [ count := count - 1 ]
-Counter >> count      [ ^count ]
-```
-
-`Entity` is a new built-in class registered in the interpreter's class table at
-startup, alongside `Object`. It carries a class-level flag `isEntityClass: true`
-that `_primSpawn` checks.
-
-`new` on an entity class raises `Error signal: 'use spawn to create entities'`.
-This enforces the distinction at the language level.
-
-### Spawning
-
-```smalltalk
-Counter class >> spawn [
-    ^self _primSpawn
-]
-```
-
-`_primSpawn` in Rust:
-
-1. Verifies the receiver class has `isEntityClass: true`.
-2. Allocates `EntityState` with zeroed ivars (one slot per declared instance
-   variable name).
-3. Wraps it in `EntityHandle(Arc::new(state))`.
-4. Registers the handle with the thread-local `Scheduler`.
-5. Queues an `initialize` message in the new entity's mailbox (so `initialize`
-   runs on the first scheduler turn, not synchronously in the spawning context).
-6. Returns `Value::Entity(handle)`.
-
-The thread-local scheduler pattern allows `_primSpawn` to register without an
-explicit scheduler argument threaded through every dispatch call.
-
-### Async dispatch
-
-The dispatch table in `builtins.rs` already routes on `Value::*`. A new top-level
-branch:
-
-```rust
-Value::Entity(handle) => dispatch_entity_send(handle, sel, args, scheduler),
-```
-
-`dispatch_entity_send`:
-
-```rust
-fn dispatch_entity_send(
-    handle: EntityHandle,
-    sel: &str,
-    args: Vec<Value>,
-    scheduler: &mut Scheduler,
-) -> Result<Value, EvalError> {
-    let args_cloned = deep_clone_args(args); // cross-entity value safety
-    let envelope = Envelope { selector: sel.into(), args: args_cloned, reply: None };
-    handle.enqueue(envelope);
-    Ok(Value::Entity(handle)) // async send returns the receiver (fire-and-forget)
-}
-```
-
-The return value of an async send is the entity handle itself. This is a
-deliberate design choice for this chunk: no futures yet, so the caller cannot
-block on a result. Returning the handle allows chaining sends.
-
-### Sync self-send
-
-When a method dispatch occurs *within an entity's scheduler turn* (i.e., the
-interpreter is already inside `dispatch_entity_turn`), sends to `self` must be
-synchronous — otherwise an entity could deadlock waiting for its own message to be
-processed by the same scheduler turn.
-
-Detection: the scheduler sets a thread-local `current_entity: Option<EntityHandle>`
-before calling dispatch. If `dispatch_entity_send` is called and the target handle
-is `ptr_eq` to `current_entity`, dispatch falls through to direct synchronous
-invocation (same path as `Value::Object` dispatch) rather than queuing.
-
-This implements sync-inside/async-outside at the call level with no programmer
-annotation.
-
-### Cross-entity value safety
-
-When values are enqueued in an `Envelope`, all arguments are deep-cloned:
-
-- `Int`, `Float`, `Bool`, `Nil`, `Symbol`, `LargeInt` — `Clone` is a no-op copy.
-- `Str(Arc<str>)` — `Arc::clone` is O(1); strings are immutable; safe to share.
-- `Object(Arc<ObjectData>)` — deep-cloned: a new `ObjectData` is allocated with
-  recursively cloned ivar slots. This gives true isolation.
-- `Array`, `ByteArray`, `OrderedCollection` indexed storage — deep-cloned.
-- `Entity(EntityHandle)` — `Arc::clone` only; entity handles are references, not
-  values. Sending an entity handle to another entity is safe and intentional
-  (it lets entities hold references to each other for later messaging).
-- `Block` — **not** sent across entity boundaries in this chunk. Sending a block
-  raises `Error signal: 'blocks may not cross entity boundaries'`. Blocks close
-  over the spawning entity's ivar frame; cross-entity block sharing is a complex
-  capability question deferred to a later chunk.
-
-### Error isolation
-
-Inside `dispatch_entity_turn`, any `EvalError` that is not `EvalError::Return` is
-caught at the scheduler level:
-
-```rust
-match dispatch_entity_turn(&handle, &mut interp) {
-    Ok(_) => {}
-    Err(EvalError::Return(_)) => {} // non-local return escaped handler; treat as ok
-    Err(e) => {
-        let msg = e.to_string();
-        eprintln!("[entity {}] fault: {}", handle.id(), msg);
-        *handle.status.lock().unwrap() = EntityStatus::Faulted(msg);
-    }
-}
-```
-
-A faulted entity accepts no further messages. Its handle remains alive (other
-entities may still hold it) but `dispatch_entity_send` checks status and raises
-`Error signal: 'entity has faulted'` on attempted send.
-
-### `_primSelf`
-
-An entity method often needs to pass itself as a callback or reply address. Within
-a synchronous method body, `self` is the raw value on the Smol receiver stack —
-for entity methods, this must be the `Value::Entity(handle)` rather than a
-`Value::Object`. The scheduler passes the entity handle as the Smol `self` when
-dispatching a turn.
-
-No additional primitive is needed if dispatch is wired correctly; this is a
-correctness requirement on the dispatch path rather than a new primitive.
+Inside the entity's message loop, any error that is not `EvalError::Return`
+is caught at the loop level. The entity is marked `Faulted`, the error is
+logged, and the loop exits. All other entities continue unaffected. A
+`Faulted` entity's reply future is resolved with a sentinel error value
+(rather than left unresolved forever, which would deadlock any waiter).
+Sending a message to a `Faulted` entity raises
+`Error signal: 'entity has faulted'`.
 
 ---
 
-## New Rust surface
+## Class Hierarchy Change
+
+`Value` is a new built-in class registered at interpreter startup as a
+subclass of `Object` with `is_actor: false`. Its instances are `Value::Object`
+in Rust (same as today's non-actor instances); there is no new Rust variant.
+
+```
+Object  (is_actor: true)
+  Value  (is_actor: false)           ← immutable / identity-free data
+    Array
+    ByteArray
+    Association
+    Error
+    Boolean
+      True
+      False
+  OrderedCollection  (is_actor: true)  ← mutable, identity-bearing
+  Dictionary         (is_actor: true)  ← mutable, identity-bearing
+  Counter  (user-defined; is_actor: true — inherits from Object)
+  ...
+```
+
+The `is_actor` flag is inherited: subclasses of `Object` are actors unless
+they or an ancestor explicitly set `is_actor: false` by subclassing `Value`
+(or `Value subclass:` in Smol). Subclassing `Value` within `Value` inherits
+`is_actor: false`.
+
+Mixed-hierarchy subclassing (an actor class subclassing a value class or vice
+versa) is an open question for the MVP. For chunk 21: detected at class-
+definition time and raises `Error signal: 'cannot mix actor and value inheritance'`.
+
+---
+
+## New Rust Surface
 
 | Addition | Location | Notes |
 |---|---|---|
-| `Value::Entity(EntityHandle)` | `value.rs` | New variant; entity references |
+| `Value::Entity(EntityHandle)` | `value.rs` | Actor references; pointer equality |
+| `Value::Future(FutureHandle)` | `value.rs` | Lazy future; resolved only at dispatch |
 | `EntityId` | `entity.rs` | `u64`, assigned atomically at spawn |
 | `EntityHandle` | `entity.rs` | `Arc<EntityState>` newtype |
-| `EntityState` | `entity.rs` | ivars, mailbox, status |
+| `EntityState` | `entity.rs` | ivars, mailbox, mailbox condvar, status |
 | `EntityStatus` | `entity.rs` | `Running \| Faulted(String) \| Terminated` |
-| `Envelope` | `entity.rs` | selector, args, optional reply |
-| `Scheduler` | `scheduler.rs` | `run_until_quiescent`, `run`, `register` |
-| `_primSpawn` | `builtins.rs` | Entity class primitive |
+| `Envelope` | `entity.rs` | selector, args, reply `FutureHandle` |
+| `FutureHandle` | `entity.rs` | `Arc<FutureState>` newtype |
+| `FutureState` | `entity.rs` | `Mutex<FutureInner> + Condvar` |
+| `FutureHandle::wait()` | `entity.rs` | Blocks caller's thread until resolved |
+| `FutureHandle::resolve(v)` | `entity.rs` | Sets value; notifies waiters |
 | `deep_clone_args` | `entity.rs` | Cross-entity value cloning |
-| Thread-local `CURRENT_ENTITY` | `scheduler.rs` | Sync-self-send detection |
+| `ClassDef.is_actor` | `interpreter.rs` | Inherited flag; determines dispatch path |
+| Thread-local `CURRENT_ENTITY` | `entity.rs` | Sync self-send detection |
 
 ---
 
-## Changes to existing source files
+## Changes to Existing Source Files
 
 ### `src/value.rs`
 
-- Add `Entity(EntityHandle)` to the `Value` enum.
-- Add `Value::Entity` arms to `Display`, `PartialEq` (pointer equality),
-  `Clone` (Arc clone), and any other derived impls.
-- `Value::Entity` `printString` renders as `'an EntityName'`.
+- Add `Entity(EntityHandle)` and `Future(FutureHandle)` variants.
+- `Display`: `'an EntityName'`, `'a Future'`.
+- `PartialEq`: entity is pointer equality; future is pointer equality.
+- `Clone`: both are `Arc::clone`.
 
 ### `src/builtins.rs`
 
-- Add top-level `Value::Entity(handle) =>` arm in `dispatch()` routing to
-  `dispatch_entity_send`.
-- Add `_primSpawn` to entity class dispatch (class-side).
-- Add guard in `Object::new` dispatch: if the class has `isEntityClass`, redirect
-  to `Error signal:`.
+- Add `Value::Entity(handle)` arm in `dispatch()`: calls `dispatch_entity_send`,
+  returning `Value::Future` immediately (unless it is a self-send, in which
+  case dispatches synchronously and wraps result in an already-resolved
+  `Value::Future` or returns directly).
+- Add `Value::Future(handle)` arm in `dispatch()`: calls `handle.wait()` to
+  block until resolved, then re-dispatches to the resolved value.
+- `Object class >> new` dispatch: if `class.is_actor`, spawn entity thread
+  and return `Value::Entity`; else existing synchronous `Value::Object` path.
+- Guard: `Value subclass:` sets `is_actor: false` on the new class.
 
 ### `src/eval.rs`
 
-- No structural changes required; `EvalError` already has `Signal` after chunk 20.
-- `eval_block` and `invoke_method` remain synchronous; the scheduler drives
-  entity-level async, not the evaluator.
+No structural changes required. The evaluator stays synchronous. Async
+behavior is handled entirely in `builtins.rs` dispatch and entity threads.
 
-### `src/interpreter.rs` (or equivalent top-level setup)
+### `src/interpreter.rs`
 
-- Register `Entity` as a built-in class at interpreter startup.
-- Initialize the thread-local `Scheduler`.
+- Register `Value` as a built-in class (`is_actor: false`) at startup,
+  as a subclass of `Object`.
+- Set `is_actor: false` on immutable/identity-free built-in classes
+  (`Array`, `ByteArray`, `Association`, `Error`, `True`, `False`, `Boolean`)
+  — these are value types; initialization-time equivalent of `Value subclass:`.
+- `OrderedCollection` and `Dictionary` retain `is_actor: true` (inherited
+  from `Object`); they become actor entities in this chunk.
 
 ### `src/kernel.smol`
 
-- Add `Entity` class declaration (no instance variables at the base level).
-- Add `Entity class >> spawn [ ^self _primSpawn ]`.
-- Add `Entity class >> new [ Error signal: 'use spawn to create entities' ]`.
+- Add `Value` class declaration (no instance variables; `is_actor: false`
+  class flag set by Rust init, not Smol source):
+
+  ```smalltalk
+  "Value — base class for passive data objects (no actor semantics)."
+  Object subclass: #Value
+      instanceVariableNames: ''
+      classVariableNames: ''
+      indexedSlots: #none.
+  ```
+
+- Change immutable/identity-free kernel types from `Object subclass:` to
+  `Value subclass:`. This is a mechanical change; no behavioral change:
+
+  ```smalltalk
+  Value subclass: #Array ... .
+  Value subclass: #ByteArray ... .
+  Value subclass: #Association ... .
+  Value subclass: #Error ... .
+  ```
+
+- `OrderedCollection` and `Dictionary` remain `Object subclass:` and become
+  actor entities. Existing tests that exercise these types now depend on
+  entity threads running and futures resolving; behavioral contracts
+  (correct element counts, correct values) are unchanged.
 
 ---
 
-## Protocol tables
+## Protocol Tables
 
-### Entity (Smol-visible)
+### Object (actor base class — Smol-visible)
 
 | Selector | Side | Requires | Ensures |
 |---|---|---|---|
-| `spawn` | class | receiver is an entity class | Returns `Value::Entity`; queues `initialize` |
-| `new` | class | — | Always signals: 'use spawn to create entities' |
-| `_primSpawn` | class | receiver's class flag `isEntityClass` is true | Allocates `EntityState`, registers with scheduler, returns handle |
+| `new` | class | receiver's `is_actor` is `true` | Allocates `EntityState`, spawns OS thread, queues `initialize`, returns `Value::Entity` |
+| `new` | class | receiver's `is_actor` is `false` | Allocates `Value::Object` synchronously, calls `initialize`, returns value |
+
+### Value (passive base class — Smol-visible)
+
+No new methods beyond `Object` inheritance. The class exists to declare
+`is_actor: false` for the subhierarchy.
 
 ### Value::Entity dispatch semantics (Rust)
 
 | Condition | Behavior |
 |---|---|
-| Target is `current_entity` (self-send) | Synchronous direct dispatch |
-| Target is any other entity, status `Running` | Enqueue `Envelope`; return handle |
-| Target is any other entity, status `Faulted` | Raise `Error signal: 'entity has faulted'` |
-| Arg is `Value::Block` | Raise `Error signal: 'blocks may not cross entity boundaries'` |
+| Target ID equals `CURRENT_ENTITY` (self-send) | Synchronous direct dispatch; return value unwrapped |
+| Target status `Running`, not self-send | Allocate `FutureHandle`; enqueue `Envelope`; return `Value::Future` |
+| Target status `Faulted` | Raise `Error signal: 'entity has faulted'` |
+| Any arg is `Value::Block` | Raise `Error signal: 'blocks may not cross entity boundaries'` |
 
-### Scheduler
+### Value::Future dispatch semantics (Rust)
+
+| Condition | Behavior |
+|---|---|
+| Future already resolved | Return resolved value; re-dispatch message synchronously |
+| Future not yet resolved | `handle.wait()` (blocks OS thread); when resolved, re-dispatch |
+
+### FutureHandle
 
 | Method | Requires | Ensures |
 |---|---|---|
-| `run_until_quiescent` | No entity ivar locks held by caller | Returns when all mailboxes are empty or all entities are Faulted |
-| `run` | — | Blocks indefinitely; returns only on process signal |
-| `register(handle)` | — | Entity included in future scheduling rounds |
+| `wait() -> Value` | Called from entity's OS thread | Blocks until `resolve()` is called; returns resolved value |
+| `resolve(v: Value)` | Called at most once | Sets value; wakes all waiters via `condvar.notify_all()` |
 
 ---
 
-## Implementation order
+## Implementation Order
 
-1. **`Value::Entity` variant** — add to `value.rs`, stub `Display` / `PartialEq` /
-   `Clone`. Tests: entity handles are not equal to each other by default (identity);
-   two clones of the same handle are `ptr_eq`.
+1. **`ClassDef.is_actor` flag** — add to `ClassDef`; set to `true` by default;
+   set `false` on all current built-in kernel classes at interpreter init.
+   Tests: `Object.is_actor` is `true`; `Array.is_actor` is `false`; a user-
+   defined `Object subclass:` inherits `true`.
 
-2. **`EntityState`, `EntityHandle`, `Envelope`** — new `entity.rs` module. Tests:
-   `enqueue` adds to mailbox; `pop_message` removes in FIFO order; `EntityStatus`
-   transitions correctly.
+2. **`Value subclass:` syntax** — detect in class-definition dispatch; set
+   `is_actor: false` on new class.
+   Tests: `Value subclass: #Point ...` produces a class with `is_actor: false`;
+   subclassing it also inherits `false`; mixed-hierarchy raises.
 
-3. **`_primSpawn` and entity class flag** — wire up `Entity` built-in class; add
-   `spawn` and guarded `new` to kernel.smol. Tests: `Counter spawn` returns a
-   `Value::Entity`; `Counter new` signals.
+3. **`Value::Entity` and `Value::Future` variants** — add to `value.rs`; stub
+   `Display`, `PartialEq`, `Clone`.
+   Tests: entity identity (two handles from same `Arc` are `ptr_eq`; two
+   distinct spawns are not); future equality is pointer equality.
 
-4. **`dispatch_entity_send` and `deep_clone_args`** — route entity sends to mailbox.
-   Tests: send to entity queues envelope; `Value::Block` send raises; `Value::Object`
-   arg is deep-cloned (verify that mutating the original after send does not affect
-   the enqueued copy).
+4. **`FutureState`, `FutureHandle`** — new in `entity.rs`.
+   Tests: `resolve` + `wait` in different threads; `wait` before `resolve`
+   blocks and then returns; double-resolve is handled gracefully (second call
+   is a no-op or panics — document the choice).
 
-5. **`Scheduler::run_until_quiescent`** with sync-self-send detection — cooperative
-   turn-based dispatch. Tests (single entity): spawn a counter, send `increment`
-   three times, run to quiescent, send `count`, run to quiescent, verify side-effects
-   via a shared `Value::Int` result channel (or `Transcript` spy).
+5. **`EntityState`, `EntityHandle`** — new in `entity.rs`; entity thread loop
+   (pop envelope, dispatch, resolve reply future, park when empty).
+   Tests: entity with no methods starts and parks without panic.
 
-6. **Two-entity test** — spawn two entities; one sends messages to the other.
-   Verify that neither entity accesses the other's ivars directly and that both
-   process their queues correctly.
+6. **`Object class >> new` for actor classes** — wire up in `builtins.rs`;
+   migrates to `Value::Entity` path when `is_actor: true`.
+   Tests: `Counter new` (actor class) returns `Value::Entity`; `Association new`
+   (value class) returns `Value::Object`.
 
-7. **Error isolation test** — spawn a faulty entity (raises `Signal` in handler)
-   alongside a healthy entity; verify that the healthy entity continues processing
-   after the faulty one is marked `Faulted`.
+7. **`dispatch_entity_send`** — `Value::Entity` arm; deep-clone args;
+   allocate `FutureHandle` pair; enqueue `Envelope`; return `Value::Future`.
+   Tests: send to entity enqueues envelope; `Value::Block` arg raises;
+   `Value::Object` arg deep-cloned (mutating original after send does not
+   affect enqueued copy); `Value::Future` arg forwarded as `Arc::clone`.
 
-8. **Sync-self-send test** — verify that an entity method calling another method
-   on `self` dispatches synchronously (no deadlock, correct ivar access).
+8. **`dispatch_future`** — `Value::Future` arm; calls `wait()`; re-dispatches.
+   Tests: `result := entity compute: 42. result + 1` returns `43` (entity's
+   `compute:` method returns `42`).
 
-9. **Coverage check** — `just cov`; no file below 80%.
+9. **Sync self-send** — `CURRENT_ENTITY` thread-local; bypass enqueue when
+   target ID matches.
+   Tests: entity calling a method on `self` within a handler does not deadlock
+   and returns the correct value.
+
+10. **kernel.smol migration** — change existing `Object subclass:` to
+    `Value subclass:` for all data types. Run full test suite; all existing
+    tests must pass.
+
+11. **Multi-entity test** — spawn two entities; one sends a message to the
+    other and uses the result. Both run on separate OS threads. Verify
+    correct result and no data races (`cargo test` with `MIRIFLAGS` or at
+    minimum ThreadSanitizer pass).
+
+12. **Error isolation test** — faulty entity (raises `Signal`) alongside healthy
+    entity; verify healthy entity continues; waiter on faulty entity's future
+    receives the sentinel error value rather than blocking forever.
+
+13. **Coverage check** — `just cov`; no file below 80%.
 
 ---
 
-## Open questions
+## Open Questions
 
-### Scheduler ownership and thread-local approach
+### One OS Thread Per Entity — Scale Ceiling
 
-Using a thread-local `Scheduler` makes `_primSpawn` registration simple but
-constrains the scheduler to a single thread. This is intentional for chunk 21 —
-multi-threaded scheduling (e.g., one OS thread per entity, or a work-stealing pool
-of OS threads each running a scheduler partition) is deferred. The thread-local
-approach does not foreclose any of those options; it just makes them opt-in
-migrations rather than requirements now.
+The MVP creates one OS thread per entity. This is correct but does not scale
+beyond hundreds of entities (OS thread overhead is ~1–8 MB stack by default,
+plus scheduling overhead). The documented upgrade path (green-thread pool,
+see Design Decisions above) is the right next step after the model is
+validated. Nothing in the chunk 21 design forecloses it; the entity thread
+loop and `FutureHandle::wait()` are written to be drop-in compatible with
+a coroutine-based implementation.
 
-### Deep clone cost
+### Faulted Entity Future Resolution
 
-Deep-cloning every `Value::Object` on entity send is correct but potentially
-expensive for large object graphs. The principled fix — copying only truly mutable
-values, sharing immutable ones — requires the Value/Entity type distinction to be
-visible at the type system level, which is a later chunk concern. For now, deep
-clone is conservative and verifiably correct.
+When an entity faults mid-handler, its reply future must be resolved or
+waiters will block forever. Options:
 
-### `Block` across entity boundaries
+- Resolve with a sentinel `Value::Object` representing the fault (e.g., an
+  `Error` instance).
+- Resolve with a special `Value::Fault(String)` variant (adds a variant).
+- Leave unresolved; document that callers must use a timeout (future chunk).
 
-Blocks are excluded from cross-entity sends in this chunk because a block closes
-over its lexical environment, which is owned by the spawning entity's ivar frame.
-Sharing that closure with another entity would violate isolation. The correct long-
-term model (blocks as capability-bounded functions, with explicit captured-value
-lists) is a design-chunk question; the error is raised now to fail-fast rather than
-silently share mutable state.
+For chunk 21: resolve with an `Error signal:` value (reuse the existing
+`Error` class). Any waiter receives the error value; if they dispatch a
+message to it expecting a different type, the error will propagate naturally.
 
-### `initialize` timing
+### `initialize` Timing
 
-`_primSpawn` queues `initialize` rather than calling it synchronously. This means
-an entity's first message may arrive before `initialize` runs if the caller
-immediately sends more messages before the scheduler runs. The scheduler processes
-the mailbox in FIFO order, so `initialize` always runs first. This is documented
-here as a contract of `_primSpawn`.
+`new` queues `initialize` as the first envelope. A caller that immediately
+sends more messages before the entity's thread has run its first envelope
+will queue those after `initialize` — `initialize` still runs first (FIFO).
+This is a contract of `new` and is documented in the protocol table above.
 
-### Entity class inheritance
+### Double-Resolve of FutureHandle
 
-Can an entity class subclass another entity class? For MVP: yes, the standard
-subclassing machinery works. The `isEntityClass` flag is inherited. Mixed hierarchies
-(an entity class subclassing a value class or vice versa) raise `Error signal:`
-at class-definition time; the interpreter checks the superclass flag on
-`subclass:instanceVariableNames:classVariableNames:indexedSlots:`.
+`resolve()` should be called exactly once per `Envelope`. The entity message
+loop always resolves the reply future at the end of a handler turn (with the
+return value). If the handler signals an error, the loop resolves with the
+error sentinel. A `debug_assert!` in `resolve()` can catch double-resolve in
+development.
 
-### Relation to triple store (chunk 22 preview)
+### Relation to Triple Store (Chunk 22 Preview)
 
-The triple store crate is complete. Chunk 22 will integrate it as the authoritative
-state store for each entity: instead of `ivars: Mutex<Vec<Value>>`, each entity will
-own a `TripleStore` instance, and ivar reads/writes will become triple queries and
-assertions. This is a contained change to `EntityState` and the dispatch layer;
-the scheduler, messaging, and Smol surface stay unchanged. The chunk 21 design
-deliberately keeps entity state simple so this substitution is a clean swap.
+Chunk 22 integrates the triple store as entity state: `EntityState.ivars`
+becomes a per-entity `TripleStore`. This is a contained change to
+`EntityState` and the ivar read/write path; the entity thread loop, mailbox,
+`FutureHandle`, and Smol surface are unchanged. The chunk 21 design keeps
+entity state simple specifically to make this swap clean.
