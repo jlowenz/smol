@@ -1,12 +1,12 @@
-"ValueObject - single value reference"
-Object subclass: #ValueObject instanceVariableNames: 'val'.
-ValueObject class >> initialValue: aVal [
-    ^ValueObject new set: aVal; yourself
+"ValueHolder - an actor that holds a single mutable value reference"
+Object subclass: #ValueHolder instanceVariableNames: 'val'.
+ValueHolder class >> initialValue: aVal [
+    ^ValueHolder new set: aVal; yourself
 ]
-ValueObject >> set: aVal [ val := aVal ]
-ValueObject >> get [ ^val ]
-"Takes aBlock that accepts the old value and return an updated value"
-ValueObject >> update: aBlock [
+ValueHolder >> set: aVal [ val := aVal ]
+ValueHolder >> get [ ^val ]
+"Takes aBlock that accepts the old value and returns an updated value"
+ValueHolder >> update: aBlock [
     self set: (aBlock value: self get)
 ]
 

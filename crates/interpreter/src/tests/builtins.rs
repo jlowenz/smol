@@ -1321,7 +1321,10 @@ fn if_not_nil_on_non_nil_passes_receiver_to_block() {
 
 #[test]
 fn if_nil_if_not_nil_nil_receiver() {
-    assert_eq!(eval("nil ifNil: [1] ifNotNil: [:v | v + 10]"), Value::Int(1));
+    assert_eq!(
+        eval("nil ifNil: [1] ifNotNil: [:v | v + 10]"),
+        Value::Int(1)
+    );
 }
 
 #[test]
@@ -1331,12 +1334,18 @@ fn if_nil_if_not_nil_non_nil_receiver() {
 
 #[test]
 fn if_not_nil_if_nil_nil_receiver() {
-    assert_eq!(eval("nil ifNotNil: [:v | v + 10] ifNil: [99]"), Value::Int(99));
+    assert_eq!(
+        eval("nil ifNotNil: [:v | v + 10] ifNil: [99]"),
+        Value::Int(99)
+    );
 }
 
 #[test]
 fn if_not_nil_if_nil_non_nil_receiver() {
-    assert_eq!(eval("5 ifNotNil: [:v | v + 10] ifNil: [99]"), Value::Int(15));
+    assert_eq!(
+        eval("5 ifNotNil: [:v | v + 10] ifNil: [99]"),
+        Value::Int(15)
+    );
 }
 
 // ── Universal then: ───────────────────────────────────────────────────────
@@ -1380,4 +1389,118 @@ fn prim_signal_on_nil_signals() {
         crate::eval::EvalError::Signal(msg) => assert!(msg.contains("raw")),
         e => panic!("expected Signal, got {e:?}"),
     }
+}
+
+// ── _primNew / _primNew: ──────────────────────────────────────────────────────
+
+#[test]
+fn prim_new_value_class_returns_value_object() {
+    let src = r#"
+Value subclass: #MyVal instanceVariableNames: ''.
+MyVal _primNew
+"#;
+    assert!(matches!(eval(src), Value::ValueObject(_)));
+}
+
+#[test]
+fn prim_new_value_class_no_initialize() {
+    let src = r#"
+Value subclass: #MyVal instanceVariableNames: 'flag'.
+MyVal >> initialize [ flag := true ]
+MyVal >> flag [ ^flag ]
+| v |
+v := MyVal _primNew.
+v flag
+"#;
+    // initialize was not called, so flag is still nil
+    assert_eq!(eval(src), Value::Nil);
+}
+
+#[test]
+fn prim_new_colon_value_class_correct_size() {
+    let src = r#"
+Value subclass: #MyBuf instanceVariableNames: '' indexedSlots: #byte.
+| v |
+v := MyBuf _primNew: 7.
+v _primSize
+"#;
+    assert_eq!(eval(src), Value::Int(7));
+}
+
+#[test]
+fn prim_new_actor_class_returns_entity_handle_running() {
+    let src = r#"
+Object subclass: #MyActor instanceVariableNames: ''.
+MyActor _primNew
+"#;
+    let v = eval(src);
+    match &v {
+        Value::Object(handle) => {
+            let mb = handle.0.mailbox.lock().unwrap();
+            assert!(mb.is_empty(), "mailbox should be empty after _primNew");
+            drop(mb);
+            let status = handle.0.status.lock().unwrap();
+            assert!(
+                matches!(*status, crate::entity::EntityStatus::Running),
+                "status should be Running immediately after _primNew"
+            );
+        }
+        other => panic!("expected Value::Object, got {other:?}"),
+    }
+}
+
+#[test]
+fn prim_new_actor_class_no_initialize() {
+    let src = r#"
+Object subclass: #MyActor instanceVariableNames: 'flag'.
+MyActor >> initialize [ flag := true ]
+MyActor >> flag [ ^flag ]
+| a |
+a := MyActor _primNew.
+a flag
+"#;
+    // initialize was not called, so flag is still nil
+    assert_eq!(eval(src), Value::Nil);
+}
+
+#[test]
+fn prim_new_colon_requires_indexed_slots() {
+    let src = r#"
+Object subclass: #Plain instanceVariableNames: ''.
+Plain _primNew: 4
+"#;
+    assert!(matches!(
+        eval_err(src),
+        crate::eval::EvalError::TypeError(_)
+    ));
+}
+
+// ── _prim* self-check ─────────────────────────────────────────────────────────
+
+#[test]
+fn prim_self_check_rejects_non_self_receiver() {
+    let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Object subclass: #Bar instanceVariableNames: ''.
+Bar >> bad: other [
+    other _primNew
+]
+"#;
+    assert!(matches!(
+        eval_err(src),
+        crate::eval::EvalError::TypeError(msg) if msg.contains("_prim*")
+    ));
+}
+
+#[test]
+fn prim_self_check_allows_self_receiver() {
+    // A class-side _primNew sent to self should install without error.
+    let src = r#"
+Object subclass: #Baz instanceVariableNames: ''.
+Baz class >> create [
+    ^self _primNew
+]
+"#;
+    // If this eval returns without error the method installed successfully.
+    assert_eq!(eval(src), Value::Nil);
 }

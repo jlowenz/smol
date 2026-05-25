@@ -301,6 +301,7 @@ impl Evaluator {
                     }
                     None => return Err(EvalError::UndefinedVariable(def.class_name.clone())),
                 };
+                check_prim_sends_in_body(&def.body)?;
                 let method = Arc::new(Method {
                     pattern: def.pattern.clone(),
                     locals: def.locals.clone(),
@@ -808,6 +809,90 @@ fn eval_literal(lit: &Literal) -> Value {
     }
 }
 
+// ── _prim* self-check ─────────────────────────────────────────────────────────
+
+fn selector_starts_with_prim(msg: &Message) -> bool {
+    match msg {
+        Message::Unary(s) => s.starts_with("_prim"),
+        Message::Binary { op, .. } => op.starts_with("_prim"),
+        // Keyword selector starts with _prim if its first fragment does.
+        Message::Keyword { parts } => parts
+            .first()
+            .map(|(k, _)| k.starts_with("_prim"))
+            .unwrap_or(false),
+    }
+}
+
+fn is_self_or_super(expr: &Expr) -> bool {
+    matches!(expr, Expr::Super) || matches!(expr, Expr::Var(name) if name.as_ref() == "self")
+}
+
+/// Walk `expr` and return an error if any `_prim*` message is sent to a
+/// receiver that is not `self` or `super`.
+fn check_prim_sends_in_expr(expr: &Expr) -> Result<(), EvalError> {
+    match expr {
+        Expr::Send { receiver, message } => {
+            if selector_starts_with_prim(message) && !is_self_or_super(receiver) {
+                return Err(EvalError::TypeError(
+                    "'_prim*' may only be sent to self".into(),
+                ));
+            }
+            check_prim_sends_in_expr(receiver)?;
+            check_prim_sends_in_message(message)
+        }
+        Expr::Cascade { receiver, messages } => {
+            for msg in messages {
+                if selector_starts_with_prim(msg) && !is_self_or_super(receiver) {
+                    return Err(EvalError::TypeError(
+                        "'_prim*' may only be sent to self".into(),
+                    ));
+                }
+            }
+            check_prim_sends_in_expr(receiver)?;
+            for msg in messages {
+                check_prim_sends_in_message(msg)?;
+            }
+            Ok(())
+        }
+        Expr::Block { body, .. } => check_prim_sends_in_body(body),
+        Expr::Lit(_)
+        | Expr::Var(_)
+        | Expr::Super
+        | Expr::ArrayLiteral(_)
+        | Expr::NamespaceRef { .. } => Ok(()),
+    }
+}
+
+fn check_prim_sends_in_message(msg: &Message) -> Result<(), EvalError> {
+    match msg {
+        Message::Unary(_) => Ok(()),
+        Message::Binary { arg, .. } => check_prim_sends_in_expr(arg),
+        Message::Keyword { parts } => {
+            for (_, e) in parts {
+                check_prim_sends_in_expr(e)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Scan a method body for `_prim*` sends to non-`self`/non-`super` receivers.
+///
+/// Requires: `stmts` is the body of a method being installed.
+/// Ensures: returns `Err(EvalError::TypeError)` if any such send is found;
+///   otherwise `Ok(())`.
+fn check_prim_sends_in_body(stmts: &[Stmt]) -> Result<(), EvalError> {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Expr(e) | Stmt::Return(e) => check_prim_sends_in_expr(e)?,
+            Stmt::Assign { value, .. } => check_prim_sends_in_expr(value)?,
+            Stmt::LocalDecl(_) => {}
+            // Nested MethodDef bodies are checked when they are installed.
+            Stmt::MethodDef(_) => {}
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 #[path = "tests/eval.rs"]

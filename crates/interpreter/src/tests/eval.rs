@@ -366,7 +366,7 @@ fn array_first_last() {
 #[test]
 fn value_object_update_basic() {
     assert_eq!(
-        eval("| s | s := ValueObject initialValue: 0. s update: [:old | old + 1]. s get"),
+        eval("| s | s := ValueHolder initialValue: 0. s update: [:old | old + 1]. s get"),
         Value::Int(1)
     );
 }
@@ -376,7 +376,7 @@ fn value_object_update_basic() {
 fn value_object_update_captures_outer_var() {
     assert_eq!(
         eval(
-            "| s | s := ValueObject initialValue: 0. [:x | s update: [:old | old + x]] value: 5. s get"
+            "| s | s := ValueHolder initialValue: 0. [:x | s update: [:old | old + x]] value: 5. s get"
         ),
         Value::Int(5)
     );
@@ -385,7 +385,7 @@ fn value_object_update_captures_outer_var() {
 #[test]
 fn await_resolves_future() {
     assert_eq!(
-        eval("| s | s := ValueObject initialValue: 42. (s get) await"),
+        eval("| s | s := ValueHolder initialValue: 42. (s get) await"),
         Value::Int(42)
     );
 }
@@ -399,7 +399,7 @@ fn await_is_noop_on_non_future() {
 fn sync_value_block_sequences_cross_entity_sends() {
     assert_eq!(
         eval(
-            "| s | s := ValueObject initialValue: 0. [s update: [:old | old + 5]. s get] syncValue"
+            "| s | s := ValueHolder initialValue: 0. [s update: [:old | old + 5]. s get] syncValue"
         ),
         Value::Int(5)
     );
@@ -410,7 +410,7 @@ fn future_then_chains_after_completion() {
     assert_eq!(
         eval(
             "| a s | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3.
-            s := ValueObject initialValue: 0.
+            s := ValueHolder initialValue: 0.
             (a do: [:e | s update: [:old | old + e]]) then: [s get]"
         ),
         Value::Int(6)
@@ -422,7 +422,7 @@ fn array_do_iterates() {
     assert_eq!(
         eval(
             "| a s | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3.
-            s := ValueObject initialValue: 0.
+            s := ValueHolder initialValue: 0.
             (a do: [:e | s update: [:old | old + e]]) await.
             s get"
         ),
@@ -470,9 +470,11 @@ fn array_inject_into_sum() {
 
 #[test]
 fn array_includes() {
-    let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a includes: 2";
+    let src =
+        "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a includes: 2";
     assert_eq!(eval(src), Value::Bool(true));
-    let src2 = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a includes: 9";
+    let src2 =
+        "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a includes: 9";
     assert_eq!(eval(src2), Value::Bool(false));
 }
 
@@ -563,7 +565,7 @@ fn bytearray_do() {
     b at: 0 put: 10.
     b at: 1 put: 20.
     b at: 2 put: 30.
-    s := ValueObject initialValue: 0.
+    s := ValueHolder initialValue: 0.
     (b do: [:e | s update: [ :old | old + e ]]) await. s get";
     assert_eq!(eval(src), Value::Int(60));
 }
@@ -599,18 +601,15 @@ fn oc_at() {
 
 #[test]
 fn oc_first_last() {
-    let src =
-        "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc first";
+    let src = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc first";
     assert_eq!(eval(src), Value::Int(10));
-    let src2 =
-        "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc last";
+    let src2 = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc last";
     assert_eq!(eval(src2), Value::Int(30));
 }
 
 #[test]
 fn oc_add_first_prepends() {
-    let src =
-        "| oc | oc := OrderedCollection new. oc add: 2. oc add: 3. oc addFirst: 1. oc at: 0";
+    let src = "| oc | oc := OrderedCollection new. oc add: 2. oc add: 3. oc addFirst: 1. oc at: 0";
     assert_eq!(eval(src), Value::Int(1));
 }
 
@@ -626,11 +625,9 @@ fn oc_remove_first() {
 
 #[test]
 fn oc_remove_last() {
-    let src =
-        "| oc v | oc := OrderedCollection new. oc add: 10. oc add: 20. v := oc removeLast. v";
+    let src = "| oc v | oc := OrderedCollection new. oc add: 10. oc add: 20. v := oc removeLast. v";
     assert_eq!(eval(src), Value::Int(20));
-    let src2 =
-        "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc removeLast. oc size";
+    let src2 = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc removeLast. oc size";
     assert_eq!(eval(src2), Value::Int(1));
 }
 
@@ -705,7 +702,8 @@ fn oc_copy_from_to() {
 
 #[test]
 fn oc_at_put() {
-    let src = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc at: 0 put: 99. oc at: 0";
+    let src =
+        "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc at: 0 put: 99. oc at: 0";
     assert_eq!(eval(src), Value::Int(99));
 }
 
@@ -717,16 +715,17 @@ fn oc_at_put_out_of_bounds_signals() {
 
 #[test]
 fn oc_detect_no_match_signals() {
-    let src =
-        "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc detect: [:e | e > 10]";
+    let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc detect: [:e | e > 10]";
     assert!(matches!(eval_err(src), EvalError::Signal(_)));
 }
 
 #[test]
 fn oc_equality() {
-    let src = "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 1. a = b";
+    let src =
+        "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 1. a = b";
     assert_eq!(eval(src), Value::Bool(true));
-    let src2 = "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 2. a = b";
+    let src2 =
+        "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 2. a = b";
     assert_eq!(eval(src2), Value::Bool(false));
 }
 
@@ -1138,7 +1137,7 @@ d := Dictionary new.
 d at: 'a' put: 1.
 d at: 'b' put: 2.
 d at: 'c' put: 3.
-s := ValueObject initialValue: 0.
+s := ValueHolder initialValue: 0.
 (d do: [:v | s update: [:old| old + v]]) then: [s get].
 "#;
     assert_eq!(eval(src), Value::Int(6));

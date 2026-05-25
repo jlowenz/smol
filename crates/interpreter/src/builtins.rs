@@ -6,7 +6,7 @@ use num_traits::Zero;
 use parking_lot::RwLock;
 
 use crate::class::{Class, IndexedSlotKind};
-use crate::entity::{EntityHandle, send_to_entity, spawn_entity};
+use crate::entity::{EntityHandle, send_to_entity, spawn_entity, spawn_entity_bare};
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
 use crate::namespace::Namespace;
@@ -1235,11 +1235,15 @@ fn dispatch_object_primitive(
     match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::ValueObject(obj) == force_value(args.remove(0))?))
+            Ok(Value::Bool(
+                Value::ValueObject(obj) == force_value(args.remove(0))?,
+            ))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::ValueObject(obj) != force_value(args.remove(0))?))
+            Ok(Value::Bool(
+                Value::ValueObject(obj) != force_value(args.remove(0))?,
+            ))
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
@@ -1532,6 +1536,41 @@ pub(crate) fn dispatch_class_builtin(
         "~=" => {
             expect_arity(&selector, 1, args.len())?;
             Ok(Value::Bool(Value::Class(class) != args[0]))
+        }
+        "_primNew" => {
+            expect_arity(&selector, 0, args.len())?;
+            if class.inherits_is_value() {
+                let obj = Arc::new(Object::new(class.clone()));
+                Ok(Value::ValueObject(obj))
+            } else {
+                let mut global_env = Env::new();
+                ev.registry.populate_env(&mut global_env);
+                let handle = spawn_entity_bare(class, ev.registry.clone(), global_env, None);
+                Ok(Value::Object(handle))
+            }
+        }
+        "_primNew:" => {
+            expect_arity(&selector, 1, args.len())?;
+            let n = as_int(args.remove(0), &selector)?;
+            if class.indexed_slot_kind.is_none() {
+                return Err(EvalError::TypeError(
+                    "_primNew: requires class to declare indexedSlots:".into(),
+                ));
+            }
+            if class.inherits_is_value() {
+                let obj = Arc::new(Object::new_with_indexed(class.clone(), n.max(0) as usize));
+                Ok(Value::ValueObject(obj))
+            } else {
+                let mut global_env = Env::new();
+                ev.registry.populate_env(&mut global_env);
+                let handle = spawn_entity_bare(
+                    class,
+                    ev.registry.clone(),
+                    global_env,
+                    Some(n.max(0) as usize),
+                );
+                Ok(Value::Object(handle))
+            }
         }
         "new" => {
             expect_arity(&selector, 0, args.len())?;

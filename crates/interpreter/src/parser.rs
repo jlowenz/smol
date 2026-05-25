@@ -603,7 +603,6 @@ impl Parser {
     }
 }
 
-
 #[cfg(test)]
 #[path = "tests/parser.rs"]
 mod tests;

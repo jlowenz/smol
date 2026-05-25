@@ -208,6 +208,46 @@ pub fn spawn_entity(
     handle
 }
 
+/// Spawn a new actor entity with an empty mailbox and no `initialize` queued.
+///
+/// Requires: `class.inherits_is_value()` is `false`.
+/// Ensures: the entity's coroutine is running in `Running` state; the mailbox
+///   is empty; `initialize` has NOT been enqueued.
+pub fn spawn_entity_bare(
+    class: Arc<Class>,
+    registry: Arc<ClassRegistry>,
+    global_env: Env,
+    indexed_size: Option<usize>,
+) -> EntityHandle {
+    let id = next_entity_id();
+    let obj = if let Some(n) = indexed_size {
+        Arc::new(Object::new_with_indexed(class.clone(), n))
+    } else {
+        Arc::new(Object::new(class.clone()))
+    };
+
+    let entity = Arc::new(EntityState {
+        id,
+        class: class.clone(),
+        data: obj,
+        mailbox: Mutex::new(VecDeque::new()),
+        mailbox_ready: Condvar::new(),
+        status: Mutex::new(EntityStatus::Running),
+    });
+
+    let handle = EntityHandle(entity.clone());
+
+    let entity_clone = entity.clone();
+    let registry_clone = registry.clone();
+    let env_clone = global_env.clone();
+    may::config().set_stack_size(0x4000);
+    may::go!(move || {
+        run_entity_loop(entity_clone, registry_clone, env_clone);
+    });
+
+    handle
+}
+
 /// Enqueue a message to an entity and return a future for the reply.
 ///
 /// Requires: `entity` status is `Running`.
