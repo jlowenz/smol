@@ -71,6 +71,7 @@ kernel grows significantly beyond its current size.
 I will add to this list as the project proceeds, but may also ask you to add things here as well. If something seems like it should be a preference or rule, please suggest putting it here. 
 
 - Very long thinking sessions must be avoided (i.e. greater than a couple minutes), I need more incremental feedback on the thought process to help avoid significant distractions and investigations that are off course. 
+- If you write out a plan for the next step, but then need to insert another plan, DO NOT overwrite the existing plan, just rename and write out the new plan. Overwriting something is a total waste of effort, unless it is REQUIRED because the existing item will never be relevant. 
 - Do your research and provide references. 
 - Do not hallucinate unless otherwise asked for potentially creative solutions.
 - Do not be obsequious. Instead, review and accept valid criticism, or form a careful argument for an opposing view or approach if necessary. However, if I make a specific decision, then that decision must be respected. 
