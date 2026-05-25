@@ -110,6 +110,10 @@ impl std::fmt::Debug for FutureHandle {
 /// Lifecycle state of an actor entity.
 #[derive(Debug, Clone)]
 pub enum EntityStatus {
+    /// `initialize` is queued but not yet complete. The held future resolves
+    /// when `initialize` finishes, allowing sequential contexts (e.g. `syncValue`)
+    /// to wait before sending further messages.
+    Initializing(FutureHandle),
     Running,
     Faulted(String),
     Terminated,
@@ -166,19 +170,31 @@ pub fn spawn_entity(
     } else {
         Arc::new(Object::new(class.clone()))
     };
+
+    let init_future = FutureHandle::new();
+
     let entity = Arc::new(EntityState {
         id,
         class: class.clone(),
         data: obj,
         mailbox: Mutex::new(VecDeque::new()),
         mailbox_ready: Condvar::new(),
-        status: Mutex::new(EntityStatus::Running),
+        status: Mutex::new(EntityStatus::Initializing(init_future.clone())),
     });
 
     let handle = EntityHandle(entity.clone());
 
-    // Queue `initialize` as the first message.
-    send_to_entity(&entity, Arc::from("initialize"), vec![]);
+    // Enqueue `initialize` using the same future stored in the status so that
+    // `eval_program_sync` can wait on it via the entity's status.
+    {
+        let mut mb = entity.mailbox.lock().unwrap();
+        mb.push_back(Envelope {
+            selector: Arc::from("initialize"),
+            args: vec![],
+            reply: init_future,
+        });
+        entity.mailbox_ready.notify_one();
+    }
 
     // Spawn the entity's green-thread coroutine.
     let entity_clone = entity.clone();
@@ -258,13 +274,25 @@ fn run_entity_loop(entity: Arc<EntityState>, registry: Arc<ClassRegistry>, globa
         // ev.current_entity_id.set(None);
 
         match result {
-            Ok(v) => envelope.reply.resolve_ok(v),
+            Ok(v) => {
+                envelope.reply.resolve_ok(v);
+                // Transition Initializing → Running once `initialize` completes.
+                let mut status = entity.status.lock().unwrap();
+                if matches!(*status, EntityStatus::Initializing(_)) {
+                    *status = EntityStatus::Running;
+                }
+            }
             Err(EvalError::Return(v, _)) => {
                 // Non-local return from a cross-entity block: resolve with v.
                 envelope.reply.resolve_ok(v);
+                let mut status = entity.status.lock().unwrap();
+                if matches!(*status, EntityStatus::Initializing(_)) {
+                    *status = EntityStatus::Running;
+                }
             }
             Err(e) => {
                 let msg = e.to_string();
+                // Overwrites Initializing if initialize itself errored.
                 *entity.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
                 envelope.reply.resolve_err(e);
                 // Drain all already-queued messages so their futures resolve immediately
