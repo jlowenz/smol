@@ -321,11 +321,18 @@ fn kernel_classes_in_env() {
     let ev = Evaluator::new();
     let mut env = Env::new();
     ev.registry.populate_env(&mut env);
-    assert!(matches!(env.get("Array"), Some(Value::Class(_))));
-    assert!(matches!(env.get("ByteArray"), Some(Value::Class(_))));
+    use crate::entity::InstanceKind;
+    assert!(matches!(
+        env.get("Array"),
+        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassObject)
+    ));
+    assert!(matches!(
+        env.get("ByteArray"),
+        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassObject)
+    ));
     assert!(matches!(
         env.get("OrderedCollection"),
-        Some(Value::Class(_))
+        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassObject)
     ));
 }
 

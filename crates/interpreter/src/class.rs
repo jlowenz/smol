@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::RwLock;
 
@@ -91,6 +91,12 @@ pub struct Class {
     /// Inherited through the superclass chain: a subclass of a value class
     /// is also a value class unless a mixed-hierarchy error is raised first.
     pub is_value: bool,
+    /// Back-reference to the canonical `InstanceState` (ClassObject kind) for this class.
+    ///
+    /// Set once after the `InstanceState` is allocated by `ClassRegistry::new()` or
+    /// `handle_subclass`; always populated before any message dispatch can reach this class.
+    /// `Weak` avoids a reference cycle between `InstanceState → Class → InstanceState`.
+    pub class_object: OnceLock<Weak<crate::entity::InstanceState>>,
 }
 
 impl Class {

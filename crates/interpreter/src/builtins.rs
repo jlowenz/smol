@@ -6,7 +6,9 @@ use num_traits::Zero;
 use parking_lot::RwLock;
 
 use crate::class::{Class, IndexedSlotKind};
-use crate::entity::{EntityHandle, send_to_entity, spawn_entity_bare};
+use crate::entity::{
+    InstanceHandle, InstanceKind, InstanceState, send_to_entity, spawn_entity_bare,
+};
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
 use crate::namespace::Namespace;
@@ -47,9 +49,9 @@ pub fn dispatch(
         return Ok(Value::Int(hash_value(&v)));
     }
     // `hash` is universal for non-object types (primitive values don't route through
-    // Object method lookup). For Value::ValueObject and Value::Object the type-specific
-    // dispatch runs instead, which will find the user-defined `hash` override.
-    if selector.as_ref() == "hash" && !matches!(recv, Value::Object(_) | Value::ValueObject(_)) {
+    // Object method lookup). For Value::Instance with Entity/ValueObject kind, the
+    // type-specific dispatch runs instead to find any user-defined `hash` override.
+    if selector.as_ref() == "hash" && !matches!(recv, Value::Instance(_)) {
         expect_arity(&selector, 0, args.len())?;
         let v = force_value(recv)?;
         return Ok(Value::Int(hash_value(&v)));
@@ -68,7 +70,7 @@ pub fn dispatch(
                 EvalError::TypeError("'->': Association not yet defined in kernel".into())
             })?;
         return ev.dispatch(
-            Value::Class(assoc_class),
+            Value::Instance(assoc_class),
             Arc::from("key:value:"),
             vec![recv, value],
             env,
@@ -171,14 +173,16 @@ pub fn dispatch(
         Value::Symbol(s) => dispatch_symbol(ev, s, &selector, args, env),
         Value::Block(blk) => dispatch_block(ev, blk, &selector, args, env),
         Value::LargeInt(n) => dispatch_largeint(ev, n, &selector, args, env),
-        Value::ValueObject(obj) => dispatch_object_value(ev, obj, selector, args, env),
-        Value::Object(entity) => dispatch_entity(ev, entity, selector, args, env),
+        Value::Instance(handle) => match &handle.0.kind {
+            InstanceKind::ValueObject(_) => dispatch_object_value(ev, handle, selector, args, env),
+            InstanceKind::Entity(_) => dispatch_entity(ev, handle, selector, args, env),
+            InstanceKind::ClassObject => dispatch_class(ev, handle, selector, args, env),
+        },
         Value::Future(future) => {
             // Transparent future: wait for it to resolve, then re-dispatch to the result.
             let resolved = future.wait()?;
             dispatch(ev, resolved, selector, args, env)
         }
-        Value::Class(class) => dispatch_class(ev, class, selector, args, env),
         Value::Namespace(ns) => dispatch_namespace(ev, ns, selector, args, env),
     }
 }
@@ -329,10 +333,8 @@ fn hash_value(v: &Value) -> i64 {
             }
             h as i64
         }
-        Value::ValueObject(obj) => fmix64(Arc::as_ptr(obj) as usize as u64) as i64,
-        Value::Object(e) => fmix64(Arc::as_ptr(&e.0) as usize as u64) as i64,
+        Value::Instance(h) => fmix64(Arc::as_ptr(&h.0) as usize as u64) as i64,
         Value::Future(f) => fmix64(Arc::as_ptr(&f.0) as usize as u64) as i64,
-        Value::Class(c) => fmix64(Arc::as_ptr(c) as usize as u64) as i64,
         Value::Block(b) => fmix64(Arc::as_ptr(b) as usize as u64) as i64,
         Value::Namespace(ns) => fmix64(Arc::as_ptr(ns) as usize as u64) as i64,
     }
@@ -1175,27 +1177,19 @@ fn dispatch_block(
 
 fn dispatch_object_value(
     ev: &Evaluator,
-    obj: Arc<Object>,
+    handle: InstanceHandle,
     selector: Arc<str>,
     args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
-    // Look up user-defined method.
-    if let Some((method, def_class)) = obj.class.lookup(&selector) {
-        return ev.invoke_method(
-            obj.clone(),
-            def_class,
-            method,
-            args,
-            env,
-            Value::ValueObject(obj.clone()),
-        );
+    let class = handle.0.class.clone();
+    if let Some((method, def_class)) = class.lookup(&selector) {
+        return ev.invoke_method(handle.clone(), def_class, method, args, env);
     }
-    // Fall back to primitive Object methods.
-    dispatch_object_primitive(obj, &selector, args)
+    dispatch_object_primitive(handle, &selector, args)
 }
 
-/// Dispatch a message to an actor entity handle. Checks for sync self-send
+/// Dispatch a message to an actor entity. Checks for sync self-send
 /// (target == CURRENT_ENTITY); otherwise enqueues the message and returns a Future.
 ///
 /// Requires: caller may be any thread including the entity's own thread.
@@ -1203,47 +1197,73 @@ fn dispatch_object_value(
 ///   send returns `Value::Future(FutureHandle)` immediately.
 fn dispatch_entity(
     ev: &Evaluator,
-    entity: EntityHandle,
+    handle: InstanceHandle,
     selector: Arc<str>,
     args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
+    let entity_id = match &handle.0.kind {
+        InstanceKind::Entity(d) => d.id,
+        _ => unreachable!("dispatch_entity called on non-Entity instance"),
+    };
+
     // Self-send: dispatch synchronously on the current thread to avoid deadlock.
     let current = ev.current_entity_id.get();
-    if current == Some(entity.0.id) {
-        let obj = entity.0.data.clone();
-        let class = entity.0.class.clone();
+    if current == Some(entity_id) {
+        let class = handle.0.class.clone();
         if let Some((method, def_class)) = class.lookup(&selector) {
-            let self_val = Value::Object(entity);
-            return ev.invoke_method(obj, def_class, method, args, env, self_val);
+            return ev.invoke_method(handle.clone(), def_class, method, args, env);
         }
-        let self_val = Value::Object(entity);
-        return dispatch_object_primitive_as_entity(obj, &selector, args, self_val);
+        return dispatch_object_primitive(handle, &selector, args);
     }
 
     // Cross-entity or non-entity-context send: enqueue and return Future.
-    let future = send_to_entity(&entity.0, selector, args);
+    let future = match &handle.0.kind {
+        InstanceKind::Entity(d) => send_to_entity(d, selector, args),
+        _ => unreachable!(),
+    };
     Ok(Value::Future(future))
 }
 
-fn dispatch_object_primitive(
-    obj: Arc<Object>,
+/// Returns the canonical `InstanceHandle` for the class of `obj`.
+///
+/// Requires: `obj.class.class_object` is set (always true after class registration).
+fn class_handle_of(obj: &Arc<Object>) -> Result<InstanceHandle, EvalError> {
+    obj.class
+        .class_object
+        .get()
+        .and_then(|w| w.upgrade())
+        .map(InstanceHandle)
+        .ok_or_else(|| {
+            EvalError::TypeError(format!("class {} has no class object", obj.class.name))
+        })
+}
+
+pub(crate) fn dispatch_object_primitive(
+    handle: InstanceHandle,
     sel: &Arc<str>,
     mut args: Vec<Value>,
 ) -> Result<Value, EvalError> {
     use crate::object::IndexedStorage;
+    let obj = match &handle.0.kind {
+        InstanceKind::ValueObject(o) => o.clone(),
+        InstanceKind::Entity(d) => d.data.clone(),
+        InstanceKind::ClassObject => {
+            return Err(EvalError::MessageNotUnderstood {
+                receiver_kind: "Class",
+                selector: sel.clone(),
+            });
+        }
+    };
+    let self_val = Value::Instance(handle);
     match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::ValueObject(obj) == force_value(args.remove(0))?,
-            ))
+            Ok(Value::Bool(self_val == force_value(args.remove(0))?))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::ValueObject(obj) != force_value(args.remove(0))?,
-            ))
+            Ok(Value::Bool(self_val != force_value(args.remove(0))?))
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
@@ -1253,12 +1273,12 @@ fn dispatch_object_primitive(
         }
         "class" => {
             expect_arity(sel, 0, args.len())?;
-            Ok(Value::Class(obj.class.clone()))
+            Ok(Value::Instance(class_handle_of(&obj)?))
         }
         "isKindOf:" => {
             expect_arity(sel, 1, args.len())?;
-            match args.remove(0) {
-                Value::Class(c) => Ok(Value::Bool(is_kind_of(&obj.class, &c))),
+            match force_value(args.remove(0))? {
+                Value::Instance(h) => Ok(Value::Bool(is_kind_of(&obj.class, &h.0.class))),
                 _ => Ok(Value::Bool(false)),
             }
         }
@@ -1422,30 +1442,6 @@ fn dispatch_object_primitive(
     }
 }
 
-/// Primitive Object dispatch for entity actor objects.
-///
-/// Identical to `dispatch_object_primitive` except that `=` / `~=` compare
-/// using the provided `self_val` (a `Value::Object(EntityHandle)`) rather than
-/// wrapping the raw `Arc<Object>`.
-pub(crate) fn dispatch_object_primitive_as_entity(
-    obj: Arc<Object>,
-    sel: &Arc<str>,
-    mut args: Vec<Value>,
-    self_val: Value,
-) -> Result<Value, EvalError> {
-    match sel.as_ref() {
-        "=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(self_val == force_value(args.remove(0))?))
-        }
-        "~=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(self_val != force_value(args.remove(0))?))
-        }
-        _ => dispatch_object_primitive(obj, sel, args),
-    }
-}
-
 fn is_kind_of(class: &Arc<Class>, target: &Arc<Class>) -> bool {
     if Arc::ptr_eq(class, target) {
         return true;
@@ -1501,16 +1497,17 @@ fn dispatch_namespace(
 
 fn dispatch_class(
     ev: &Evaluator,
-    class: Arc<Class>,
+    handle: InstanceHandle,
     selector: Arc<str>,
     args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
+    let class = handle.0.class.clone();
     // Check user-defined class-side methods BEFORE built-ins.
     if let Some((method, def_class)) = class.lookup_class_method(&selector) {
-        return ev.invoke_class_method(class, def_class, method, args, env);
+        return ev.invoke_class_method(handle, def_class, method, args, env);
     }
-    dispatch_class_builtin(ev, class, selector, args, env)
+    dispatch_class_builtin(ev, handle, selector, args, env)
 }
 
 /// Built-in class-side dispatch that bypasses user-defined class methods.
@@ -1521,23 +1518,21 @@ fn dispatch_class(
 /// without triggering the receiver class's own `new` override.
 pub(crate) fn dispatch_class_builtin(
     ev: &Evaluator,
-    class: Arc<Class>,
+    handle: InstanceHandle,
     selector: Arc<str>,
     mut args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
+    let class = handle.0.class.clone();
+    let self_val = Value::Instance(handle);
     match selector.as_ref() {
         "=" => {
             expect_arity(&selector, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::Class(class) == force_value(args[0].clone())?,
-            ))
+            Ok(Value::Bool(self_val == force_value(args[0].clone())?))
         }
         "~=" => {
             expect_arity(&selector, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::Class(class) != force_value(args.remove(0))?,
-            ))
+            Ok(Value::Bool(self_val != force_value(args.remove(0))?))
         }
         "_primNew" => {
             expect_arity(&selector, 0, args.len())?;
@@ -1552,13 +1547,15 @@ pub(crate) fn dispatch_class_builtin(
                     Some(n) => Arc::new(Object::new_with_indexed(class.clone(), n)),
                     None => Arc::new(Object::new(class.clone())),
                 };
-                Ok(Value::ValueObject(obj))
+                Ok(Value::Instance(InstanceHandle(Arc::new(InstanceState {
+                    class,
+                    kind: InstanceKind::ValueObject(obj),
+                }))))
             } else {
                 let mut global_env = Env::new();
                 ev.registry.populate_env(&mut global_env);
-                let handle =
-                    spawn_entity_bare(class, ev.registry.clone(), global_env, indexed_size);
-                Ok(Value::Object(handle))
+                let inst = spawn_entity_bare(class, ev.registry.clone(), global_env, indexed_size);
+                Ok(Value::Instance(inst))
             }
         }
         "_primNew:" => {
@@ -1571,17 +1568,20 @@ pub(crate) fn dispatch_class_builtin(
             }
             if class.inherits_is_value() {
                 let obj = Arc::new(Object::new_with_indexed(class.clone(), n.max(0) as usize));
-                Ok(Value::ValueObject(obj))
+                Ok(Value::Instance(InstanceHandle(Arc::new(InstanceState {
+                    class,
+                    kind: InstanceKind::ValueObject(obj),
+                }))))
             } else {
                 let mut global_env = Env::new();
                 ev.registry.populate_env(&mut global_env);
-                let handle = spawn_entity_bare(
+                let inst = spawn_entity_bare(
                     class,
                     ev.registry.clone(),
                     global_env,
                     Some(n.max(0) as usize),
                 );
-                Ok(Value::Object(handle))
+                Ok(Value::Instance(inst))
             }
         }
         "name" => {
@@ -1594,7 +1594,10 @@ pub(crate) fn dispatch_class_builtin(
             println!("{:?}", s);
             Ok(Value::Str(s))
         }
-        sel if sel.contains("subclass:") => handle_subclass(ev, class, selector, args, env),
+        sel if sel.contains("subclass:") => {
+            // Extract the handle back from self_val to pass the Arc<Class> as superclass.
+            handle_subclass(ev, class, selector, args, env)
+        }
         _ => Err(EvalError::MessageNotUnderstood {
             receiver_kind: "Class",
             selector,
@@ -1715,19 +1718,29 @@ fn handle_subclass(
         methods: RwLock::new(HashMap::new()),
         class_methods: RwLock::new(HashMap::new()),
         is_value: declared_is_value,
+        class_object: std::sync::OnceLock::new(),
     });
+    let class_state = Arc::new(InstanceState {
+        class: new_class.clone(),
+        kind: InstanceKind::ClassObject,
+    });
+    new_class
+        .class_object
+        .set(Arc::downgrade(&class_state))
+        .ok();
+    let class_handle = InstanceHandle(class_state);
 
     let active_ns = ev.active_namespace();
-    active_ns.register(new_class.clone());
+    active_ns.register(class_handle.clone());
     // Kernel classes get a global binding so they're always in scope by simple name.
     // Non-Kernel classes are scoped to the current frame (e.g. inside `Namespace do: [...]`);
     // outside that scope they are only reachable via `Ns::ClassName`.
     if Arc::ptr_eq(&active_ns, &ev.registry.kernel()) {
-        env.define_global(name, Value::Class(new_class.clone()));
+        env.define_global(name, Value::Instance(class_handle.clone()));
     } else {
-        env.define(name, Value::Class(new_class.clone()));
+        env.define(name, Value::Instance(class_handle.clone()));
     }
-    Ok(Value::Class(new_class))
+    Ok(Value::Instance(class_handle))
 }
 
 #[cfg(test)]

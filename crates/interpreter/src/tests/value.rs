@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use super::*;
 use crate::class::Class;
+use crate::entity::{InstanceHandle, InstanceKind, InstanceState};
 use crate::env::Env;
+use crate::object::Object;
 use parking_lot::RwLock;
 
 fn make_class(name: &str) -> Arc<Class> {
@@ -17,7 +19,25 @@ fn make_class(name: &str) -> Arc<Class> {
         methods: RwLock::new(HashMap::new()),
         class_methods: RwLock::new(HashMap::new()),
         is_value: false,
+        class_object: std::sync::OnceLock::new(),
     })
+}
+
+fn class_handle(name: &str) -> InstanceHandle {
+    let cls = make_class(name);
+    InstanceHandle(Arc::new(InstanceState {
+        class: cls,
+        kind: InstanceKind::ClassObject,
+    }))
+}
+
+fn value_object_handle(name: &str) -> InstanceHandle {
+    let cls = make_class(name);
+    let obj = Arc::new(Object::new(cls.clone()));
+    InstanceHandle(Arc::new(InstanceState {
+        class: cls,
+        kind: InstanceKind::ValueObject(obj),
+    }))
 }
 
 #[test]
@@ -47,7 +67,6 @@ fn largeint_eq_int() {
 
 #[test]
 fn kind_remaining_variants() {
-    let class = make_class("X");
     let block = Value::Block(Arc::new(Block {
         params: vec![],
         locals: vec![],
@@ -61,11 +80,8 @@ fn kind_remaining_variants() {
     assert_eq!(Value::Symbol(Arc::from("s")).kind(), "Symbol");
     assert_eq!(Value::Str(Arc::from("s")).kind(), "String");
     assert_eq!(block.kind(), "Block");
-    assert_eq!(
-        Value::ValueObject(Arc::new(Object::new(class.clone()))).kind(),
-        "Object"
-    );
-    assert_eq!(Value::Class(class).kind(), "Class");
+    assert_eq!(Value::Instance(value_object_handle("X")).kind(), "Object");
+    assert_eq!(Value::Instance(class_handle("X")).kind(), "Class");
     assert_eq!(
         Value::Namespace(Arc::new(Namespace::new(Arc::from("N"), None))).kind(),
         "Namespace"
@@ -89,10 +105,9 @@ fn display_scalars() {
 
 #[test]
 fn display_composite_variants() {
-    let class = make_class("Dog");
-    assert_eq!(format!("{}", Value::Class(class.clone())), "Dog");
+    assert_eq!(format!("{}", Value::Instance(class_handle("Dog"))), "Dog");
     assert_eq!(
-        format!("{}", Value::ValueObject(Arc::new(Object::new(class)))),
+        format!("{}", Value::Instance(value_object_handle("Dog"))),
         "a Dog"
     );
     assert_eq!(
@@ -149,19 +164,16 @@ fn eq_block_uses_pointer_identity() {
 }
 
 #[test]
-fn eq_value_object_class_namespace_use_pointer_identity() {
-    let class = make_class("Z");
-    let class2 = make_class("Z");
-    assert_eq!(Value::Class(class.clone()), Value::Class(class.clone()));
-    assert_ne!(Value::Class(class.clone()), Value::Class(class2));
+fn eq_instance_uses_pointer_identity() {
+    let ch = class_handle("Z");
+    assert_eq!(Value::Instance(ch.clone()), Value::Instance(ch.clone()));
+    let ch2 = class_handle("Z");
+    assert_ne!(Value::Instance(ch), Value::Instance(ch2));
 
-    let obj = Arc::new(Object::new(class.clone()));
-    assert_eq!(
-        Value::ValueObject(obj.clone()),
-        Value::ValueObject(obj.clone())
-    );
-    let obj2 = Arc::new(Object::new(class));
-    assert_ne!(Value::ValueObject(obj), Value::ValueObject(obj2));
+    let vo = value_object_handle("Z");
+    assert_eq!(Value::Instance(vo.clone()), Value::Instance(vo.clone()));
+    let vo2 = value_object_handle("Z");
+    assert_ne!(Value::Instance(vo), Value::Instance(vo2));
 
     let ns = Arc::new(Namespace::new(Arc::from("A"), None));
     assert_eq!(Value::Namespace(ns.clone()), Value::Namespace(ns.clone()));
@@ -180,9 +192,8 @@ fn hash_does_not_panic() {
     map.insert(Value::Symbol(Arc::from("s")), 5);
     map.insert(Value::Str(Arc::from("t")), 6);
     map.insert(Value::LargeInt(Arc::new(BigInt::from(999))), 7);
-    let class = make_class("H");
-    map.insert(Value::Class(class.clone()), 8);
-    map.insert(Value::ValueObject(Arc::new(Object::new(class))), 9);
+    map.insert(Value::Instance(class_handle("H")), 8);
+    map.insert(Value::Instance(value_object_handle("H")), 9);
     map.insert(
         Value::Namespace(Arc::new(Namespace::new(Arc::from("N"), None))),
         10,

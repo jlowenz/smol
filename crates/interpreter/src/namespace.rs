@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::class::Class;
+use crate::entity::InstanceHandle;
 
 /// A named container of classes with explicit import semantics.
 ///
@@ -14,7 +14,10 @@ pub struct Namespace {
     /// For qualified-name construction only. NOT an implicit search scope.
     pub parent: Option<Arc<Namespace>>,
     sub_namespaces: RwLock<HashMap<Arc<str>, Arc<Namespace>>>,
-    pub(crate) classes: RwLock<HashMap<Arc<str>, Arc<Class>>>,
+    /// Canonical `InstanceHandle` for each registered class. Storing the handle
+    /// (not `Arc<Class>`) ensures pointer-identity comparisons on class objects
+    /// are stable across multiple calls to `populate_env`.
+    pub(crate) classes: RwLock<HashMap<Arc<str>, InstanceHandle>>,
     /// Explicit imports — parent namespace NOT implicitly included.
     imports: RwLock<Vec<Arc<Namespace>>>,
 }
@@ -30,8 +33,10 @@ impl Namespace {
         }
     }
 
-    pub fn register(&self, class: Arc<Class>) {
-        self.classes.write().insert(class.name.clone(), class);
+    pub fn register(&self, handle: InstanceHandle) {
+        self.classes
+            .write()
+            .insert(handle.0.class.name.clone(), handle);
     }
 
     pub fn register_sub(&self, ns: Arc<Namespace>) {
@@ -44,13 +49,16 @@ impl Namespace {
 
     /// Look up a class by simple name: own classes first, then imports (in order).
     /// Does NOT search the parent namespace.
-    pub fn lookup_class(&self, name: &str) -> Option<Arc<Class>> {
-        if let Some(c) = self.classes.read().get(name) {
-            return Some(c.clone());
+    ///
+    /// Returns the canonical `InstanceHandle` for the class. The `Arc<Class>`
+    /// descriptor is accessible as `handle.0.class`.
+    pub fn lookup_class(&self, name: &str) -> Option<InstanceHandle> {
+        if let Some(h) = self.classes.read().get(name) {
+            return Some(h.clone());
         }
         for imp in self.imports.read().iter() {
-            if let Some(c) = imp.classes.read().get(name) {
-                return Some(c.clone());
+            if let Some(h) = imp.classes.read().get(name) {
+                return Some(h.clone());
             }
         }
         None
@@ -77,69 +85,5 @@ impl std::fmt::Debug for Namespace {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    use super::*;
-    use crate::class::Class;
-    use parking_lot::RwLock;
-
-    fn bare_class(name: &str) -> Arc<Class> {
-        Arc::new(Class {
-            name: Arc::from(name),
-            superclass: None,
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-        })
-    }
-
-    #[test]
-    fn lookup_sub_found_and_missing() {
-        let parent = Arc::new(Namespace::new(Arc::from("Parent"), None));
-        let child = Arc::new(Namespace::new(Arc::from("Child"), Some(parent.clone())));
-        parent.register_sub(child);
-        assert!(parent.lookup_sub("Child").is_some());
-        assert!(parent.lookup_sub("Missing").is_none());
-    }
-
-    #[test]
-    fn qualified_name_with_parent_chain() {
-        let root = Arc::new(Namespace::new(Arc::from("Kernel"), None));
-        let child = Arc::new(Namespace::new(Arc::from("Collections"), Some(root)));
-        assert_eq!(child.qualified_name(), "Kernel::Collections");
-    }
-
-    #[test]
-    fn lookup_class_via_import() {
-        let ns_a = Arc::new(Namespace::new(Arc::from("A"), None));
-        let ns_b = Arc::new(Namespace::new(Arc::from("B"), None));
-        ns_b.register(bare_class("Widget"));
-        assert!(ns_a.lookup_class("Widget").is_none());
-        ns_a.add_import(ns_b);
-        assert!(ns_a.lookup_class("Widget").is_some());
-    }
-
-    #[test]
-    fn own_class_shadows_import() {
-        let ns_a = Arc::new(Namespace::new(Arc::from("A"), None));
-        let ns_b = Arc::new(Namespace::new(Arc::from("B"), None));
-        ns_b.register(bare_class("Foo"));
-        ns_a.register(bare_class("Foo"));
-        ns_a.add_import(ns_b);
-        let found = ns_a.lookup_class("Foo").unwrap();
-        // own class is returned (not the import)
-        assert!(Arc::ptr_eq(&found, &ns_a.classes.read()["Foo"]));
-    }
-
-    #[test]
-    fn debug_includes_qualified_name() {
-        let ns = Arc::new(Namespace::new(Arc::from("Kernel"), None));
-        assert!(format!("{ns:?}").contains("Kernel"));
-    }
-}
+#[path = "tests/namespace.rs"]
+mod tests;

@@ -3,11 +3,9 @@ use std::sync::Arc;
 use num_bigint::BigInt;
 
 use crate::ast::Stmt;
-use crate::class::Class;
-use crate::entity::{EntityHandle, EntityId, FutureHandle};
+use crate::entity::{EntityId, FutureHandle, InstanceHandle};
 use crate::env::Env;
 use crate::namespace::Namespace;
-use crate::object::Object;
 
 /// Runtime representation of every object in the language.
 ///
@@ -29,16 +27,11 @@ pub enum Value {
     Block(Arc<Block>),
     /// Arbitrary-precision integer. Used when Int arithmetic overflows i64.
     LargeInt(Arc<BigInt>),
-    /// A passive value object instance (immutable after construction).
-    /// Corresponds to classes declared with `Value subclass:`.
-    ValueObject(Arc<Object>),
-    /// An actor entity reference. Sending a message to an entity enqueues an
-    /// `Envelope` and returns a `Future` immediately.
-    Object(EntityHandle),
+    /// Any object instance: actor entity, passive value object, or class object.
+    /// Discriminated by `InstanceKind` inside the handle.
+    Instance(InstanceHandle),
     /// A lazy future reference. Resolved only when a message is dispatched to it.
     Future(FutureHandle),
-    /// A class object. Class names in the environment are bound to this variant.
-    Class(Arc<Class>),
     /// A namespace object. Namespace names in the environment are bound to this variant.
     Namespace(Arc<Namespace>),
 }
@@ -76,10 +69,8 @@ impl PartialEq for Value {
             (Value::LargeInt(a), Value::LargeInt(b)) => a == b,
             (Value::Int(a), Value::LargeInt(b)) => BigInt::from(*a) == **b,
             (Value::LargeInt(a), Value::Int(b)) => **a == BigInt::from(*b),
-            (Value::ValueObject(a), Value::ValueObject(b)) => Arc::ptr_eq(a, b),
-            (Value::Object(a), Value::Object(b)) => Arc::ptr_eq(&a.0, &b.0),
+            (Value::Instance(a), Value::Instance(b)) => Arc::ptr_eq(&a.0, &b.0),
             (Value::Future(a), Value::Future(b)) => Arc::ptr_eq(&a.0, &b.0),
-            (Value::Class(a), Value::Class(b)) => Arc::ptr_eq(a, b),
             (Value::Namespace(a), Value::Namespace(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
@@ -99,10 +90,8 @@ impl std::hash::Hash for Value {
             Value::Symbol(s) | Value::Str(s) => s.hash(state),
             Value::Block(b) => Arc::as_ptr(b).hash(state),
             Value::LargeInt(b) => b.hash(state),
-            Value::ValueObject(o) => Arc::as_ptr(o).hash(state),
-            Value::Object(e) => Arc::as_ptr(&e.0).hash(state),
+            Value::Instance(h) => Arc::as_ptr(&h.0).hash(state),
             Value::Future(f) => Arc::as_ptr(&f.0).hash(state),
-            Value::Class(c) => Arc::as_ptr(c).hash(state),
             Value::Namespace(ns) => Arc::as_ptr(ns).hash(state),
         }
     }
@@ -110,6 +99,7 @@ impl std::hash::Hash for Value {
 
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::entity::InstanceKind;
         match self {
             Value::Int(n) => write!(f, "{n}"),
             Value::Float(n) => write!(f, "{n:?}"),
@@ -120,10 +110,11 @@ impl std::fmt::Display for Value {
             Value::Str(s) => write!(f, "'{s}'"),
             Value::Block(_) => write!(f, "a Block"),
             Value::LargeInt(n) => write!(f, "{n}"),
-            Value::ValueObject(o) => write!(f, "a {}", o.class.name),
-            Value::Object(e) => write!(f, "a {}", e.0.class.name),
+            Value::Instance(h) => match &h.0.kind {
+                InstanceKind::ClassObject => write!(f, "{}", h.0.class.name),
+                _ => write!(f, "a {}", h.0.class.name),
+            },
             Value::Future(_) => write!(f, "a Future"),
-            Value::Class(c) => write!(f, "{}", c.name),
             Value::Namespace(ns) => write!(f, "Namespace({})", ns.name),
         }
     }
@@ -132,6 +123,7 @@ impl std::fmt::Display for Value {
 impl Value {
     /// Bootstrap kind tag used in error messages. Not the same as the class name.
     pub fn kind(&self) -> &'static str {
+        use crate::entity::InstanceKind;
         match self {
             Value::Int(_) => "Int",
             Value::Float(_) => "Float",
@@ -141,10 +133,11 @@ impl Value {
             Value::Str(_) => "String",
             Value::Block(_) => "Block",
             Value::LargeInt(_) => "LargeInt",
-            Value::ValueObject(_) => "Object",
-            Value::Object(_) => "Object",
+            Value::Instance(h) => match &h.0.kind {
+                InstanceKind::ClassObject => "Class",
+                _ => "Object",
+            },
             Value::Future(_) => "Future",
-            Value::Class(_) => "Class",
             Value::Namespace(_) => "Namespace",
         }
     }

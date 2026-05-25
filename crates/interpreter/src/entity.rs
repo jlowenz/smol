@@ -105,7 +105,7 @@ impl std::fmt::Debug for FutureHandle {
     }
 }
 
-// ── EntityHandle ──────────────────────────────────────────────────────────────
+// ── Instance types ────────────────────────────────────────────────────────────
 
 /// Lifecycle state of an actor entity.
 #[derive(Debug, Clone)]
@@ -123,26 +123,80 @@ pub struct Envelope {
     pub reply: FutureHandle,
 }
 
-/// Per-entity isolated state: instance variables, mailbox, and green-thread coroutine.
-pub struct EntityState {
+/// Per-entity isolated data: instance variables, mailbox, status.
+///
+/// `class` is held in the enclosing `InstanceState`; this struct carries only
+/// the data that is exclusive to actor entities.
+pub struct EntityData {
     pub id: EntityId,
-    pub class: Arc<Class>,
-    /// The entity's own Object instance (instance variables).
-    /// Accessed exclusively by the entity's own coroutine.
+    /// Instance variable storage. Accessed exclusively by the entity's coroutine.
     pub data: Arc<Object>,
     pub mailbox: Mutex<VecDeque<Envelope>>,
     pub mailbox_ready: Condvar,
     pub status: Mutex<EntityStatus>,
 }
 
-/// An `Arc`-wrapped reference to an `EntityState`. Actor entity references
-/// in Smol are represented by this type.
-#[derive(Clone)]
-pub struct EntityHandle(pub Arc<EntityState>);
+/// Discriminates the semantics of an object instance.
+pub enum InstanceKind {
+    /// Actor entity — async mailbox dispatch, dedicated coroutine.
+    Entity(Box<EntityData>),
+    /// Passive value object — synchronous dispatch, safely shared across threads.
+    ValueObject(Arc<Object>),
+    /// Class object — synchronous class-side dispatch.
+    ///
+    /// The class descriptor is `InstanceState.class`. Making class objects full
+    /// actors (async dispatch) is deferred to a later chunk.
+    ClassObject,
+}
 
-impl std::fmt::Debug for EntityHandle {
+impl std::fmt::Debug for InstanceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EntityHandle(id={})", self.0.id)
+        match self {
+            InstanceKind::Entity(data) => write!(f, "Entity(id={})", data.id),
+            InstanceKind::ValueObject(_) => write!(f, "ValueObject"),
+            InstanceKind::ClassObject => write!(f, "ClassObject"),
+        }
+    }
+}
+
+/// Shared state for every object instance regardless of kind.
+pub struct InstanceState {
+    pub class: Arc<Class>,
+    pub kind: InstanceKind,
+}
+
+/// Reference to any object instance.
+///
+/// Replaces the old `EntityHandle`, `Arc<Object>` (in ValueObject context), and
+/// `Arc<Class>` (as a `Value` binding). The class descriptor is always accessible
+/// as `handle.0.class` for method lookup.
+#[derive(Clone)]
+pub struct InstanceHandle(pub Arc<InstanceState>);
+
+impl InstanceHandle {
+    /// Returns the instance variable storage for this handle.
+    ///
+    /// Requires: `self.0.kind` is `Entity` or `ValueObject`.
+    pub fn ivar_storage(&self) -> &Arc<Object> {
+        match &self.0.kind {
+            InstanceKind::Entity(d) => &d.data,
+            InstanceKind::ValueObject(o) => o,
+            InstanceKind::ClassObject => panic!("ClassObject has no instance variable storage"),
+        }
+    }
+}
+
+impl std::fmt::Debug for InstanceHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0.kind {
+            InstanceKind::Entity(data) => write!(f, "InstanceHandle::Entity(id={})", data.id),
+            InstanceKind::ValueObject(_) => {
+                write!(f, "InstanceHandle::ValueObject({})", self.0.class.name)
+            }
+            InstanceKind::ClassObject => {
+                write!(f, "InstanceHandle::ClassObject({})", self.0.class.name)
+            }
+        }
     }
 }
 
@@ -158,7 +212,7 @@ pub fn spawn_entity_bare(
     registry: Arc<ClassRegistry>,
     global_env: Env,
     indexed_size: Option<usize>,
-) -> EntityHandle {
+) -> InstanceHandle {
     let id = next_entity_id();
     let obj = if let Some(n) = indexed_size {
         Arc::new(Object::new_with_indexed(class.clone(), n))
@@ -166,23 +220,25 @@ pub fn spawn_entity_bare(
         Arc::new(Object::new(class.clone()))
     };
 
-    let entity = Arc::new(EntityState {
-        id,
-        class: class.clone(),
-        data: obj,
-        mailbox: Mutex::new(VecDeque::new()),
-        mailbox_ready: Condvar::new(),
-        status: Mutex::new(EntityStatus::Running),
+    let state = Arc::new(InstanceState {
+        class,
+        kind: InstanceKind::Entity(Box::new(EntityData {
+            id,
+            data: obj,
+            mailbox: Mutex::new(VecDeque::new()),
+            mailbox_ready: Condvar::new(),
+            status: Mutex::new(EntityStatus::Running),
+        })),
     });
 
-    let handle = EntityHandle(entity.clone());
+    let handle = InstanceHandle(state.clone());
 
-    let entity_clone = entity.clone();
+    let state_clone = state.clone();
     let registry_clone = registry.clone();
     let env_clone = global_env.clone();
     may::config().set_stack_size(0x4000);
     may::go!(move || {
-        run_entity_loop(entity_clone, registry_clone, env_clone);
+        run_entity_loop(state_clone, registry_clone, env_clone);
     });
 
     handle
@@ -190,50 +246,50 @@ pub fn spawn_entity_bare(
 
 /// Enqueue a message to an entity and return a future for the reply.
 ///
-/// Requires: `entity` status is `Running`.
+/// Requires: `data.status` is `Running`; called from outside the entity's own coroutine.
 /// Ensures: the envelope is appended to the mailbox; the returned
 ///   `FutureHandle` resolves when the entity completes the handler.
-pub fn send_to_entity(
-    entity: &Arc<EntityState>,
-    selector: Arc<str>,
-    args: Vec<Value>,
-) -> FutureHandle {
+pub fn send_to_entity(data: &EntityData, selector: Arc<str>, args: Vec<Value>) -> FutureHandle {
     let future = FutureHandle::new();
-    let mut mb = entity.mailbox.lock().unwrap();
+    let mut mb = data.mailbox.lock().unwrap();
     mb.push_back(Envelope {
         selector,
         args,
         reply: future.clone(),
     });
-    entity.mailbox_ready.notify_one();
+    data.mailbox_ready.notify_one();
     future
 }
 
 // ── Entity message loop ───────────────────────────────────────────────────────
 
-fn run_entity_loop(entity: Arc<EntityState>, registry: Arc<ClassRegistry>, global_env: Env) {
+fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, global_env: Env) {
     use crate::eval::EvalError;
     use crate::eval::Evaluator;
 
+    let data = match &state.kind {
+        InstanceKind::Entity(d) => d.as_ref(),
+        _ => panic!("run_entity_loop called on non-Entity instance"),
+    };
+
     let ev = Evaluator::with_registry(registry);
-    ev.current_entity_id.set(Some(entity.id));
+    ev.current_entity_id.set(Some(data.id));
 
     let mut env = global_env;
-    let self_val = Value::Object(EntityHandle(entity.clone()));
 
     loop {
         // Wait for an envelope.
         let envelope = {
-            let mut mb = entity.mailbox.lock().unwrap();
+            let mut mb = data.mailbox.lock().unwrap();
             while mb.is_empty() {
-                mb = entity.mailbox_ready.wait(mb).unwrap();
+                mb = data.mailbox_ready.wait(mb).unwrap();
             }
             mb.pop_front().unwrap()
         };
 
         // Reject envelopes if the entity has already faulted.
         {
-            let status = entity.status.lock().unwrap();
+            let status = data.status.lock().unwrap();
             if let EntityStatus::Faulted(msg) = &*status {
                 envelope
                     .reply
@@ -244,14 +300,11 @@ fn run_entity_loop(entity: Arc<EntityState>, registry: Arc<ClassRegistry>, globa
 
         let result = dispatch_envelope(
             &ev,
-            &entity,
+            InstanceHandle(state.clone()),
             &envelope.selector,
             envelope.args,
-            self_val.clone(),
             &mut env,
         );
-
-        // ev.current_entity_id.set(None);
 
         match result {
             Ok(v) => {
@@ -263,11 +316,11 @@ fn run_entity_loop(entity: Arc<EntityState>, registry: Arc<ClassRegistry>, globa
             }
             Err(e) => {
                 let msg = e.to_string();
-                *entity.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
+                *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
                 envelope.reply.resolve_err(e);
                 // Drain all already-queued messages so their futures resolve immediately
                 // rather than parking forever.
-                let mut mb = entity.mailbox.lock().unwrap();
+                let mut mb = data.mailbox.lock().unwrap();
                 for pending in mb.drain(..) {
                     pending
                         .reply
@@ -281,69 +334,17 @@ fn run_entity_loop(entity: Arc<EntityState>, registry: Arc<ClassRegistry>, globa
 
 fn dispatch_envelope(
     ev: &crate::eval::Evaluator,
-    entity: &Arc<EntityState>,
+    handle: InstanceHandle,
     selector: &Arc<str>,
     args: Vec<Value>,
-    self_val: Value,
     env: &mut Env,
 ) -> Result<Value, crate::eval::EvalError> {
-    let receiver = entity.data.clone();
-    let class = entity.class.clone();
-
-    // User-defined method?
-    if let Some((method, def_class)) = class.lookup(selector) {
-        return ev.invoke_method(receiver, def_class, method, args, env, self_val);
+    if let Some((method, def_class)) = handle.0.class.lookup(selector) {
+        return ev.invoke_method(handle.clone(), def_class, method, args, env);
     }
-
-    // Primitive Object methods (printString, class, =, ~=, _primHash, etc.)
-    crate::builtins::dispatch_object_primitive_as_entity(receiver, selector, args, self_val)
+    crate::builtins::dispatch_object_primitive(handle, selector, args)
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use crate::test_helpers::eval;
-
-    use super::*;
-
-    #[test]
-    fn future_resolves_and_wakes_waiter() {
-        let fut = FutureHandle::new();
-        let fut2 = fut.clone();
-        let t = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            fut2.resolve_ok(Value::Int(42));
-        });
-        assert_eq!(fut.wait(), Ok(Value::Int(42)));
-        t.join().unwrap();
-    }
-
-    #[test]
-    fn future_already_resolved_returns_immediately() {
-        let fut = FutureHandle::new();
-        fut.resolve_ok(Value::Int(7));
-        assert_eq!(fut.wait(), Ok(Value::Int(7)));
-        assert_eq!(fut.wait(), Ok(Value::Int(7))); // idempotent reads
-    }
-
-    #[test]
-    #[should_panic(expected = "FutureHandle resolved twice")]
-    fn future_double_resolve_panics_in_debug() {
-        let fut = FutureHandle::new();
-        fut.resolve_ok(Value::Int(1));
-        fut.resolve_ok(Value::Int(2)); // debug_assert fires
-    }
-
-    #[test]
-    fn message_send_resolves_future() {
-        let prog = r#"
-| f f2 | Object subclass: #Five.
-Five >> value [ ^5 ].
-Five >> anotherFive [ ^Five new ].
-f := Five new.
-f anotherFive anotherFive value.
-"#;
-        assert_eq!(eval(prog), Value::Int(5));
-    }
-}
+#[path = "tests/entity.rs"]
+mod tests;

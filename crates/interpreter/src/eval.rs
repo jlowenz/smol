@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, OnceLock};
 
-use crate::entity::EntityId;
+use crate::entity::{EntityId, InstanceHandle};
 
 use thiserror::Error;
 
@@ -43,11 +43,11 @@ pub enum EvalError {
 #[derive(Clone)]
 pub enum SelfBinding {
     Instance {
-        receiver: Arc<Object>,
+        handle: InstanceHandle,
         defining_class: Arc<Class>,
     },
     ClassSide {
-        class: Arc<Class>,
+        handle: InstanceHandle,
         defining_class: Arc<Class>,
     },
 }
@@ -168,17 +168,17 @@ impl Evaluator {
         // Clone the top binding to avoid holding the RefCell borrow across further ops.
         let top = self.method_stack.borrow().last().cloned();
         match top {
-            Some(SelfBinding::Instance { receiver, .. }) => {
+            Some(SelfBinding::Instance { handle, .. }) => {
                 // 1. local frame (params, method locals, self)
                 if let Some(v) = env.lookup_top_frame(name) {
                     return Some(v);
                 }
                 // 2. instance variables
-                if let Some(v) = receiver.get_slot(name) {
+                if let Some(v) = handle.ivar_storage().get_slot(name) {
                     return Some(v);
                 }
                 // 3. class variables
-                if let Some(owner) = receiver.class.lookup_class_var_owner(name)
+                if let Some(owner) = handle.0.class.lookup_class_var_owner(name)
                     && let Some(v) = owner.class_var_storage.read().get(name).cloned()
                 {
                     return Some(v);
@@ -186,7 +186,8 @@ impl Evaluator {
                 // 4. outer env (globals)
                 env.lookup_outer_frames(name)
             }
-            Some(SelfBinding::ClassSide { class, .. }) => {
+            Some(SelfBinding::ClassSide { handle, .. }) => {
+                let class = &handle.0.class;
                 // 1. local frame
                 if let Some(v) = env.lookup_top_frame(name) {
                     return Some(v);
@@ -214,25 +215,26 @@ impl Evaluator {
         if self.method_depth.get() > 0 {
             let top = self.method_stack.borrow().last().cloned();
             match top {
-                Some(SelfBinding::Instance { receiver, .. }) => {
-                    // Extract bool before any other receiver access to avoid holding
-                    // the Mutex guard across a re-entrant lock on the same object.
-                    let has_ivar = receiver.slots.lock().contains_key(name.as_ref());
+                Some(SelfBinding::Instance { handle, .. }) => {
+                    let obj = handle.ivar_storage();
+                    // Extract bool before any other access to avoid holding the Mutex
+                    // guard across a re-entrant lock on the same object.
+                    let has_ivar = obj.slots.lock().contains_key(name.as_ref());
                     if has_ivar {
                         let ret = value.clone();
-                        receiver.set_slot(name.clone(), value);
+                        obj.set_slot(name.clone(), value);
                         return Ok(ret);
                     }
                     // Check class var.
-                    if let Some(owner) = receiver.class.lookup_class_var_owner(name.as_ref()) {
+                    if let Some(owner) = handle.0.class.lookup_class_var_owner(name.as_ref()) {
                         let ret = value.clone();
                         owner.class_var_storage.write().insert(name.clone(), value);
                         return Ok(ret);
                     }
                 }
-                Some(SelfBinding::ClassSide { class, .. }) => {
+                Some(SelfBinding::ClassSide { handle, .. }) => {
                     // No ivar check for class-side.
-                    if let Some(owner) = class.lookup_class_var_owner(name.as_ref()) {
+                    if let Some(owner) = handle.0.class.lookup_class_var_owner(name.as_ref()) {
                         let ret = value.clone();
                         owner.class_var_storage.write().insert(name.clone(), value);
                         return Ok(ret);
@@ -290,9 +292,12 @@ impl Evaluator {
                 Err(EvalError::Return(v, depth))
             }
             Stmt::MethodDef(def) => {
+                use crate::entity::InstanceKind;
                 // Look up the class from env first (covers non-Kernel namespace classes).
                 let class = match self.lookup_var(&def.class_name, env) {
-                    Some(Value::Class(c)) => c,
+                    Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassObject) => {
+                        h.0.class.clone()
+                    }
                     Some(_) => {
                         return Err(EvalError::TypeError(format!(
                             "{} is not a class",
@@ -373,19 +378,27 @@ impl Evaluator {
     }
 
     fn eval_array_literal(&self, elements: &[Literal], env: &mut Env) -> Result<Value, EvalError> {
-        let array_class = self
+        use crate::entity::{InstanceHandle, InstanceKind, InstanceState};
+        let array_handle = self
             .registry
             .kernel()
             .lookup_class("Array")
             .ok_or_else(|| EvalError::UndefinedVariable(Arc::from("Array")))?;
-        let obj = Arc::new(Object::new_with_indexed(array_class, elements.len()));
+        let array_class = array_handle.0.class.clone();
+        let obj = Arc::new(Object::new_with_indexed(
+            array_class.clone(),
+            elements.len(),
+        ));
         for (i, elem) in elements.iter().enumerate() {
             let v = self.eval_literal_as_value(elem, env)?;
             if let Some(IndexedStorage::Pointer(slots)) = obj.indexed.as_ref() {
                 slots.lock()[i] = v;
             }
         }
-        Ok(Value::ValueObject(obj))
+        Ok(Value::Instance(InstanceHandle(Arc::new(InstanceState {
+            class: array_class,
+            kind: InstanceKind::ValueObject(obj),
+        }))))
     }
 
     /// Evaluate a `Literal` into a runtime `Value`. For `Literal::Array` this
@@ -468,30 +481,25 @@ impl Evaluator {
         // Clone the top binding to avoid holding the RefCell borrow during invoke.
         let top = self.method_stack.borrow().last().cloned();
         match top {
-            Some(SelfBinding::Instance { receiver, .. }) => match superclass.lookup(&selector) {
-                Some((method, def_class)) => self.invoke_method(
-                    receiver.clone(),
-                    def_class,
-                    method,
-                    args,
-                    env,
-                    Value::ValueObject(receiver),
-                ),
+            Some(SelfBinding::Instance { handle, .. }) => match superclass.lookup(&selector) {
+                Some((method, def_class)) => {
+                    self.invoke_method(handle, def_class, method, args, env)
+                }
                 None => Err(EvalError::MessageNotUnderstood {
                     receiver_kind: "Object",
                     selector,
                 }),
             },
-            Some(SelfBinding::ClassSide { class, .. }) => {
+            Some(SelfBinding::ClassSide { handle, .. }) => {
                 match superclass.lookup_class_method(&selector) {
                     Some((method, def_class)) => {
-                        self.invoke_class_method(class, def_class, method, args, env)
+                        self.invoke_class_method(handle, def_class, method, args, env)
                     }
                     // No user-defined super method; fall through to built-in class
                     // dispatch so `super new` / `super new:` reach the Rust primitives
                     // without re-entering the receiver's own `new` override.
                     None => {
-                        crate::builtins::dispatch_class_builtin(self, class, selector, args, env)
+                        crate::builtins::dispatch_class_builtin(self, handle, selector, args, env)
                     }
                 }
             }
@@ -530,7 +538,7 @@ impl Evaluator {
             })?;
         }
         ns.lookup_class(name.as_ref())
-            .map(Value::Class)
+            .map(Value::Instance)
             .ok_or_else(|| {
                 EvalError::TypeError(format!("class {name} not found in namespace {}", ns.name))
             })
@@ -638,17 +646,16 @@ impl Evaluator {
     /// Requires: `args.len() == method.pattern.params().len()`.
     /// Ensures: method locals and `self` are bound in a fresh frame; the frame
     ///   is cleaned up on return; a method with no explicit `^` returns
-    ///   `self_value` (Smalltalk implicit self return); `EvalError::Return`
+    ///   `Value::Instance(handle)` (Smalltalk implicit self return); `EvalError::Return`
     ///   whose depth matches this frame is caught and unwrapped; Returns
     ///   targeting an outer frame propagate.
     pub fn invoke_method(
         &self,
-        receiver: Arc<Object>,
+        handle: InstanceHandle,
         defining_class: Arc<Class>,
         method: Arc<Method>,
         args: Vec<Value>,
         env: &mut Env,
-        self_value: Value,
     ) -> Result<Value, EvalError> {
         let params = method.pattern.params();
         if args.len() != params.len() {
@@ -657,6 +664,7 @@ impl Evaluator {
                 got: args.len(),
             });
         }
+        let self_value = Value::Instance(handle.clone());
         let mut method_env = env.clone();
         method_env.push_frame();
         method_env.define(self_sym(), self_value.clone());
@@ -667,7 +675,7 @@ impl Evaluator {
             method_env.define(local.clone(), Value::Nil);
         }
         self.push_self(SelfBinding::Instance {
-            receiver: receiver.clone(),
+            handle: handle.clone(),
             defining_class,
         });
         let my_depth = self.method_depth.get();
@@ -680,7 +688,7 @@ impl Evaluator {
         self.pop_self();
         method_env.pop_frame();
         match result {
-            Ok(_) => Ok(self_value.clone()),
+            Ok(_) => Ok(self_value),
             Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
             Err(e) => Err(e),
         }
@@ -689,13 +697,13 @@ impl Evaluator {
     /// Invoke a user-defined class-side method.
     ///
     /// Requires: `args.len() == method.pattern.params().len()`.
-    /// Ensures: `self` is bound to `Value::Class(class)` in the method frame;
-    ///   a method with no explicit `^` returns `Value::Class(class)` (Smalltalk
+    /// Ensures: `self` is bound to `Value::Instance(handle)` in the method frame;
+    ///   a method with no explicit `^` returns `Value::Instance(handle)` (Smalltalk
     ///   implicit self return); `EvalError::Return` whose depth matches this
     ///   frame is caught and unwrapped.
     pub fn invoke_class_method(
         &self,
-        class: Arc<Class>,
+        handle: crate::entity::InstanceHandle,
         defining_class: Arc<Class>,
         method: Arc<Method>,
         args: Vec<Value>,
@@ -708,9 +716,10 @@ impl Evaluator {
                 got: args.len(),
             });
         }
+        let self_val = Value::Instance(handle.clone());
         let mut method_env = env.clone();
         method_env.push_frame();
-        method_env.define(self_sym(), Value::Class(class.clone()));
+        method_env.define(self_sym(), self_val.clone());
         for (param, val) in params.iter().zip(args.iter()) {
             method_env.define(param.clone(), val.clone());
         }
@@ -718,7 +727,7 @@ impl Evaluator {
             method_env.define(local.clone(), Value::Nil);
         }
         self.push_self(SelfBinding::ClassSide {
-            class: class.clone(),
+            handle,
             defining_class,
         });
         let my_depth = self.method_depth.get();
@@ -729,7 +738,7 @@ impl Evaluator {
         self.pop_self();
         method_env.pop_frame();
         match result {
-            Ok(_) => Ok(Value::Class(class.clone())),
+            Ok(_) => Ok(self_val),
             Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
             Err(e) => Err(e),
         }

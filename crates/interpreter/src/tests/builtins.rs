@@ -540,7 +540,8 @@ Object subclass: #ByteBuf instanceVariableNames: '' indexedSlots: #byte.
 ByteBuf new: 8
 "#;
     let v = eval(src);
-    assert!(matches!(v, Value::Object(_)));
+    use crate::entity::InstanceKind;
+    assert!(matches!(v, Value::Instance(ref h) if matches!(h.0.kind, InstanceKind::Entity(_))));
 }
 
 // ── Error cases ───────────────────────────────────────────────────────────
@@ -1399,7 +1400,10 @@ fn prim_new_value_class_returns_value_object() {
 Value subclass: #MyVal instanceVariableNames: ''.
 MyVal _primNew
 "#;
-    assert!(matches!(eval(src), Value::ValueObject(_)));
+    use crate::entity::InstanceKind;
+    assert!(
+        matches!(eval(src), Value::Instance(ref h) if matches!(h.0.kind, InstanceKind::ValueObject(_)))
+    );
 }
 
 #[test]
@@ -1435,17 +1439,23 @@ MyActor _primNew
 "#;
     let v = eval(src);
     match &v {
-        Value::Object(handle) => {
-            let mb = handle.0.mailbox.lock().unwrap();
-            assert!(mb.is_empty(), "mailbox should be empty after _primNew");
-            drop(mb);
-            let status = handle.0.status.lock().unwrap();
-            assert!(
-                matches!(*status, crate::entity::EntityStatus::Running),
-                "status should be Running immediately after _primNew"
-            );
+        Value::Instance(handle) => {
+            use crate::entity::InstanceKind;
+            match &handle.0.kind {
+                InstanceKind::Entity(data) => {
+                    let mb = data.mailbox.lock().unwrap();
+                    assert!(mb.is_empty(), "mailbox should be empty after _primNew");
+                    drop(mb);
+                    let status = data.status.lock().unwrap();
+                    assert!(
+                        matches!(*status, crate::entity::EntityStatus::Running),
+                        "status should be Running immediately after _primNew"
+                    );
+                }
+                other => panic!("expected InstanceKind::Entity, got {other:?}"),
+            }
         }
-        other => panic!("expected Value::Object, got {other:?}"),
+        other => panic!("expected Value::Instance, got {other:?}"),
     }
 }
 
