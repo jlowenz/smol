@@ -364,7 +364,7 @@ Value subclass: #Error
 
 Error class >> signal: aString [
     | e |
-    e := self new.
+    e := self _primNew.
     e pvtSetMessage: aString.
     e signal
 ]
@@ -386,17 +386,11 @@ Object >> hash [ ^self _primHash ]
 Object >> initialize []
 
 Object class >> new [
-    | inst |
-    inst := self _primNew.
-    inst initialize.
-    ^inst
+    ^[self _primNew initialize] syncValue
 ]
 
 Object class >> new: n [
-    | inst |
-    inst := self _primNew: n.
-    inst initialize.
-    ^inst
+    ^[(self _primNew: n) initialize] syncValue
 ]
 
 "Association — immutable key / mutable value pair."
@@ -407,7 +401,7 @@ Value subclass: #Association
 
 Association class >> key: k value: v [
     | a |
-    a := self new.
+    a := self _primNew.
     a pvtKey: k value: v.
     ^a
 ]
