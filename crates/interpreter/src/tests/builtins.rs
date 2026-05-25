@@ -1504,3 +1504,69 @@ Baz class >> create [
     // If this eval returns without error the method installed successfully.
     assert_eq!(eval(src), Value::Nil);
 }
+
+// ── force_value audit: comparisons and signals with future args ───────────────
+
+// Helper: an actor whose only method returns a known value — the reply is a
+// future from the caller's perspective, exercising the force_value paths.
+
+#[test]
+fn class_neq_forces_future_arg() {
+    // Class ~= should resolve a future arg before comparing.
+    // Uses two distinct classes; myClass returns ClassA as a future from the actor.
+    let src = r#"
+Object subclass: #ClassA instanceVariableNames: ''.
+Object subclass: #ClassB instanceVariableNames: ''.
+ClassA >> myClass [ ^ClassA ]
+| a |
+a := ClassA new.
+ClassB ~= a myClass
+"#;
+    assert_eq!(eval(src), Value::Bool(true));
+}
+
+#[test]
+fn entity_eq_forces_future_arg() {
+    // Entity = should resolve a future arg (another entity reply) before comparing.
+    let src = r#"
+Object subclass: #Box instanceVariableNames: ''.
+Box >> self [ ^self ]
+| a b |
+a := Box new.
+b := Box new.
+a = (b self)
+"#;
+    assert_eq!(eval(src), Value::Bool(false));
+}
+
+#[test]
+fn entity_neq_forces_future_arg() {
+    let src = r#"
+Object subclass: #Box2 instanceVariableNames: ''.
+Box2 >> self [ ^self ]
+| a |
+a := Box2 new.
+a ~= (a self)
+"#;
+    assert_eq!(eval(src), Value::Bool(false));
+}
+
+#[test]
+fn prim_signal_forces_future_arg() {
+    // _primSignal: should resolve a future string arg before signalling.
+    // The actor m is the receiver; m text returns a future that must be forced
+    // to 'hello'. Without force_value the signal message would be something like
+    // "FutureHandle(resolved=true)" instead of the actual string.
+    let src = r#"
+Object subclass: #Msg instanceVariableNames: ''.
+Msg >> text [ ^'hello' ]
+| m |
+m := Msg new.
+m _primSignal: m text
+"#;
+    let err = eval_err(src);
+    assert!(
+        matches!(&err, crate::eval::EvalError::Signal(s) if s.as_ref() == "hello"),
+        "expected Signal('hello'), got {err:?}"
+    );
+}

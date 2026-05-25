@@ -1401,7 +1401,7 @@ fn dispatch_object_primitive(
         }
         "_primSignal:" => {
             expect_arity(sel, 1, args.len())?;
-            let msg = match args.remove(0) {
+            let msg = match force_value(args.remove(0))? {
                 Value::Str(s) => s,
                 other => Arc::from(format!("{other}").as_str()),
             };
@@ -1409,7 +1409,7 @@ fn dispatch_object_primitive(
         }
         "error:" => {
             expect_arity(sel, 1, args.len())?;
-            let msg = match args.remove(0) {
+            let msg = match force_value(args.remove(0))? {
                 Value::Str(s) => s,
                 other => Arc::from(format!("error: argument was {}", other.kind()).as_str()),
             };
@@ -1436,11 +1436,11 @@ pub(crate) fn dispatch_object_primitive_as_entity(
     match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(self_val == args.remove(0)))
+            Ok(Value::Bool(self_val == force_value(args.remove(0))?))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(self_val != args.remove(0)))
+            Ok(Value::Bool(self_val != force_value(args.remove(0))?))
         }
         _ => dispatch_object_primitive(obj, sel, args),
     }
@@ -1535,7 +1535,9 @@ pub(crate) fn dispatch_class_builtin(
         }
         "~=" => {
             expect_arity(&selector, 1, args.len())?;
-            Ok(Value::Bool(Value::Class(class) != args[0]))
+            Ok(Value::Bool(
+                Value::Class(class) != force_value(args.remove(0))?,
+            ))
         }
         "_primNew" => {
             expect_arity(&selector, 0, args.len())?;
