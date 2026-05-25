@@ -88,17 +88,10 @@ Array >> copyFrom: start to: stop [
 
 Array >> = other [
     | n |
-    self printString. other printString.
-    self class printString.
-    other class printString.
-    (self class = other class) printString.
     self class = other class ifFalse: [^false].
-    'classes match' printString.
     n := self _primSize.
     n = other size ifFalse: [^false].
-    'sizes match' printString.
-    "we know the sizes are the same"
-    0 to: n - 1 do: [ :i | 
+    0 to: n - 1 do: [ :i |
         (self _primAt: i) = (other at: i) ifFalse: [^false].
     ].
     ^true
@@ -114,9 +107,7 @@ Array >> printString [
         s := s , (self _primAt: i) printString , ' '.
         i := i + 1
     ].
-    s := s , ')'.
-    s printString.
-    ^s
+    ^s , ')'
 ]
 
 "ByteArray — fixed-size indexed collection of byte (0..255) slots."

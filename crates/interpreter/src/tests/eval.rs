@@ -458,8 +458,12 @@ fn array_detect() {
 
 #[test]
 fn array_detect_if_none() {
+    // noneBlock branch
     let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a detect: [:e | e > 10] ifNone: [99]";
     assert_eq!(eval(src), Value::Int(99));
+    // found branch
+    let src2 = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 5. a at: 2 put: 3. a detect: [:e | e > 4] ifNone: [0]";
+    assert_eq!(eval(src2), Value::Int(5));
 }
 
 #[test]
@@ -514,6 +518,13 @@ fn array_not_equal() {
 fn array_eq_class_mismatch() {
     // Array vs OrderedCollection should be unequal even if content looks similar
     let src = "| a oc | a := Array new: 0. oc := OrderedCollection new. a = oc";
+    assert_eq!(eval(src), Value::Bool(false));
+}
+
+#[test]
+fn array_eq_size_mismatch() {
+    // Same class, different sizes — exercises the n = other size ifFalse: [^false] branch.
+    let src = "| a b | a := Array new: 2. b := Array new: 3. a = b";
     assert_eq!(eval(src), Value::Bool(false));
 }
 
@@ -674,8 +685,12 @@ fn oc_detect() {
 
 #[test]
 fn oc_detect_if_none() {
+    // noneBlock branch
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc detect: [:e | e > 10] ifNone: [42]";
     assert_eq!(eval(src), Value::Int(42));
+    // found branch
+    let src2 = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 5. oc add: 3. oc detect: [:e | e > 4] ifNone: [0]";
+    assert_eq!(eval(src2), Value::Int(5));
 }
 
 #[test]
@@ -755,10 +770,20 @@ fn oc_print_string() {
 
 #[test]
 fn oc_growth_trigger() {
-    // Add more than initial capacity of 8 to force pvtGrow.
+    // add: beyond initial capacity of 8 forces pvtGrow.
     let src = "| oc | oc := OrderedCollection new. 1 to: 12 do: [:i | oc add: i]. oc size";
     assert_eq!(eval(src), Value::Int(12));
     let src2 = "| oc | oc := OrderedCollection new. 1 to: 12 do: [:i | oc add: i]. oc at: 11";
+    assert_eq!(eval(src2), Value::Int(12));
+}
+
+#[test]
+fn oc_add_first_growth_trigger() {
+    // addFirst: beyond initial capacity of 8 forces pvtGrow via its own guard.
+    let src = "| oc | oc := OrderedCollection new. 1 to: 12 do: [:i | oc addFirst: i]. oc size";
+    assert_eq!(eval(src), Value::Int(12));
+    // addFirst prepends, so the last addFirst: (12) is at index 0.
+    let src2 = "| oc | oc := OrderedCollection new. 1 to: 12 do: [:i | oc addFirst: i]. oc at: 0";
     assert_eq!(eval(src2), Value::Int(12));
 }
 
@@ -1062,6 +1087,15 @@ fn association_equality_by_key() {
     assert_eq!(eval(src), Value::Bool(true));
     let src2 = "('x' -> 1) = ('y' -> 1)";
     assert_eq!(eval(src2), Value::Bool(false));
+}
+
+#[test]
+fn association_eq_class_mismatch() {
+    // Association = a different value object should be false via the class guard.
+    // Error is also a Value subclass, so it has `class` — exercises the class
+    // mismatch branch without hitting MessageNotUnderstood.
+    let src = "| e | e := Error new. ('x' -> 1) = e";
+    assert_eq!(eval(src), Value::Bool(false));
 }
 
 #[test]
