@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, OnceLock};
 
-use crate::entity::{EntityId, EntityStatus};
+use crate::entity::EntityId;
 
 use thiserror::Error;
 
@@ -628,23 +628,6 @@ impl Evaluator {
         let mut last = Value::Nil;
         for stmt in stmts {
             let v = self.eval_stmt(stmt, env)?;
-            // If this statement produced a freshly spawned entity, wait for
-            // `initialize` to complete before proceeding. This prevents TOCTOU
-            // races on class variables shared across entities (e.g. a counter
-            // incremented in `initialize`).
-            if let Value::Object(ref handle) = v {
-                let maybe_future = {
-                    let status = handle.0.status.lock().unwrap();
-                    if let EntityStatus::Initializing(ref f) = *status {
-                        Some(f.clone())
-                    } else {
-                        None
-                    }
-                };
-                if let Some(f) = maybe_future {
-                    f.wait()?;
-                }
-            }
             last = crate::builtins::force_value(v)?;
         }
         Ok(last)
@@ -750,25 +733,6 @@ impl Evaluator {
             Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
             Err(e) => Err(e),
         }
-    }
-
-    /// After allocating a new object, send `initialize` if it is defined.
-    pub fn send_initialize(
-        &self,
-        obj: Arc<Object>,
-        env: &mut Env,
-    ) -> Result<Arc<Object>, EvalError> {
-        if let Some((method, def_class)) = obj.class.lookup("initialize") {
-            self.invoke_method(
-                obj.clone(),
-                def_class,
-                method,
-                vec![],
-                env,
-                Value::ValueObject(obj.clone()),
-            )?;
-        }
-        Ok(obj)
     }
 
     /// Create an evaluator from an existing `ClassRegistry`, loading `kernel.smol`.

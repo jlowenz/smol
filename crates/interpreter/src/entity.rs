@@ -110,10 +110,6 @@ impl std::fmt::Debug for FutureHandle {
 /// Lifecycle state of an actor entity.
 #[derive(Debug, Clone)]
 pub enum EntityStatus {
-    /// `initialize` is queued but not yet complete. The held future resolves
-    /// when `initialize` finishes, allowing sequential contexts (e.g. `syncValue`)
-    /// to wait before sending further messages.
-    Initializing(FutureHandle),
     Running,
     Faulted(String),
     Terminated,
@@ -151,62 +147,6 @@ impl std::fmt::Debug for EntityHandle {
 }
 
 // ── Entity spawning ───────────────────────────────────────────────────────────
-
-/// Spawn a new actor entity: allocate its state, start its green-thread coroutine
-/// message loop, queue `initialize`, and return the handle.
-///
-/// Requires: `class.inherits_is_value()` is `false`.
-/// Ensures: the entity's coroutine is running and will process `initialize`
-///   as its first message.
-pub fn spawn_entity(
-    class: Arc<Class>,
-    registry: Arc<ClassRegistry>,
-    global_env: Env,
-    indexed_size: Option<usize>,
-) -> EntityHandle {
-    let id = next_entity_id();
-    let obj = if let Some(n) = indexed_size {
-        Arc::new(Object::new_with_indexed(class.clone(), n))
-    } else {
-        Arc::new(Object::new(class.clone()))
-    };
-
-    let init_future = FutureHandle::new();
-
-    let entity = Arc::new(EntityState {
-        id,
-        class: class.clone(),
-        data: obj,
-        mailbox: Mutex::new(VecDeque::new()),
-        mailbox_ready: Condvar::new(),
-        status: Mutex::new(EntityStatus::Initializing(init_future.clone())),
-    });
-
-    let handle = EntityHandle(entity.clone());
-
-    // Enqueue `initialize` using the same future stored in the status so that
-    // `eval_program_sync` can wait on it via the entity's status.
-    {
-        let mut mb = entity.mailbox.lock().unwrap();
-        mb.push_back(Envelope {
-            selector: Arc::from("initialize"),
-            args: vec![],
-            reply: init_future,
-        });
-        entity.mailbox_ready.notify_one();
-    }
-
-    // Spawn the entity's green-thread coroutine.
-    let entity_clone = entity.clone();
-    let registry_clone = registry.clone();
-    let env_clone = global_env.clone();
-    may::config().set_stack_size(0x4000);
-    may::go!(move || {
-        run_entity_loop(entity_clone, registry_clone, env_clone);
-    });
-
-    handle
-}
 
 /// Spawn a new actor entity with an empty mailbox and no `initialize` queued.
 ///
@@ -316,23 +256,13 @@ fn run_entity_loop(entity: Arc<EntityState>, registry: Arc<ClassRegistry>, globa
         match result {
             Ok(v) => {
                 envelope.reply.resolve_ok(v);
-                // Transition Initializing → Running once `initialize` completes.
-                let mut status = entity.status.lock().unwrap();
-                if matches!(*status, EntityStatus::Initializing(_)) {
-                    *status = EntityStatus::Running;
-                }
             }
             Err(EvalError::Return(v, _)) => {
                 // Non-local return from a cross-entity block: resolve with v.
                 envelope.reply.resolve_ok(v);
-                let mut status = entity.status.lock().unwrap();
-                if matches!(*status, EntityStatus::Initializing(_)) {
-                    *status = EntityStatus::Running;
-                }
             }
             Err(e) => {
                 let msg = e.to_string();
-                // Overwrites Initializing if initialize itself errored.
                 *entity.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
                 envelope.reply.resolve_err(e);
                 // Drain all already-queued messages so their futures resolve immediately

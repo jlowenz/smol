@@ -16,8 +16,6 @@ Object subclass: #Array
     classVariableNames: ''
     indexedSlots: #pointer.
 
-Array class >> new: n [ ^super new: n ]
-
 Array >> at: i       [ ^self _primAt: i ]
 Array >> at: i put: v [ self _primAt: i put: v. ^v ]
 Array >> size        [ ^self _primSize ]
@@ -384,8 +382,22 @@ Object >> error: aString [ Error signal: aString ]
  to maintain the invariant: a = b → a hash = b hash."
 Object >> hash [ ^self _primHash ]
 
-"Default initialize is a no-op; actor entities receive this as their first message."
+"Default initialize is a no-op."
 Object >> initialize []
+
+Object class >> new [
+    | inst |
+    inst := self _primNew.
+    inst initialize.
+    ^inst
+]
+
+Object class >> new: n [
+    | inst |
+    inst := self _primNew: n.
+    inst initialize.
+    ^inst
+]
 
 "Association — immutable key / mutable value pair."
 Value subclass: #Association

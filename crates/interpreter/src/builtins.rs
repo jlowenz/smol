@@ -6,7 +6,7 @@ use num_traits::Zero;
 use parking_lot::RwLock;
 
 use crate::class::{Class, IndexedSlotKind};
-use crate::entity::{EntityHandle, send_to_entity, spawn_entity, spawn_entity_bare};
+use crate::entity::{EntityHandle, send_to_entity, spawn_entity_bare};
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
 use crate::namespace::Namespace;
@@ -1539,13 +1539,23 @@ pub(crate) fn dispatch_class_builtin(
         }
         "_primNew" => {
             expect_arity(&selector, 0, args.len())?;
+            // Indexed classes get zero-size indexed storage; non-indexed get plain Object.
+            let indexed_size = if class.indexed_slot_kind.is_some() {
+                Some(0usize)
+            } else {
+                None
+            };
             if class.inherits_is_value() {
-                let obj = Arc::new(Object::new(class.clone()));
+                let obj = match indexed_size {
+                    Some(n) => Arc::new(Object::new_with_indexed(class.clone(), n)),
+                    None => Arc::new(Object::new(class.clone())),
+                };
                 Ok(Value::ValueObject(obj))
             } else {
                 let mut global_env = Env::new();
                 ev.registry.populate_env(&mut global_env);
-                let handle = spawn_entity_bare(class, ev.registry.clone(), global_env, None);
+                let handle =
+                    spawn_entity_bare(class, ev.registry.clone(), global_env, indexed_size);
                 Ok(Value::Object(handle))
             }
         }
@@ -1564,56 +1574,6 @@ pub(crate) fn dispatch_class_builtin(
                 let mut global_env = Env::new();
                 ev.registry.populate_env(&mut global_env);
                 let handle = spawn_entity_bare(
-                    class,
-                    ev.registry.clone(),
-                    global_env,
-                    Some(n.max(0) as usize),
-                );
-                Ok(Value::Object(handle))
-            }
-        }
-        "new" => {
-            expect_arity(&selector, 0, args.len())?;
-            if class.inherits_is_value() {
-                // Value class: synchronous allocation + initialize.
-                let obj = if class.indexed_slot_kind.is_some() {
-                    Arc::new(Object::new_with_indexed(class.clone(), 0))
-                } else {
-                    Arc::new(Object::new(class.clone()))
-                };
-                let obj = ev.send_initialize(obj, env)?;
-                Ok(Value::ValueObject(obj))
-            } else {
-                // Actor class: spawn entity thread; initialize is queued as the first message.
-                let mut global_env = Env::new();
-                ev.registry.populate_env(&mut global_env);
-                let handle = spawn_entity(class, ev.registry.clone(), global_env, None);
-                Ok(Value::Object(handle))
-            }
-        }
-        "new:" => {
-            expect_arity(&selector, 1, args.len())?;
-            let n = as_int(args.remove(0), &selector)?;
-            if class.inherits_is_value() {
-                // Value class: allocate with indexed storage.
-                if class.indexed_slot_kind.is_none() {
-                    return Err(EvalError::TypeError(
-                        "new: requires class to declare indexedSlots:".into(),
-                    ));
-                }
-                let obj = Arc::new(Object::new_with_indexed(class.clone(), n.max(0) as usize));
-                let obj = ev.send_initialize(obj, env)?;
-                Ok(Value::ValueObject(obj))
-            } else {
-                // Actor class with indexed storage.
-                if class.indexed_slot_kind.is_none() {
-                    return Err(EvalError::TypeError(
-                        "new: requires class to declare indexedSlots:".into(),
-                    ));
-                }
-                let mut global_env = Env::new();
-                ev.registry.populate_env(&mut global_env);
-                let handle = spawn_entity(
                     class,
                     ev.registry.clone(),
                     global_env,
