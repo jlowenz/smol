@@ -654,8 +654,10 @@ impl Evaluator {
     ///
     /// Requires: `args.len() == method.pattern.params().len()`.
     /// Ensures: method locals and `self` are bound in a fresh frame; the frame
-    ///   is cleaned up on return; `EvalError::Return` whose depth matches this
-    ///   frame is caught and unwrapped; Returns targeting an outer frame propagate.
+    ///   is cleaned up on return; a method with no explicit `^` returns
+    ///   `self_value` (Smalltalk implicit self return); `EvalError::Return`
+    ///   whose depth matches this frame is caught and unwrapped; Returns
+    ///   targeting an outer frame propagate.
     pub fn invoke_method(
         &self,
         receiver: Arc<Object>,
@@ -695,7 +697,7 @@ impl Evaluator {
         self.pop_self();
         method_env.pop_frame();
         match result {
-            Ok(v) => Ok(v),
+            Ok(_) => Ok(self_value.clone()),
             Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
             Err(e) => Err(e),
         }
@@ -705,7 +707,9 @@ impl Evaluator {
     ///
     /// Requires: `args.len() == method.pattern.params().len()`.
     /// Ensures: `self` is bound to `Value::Class(class)` in the method frame;
-    ///   `EvalError::Return` whose depth matches this frame is caught and unwrapped.
+    ///   a method with no explicit `^` returns `Value::Class(class)` (Smalltalk
+    ///   implicit self return); `EvalError::Return` whose depth matches this
+    ///   frame is caught and unwrapped.
     pub fn invoke_class_method(
         &self,
         class: Arc<Class>,
@@ -742,7 +746,7 @@ impl Evaluator {
         self.pop_self();
         method_env.pop_frame();
         match result {
-            Ok(v) => Ok(v),
+            Ok(_) => Ok(Value::Class(class.clone())),
             Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
             Err(e) => Err(e),
         }

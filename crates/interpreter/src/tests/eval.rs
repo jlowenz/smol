@@ -1276,3 +1276,59 @@ fn dict_symbol_keys() {
     let src = "| d | d := Dictionary new. d at: #foo put: 42. d at: #foo";
     assert_eq!(eval(src), Value::Int(42));
 }
+
+// ── C2: implicit self return ──────────────────────────────────────────────────
+
+#[test]
+fn method_without_caret_returns_self() {
+    let src = r#"
+Object subclass: #Setter instanceVariableNames: 'val'.
+Setter >> val: v [ val := v ]
+Setter >> val [ ^val ]
+| s |
+s := Setter new.
+(s val: 42) = s
+"#;
+    // val: has no ^, so it returns self; identity check with s should be true
+    assert_eq!(eval(src), Value::Bool(true));
+}
+
+#[test]
+fn method_with_caret_still_returns_explicit_value() {
+    let src = r#"
+Object subclass: #Getter instanceVariableNames: 'val'.
+Getter >> initialize [ val := 99 ]
+Getter >> val [ ^val ]
+| g |
+g := Getter new.
+g val
+"#;
+    assert_eq!(eval(src), Value::Int(99));
+}
+
+#[test]
+fn class_method_without_caret_returns_self_class() {
+    let src = r#"
+Object subclass: #Foo instanceVariableNames: ''.
+Foo class >> setup [ 42 ]
+Foo setup = Foo
+"#;
+    // setup has no ^; class-side implicit return is the class itself
+    assert_eq!(eval(src), Value::Bool(true));
+}
+
+#[test]
+fn actor_method_without_caret_returns_self() {
+    let src = r#"
+Object subclass: #MyActor instanceVariableNames: 'x'.
+MyActor >> setX: v [ x := v ]
+MyActor >> x [ ^x ]
+| a |
+a := MyActor new.
+(a setX: 7) await.
+a x
+"#;
+    // setX: has no ^; the future it returns resolves to the actor handle (self)
+    // We don't assert the identity here, just that x was set correctly
+    assert_eq!(eval(src), Value::Int(7));
+}
