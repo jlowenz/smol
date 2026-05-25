@@ -4,6 +4,7 @@ use num_bigint::BigInt;
 
 use crate::ast::Stmt;
 use crate::class::Class;
+use crate::entity::{EntityHandle, EntityId, FutureHandle};
 use crate::env::Env;
 use crate::namespace::Namespace;
 use crate::object::Object;
@@ -28,8 +29,14 @@ pub enum Value {
     Block(Arc<Block>),
     /// Arbitrary-precision integer. Used when Int arithmetic overflows i64.
     LargeInt(Arc<BigInt>),
-    /// A user-defined object instance.
-    Object(Arc<Object>),
+    /// A passive value object instance (immutable after construction).
+    /// Corresponds to classes declared with `Value subclass:`.
+    ValueObject(Arc<Object>),
+    /// An actor entity reference. Sending a message to an entity enqueues an
+    /// `Envelope` and returns a `Future` immediately.
+    Object(EntityHandle),
+    /// A lazy future reference. Resolved only when a message is dispatched to it.
+    Future(FutureHandle),
     /// A class object. Class names in the environment are bound to this variant.
     Class(Arc<Class>),
     /// A namespace object. Namespace names in the environment are bound to this variant.
@@ -43,13 +50,17 @@ pub struct Block {
     pub locals: Vec<Arc<str>>,
     pub body: Vec<Stmt>,
     /// Captured lexical environment. Because `Env` frames are
-    /// `Arc<RefCell<Frame>>`, this is a live shared reference, not a snapshot.
+    /// `Arc<Mutex<Frame>>`, this is a live shared reference, not a snapshot.
     pub env: Env,
     /// Method-stack depth of the frame a `^`-return inside this block should
     /// target. Equal to the method depth at the block's creation site, so that
     /// non-local returns propagate past intermediate method calls and are caught
     /// by the correct `invoke_method` frame.
     pub home_depth: usize,
+    /// The `EntityId` of the entity that created this block, or `None` when
+    /// created outside any entity context. Used to detect cross-entity block
+    /// invocations for write-guard enforcement.
+    pub home_entity: Option<EntityId>,
 }
 
 impl PartialEq for Value {
@@ -65,7 +76,9 @@ impl PartialEq for Value {
             (Value::LargeInt(a), Value::LargeInt(b)) => a == b,
             (Value::Int(a), Value::LargeInt(b)) => BigInt::from(*a) == **b,
             (Value::LargeInt(a), Value::Int(b)) => **a == BigInt::from(*b),
-            (Value::Object(a), Value::Object(b)) => Arc::ptr_eq(a, b),
+            (Value::ValueObject(a), Value::ValueObject(b)) => Arc::ptr_eq(a, b),
+            (Value::Object(a), Value::Object(b)) => Arc::ptr_eq(&a.0, &b.0),
+            (Value::Future(a), Value::Future(b)) => Arc::ptr_eq(&a.0, &b.0),
             (Value::Class(a), Value::Class(b)) => Arc::ptr_eq(a, b),
             (Value::Namespace(a), Value::Namespace(b)) => Arc::ptr_eq(a, b),
             _ => false,
@@ -86,7 +99,9 @@ impl std::hash::Hash for Value {
             Value::Symbol(s) | Value::Str(s) => s.hash(state),
             Value::Block(b) => Arc::as_ptr(b).hash(state),
             Value::LargeInt(b) => b.hash(state),
-            Value::Object(o) => Arc::as_ptr(o).hash(state),
+            Value::ValueObject(o) => Arc::as_ptr(o).hash(state),
+            Value::Object(e) => Arc::as_ptr(&e.0).hash(state),
+            Value::Future(f) => Arc::as_ptr(&f.0).hash(state),
             Value::Class(c) => Arc::as_ptr(c).hash(state),
             Value::Namespace(ns) => Arc::as_ptr(ns).hash(state),
         }
@@ -105,7 +120,9 @@ impl std::fmt::Display for Value {
             Value::Str(s) => write!(f, "'{s}'"),
             Value::Block(_) => write!(f, "a Block"),
             Value::LargeInt(n) => write!(f, "{n}"),
-            Value::Object(o) => write!(f, "a {}", o.class.name),
+            Value::ValueObject(o) => write!(f, "a {}", o.class.name),
+            Value::Object(e) => write!(f, "a {}", e.0.class.name),
+            Value::Future(_) => write!(f, "a Future"),
             Value::Class(c) => write!(f, "{}", c.name),
             Value::Namespace(ns) => write!(f, "Namespace({})", ns.name),
         }
@@ -124,7 +141,9 @@ impl Value {
             Value::Str(_) => "String",
             Value::Block(_) => "Block",
             Value::LargeInt(_) => "LargeInt",
+            Value::ValueObject(_) => "Object",
             Value::Object(_) => "Object",
+            Value::Future(_) => "Future",
             Value::Class(_) => "Class",
             Value::Namespace(_) => "Namespace",
         }
@@ -134,10 +153,12 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::*;
     use crate::class::Class;
     use crate::env::Env;
+    use parking_lot::RwLock;
 
     fn make_class(name: &str) -> Arc<Class> {
         Arc::new(Class {
@@ -145,22 +166,20 @@ mod tests {
             superclass: None,
             own_instance_vars: vec![],
             own_class_vars: vec![],
-            class_var_storage: std::cell::RefCell::new(HashMap::new()),
+            class_var_storage: RwLock::new(HashMap::new()),
             indexed_slot_kind: None,
-            methods: std::cell::RefCell::new(HashMap::new()),
-            class_methods: std::cell::RefCell::new(HashMap::new()),
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
         })
     }
 
     #[test]
     fn float_eq_bit_pattern() {
-        // Bit-pattern comparison: same NaN bits are equal (unlike IEEE 754).
-        // This is intentional — it gives reflexivity so NaN works as a HashMap key.
         let nan = Value::Float(f64::NAN);
         assert_eq!(nan, nan);
         assert_eq!(Value::Float(1.5), Value::Float(1.5));
         assert_ne!(Value::Float(1.5), Value::Float(2.0));
-        // +0.0 and -0.0 have different bit patterns → unequal under this scheme.
         assert_ne!(Value::Float(0.0_f64), Value::Float(-0.0_f64));
     }
 
@@ -168,7 +187,10 @@ mod tests {
     fn value_kind_names() {
         assert_eq!(Value::Int(0).kind(), "Int");
         assert_eq!(Value::Nil.kind(), "Nil");
-        assert_eq!(Value::LargeInt(Arc::new(BigInt::from(0))).kind(), "LargeInt");
+        assert_eq!(
+            Value::LargeInt(Arc::new(BigInt::from(0))).kind(),
+            "LargeInt"
+        );
     }
 
     #[test]
@@ -186,15 +208,22 @@ mod tests {
             body: vec![],
             env: Env::new(),
             home_depth: 0,
+            home_entity: None,
         }));
         assert_eq!(Value::Float(1.0).kind(), "Float");
         assert_eq!(Value::Bool(true).kind(), "Bool");
         assert_eq!(Value::Symbol(Arc::from("s")).kind(), "Symbol");
         assert_eq!(Value::Str(Arc::from("s")).kind(), "String");
         assert_eq!(block.kind(), "Block");
-        assert_eq!(Value::Object(Arc::new(Object::new(class.clone()))).kind(), "Object");
+        assert_eq!(
+            Value::ValueObject(Arc::new(Object::new(class.clone()))).kind(),
+            "Object"
+        );
         assert_eq!(Value::Class(class).kind(), "Class");
-        assert_eq!(Value::Namespace(Arc::new(Namespace::new(Arc::from("N"), None))).kind(), "Namespace");
+        assert_eq!(
+            Value::Namespace(Arc::new(Namespace::new(Arc::from("N"), None))).kind(),
+            "Namespace"
+        );
     }
 
     #[test]
@@ -206,16 +235,25 @@ mod tests {
         assert_eq!(format!("{}", Value::Nil), "nil");
         assert_eq!(format!("{}", Value::Symbol(Arc::from("ok"))), "#ok");
         assert_eq!(format!("{}", Value::Str(Arc::from("hi"))), "'hi'");
-        assert_eq!(format!("{}", Value::LargeInt(Arc::new(BigInt::from(99)))), "99");
+        assert_eq!(
+            format!("{}", Value::LargeInt(Arc::new(BigInt::from(99)))),
+            "99"
+        );
     }
 
     #[test]
     fn display_composite_variants() {
         let class = make_class("Dog");
         assert_eq!(format!("{}", Value::Class(class.clone())), "Dog");
-        assert_eq!(format!("{}", Value::Object(Arc::new(Object::new(class)))), "a Dog");
         assert_eq!(
-            format!("{}", Value::Namespace(Arc::new(Namespace::new(Arc::from("Lib"), None)))),
+            format!("{}", Value::ValueObject(Arc::new(Object::new(class)))),
+            "a Dog"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                Value::Namespace(Arc::new(Namespace::new(Arc::from("Lib"), None)))
+            ),
             "Namespace(Lib)"
         );
         let block = Value::Block(Arc::new(Block {
@@ -224,6 +262,7 @@ mod tests {
             body: vec![],
             env: Env::new(),
             home_depth: 0,
+            home_entity: None,
         }));
         assert_eq!(format!("{block}"), "a Block");
     }
@@ -243,23 +282,40 @@ mod tests {
 
     #[test]
     fn eq_block_uses_pointer_identity() {
-        let b = Arc::new(Block { params: vec![], locals: vec![], body: vec![], env: Env::new(), home_depth: 0 });
+        let b = Arc::new(Block {
+            params: vec![],
+            locals: vec![],
+            body: vec![],
+            env: Env::new(),
+            home_depth: 0,
+            home_entity: None,
+        });
         assert_eq!(Value::Block(b.clone()), Value::Block(b.clone()));
-        let b2 = Arc::new(Block { params: vec![], locals: vec![], body: vec![], env: Env::new(), home_depth: 0 });
+        let b2 = Arc::new(Block {
+            params: vec![],
+            locals: vec![],
+            body: vec![],
+            env: Env::new(),
+            home_depth: 0,
+            home_entity: None,
+        });
         assert_ne!(Value::Block(b), Value::Block(b2));
     }
 
     #[test]
-    fn eq_object_class_namespace_use_pointer_identity() {
+    fn eq_value_object_class_namespace_use_pointer_identity() {
         let class = make_class("Z");
         let class2 = make_class("Z");
         assert_eq!(Value::Class(class.clone()), Value::Class(class.clone()));
         assert_ne!(Value::Class(class.clone()), Value::Class(class2));
 
         let obj = Arc::new(Object::new(class.clone()));
-        assert_eq!(Value::Object(obj.clone()), Value::Object(obj.clone()));
+        assert_eq!(
+            Value::ValueObject(obj.clone()),
+            Value::ValueObject(obj.clone())
+        );
         let obj2 = Arc::new(Object::new(class));
-        assert_ne!(Value::Object(obj), Value::Object(obj2));
+        assert_ne!(Value::ValueObject(obj), Value::ValueObject(obj2));
 
         let ns = Arc::new(Namespace::new(Arc::from("A"), None));
         assert_eq!(Value::Namespace(ns.clone()), Value::Namespace(ns.clone()));
@@ -280,9 +336,19 @@ mod tests {
         map.insert(Value::LargeInt(Arc::new(BigInt::from(999))), 7);
         let class = make_class("H");
         map.insert(Value::Class(class.clone()), 8);
-        map.insert(Value::Object(Arc::new(Object::new(class))), 9);
-        map.insert(Value::Namespace(Arc::new(Namespace::new(Arc::from("N"), None))), 10);
-        let b = Arc::new(Block { params: vec![], locals: vec![], body: vec![], env: Env::new(), home_depth: 0 });
+        map.insert(Value::ValueObject(Arc::new(Object::new(class))), 9);
+        map.insert(
+            Value::Namespace(Arc::new(Namespace::new(Arc::from("N"), None))),
+            10,
+        );
+        let b = Arc::new(Block {
+            params: vec![],
+            locals: vec![],
+            body: vec![],
+            env: Env::new(),
+            home_depth: 0,
+            home_entity: None,
+        });
         map.insert(Value::Block(b), 11);
         assert_eq!(map.len(), 11);
     }

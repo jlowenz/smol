@@ -1,6 +1,7 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::class::Class;
 
@@ -12,10 +13,10 @@ pub struct Namespace {
     pub name: Arc<str>,
     /// For qualified-name construction only. NOT an implicit search scope.
     pub parent: Option<Arc<Namespace>>,
-    sub_namespaces: RefCell<HashMap<Arc<str>, Arc<Namespace>>>,
-    pub(crate) classes: RefCell<HashMap<Arc<str>, Arc<Class>>>,
+    sub_namespaces: RwLock<HashMap<Arc<str>, Arc<Namespace>>>,
+    pub(crate) classes: RwLock<HashMap<Arc<str>, Arc<Class>>>,
     /// Explicit imports — parent namespace NOT implicitly included.
-    imports: RefCell<Vec<Arc<Namespace>>>,
+    imports: RwLock<Vec<Arc<Namespace>>>,
 }
 
 impl Namespace {
@@ -23,32 +24,32 @@ impl Namespace {
         Self {
             name,
             parent,
-            sub_namespaces: RefCell::new(HashMap::new()),
-            classes: RefCell::new(HashMap::new()),
-            imports: RefCell::new(Vec::new()),
+            sub_namespaces: RwLock::new(HashMap::new()),
+            classes: RwLock::new(HashMap::new()),
+            imports: RwLock::new(Vec::new()),
         }
     }
 
     pub fn register(&self, class: Arc<Class>) {
-        self.classes.borrow_mut().insert(class.name.clone(), class);
+        self.classes.write().insert(class.name.clone(), class);
     }
 
     pub fn register_sub(&self, ns: Arc<Namespace>) {
-        self.sub_namespaces.borrow_mut().insert(ns.name.clone(), ns);
+        self.sub_namespaces.write().insert(ns.name.clone(), ns);
     }
 
     pub fn add_import(&self, ns: Arc<Namespace>) {
-        self.imports.borrow_mut().push(ns);
+        self.imports.write().push(ns);
     }
 
     /// Look up a class by simple name: own classes first, then imports (in order).
     /// Does NOT search the parent namespace.
     pub fn lookup_class(&self, name: &str) -> Option<Arc<Class>> {
-        if let Some(c) = self.classes.borrow().get(name) {
+        if let Some(c) = self.classes.read().get(name) {
             return Some(c.clone());
         }
-        for imp in self.imports.borrow().iter() {
-            if let Some(c) = imp.classes.borrow().get(name) {
+        for imp in self.imports.read().iter() {
+            if let Some(c) = imp.classes.read().get(name) {
                 return Some(c.clone());
             }
         }
@@ -57,7 +58,7 @@ impl Namespace {
 
     /// Look up a sub-namespace by name.
     pub fn lookup_sub(&self, name: &str) -> Option<Arc<Namespace>> {
-        self.sub_namespaces.borrow().get(name).cloned()
+        self.sub_namespaces.read().get(name).cloned()
     }
 
     /// Fully-qualified name built from parent chain (e.g. `Kernel::Collections`).
@@ -82,6 +83,7 @@ mod tests {
 
     use super::*;
     use crate::class::Class;
+    use parking_lot::RwLock;
 
     fn bare_class(name: &str) -> Arc<Class> {
         Arc::new(Class {
@@ -89,10 +91,11 @@ mod tests {
             superclass: None,
             own_instance_vars: vec![],
             own_class_vars: vec![],
-            class_var_storage: std::cell::RefCell::new(HashMap::new()),
+            class_var_storage: RwLock::new(HashMap::new()),
             indexed_slot_kind: None,
-            methods: std::cell::RefCell::new(HashMap::new()),
-            class_methods: std::cell::RefCell::new(HashMap::new()),
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
         })
     }
 
@@ -131,7 +134,7 @@ mod tests {
         ns_a.add_import(ns_b);
         let found = ns_a.lookup_class("Foo").unwrap();
         // own class is returned (not the import)
-        assert!(Arc::ptr_eq(&found, &ns_a.classes.borrow()["Foo"]));
+        assert!(Arc::ptr_eq(&found, &ns_a.classes.read()["Foo"]));
     }
 
     #[test]

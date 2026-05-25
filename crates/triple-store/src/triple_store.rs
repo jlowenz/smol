@@ -47,11 +47,7 @@ pub trait TripleStore<TFact: BitemporalFact>: Queryable<TFact> + Send + Sync {
     /// Ensures: returned `Subscription` id is unique within this store instance.
     ///   If `filter` is `Some(f)`, only events for which `f(event)` returns `true`
     ///   are delivered. If `None`, all pattern-matching events are delivered.
-    fn subscribe(
-        &self,
-        pattern: Pattern,
-        filter: Option<EventFilter>,
-    ) -> Subscription;
+    fn subscribe(&self, pattern: Pattern, filter: Option<EventFilter>) -> Subscription;
 
     /// Cancel a subscription. No-op if `id` is unknown.
     fn unsubscribe(&self, id: SubscriptionId);

@@ -1,6 +1,7 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::ast::Stmt;
 use crate::value::Value;
@@ -17,9 +18,14 @@ pub enum IndexedSlotKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MethodPattern {
     Unary(Arc<str>),
-    Binary { op: Arc<str>, param: Arc<str> },
+    Binary {
+        op: Arc<str>,
+        param: Arc<str>,
+    },
     /// `(keyword, param_name)` pairs; e.g. `[(at:, i), (put:, v)]` → selector `at:put:`.
-    Keyword { parts: Vec<(Arc<str>, Arc<str>)> },
+    Keyword {
+        parts: Vec<(Arc<str>, Arc<str>)>,
+    },
 }
 
 impl MethodPattern {
@@ -60,6 +66,10 @@ pub struct Method {
 }
 
 /// A user-defined class.
+///
+/// `is_value` is inherited: a class with `is_value: true` is a passive value
+/// type (immutable, no actor thread). `Object` has `is_value: false`; `Value`
+/// has `is_value: true`.
 pub struct Class {
     pub name: Arc<str>,
     /// `None` only for the root `Object` class.
@@ -71,12 +81,16 @@ pub struct Class {
     /// Class variable names owned by this class.
     pub own_class_vars: Vec<Arc<str>>,
     /// Shared storage for this class's own class variables.
-    pub class_var_storage: RefCell<HashMap<Arc<str>, Value>>,
+    pub class_var_storage: RwLock<HashMap<Arc<str>, Value>>,
     /// `None` means no indexed region.
     pub indexed_slot_kind: Option<IndexedSlotKind>,
-    pub methods: RefCell<HashMap<Arc<str>, Arc<Method>>>,
+    pub methods: RwLock<HashMap<Arc<str>, Arc<Method>>>,
     /// Methods defined on the class side (`ClassName class >> selector`).
-    pub class_methods: RefCell<HashMap<Arc<str>, Arc<Method>>>,
+    pub class_methods: RwLock<HashMap<Arc<str>, Arc<Method>>>,
+    /// If `true`, instances are passive value objects (no actor thread).
+    /// Inherited through the superclass chain: a subclass of a value class
+    /// is also a value class unless a mixed-hierarchy error is raised first.
+    pub is_value: bool,
 }
 
 impl Class {
@@ -94,7 +108,7 @@ impl Class {
     ///
     /// Returns the method and the `Arc<Class>` it was found in (needed for `super` dispatch).
     pub fn lookup(self: &Arc<Self>, selector: &str) -> Option<(Arc<Method>, Arc<Class>)> {
-        if let Some(m) = self.methods.borrow().get(selector) {
+        if let Some(m) = self.methods.read().get(selector) {
             return Some((m.clone(), self.clone()));
         }
         if let Some(sc) = &self.superclass {
@@ -106,8 +120,11 @@ impl Class {
     /// Look up a class-side method by selector, walking the superclass chain.
     ///
     /// Returns the method and the `Arc<Class>` it was found in (needed for `super` dispatch).
-    pub fn lookup_class_method(self: &Arc<Self>, selector: &str) -> Option<(Arc<Method>, Arc<Class>)> {
-        if let Some(m) = self.class_methods.borrow().get(selector) {
+    pub fn lookup_class_method(
+        self: &Arc<Self>,
+        selector: &str,
+    ) -> Option<(Arc<Method>, Arc<Class>)> {
+        if let Some(m) = self.class_methods.read().get(selector) {
             return Some((m.clone(), self.clone()));
         }
         if let Some(sc) = &self.superclass {
@@ -121,7 +138,10 @@ impl Class {
     /// Ensures: returns the highest ancestor that declares `name`, so writes always
     /// go to the same storage entry regardless of which subclass's instance triggers them.
     pub fn lookup_class_var_owner(self: &Arc<Self>, name: &str) -> Option<Arc<Class>> {
-        let in_super = self.superclass.as_ref().and_then(|sc| sc.lookup_class_var_owner(name));
+        let in_super = self
+            .superclass
+            .as_ref()
+            .and_then(|sc| sc.lookup_class_var_owner(name));
         if in_super.is_some() {
             return in_super;
         }
@@ -129,6 +149,18 @@ impl Class {
             Some(self.clone())
         } else {
             None
+        }
+    }
+
+    /// Returns `true` if this class (or any ancestor) has `is_value: true`.
+    pub fn inherits_is_value(&self) -> bool {
+        if self.is_value {
+            return true;
+        }
+        if let Some(sc) = &self.superclass {
+            sc.inherits_is_value()
+        } else {
+            false
         }
     }
 }

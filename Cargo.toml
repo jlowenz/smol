@@ -20,6 +20,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 num-bigint = "0.4"
 num-traits = "0.2"
+may = "0.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

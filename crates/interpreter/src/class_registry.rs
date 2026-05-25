@@ -1,6 +1,7 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::class::Class;
 use crate::namespace::Namespace;
@@ -12,31 +13,47 @@ use crate::value::Value;
 pub struct ClassRegistry {
     kernel: Arc<Namespace>,
     /// Root namespaces keyed by their simple name. All entries satisfy `parent == None`.
-    roots: RefCell<HashMap<Arc<str>, Arc<Namespace>>>,
+    roots: RwLock<HashMap<Arc<str>, Arc<Namespace>>>,
 }
 
 impl ClassRegistry {
-    /// Creates a new registry with `Kernel` namespace pre-populated with `Object`.
+    /// Creates a new registry with `Kernel` namespace pre-populated with `Object` and `Value`.
     pub fn new() -> Self {
         let kernel = Arc::new(Namespace::new(Arc::from("Kernel"), None));
+
         let object_class = Arc::new(Class {
             name: Arc::from("Object"),
             superclass: None,
             own_instance_vars: vec![],
             own_class_vars: vec![],
-            class_var_storage: RefCell::new(HashMap::new()),
+            class_var_storage: RwLock::new(HashMap::new()),
             indexed_slot_kind: None,
-            methods: RefCell::new(HashMap::new()),
-            class_methods: RefCell::new(HashMap::new()),
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
         });
-        kernel.register(object_class);
+        kernel.register(object_class.clone());
+
+        // `Value` is the built-in passive base class (is_value: true), a subclass of Object.
+        let value_class = Arc::new(Class {
+            name: Arc::from("Value"),
+            superclass: Some(object_class),
+            own_instance_vars: vec![],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(HashMap::new()),
+            indexed_slot_kind: None,
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: true,
+        });
+        kernel.register(value_class);
 
         let mut roots = HashMap::new();
         roots.insert(Arc::from("Kernel"), kernel.clone());
 
         Self {
             kernel,
-            roots: RefCell::new(roots),
+            roots: RwLock::new(roots),
         }
     }
 
@@ -46,7 +63,7 @@ impl ClassRegistry {
 
     /// Look up a root namespace by its simple name.
     pub fn get_namespace(&self, name: &str) -> Option<Arc<Namespace>> {
-        self.roots.borrow().get(name).cloned()
+        self.roots.read().get(name).cloned()
     }
 
     /// Register a root namespace (one with no parent) by its simple name.
@@ -59,16 +76,16 @@ impl ClassRegistry {
             "register_namespace requires a root namespace (parent == None); \
              use parent.register_sub() for nested namespaces"
         );
-        self.roots.borrow_mut().insert(ns.name.clone(), ns);
+        self.roots.write().insert(ns.name.clone(), ns);
     }
 
     /// Seed `env` with Kernel's classes and every root namespace name.
     /// Sub-namespaces are intentionally excluded — they are reached via `::` only.
     pub fn populate_env(&self, env: &mut crate::env::Env) {
-        for (name, class) in self.kernel.classes.borrow().iter() {
+        for (name, class) in self.kernel.classes.read().iter() {
             env.define(name.clone(), Value::Class(class.clone()));
         }
-        for (name, ns) in self.roots.borrow().iter() {
+        for (name, ns) in self.roots.read().iter() {
             env.define(name.clone(), Value::Namespace(ns.clone()));
         }
     }
@@ -128,9 +145,24 @@ mod tests {
         let mut env = Env::new();
         reg.populate_env(&mut env);
 
-        // Kernel namespace should be bound.
         assert!(env.get(&Arc::from("Kernel")).is_some());
-        // Object class (from Kernel) should be bound at the top level.
         assert!(env.get(&Arc::from("Object")).is_some());
+        assert!(env.get(&Arc::from("Value")).is_some());
+    }
+
+    #[test]
+    fn value_class_is_value_true() {
+        let reg = ClassRegistry::new();
+        let kernel = reg.kernel();
+        let value_class = kernel.lookup_class("Value").unwrap();
+        assert!(value_class.is_value);
+    }
+
+    #[test]
+    fn object_class_is_value_false() {
+        let reg = ClassRegistry::new();
+        let kernel = reg.kernel();
+        let object_class = kernel.lookup_class("Object").unwrap();
+        assert!(!object_class.is_value);
     }
 }

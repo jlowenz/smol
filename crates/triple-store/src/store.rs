@@ -365,7 +365,9 @@ impl Store {
     ) -> Result<Vec<StoredFact>, StoreError> {
         let meta = self.registry.load().meta(predicate);
         ctx.check_read(subject, meta)?;
-        Ok(self.backend.query_at(subject, predicate, tx_time, valid_time, pattern))
+        Ok(self
+            .backend
+            .query_at(subject, predicate, tx_time, valid_time, pattern))
     }
 
     /// Facts visible at the bitemporal point described by `as_of`, resolving
@@ -448,11 +450,7 @@ impl<'store> StoreTransaction<'store> {
     ///
     /// Requires: `ctx` permits assert on `fact.subject` for `fact.predicate`.
     /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
-    pub fn assert_indexed(
-        &mut self,
-        fact: Fact,
-        index_key: OrderingKey,
-    ) -> Result<(), StoreError> {
+    pub fn assert_indexed(&mut self, fact: Fact, index_key: OrderingKey) -> Result<(), StoreError> {
         let meta = self.store.registry.load().meta(fact.predicate);
         self.ctx.check_assert(fact.subject, meta)?;
         self.tx.assert_indexed(fact, index_key);
@@ -507,7 +505,8 @@ impl<'store> StoreTransaction<'store> {
     ) -> Result<(), StoreError> {
         let meta = self.store.registry.load().meta(predicate);
         self.ctx.check_assert(subject, meta)?;
-        self.tx.retract_indexed(subject, predicate, asserter, index_key);
+        self.tx
+            .retract_indexed(subject, predicate, asserter, index_key);
         Ok(())
     }
 
@@ -540,14 +539,26 @@ mod tests {
     }
 
     fn fact(subject: EntityId, predicate: Predicate, asserter: EntityId) -> Fact {
-        Fact { subject, predicate, object: Term::Int(0), asserter, valid: None }
+        Fact {
+            subject,
+            predicate,
+            object: Term::Int(0),
+            asserter,
+            valid: None,
+        }
     }
 
     fn store_3() -> (Store, Predicate, Predicate, Predicate) {
         let store = Store::in_memory();
-        let prv = store.declare("priv", Visibility::Private, Cardinality::Single).unwrap();
-        let shr = store.declare("shared", Visibility::Shared, Cardinality::Single).unwrap();
-        let pub_ = store.declare("public", Visibility::Public, Cardinality::Single).unwrap();
+        let prv = store
+            .declare("priv", Visibility::Private, Cardinality::Single)
+            .unwrap();
+        let shr = store
+            .declare("shared", Visibility::Shared, Cardinality::Single)
+            .unwrap();
+        let pub_ = store
+            .declare("public", Visibility::Public, Cardinality::Single)
+            .unwrap();
         (store, prv, shr, pub_)
     }
 
@@ -566,7 +577,9 @@ mod tests {
     fn external_assert_denied_for_private_predicate() {
         let (store, prv, _, _) = store_3();
         let ctx = ExecContext::Entity(e(1));
-        let err = store.assert_single(&ctx, fact(e(2), prv, e(1))).unwrap_err();
+        let err = store
+            .assert_single(&ctx, fact(e(2), prv, e(1)))
+            .unwrap_err();
         assert!(matches!(err, StoreError::AccessDenied { .. }));
     }
 
@@ -574,7 +587,9 @@ mod tests {
     fn external_assert_denied_for_shared_predicate() {
         let (store, _, shr, _) = store_3();
         let ctx = ExecContext::Entity(e(1));
-        let err = store.assert_single(&ctx, fact(e(2), shr, e(1))).unwrap_err();
+        let err = store
+            .assert_single(&ctx, fact(e(2), shr, e(1)))
+            .unwrap_err();
         assert!(matches!(err, StoreError::AccessDenied { .. }));
     }
 
@@ -725,7 +740,9 @@ mod tests {
         store.assert_single(&sys, fact(e(1), prv, e(1))).unwrap();
 
         let owner = ExecContext::Entity(e(1));
-        let results = store.query_as_of(&owner, e(1), prv, AsOf::default(), None).unwrap();
+        let results = store
+            .query_as_of(&owner, e(1), prv, AsOf::default(), None)
+            .unwrap();
         assert_eq!(results.len(), 1);
 
         let other = ExecContext::Entity(e(2));
@@ -764,7 +781,10 @@ mod tests {
         let sub = store.subscribe(ctx_2, any_pattern());
         store.assert_single(&ctx_1, fact(e(1), prv, e(1))).unwrap();
 
-        assert!(drain(&sub).is_empty(), "entity(2) must not see entity(1)'s private events");
+        assert!(
+            drain(&sub).is_empty(),
+            "entity(2) must not see entity(1)'s private events"
+        );
     }
 
     #[test]
@@ -801,7 +821,11 @@ mod tests {
         let sub = store.subscribe(ctx_1, any_pattern());
         store.assert_single(&ctx_1, fact(e(1), prv, e(1))).unwrap();
 
-        assert_eq!(drain(&sub).len(), 1, "owner must receive their own private events");
+        assert_eq!(
+            drain(&sub).len(),
+            1,
+            "owner must receive their own private events"
+        );
     }
 
     // ── clone_handle ──────────────────────────────────────────────────────────
@@ -821,7 +845,9 @@ mod tests {
         let store_a = Store::in_memory();
         let store_b = store_a.clone_handle();
 
-        let pred = store_a.declare("shared.pred", Visibility::Public, Cardinality::Single).unwrap();
+        let pred = store_a
+            .declare("shared.pred", Visibility::Public, Cardinality::Single)
+            .unwrap();
         assert_eq!(store_b.lookup("shared.pred"), Some(pred));
         assert_eq!(store_b.meta(pred).visibility, Visibility::Public);
     }
@@ -847,11 +873,14 @@ mod tests {
         let sub = store.subscribe(sys, any_pattern());
 
         // declare a new Public predicate *after* subscribe
-        let late_pred =
-            store.declare("late.predicate", Visibility::Public, Cardinality::Single).unwrap();
+        let late_pred = store
+            .declare("late.predicate", Visibility::Public, Cardinality::Single)
+            .unwrap();
 
         // assert a fact on it; the filter must see Public visibility and deliver the event
-        store.assert_single(&sys, fact(e(1), late_pred, e(1))).unwrap();
+        store
+            .assert_single(&sys, fact(e(1), late_pred, e(1)))
+            .unwrap();
 
         assert_eq!(drain(&sub).len(), 1, "filter must see the live registry");
     }
@@ -862,7 +891,9 @@ mod tests {
         let store_b = store_a.clone_handle();
         let sys = ExecContext::System;
 
-        store_b.assert_single(&sys, fact(e(10), prv, e(10))).unwrap();
+        store_b
+            .assert_single(&sys, fact(e(10), prv, e(10)))
+            .unwrap();
         assert_eq!(store_a.query_open(&sys, e(10), prv, None).unwrap().len(), 1);
     }
 
@@ -880,7 +911,9 @@ mod tests {
     #[test]
     fn resolve_known_predicate_returns_name() {
         let store = Store::in_memory();
-        let pred = store.declare("my.predicate", Visibility::Public, Cardinality::Single).unwrap();
+        let pred = store
+            .declare("my.predicate", Visibility::Public, Cardinality::Single)
+            .unwrap();
         let name = store.resolve(pred).unwrap();
         assert_eq!(name.as_ref(), "my.predicate");
     }
@@ -898,8 +931,12 @@ mod tests {
     #[test]
     fn declare_conflict_returns_declaration_conflict() {
         let store = Store::in_memory();
-        store.declare("pred", Visibility::Public, Cardinality::Single).unwrap();
-        let err = store.declare("pred", Visibility::Private, Cardinality::Single).unwrap_err();
+        store
+            .declare("pred", Visibility::Public, Cardinality::Single)
+            .unwrap();
+        let err = store
+            .declare("pred", Visibility::Private, Cardinality::Single)
+            .unwrap_err();
         assert!(matches!(err, StoreError::DeclarationConflict(_)));
     }
 
@@ -919,7 +956,11 @@ mod tests {
         store.assert_single(&sys, f2).unwrap();
 
         let history = store.history(&sys, e(1), prv, None).unwrap();
-        assert_eq!(history.len(), 2, "both the superseded and current fact must appear");
+        assert_eq!(
+            history.len(),
+            2,
+            "both the superseded and current fact must appear"
+        );
     }
 
     #[test]
@@ -940,19 +981,38 @@ mod tests {
     #[test]
     fn assert_set_and_retract_set_roundtrip() {
         let store = Store::in_memory();
-        let set_pred =
-            store.declare("tags", Visibility::Public, Cardinality::Set).unwrap();
+        let set_pred = store
+            .declare("tags", Visibility::Public, Cardinality::Set)
+            .unwrap();
         let sys = ExecContext::System;
         let subject = e(1);
         let asserter = e(1);
 
-        let f =
-            Fact { subject, predicate: set_pred, object: Term::Int(42), asserter, valid: None };
+        let f = Fact {
+            subject,
+            predicate: set_pred,
+            object: Term::Int(42),
+            asserter,
+            valid: None,
+        };
         store.assert_set(&sys, f.clone()).unwrap();
-        assert_eq!(store.query_open(&sys, subject, set_pred, None).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .query_open(&sys, subject, set_pred, None)
+                .unwrap()
+                .len(),
+            1
+        );
 
-        store.retract_set(&sys, subject, set_pred, asserter, Term::Int(42)).unwrap();
-        assert!(store.query_open(&sys, subject, set_pred, None).unwrap().is_empty());
+        store
+            .retract_set(&sys, subject, set_pred, asserter, Term::Int(42))
+            .unwrap();
+        assert!(
+            store
+                .query_open(&sys, subject, set_pred, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ── Indexed cardinality ───────────────────────────────────────────────────
@@ -961,20 +1021,39 @@ mod tests {
     fn assert_indexed_and_retract_indexed_roundtrip() {
         use crate::predicates::OrderingKey;
         let store = Store::in_memory();
-        let idx_pred =
-            store.declare("items", Visibility::Public, Cardinality::Indexed).unwrap();
+        let idx_pred = store
+            .declare("items", Visibility::Public, Cardinality::Indexed)
+            .unwrap();
         let sys = ExecContext::System;
         let subject = e(1);
         let asserter = e(1);
         let key = OrderingKey::new(1.0).unwrap();
 
-        let f =
-            Fact { subject, predicate: idx_pred, object: Term::Int(7), asserter, valid: None };
+        let f = Fact {
+            subject,
+            predicate: idx_pred,
+            object: Term::Int(7),
+            asserter,
+            valid: None,
+        };
         store.assert_indexed(&sys, f, key).unwrap();
-        assert_eq!(store.query_open(&sys, subject, idx_pred, None).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .query_open(&sys, subject, idx_pred, None)
+                .unwrap()
+                .len(),
+            1
+        );
 
-        store.retract_indexed(&sys, subject, idx_pred, asserter, key).unwrap();
-        assert!(store.query_open(&sys, subject, idx_pred, None).unwrap().is_empty());
+        store
+            .retract_indexed(&sys, subject, idx_pred, asserter, key)
+            .unwrap();
+        assert!(
+            store
+                .query_open(&sys, subject, idx_pred, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ── query_at with explicit timestamps ─────────────────────────────────────
@@ -1010,58 +1089,100 @@ mod tests {
     #[test]
     fn store_tx_set_assert_and_retract() {
         let store = Store::in_memory();
-        let set_pred =
-            store.declare("items", Visibility::Public, Cardinality::Set).unwrap();
+        let set_pred = store
+            .declare("items", Visibility::Public, Cardinality::Set)
+            .unwrap();
         let sys = ExecContext::System;
         let subject = e(1);
         let asserter = e(1);
 
-        let f =
-            Fact { subject, predicate: set_pred, object: Term::Int(1), asserter, valid: None };
+        let f = Fact {
+            subject,
+            predicate: set_pred,
+            object: Term::Int(1),
+            asserter,
+            valid: None,
+        };
 
         let mut tx = store.begin(sys);
         tx.assert_set(f).unwrap();
         tx.commit().unwrap();
-        assert_eq!(store.query_open(&sys, subject, set_pred, None).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .query_open(&sys, subject, set_pred, None)
+                .unwrap()
+                .len(),
+            1
+        );
 
-        let f2 =
-            Fact { subject, predicate: set_pred, object: Term::Int(1), asserter, valid: None };
+        let f2 = Fact {
+            subject,
+            predicate: set_pred,
+            object: Term::Int(1),
+            asserter,
+            valid: None,
+        };
         let mut tx2 = store.begin(sys);
-        tx2.retract_set(subject, set_pred, asserter, f2.object).unwrap();
+        tx2.retract_set(subject, set_pred, asserter, f2.object)
+            .unwrap();
         tx2.commit().unwrap();
-        assert!(store.query_open(&sys, subject, set_pred, None).unwrap().is_empty());
+        assert!(
+            store
+                .query_open(&sys, subject, set_pred, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn store_tx_indexed_assert_and_retract() {
         use crate::predicates::OrderingKey;
         let store = Store::in_memory();
-        let idx_pred =
-            store.declare("ranked", Visibility::Public, Cardinality::Indexed).unwrap();
+        let idx_pred = store
+            .declare("ranked", Visibility::Public, Cardinality::Indexed)
+            .unwrap();
         let sys = ExecContext::System;
         let subject = e(1);
         let asserter = e(1);
         let key = OrderingKey::new(0.5).unwrap();
 
-        let f =
-            Fact { subject, predicate: idx_pred, object: Term::Int(99), asserter, valid: None };
+        let f = Fact {
+            subject,
+            predicate: idx_pred,
+            object: Term::Int(99),
+            asserter,
+            valid: None,
+        };
 
         let mut tx = store.begin(sys);
         tx.assert_indexed(f, key).unwrap();
         tx.commit().unwrap();
-        assert_eq!(store.query_open(&sys, subject, idx_pred, None).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .query_open(&sys, subject, idx_pred, None)
+                .unwrap()
+                .len(),
+            1
+        );
 
         let mut tx2 = store.begin(sys);
-        tx2.retract_indexed(subject, idx_pred, asserter, key).unwrap();
+        tx2.retract_indexed(subject, idx_pred, asserter, key)
+            .unwrap();
         tx2.commit().unwrap();
-        assert!(store.query_open(&sys, subject, idx_pred, None).unwrap().is_empty());
+        assert!(
+            store
+                .query_open(&sys, subject, idx_pred, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn store_tx_denied_set_buffer_call_leaves_buffer_intact() {
         let store = Store::in_memory();
-        let set_pred =
-            store.declare("tags", Visibility::Private, Cardinality::Set).unwrap();
+        let set_pred = store
+            .declare("tags", Visibility::Private, Cardinality::Set)
+            .unwrap();
         let ctx = ExecContext::Entity(e(1));
 
         let f_own = Fact {
@@ -1085,8 +1206,16 @@ mod tests {
         tx.commit().unwrap();
 
         let sys = ExecContext::System;
-        assert_eq!(store.query_open(&sys, e(1), set_pred, None).unwrap().len(), 1);
-        assert!(store.query_open(&sys, e(2), set_pred, None).unwrap().is_empty());
+        assert_eq!(
+            store.query_open(&sys, e(1), set_pred, None).unwrap().len(),
+            1
+        );
+        assert!(
+            store
+                .query_open(&sys, e(2), set_pred, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ── unsubscribe ───────────────────────────────────────────────────────────

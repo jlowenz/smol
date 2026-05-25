@@ -149,8 +149,14 @@ mod tests {
 
     #[test]
     fn timestamp_equality_and_hash() {
-        assert_eq!(Term::Timestamp(Timestamp(100)), Term::Timestamp(Timestamp(100)));
-        assert_ne!(Term::Timestamp(Timestamp(100)), Term::Timestamp(Timestamp(200)));
+        assert_eq!(
+            Term::Timestamp(Timestamp(100)),
+            Term::Timestamp(Timestamp(100))
+        );
+        assert_ne!(
+            Term::Timestamp(Timestamp(100)),
+            Term::Timestamp(Timestamp(200))
+        );
 
         let mut set = HashSet::new();
         set.insert(Term::Timestamp(Timestamp(1)));
@@ -176,7 +182,10 @@ mod tests {
         assert_ne!(Term::Int(0), Term::Bool(false));
         assert_ne!(Term::Bool(false), Term::Int(0));
         assert_ne!(Term::Str(Arc::from("0")), Term::Symbol(SymbolId(0)));
-        assert_ne!(Term::Bytes(Arc::from([].as_ref())), Term::Str(Arc::from("")));
+        assert_ne!(
+            Term::Bytes(Arc::from([].as_ref())),
+            Term::Str(Arc::from(""))
+        );
         assert_ne!(Term::Timestamp(Timestamp(0)), Term::EntityRef(EntityId(0)));
     }
 }

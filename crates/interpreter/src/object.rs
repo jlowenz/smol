@@ -1,6 +1,7 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::class::{Class, IndexedSlotKind};
 use crate::value::Value;
@@ -13,16 +14,22 @@ impl std::fmt::Debug for Object {
 
 /// Indexed storage region for variadic-slot instances.
 pub enum IndexedStorage {
-    Pointer(RefCell<Vec<Value>>),
-    Byte(RefCell<Vec<u8>>),
-    Float64(RefCell<Vec<f64>>),
+    Pointer(Mutex<Vec<Value>>),
+    Byte(Mutex<Vec<u8>>),
+    Float64(Mutex<Vec<f64>>),
 }
 
 /// A user-defined object instance.
+///
+/// `slots` and indexed storage are behind `parking_lot::Mutex` so that
+/// `Arc<Object>: Send + Sync`, making value objects safely shareable across
+/// entity threads. In practice the mutex is uncontended: value objects are
+/// immutable after construction and entity objects are owned by a single
+/// entity thread.
 pub struct Object {
     pub class: Arc<Class>,
     /// Named instance variable storage (own + inherited), keyed by variable name.
-    pub slots: RefCell<HashMap<Arc<str>, Value>>,
+    pub slots: Mutex<HashMap<Arc<str>, Value>>,
     /// Present iff `class.indexed_slot_kind` is `Some(_)`.
     pub indexed: Option<IndexedStorage>,
 }
@@ -40,7 +47,7 @@ impl Object {
             .collect();
         Self {
             class,
-            slots: RefCell::new(slots),
+            slots: Mutex::new(slots),
             indexed: None,
         }
     }
@@ -56,25 +63,25 @@ impl Object {
             .into_iter()
             .map(|name| (name, Value::Nil))
             .collect();
-        let indexed = match class.indexed_slot_kind.as_ref().expect("no indexed slot kind") {
-            IndexedSlotKind::Pointer => {
-                IndexedStorage::Pointer(RefCell::new(vec![Value::Nil; size]))
-            }
-            IndexedSlotKind::Byte => IndexedStorage::Byte(RefCell::new(vec![0u8; size])),
-            IndexedSlotKind::Float64 => {
-                IndexedStorage::Float64(RefCell::new(vec![0f64; size]))
-            }
+        let indexed = match class
+            .indexed_slot_kind
+            .as_ref()
+            .expect("no indexed slot kind")
+        {
+            IndexedSlotKind::Pointer => IndexedStorage::Pointer(Mutex::new(vec![Value::Nil; size])),
+            IndexedSlotKind::Byte => IndexedStorage::Byte(Mutex::new(vec![0u8; size])),
+            IndexedSlotKind::Float64 => IndexedStorage::Float64(Mutex::new(vec![0f64; size])),
         };
         Self {
             class,
-            slots: RefCell::new(slots),
+            slots: Mutex::new(slots),
             indexed: Some(indexed),
         }
     }
 
     /// Returns a clone of the named instance variable, or `None` if unknown.
     pub fn get_slot(&self, name: &str) -> Option<Value> {
-        self.slots.borrow().get(name).cloned()
+        self.slots.lock().get(name).cloned()
     }
 
     /// Write a named instance variable slot.
@@ -82,7 +89,12 @@ impl Object {
     /// Requires: `name` is a known instance variable of this object's class.
     /// Ensures: the slot is updated to `value`.
     pub fn set_slot(&self, name: Arc<str>, value: Value) {
-        self.slots.borrow_mut().insert(name, value);
+        self.slots.lock().insert(name, value);
+    }
+
+    /// Returns `true` if the named slot exists (regardless of its value).
+    pub fn has_slot(&self, name: &str) -> bool {
+        self.slots.lock().contains_key(name)
     }
 }
 
@@ -94,6 +106,7 @@ mod tests {
     use super::*;
     use crate::class::{Class, IndexedSlotKind};
     use crate::value::Value;
+    use parking_lot::RwLock;
 
     fn make_class(name: &str, ivars: Vec<&str>, indexed: Option<IndexedSlotKind>) -> Arc<Class> {
         Arc::new(Class {
@@ -101,10 +114,11 @@ mod tests {
             superclass: None,
             own_instance_vars: ivars.into_iter().map(Arc::from).collect(),
             own_class_vars: vec![],
-            class_var_storage: std::cell::RefCell::new(HashMap::new()),
+            class_var_storage: RwLock::new(HashMap::new()),
             indexed_slot_kind: indexed,
-            methods: std::cell::RefCell::new(HashMap::new()),
-            class_methods: std::cell::RefCell::new(HashMap::new()),
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
         })
     }
 
@@ -137,7 +151,7 @@ mod tests {
         let class = make_class("Arr", vec![], Some(IndexedSlotKind::Pointer));
         let obj = Object::new_with_indexed(class, 3);
         match obj.indexed.as_ref().unwrap() {
-            IndexedStorage::Pointer(slots) => assert_eq!(slots.borrow().len(), 3),
+            IndexedStorage::Pointer(slots) => assert_eq!(slots.lock().len(), 3),
             _ => panic!("expected Pointer storage"),
         }
     }
@@ -147,7 +161,7 @@ mod tests {
         let class = make_class("ByteArr", vec![], Some(IndexedSlotKind::Byte));
         let obj = Object::new_with_indexed(class, 4);
         match obj.indexed.as_ref().unwrap() {
-            IndexedStorage::Byte(slots) => assert_eq!(slots.borrow().len(), 4),
+            IndexedStorage::Byte(slots) => assert_eq!(slots.lock().len(), 4),
             _ => panic!("expected Byte storage"),
         }
     }
@@ -157,8 +171,16 @@ mod tests {
         let class = make_class("FloatArr", vec![], Some(IndexedSlotKind::Float64));
         let obj = Object::new_with_indexed(class, 2);
         match obj.indexed.as_ref().unwrap() {
-            IndexedStorage::Float64(slots) => assert_eq!(slots.borrow().len(), 2),
+            IndexedStorage::Float64(slots) => assert_eq!(slots.lock().len(), 2),
             _ => panic!("expected Float64 storage"),
         }
+    }
+
+    #[test]
+    fn has_slot_returns_true_for_known_ivar() {
+        let class = make_class("Box", vec!["val"], None);
+        let obj = Object::new(class);
+        assert!(obj.has_slot("val"));
+        assert!(!obj.has_slot("missing"));
     }
 }

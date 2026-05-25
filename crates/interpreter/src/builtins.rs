@@ -1,11 +1,12 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use num_bigint::BigInt;
 use num_traits::Zero;
+use parking_lot::RwLock;
 
 use crate::class::{Class, IndexedSlotKind};
+use crate::entity::{EntityHandle, send_to_entity, spawn_entity};
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
 use crate::namespace::Namespace;
@@ -25,26 +26,33 @@ pub fn dispatch(
         expect_arity(&selector, 0, args.len())?;
         return Ok(recv);
     }
+    // `await` is universal — blocks until a Future resolves; no-op on non-futures.
+    if selector.as_ref() == "await" {
+        expect_arity(&selector, 0, args.len())?;
+        return force_value(recv);
+    }
     // `isNil` / `notNil` are universal.
     if selector.as_ref() == "isNil" {
         expect_arity(&selector, 0, args.len())?;
-        return Ok(Value::Bool(matches!(recv, Value::Nil)));
+        return Ok(Value::Bool(matches!(force_value(recv)?, Value::Nil)));
     }
     if selector.as_ref() == "notNil" {
         expect_arity(&selector, 0, args.len())?;
-        return Ok(Value::Bool(!matches!(recv, Value::Nil)));
+        return Ok(Value::Bool(!matches!(force_value(recv)?, Value::Nil)));
     }
     // `_primHash` is universal — handled here so all value kinds are covered.
     if selector.as_ref() == "_primHash" {
         expect_arity(&selector, 0, args.len())?;
-        return Ok(Value::Int(hash_value(&recv)));
+        let v = force_value(recv)?;
+        return Ok(Value::Int(hash_value(&v)));
     }
-    // `hash` is universal for non-Object types (primitive values don't route through
-    // Object method lookup). For Value::Object the type-specific dispatch runs instead,
-    // which will find the user-defined `hash` override (or the default `Object >> hash`).
-    if selector.as_ref() == "hash" && !matches!(recv, Value::Object(_)) {
+    // `hash` is universal for non-object types (primitive values don't route through
+    // Object method lookup). For Value::ValueObject and Value::Object the type-specific
+    // dispatch runs instead, which will find the user-defined `hash` override.
+    if selector.as_ref() == "hash" && !matches!(recv, Value::Object(_) | Value::ValueObject(_)) {
         expect_arity(&selector, 0, args.len())?;
-        return Ok(Value::Int(hash_value(&recv)));
+        let v = force_value(recv)?;
+        return Ok(Value::Int(hash_value(&v)));
     }
     // `->` is universal — any receiver can create an Association.
     // Implemented in Rust so primitive values (String, Int, …) work without an
@@ -52,17 +60,106 @@ pub fn dispatch(
     if selector.as_ref() == "->" {
         expect_arity(&selector, 1, args.len())?;
         let value = args.into_iter().next().unwrap();
-        let assoc_class = ev.registry.kernel()
+        let assoc_class = ev
+            .registry
+            .kernel()
             .lookup_class("Association")
-            .ok_or_else(|| EvalError::TypeError(
-                "'->': Association not yet defined in kernel".into()
-            ))?;
+            .ok_or_else(|| {
+                EvalError::TypeError("'->': Association not yet defined in kernel".into())
+            })?;
         return ev.dispatch(
             Value::Class(assoc_class),
             Arc::from("key:value:"),
             vec![recv, value],
             env,
         );
+    }
+    // `ifNil:` / `ifNotNil:` family — universal nil-guards that work on every value,
+    // including futures (force_value resolves them before the nil check).
+    // Defined here so no type-specific dispatch function needs to repeat them.
+    if selector.as_ref() == "ifNil:" {
+        expect_arity(&selector, 1, args.len())?;
+        let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+        return if matches!(force_value(recv)?, Value::Nil) {
+            ev.eval_block(&blk, vec![], env)
+        } else {
+            Ok(Value::Nil)
+        };
+    }
+    if selector.as_ref() == "ifNotNil:" {
+        expect_arity(&selector, 1, args.len())?;
+        let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+        let forced = force_value(recv)?;
+        return if !matches!(forced, Value::Nil) {
+            ev.eval_block(&blk, vec![forced], env)
+        } else {
+            Ok(Value::Nil)
+        };
+    }
+    if selector.as_ref() == "ifNil:ifNotNil:" {
+        expect_arity(&selector, 2, args.len())?;
+        let mut iter = args.into_iter();
+        let nil_blk = as_block(iter.next().unwrap(), &selector)?;
+        let not_nil_blk = as_block(iter.next().unwrap(), &selector)?;
+        let forced = force_value(recv)?;
+        return if matches!(forced, Value::Nil) {
+            ev.eval_block(&nil_blk, vec![], env)
+        } else {
+            ev.eval_block(&not_nil_blk, vec![forced], env)
+        };
+    }
+    if selector.as_ref() == "ifNotNil:ifNil:" {
+        expect_arity(&selector, 2, args.len())?;
+        let mut iter = args.into_iter();
+        let not_nil_blk = as_block(iter.next().unwrap(), &selector)?;
+        let nil_blk = as_block(iter.next().unwrap(), &selector)?;
+        let forced = force_value(recv)?;
+        return if matches!(forced, Value::Nil) {
+            ev.eval_block(&nil_blk, vec![], env)
+        } else {
+            ev.eval_block(&not_nil_blk, vec![forced], env)
+        };
+    }
+    // `then:` — chains a block after this value resolves.
+    // Future: spawns an async continuation and returns a new Future.
+    // Any other value: the value is already resolved; the block is run synchronously.
+    // The block receives no arguments in either case — use `await` + a regular send
+    // when the resolved value is needed inside the block.
+    if selector.as_ref() == "then:" {
+        expect_arity(&selector, 1, args.len())?;
+        let blk_val = args.into_iter().next().unwrap();
+        return match recv {
+            Value::Future(future) => {
+                let blk = as_block(blk_val, &selector)?;
+                let result_future = crate::entity::FutureHandle::new();
+                let result_reply = result_future.clone();
+                let registry = ev.registry.clone();
+                may::config().set_stack_size(0x4000);
+                may::go!(move || {
+                    match future.wait() {
+                        Err(e) => result_reply.resolve_err(e),
+                        Ok(_) => {
+                            let then_ev = Evaluator::with_registry(registry);
+                            let mut dummy_env = crate::env::Env::new();
+                            let result = then_ev.eval_block(&blk, vec![], &mut dummy_env);
+                            match result {
+                                Ok(v) => match force_value(v) {
+                                    Ok(forced) => result_reply.resolve_ok(forced),
+                                    Err(e) => result_reply.resolve_err(e),
+                                },
+                                Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
+                                Err(e) => result_reply.resolve_err(e),
+                            }
+                        }
+                    }
+                });
+                Ok(Value::Future(result_future))
+            }
+            _ => {
+                let blk = as_block(blk_val, &selector)?;
+                ev.eval_block(&blk, vec![], env)
+            }
+        };
     }
 
     match recv {
@@ -74,7 +171,13 @@ pub fn dispatch(
         Value::Symbol(s) => dispatch_symbol(ev, s, &selector, args, env),
         Value::Block(blk) => dispatch_block(ev, blk, &selector, args, env),
         Value::LargeInt(n) => dispatch_largeint(ev, n, &selector, args, env),
-        Value::Object(obj) => dispatch_object_value(ev, obj, selector, args, env),
+        Value::ValueObject(obj) => dispatch_object_value(ev, obj, selector, args, env),
+        Value::Object(entity) => dispatch_entity(ev, entity, selector, args, env),
+        Value::Future(future) => {
+            // Transparent future: wait for it to resolve, then re-dispatch to the result.
+            let resolved = future.wait()?;
+            dispatch(ev, resolved, selector, args, env)
+        }
         Value::Class(class) => dispatch_class(ev, class, selector, args, env),
         Value::Namespace(ns) => dispatch_namespace(ev, ns, selector, args, env),
     }
@@ -97,31 +200,54 @@ fn expect_arity(_selector: &Arc<str>, expected: usize, got: usize) -> Result<(),
     }
 }
 
-fn as_int(v: Value, selector: &Arc<str>) -> Result<i64, EvalError> {
+/// Resolves a `Value::Future` to its concrete value at the point it is needed.
+///
+/// Requires: called from a may coroutine so that `FutureHandle::wait()` parks
+///   cooperatively rather than blocking the OS thread.
+/// Ensures: returns the first non-Future value reachable by following the chain,
+///   or propagates any error from the future.
+pub(crate) fn force_value(v: Value) -> Result<Value, EvalError> {
     match v {
+        Value::Future(f) => force_value(f.wait()?),
+        v => Ok(v),
+    }
+}
+
+fn as_int(v: Value, selector: &Arc<str>) -> Result<i64, EvalError> {
+    match force_value(v)? {
         Value::Int(n) => Ok(n),
-        _ => Err(EvalError::TypeError(format!("{selector}: argument must be Int"))),
+        _ => Err(EvalError::TypeError(format!(
+            "{selector}: argument must be Int"
+        ))),
     }
 }
 
 fn as_block(v: Value, selector: &Arc<str>) -> Result<Arc<Block>, EvalError> {
-    match v {
+    match force_value(v)? {
         Value::Block(b) => Ok(b),
-        _ => Err(EvalError::TypeError(format!("{selector}: argument must be a Block"))),
+        _ => Err(EvalError::TypeError(format!(
+            "{selector}: argument must be a Block"
+        ))),
     }
 }
 
 fn bigint_from_value(v: Value, sel: &Arc<str>) -> Result<BigInt, EvalError> {
-    match v {
+    match force_value(v)? {
         Value::Int(n) => Ok(BigInt::from(n)),
         Value::LargeInt(b) => Ok((*b).clone()),
-        _ => Err(EvalError::TypeError(format!("{sel}: argument must be Int or LargeInt"))),
+        _ => Err(EvalError::TypeError(format!(
+            "{sel}: argument must be Int or LargeInt"
+        ))),
     }
 }
 
 fn normalize_bigint(b: BigInt) -> Value {
     use num_traits::ToPrimitive;
-    if let Some(n) = b.to_i64() { Value::Int(n) } else { Value::LargeInt(Arc::new(b)) }
+    if let Some(n) = b.to_i64() {
+        Value::Int(n)
+    } else {
+        Value::LargeInt(Arc::new(b))
+    }
 }
 
 /// Smalltalk `//`: floor division (truncates toward negative infinity).
@@ -129,14 +255,22 @@ fn bigint_floor_div(n: BigInt, d: &BigInt) -> BigInt {
     use num_traits::Signed;
     let q = &n / d;
     let r = n % d;
-    if !r.is_zero() && r.is_negative() != d.is_negative() { q - 1 } else { q }
+    if !r.is_zero() && r.is_negative() != d.is_negative() {
+        q - 1
+    } else {
+        q
+    }
 }
 
 /// Smalltalk `\\`: modulo with the sign of the divisor.
 fn bigint_floor_rem(n: BigInt, d: &BigInt) -> BigInt {
     use num_traits::Signed;
     let r = &n % d;
-    if !r.is_zero() && r.is_negative() != d.is_negative() { r + d } else { r }
+    if !r.is_zero() && r.is_negative() != d.is_negative() {
+        r + d
+    } else {
+        r
+    }
 }
 
 // ── Hashing helpers ───────────────────────────────────────────────────────────
@@ -175,7 +309,13 @@ fn hash_value(v: &Value) -> i64 {
         Value::Float(f) => f.to_bits() as i64,
         Value::Str(s) => fnv1a_hash(s),
         Value::Symbol(s) => fnv1a_hash(s),
-        Value::Bool(b) => if *b { 1 } else { 0 },
+        Value::Bool(b) => {
+            if *b {
+                1
+            } else {
+                0
+            }
+        }
         Value::Nil => 0,
         Value::LargeInt(n) => {
             use num_bigint::Sign;
@@ -184,13 +324,51 @@ fn hash_value(v: &Value) -> i64 {
             for (i, &b) in bytes.iter().take(8).enumerate() {
                 h |= (b as u64) << (i * 8);
             }
-            if sign == Sign::Minus { h = h.wrapping_neg(); }
+            if sign == Sign::Minus {
+                h = h.wrapping_neg();
+            }
             h as i64
         }
-        Value::Object(obj) => fmix64(Arc::as_ptr(obj) as usize as u64) as i64,
+        Value::ValueObject(obj) => fmix64(Arc::as_ptr(obj) as usize as u64) as i64,
+        Value::Object(e) => fmix64(Arc::as_ptr(&e.0) as usize as u64) as i64,
+        Value::Future(f) => fmix64(Arc::as_ptr(&f.0) as usize as u64) as i64,
         Value::Class(c) => fmix64(Arc::as_ptr(c) as usize as u64) as i64,
         Value::Block(b) => fmix64(Arc::as_ptr(b) as usize as u64) as i64,
         Value::Namespace(ns) => fmix64(Arc::as_ptr(ns) as usize as u64) as i64,
+    }
+}
+
+/// Fallback dispatch for primitive value types (Int, Float, Bool, Nil, Str,
+/// Symbol, Block, LargeInt). Called from the `_` arm of each type-specific
+/// dispatch function after type-specific cases are exhausted.
+///
+/// Handles selectors that are meaningful on every value but are not universal
+/// enough to bypass user-defined method lookup (unlike the pre-checks in
+/// `dispatch()`). Object/ValueObject instances never reach this function —
+/// they have their own fallback in `dispatch_object_primitive`.
+fn dispatch_primitive_fallback(
+    kind: &'static str,
+    sel: &Arc<str>,
+    mut args: Vec<Value>,
+) -> Result<Value, EvalError> {
+    match sel.as_ref() {
+        "error:" => {
+            expect_arity(sel, 1, args.len())?;
+            let msg = match args.remove(0) {
+                Value::Str(s) => s,
+                other => Arc::from(format!("{other}").as_str()),
+            };
+            Err(EvalError::Signal(msg))
+        }
+        "_primSignal:" => {
+            expect_arity(sel, 1, args.len())?;
+            let msg = match args.remove(0) {
+                Value::Str(s) => s,
+                other => Arc::from(format!("{other}").as_str()),
+            };
+            Err(EvalError::Signal(msg))
+        }
+        _ => Err(mnu(kind, sel)),
     }
 }
 
@@ -206,82 +384,114 @@ fn dispatch_int(
     match sel.as_ref() {
         "+" => {
             expect_arity(sel, 1, args.len())?;
-            let arg = args.remove(0);
+            let arg = force_value(args.remove(0))?;
             match arg {
                 Value::Int(m) => match n.checked_add(m) {
                     Some(r) => Ok(Value::Int(r)),
                     None => Ok(normalize_bigint(BigInt::from(n) + BigInt::from(m))),
                 },
                 Value::LargeInt(m) => Ok(normalize_bigint(BigInt::from(n) + (*m).clone())),
-                _ => Err(EvalError::TypeError("+: argument must be Int or LargeInt".into())),
+                _ => Err(EvalError::TypeError(
+                    "+: argument must be Int or LargeInt".into(),
+                )),
             }
         }
         "-" => {
             expect_arity(sel, 1, args.len())?;
-            let arg = args.remove(0);
+            let arg = force_value(args.remove(0))?;
             match arg {
                 Value::Int(m) => match n.checked_sub(m) {
                     Some(r) => Ok(Value::Int(r)),
                     None => Ok(normalize_bigint(BigInt::from(n) - BigInt::from(m))),
                 },
                 Value::LargeInt(m) => Ok(normalize_bigint(BigInt::from(n) - (*m).clone())),
-                _ => Err(EvalError::TypeError("-: argument must be Int or LargeInt".into())),
+                _ => Err(EvalError::TypeError(
+                    "-: argument must be Int or LargeInt".into(),
+                )),
             }
         }
         "*" => {
             expect_arity(sel, 1, args.len())?;
-            let arg = args.remove(0);
+            let arg = force_value(args.remove(0))?;
             match arg {
                 Value::Int(m) => match n.checked_mul(m) {
                     Some(r) => Ok(Value::Int(r)),
                     None => Ok(normalize_bigint(BigInt::from(n) * BigInt::from(m))),
                 },
                 Value::LargeInt(m) => Ok(normalize_bigint(BigInt::from(n) * (*m).clone())),
-                _ => Err(EvalError::TypeError("*: argument must be Int or LargeInt".into())),
+                _ => Err(EvalError::TypeError(
+                    "*: argument must be Int or LargeInt".into(),
+                )),
             }
         }
         "/" => {
             expect_arity(sel, 1, args.len())?;
-            match args.remove(0) {
+            match force_value(args.remove(0))? {
                 Value::Int(d) => {
-                    if d == 0 { return Err(EvalError::TypeError("division by zero".into())); }
+                    if d == 0 {
+                        return Err(EvalError::TypeError("division by zero".into()));
+                    }
                     Ok(Value::Int(n / d))
                 }
                 Value::LargeInt(d) => {
-                    if d.is_zero() { return Err(EvalError::TypeError("division by zero".into())); }
+                    if d.is_zero() {
+                        return Err(EvalError::TypeError("division by zero".into()));
+                    }
                     Ok(normalize_bigint(BigInt::from(n) / (*d).clone()))
                 }
-                _ => Err(EvalError::TypeError("/: argument must be Int or LargeInt".into())),
+                _ => Err(EvalError::TypeError(
+                    "/: argument must be Int or LargeInt".into(),
+                )),
             }
         }
         "//" => {
             expect_arity(sel, 1, args.len())?;
-            match args.remove(0) {
+            match force_value(args.remove(0))? {
                 Value::Int(d) => {
-                    if d == 0 { return Err(EvalError::TypeError("division by zero".into())); }
+                    if d == 0 {
+                        return Err(EvalError::TypeError("division by zero".into()));
+                    }
                     let r = n % d;
-                    Ok(Value::Int(if r != 0 && (r < 0) != (d < 0) { n / d - 1 } else { n / d }))
+                    Ok(Value::Int(if r != 0 && (r < 0) != (d < 0) {
+                        n / d - 1
+                    } else {
+                        n / d
+                    }))
                 }
                 Value::LargeInt(d) => {
-                    if d.is_zero() { return Err(EvalError::TypeError("division by zero".into())); }
+                    if d.is_zero() {
+                        return Err(EvalError::TypeError("division by zero".into()));
+                    }
                     Ok(normalize_bigint(bigint_floor_div(BigInt::from(n), &d)))
                 }
-                _ => Err(EvalError::TypeError("//: argument must be Int or LargeInt".into())),
+                _ => Err(EvalError::TypeError(
+                    "//: argument must be Int or LargeInt".into(),
+                )),
             }
         }
         "\\\\" => {
             expect_arity(sel, 1, args.len())?;
-            match args.remove(0) {
+            match force_value(args.remove(0))? {
                 Value::Int(d) => {
-                    if d == 0 { return Err(EvalError::TypeError("division by zero".into())); }
+                    if d == 0 {
+                        return Err(EvalError::TypeError("division by zero".into()));
+                    }
                     let r = n % d;
-                    Ok(Value::Int(if r != 0 && (r < 0) != (d < 0) { r + d } else { r }))
+                    Ok(Value::Int(if r != 0 && (r < 0) != (d < 0) {
+                        r + d
+                    } else {
+                        r
+                    }))
                 }
                 Value::LargeInt(d) => {
-                    if d.is_zero() { return Err(EvalError::TypeError("division by zero".into())); }
+                    if d.is_zero() {
+                        return Err(EvalError::TypeError("division by zero".into()));
+                    }
                     Ok(normalize_bigint(bigint_floor_rem(BigInt::from(n), &d)))
                 }
-                _ => Err(EvalError::TypeError("\\\\: argument must be Int or LargeInt".into())),
+                _ => Err(EvalError::TypeError(
+                    "\\\\: argument must be Int or LargeInt".into(),
+                )),
             }
         }
         "<" => {
@@ -302,11 +512,11 @@ fn dispatch_int(
         }
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Int(n) == args.remove(0)))
+            Ok(Value::Bool(Value::Int(n) == force_value(args.remove(0))?))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Int(n) != args.remove(0)))
+            Ok(Value::Bool(Value::Int(n) != force_value(args.remove(0))?))
         }
         "negated" => {
             expect_arity(sel, 0, args.len())?;
@@ -378,7 +588,7 @@ fn dispatch_int(
             }
             Ok(Value::Nil)
         }
-        _ => Err(mnu("Int", sel)),
+        _ => dispatch_primitive_fallback("Int", sel, args),
     }
 }
 
@@ -450,11 +660,15 @@ fn dispatch_largeint(
         }
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::LargeInt(n) == args.remove(0)))
+            Ok(Value::Bool(
+                Value::LargeInt(n) == force_value(args.remove(0))?,
+            ))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::LargeInt(n) != args.remove(0)))
+            Ok(Value::Bool(
+                Value::LargeInt(n) != force_value(args.remove(0))?,
+            ))
         }
         "negated" => {
             expect_arity(sel, 0, args.len())?;
@@ -474,17 +688,19 @@ fn dispatch_largeint(
             let f = n.to_f64().unwrap_or(f64::INFINITY);
             Ok(Value::Float(f))
         }
-        _ => Err(mnu("LargeInt", sel)),
+        _ => dispatch_primitive_fallback("LargeInt", sel, args),
     }
 }
 
 // ── Float ────────────────────────────────────────────────────────────────────
 
 fn as_float_coerce(v: Value, sel: &Arc<str>) -> Result<f64, EvalError> {
-    match v {
+    match force_value(v)? {
         Value::Float(f) => Ok(f),
         Value::Int(n) => Ok(n as f64),
-        _ => Err(EvalError::TypeError(format!("{sel}: argument must be Float or Int"))),
+        _ => Err(EvalError::TypeError(format!(
+            "{sel}: argument must be Float or Int"
+        ))),
     }
 }
 
@@ -530,11 +746,11 @@ fn dispatch_float(
         }
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Float(f) == args.remove(0)))
+            Ok(Value::Bool(Value::Float(f) == force_value(args.remove(0))?))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Float(f) != args.remove(0)))
+            Ok(Value::Bool(Value::Float(f) != force_value(args.remove(0))?))
         }
         "negated" => {
             expect_arity(sel, 0, args.len())?;
@@ -568,7 +784,7 @@ fn dispatch_float(
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from(format!("{f:?}").as_str())))
         }
-        _ => Err(mnu("Float", sel)),
+        _ => dispatch_primitive_fallback("Float", sel, args),
     }
 }
 
@@ -585,12 +801,20 @@ fn dispatch_bool(
         "ifTrue:" => {
             expect_arity(sel, 1, args.len())?;
             let blk = as_block(args.remove(0), sel)?;
-            if b { ev.eval_block(&blk, vec![], env) } else { Ok(Value::Nil) }
+            if b {
+                ev.eval_block(&blk, vec![], env)
+            } else {
+                Ok(Value::Nil)
+            }
         }
         "ifFalse:" => {
             expect_arity(sel, 1, args.len())?;
             let blk = as_block(args.remove(0), sel)?;
-            if !b { ev.eval_block(&blk, vec![], env) } else { Ok(Value::Nil) }
+            if !b {
+                ev.eval_block(&blk, vec![], env)
+            } else {
+                Ok(Value::Nil)
+            }
         }
         "ifTrue:ifFalse:" => {
             expect_arity(sel, 2, args.len())?;
@@ -614,16 +838,20 @@ fn dispatch_bool(
         }
         "&" => {
             expect_arity(sel, 1, args.len())?;
-            match args.remove(0) {
+            match force_value(args.remove(0))? {
                 Value::Bool(b2) => Ok(Value::Bool(b && b2)),
-                _ => Err(EvalError::TypeError(format!("{sel}: argument must be Bool"))),
+                _ => Err(EvalError::TypeError(format!(
+                    "{sel}: argument must be Bool"
+                ))),
             }
         }
         "|" => {
             expect_arity(sel, 1, args.len())?;
-            match args.remove(0) {
+            match force_value(args.remove(0))? {
                 Value::Bool(b2) => Ok(Value::Bool(b || b2)),
-                _ => Err(EvalError::TypeError(format!("{sel}: argument must be Bool"))),
+                _ => Err(EvalError::TypeError(format!(
+                    "{sel}: argument must be Bool"
+                ))),
             }
         }
         "and:" => {
@@ -632,9 +860,13 @@ fn dispatch_bool(
                 return Ok(Value::Bool(false));
             }
             let blk = as_block(args.remove(0), sel)?;
-            match ev.eval_block(&blk, vec![], env)? {
+            let f = ev.eval_block(&blk, vec![], env)?;
+            match f {
                 Value::Bool(b2) => Ok(Value::Bool(b2)),
-                _ => Err(EvalError::TypeError(format!("{sel}: block must return Bool"))),
+                Value::Future(_) => force_value(f),
+                _ => Err(EvalError::TypeError(format!(
+                    "{sel}: block must return Bool"
+                ))),
             }
         }
         "or:" => {
@@ -643,9 +875,13 @@ fn dispatch_bool(
                 return Ok(Value::Bool(true));
             }
             let blk = as_block(args.remove(0), sel)?;
-            match ev.eval_block(&blk, vec![], env)? {
+            let f = ev.eval_block(&blk, vec![], env)?;
+            match f {
                 Value::Bool(b2) => Ok(Value::Bool(b2)),
-                _ => Err(EvalError::TypeError(format!("{sel}: block must return Bool"))),
+                Value::Future(_) => force_value(f),
+                _ => Err(EvalError::TypeError(format!(
+                    "{sel}: block must return Bool"
+                ))),
             }
         }
         "not" => {
@@ -654,63 +890,53 @@ fn dispatch_bool(
         }
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Bool(b) == args.remove(0)))
+            Ok(Value::Bool(Value::Bool(b) == force_value(args.remove(0))?))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Bool(b) != args.remove(0)))
+            Ok(Value::Bool(Value::Bool(b) != force_value(args.remove(0))?))
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
+            if b {
+                println!("true")
+            } else {
+                println!("false")
+            }
             Ok(Value::Str(Arc::from(if b { "true" } else { "false" })))
         }
-        _ => Err(mnu("Bool", sel)),
+        _ => dispatch_primitive_fallback("Bool", sel, args),
     }
 }
 
 // ── Nil ───────────────────────────────────────────────────────────────────────
 
 fn dispatch_nil(
-    ev: &Evaluator,
+    _ev: &Evaluator,
     sel: &Arc<str>,
     mut args: Vec<Value>,
-    env: &mut Env,
+    _env: &mut Env,
 ) -> Result<Value, EvalError> {
     match sel.as_ref() {
-        "ifNil:" => {
-            expect_arity(sel, 1, args.len())?;
-            let blk = as_block(args.remove(0), sel)?;
-            ev.eval_block(&blk, vec![], env)
-        }
-        "ifNotNil:" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Nil)
-        }
-        "ifNil:ifNotNil:" => {
-            expect_arity(sel, 2, args.len())?;
-            let nil_blk = as_block(args.remove(0), sel)?;
-            let _ = args.remove(0);
-            ev.eval_block(&nil_blk, vec![], env)
-        }
-        "ifNotNil:ifNil:" => {
-            expect_arity(sel, 2, args.len())?;
-            let _ = args.remove(0);
-            let nil_blk = as_block(args.remove(0), sel)?;
-            ev.eval_block(&nil_blk, vec![], env)
-        }
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(matches!(args.remove(0), Value::Nil)))
+            Ok(Value::Bool(matches!(
+                force_value(args.remove(0))?,
+                Value::Nil
+            )))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(!matches!(args.remove(0), Value::Nil)))
+            Ok(Value::Bool(!matches!(
+                force_value(args.remove(0))?,
+                Value::Nil
+            )))
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from("nil")))
         }
-        _ => Err(mnu("Nil", sel)),
+        _ => dispatch_primitive_fallback("Nil", sel, args),
     }
 }
 
@@ -739,22 +965,26 @@ fn dispatch_str(
         }
         "," => {
             expect_arity(sel, 1, args.len())?;
-            match args.remove(0) {
+            match force_value(args.remove(0))? {
                 Value::Str(other) => Ok(Value::Str(Arc::from(format!("{s}{other}").as_str()))),
-                _ => Err(EvalError::TypeError(format!("{sel}: argument must be String"))),
+                _ => Err(EvalError::TypeError(format!(
+                    "{sel}: argument must be String"
+                ))),
             }
         }
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Str(s) == args.remove(0)))
+            Ok(Value::Bool(Value::Str(s) == force_value(args.remove(0))?))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Str(s) != args.remove(0)))
+            Ok(Value::Bool(Value::Str(s) != force_value(args.remove(0))?))
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(Arc::from(format!("'{s}'").as_str())))
+            let s: Arc<str> = Arc::from(format!("'{s}'").as_str());
+            println!("{:?}", s);
+            Ok(Value::Str(s))
         }
         "asSymbol" => {
             expect_arity(sel, 0, args.len())?;
@@ -762,7 +992,9 @@ fn dispatch_str(
         }
         "reversed" => {
             expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(Arc::from(s.chars().rev().collect::<String>().as_str())))
+            Ok(Value::Str(Arc::from(
+                s.chars().rev().collect::<String>().as_str(),
+            )))
         }
         "copyFrom:to:" => {
             expect_arity(sel, 2, args.len())?;
@@ -774,12 +1006,14 @@ fn dispatch_str(
         }
         "includesSubString:" => {
             expect_arity(sel, 1, args.len())?;
-            match args.remove(0) {
+            match force_value(args.remove(0))? {
                 Value::Str(sub) => Ok(Value::Bool(s.contains(sub.as_ref()))),
-                _ => Err(EvalError::TypeError(format!("{sel}: argument must be String"))),
+                _ => Err(EvalError::TypeError(format!(
+                    "{sel}: argument must be String"
+                ))),
             }
         }
-        _ => Err(mnu("String", sel)),
+        _ => dispatch_primitive_fallback("String", sel, args),
     }
 }
 
@@ -795,11 +1029,15 @@ fn dispatch_symbol(
     match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Symbol(s) == args.remove(0)))
+            Ok(Value::Bool(
+                Value::Symbol(s) == force_value(args.remove(0))?,
+            ))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Symbol(s) != args.remove(0)))
+            Ok(Value::Bool(
+                Value::Symbol(s) != force_value(args.remove(0))?,
+            ))
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
@@ -813,7 +1051,7 @@ fn dispatch_symbol(
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Symbol(s))
         }
-        _ => Err(mnu("Symbol", sel)),
+        _ => dispatch_primitive_fallback("Symbol", sel, args),
     }
 }
 
@@ -855,7 +1093,7 @@ fn dispatch_block(
                     _ => {
                         return Err(EvalError::TypeError(format!(
                             "{sel}: condition block must return Bool"
-                        )))
+                        )));
                     }
                 }
             }
@@ -873,7 +1111,7 @@ fn dispatch_block(
                     _ => {
                         return Err(EvalError::TypeError(format!(
                             "{sel}: condition block must return Bool"
-                        )))
+                        )));
                     }
                 }
             }
@@ -888,7 +1126,7 @@ fn dispatch_block(
                     _ => {
                         return Err(EvalError::TypeError(format!(
                             "{sel}: block must return Bool"
-                        )))
+                        )));
                     }
                 }
             }
@@ -903,7 +1141,7 @@ fn dispatch_block(
                     _ => {
                         return Err(EvalError::TypeError(format!(
                             "{sel}: block must return Bool"
-                        )))
+                        )));
                     }
                 }
             }
@@ -925,7 +1163,11 @@ fn dispatch_block(
                 }
             }
         }
-        _ => Err(mnu("Block", sel)),
+        "syncValue" => {
+            expect_arity(sel, 0, args.len())?;
+            ev.eval_block_sync(&blk, vec![], env)
+        }
+        _ => dispatch_primitive_fallback("Block", sel, args),
     }
 }
 
@@ -940,10 +1182,48 @@ fn dispatch_object_value(
 ) -> Result<Value, EvalError> {
     // Look up user-defined method.
     if let Some((method, def_class)) = obj.class.lookup(&selector) {
-        return ev.invoke_method(obj.clone(), def_class, method, args, env);
+        return ev.invoke_method(
+            obj.clone(),
+            def_class,
+            method,
+            args,
+            env,
+            Value::ValueObject(obj.clone()),
+        );
     }
     // Fall back to primitive Object methods.
     dispatch_object_primitive(obj, &selector, args)
+}
+
+/// Dispatch a message to an actor entity handle. Checks for sync self-send
+/// (target == CURRENT_ENTITY); otherwise enqueues the message and returns a Future.
+///
+/// Requires: caller may be any thread including the entity's own thread.
+/// Ensures: self-send is dispatched synchronously (no deadlock); cross-entity
+///   send returns `Value::Future(FutureHandle)` immediately.
+fn dispatch_entity(
+    ev: &Evaluator,
+    entity: EntityHandle,
+    selector: Arc<str>,
+    args: Vec<Value>,
+    env: &mut Env,
+) -> Result<Value, EvalError> {
+    // Self-send: dispatch synchronously on the current thread to avoid deadlock.
+    let current = ev.current_entity_id.get();
+    if current == Some(entity.0.id) {
+        let obj = entity.0.data.clone();
+        let class = entity.0.class.clone();
+        if let Some((method, def_class)) = class.lookup(&selector) {
+            let self_val = Value::Object(entity);
+            return ev.invoke_method(obj, def_class, method, args, env, self_val);
+        }
+        let self_val = Value::Object(entity);
+        return dispatch_object_primitive_as_entity(obj, &selector, args, self_val);
+    }
+
+    // Cross-entity or non-entity-context send: enqueue and return Future.
+    let future = send_to_entity(&entity.0, selector, args);
+    Ok(Value::Future(future))
 }
 
 fn dispatch_object_primitive(
@@ -955,15 +1235,17 @@ fn dispatch_object_primitive(
     match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Object(obj) == args.remove(0)))
+            Ok(Value::Bool(Value::ValueObject(obj) == args.remove(0)))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Object(obj) != args.remove(0)))
+            Ok(Value::Bool(Value::ValueObject(obj) != args.remove(0)))
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(Arc::from(format!("a {}", obj.class.name).as_str())))
+            let s: Arc<str> = Arc::from(format!("a {}", obj.class.name).as_str());
+            println!("{:?}", s);
+            Ok(Value::Str(s))
         }
         "class" => {
             expect_arity(sel, 0, args.len())?;
@@ -971,27 +1253,17 @@ fn dispatch_object_primitive(
         }
         "isKindOf:" => {
             expect_arity(sel, 1, args.len())?;
-            let target = match args.remove(0) {
-                Value::Class(c) => c,
-                _ => {
-                    return Err(EvalError::TypeError(format!(
-                        "{sel}: argument must be a Class"
-                    )))
-                }
-            };
-            Ok(Value::Bool(is_kind_of(&obj.class, &target)))
+            match args.remove(0) {
+                Value::Class(c) => Ok(Value::Bool(is_kind_of(&obj.class, &c))),
+                _ => Ok(Value::Bool(false)),
+            }
         }
         "respondsTo:" => {
             expect_arity(sel, 1, args.len())?;
-            let sym = match args.remove(0) {
-                Value::Symbol(s) => s,
-                _ => {
-                    return Err(EvalError::TypeError(format!(
-                        "{sel}: argument must be a Symbol"
-                    )))
-                }
-            };
-            Ok(Value::Bool(obj.class.lookup(&sym).is_some()))
+            match args.remove(0) {
+                Value::Symbol(s) => Ok(Value::Bool(obj.class.lookup(&s).is_some())),
+                _ => Ok(Value::Bool(false)),
+            }
         }
         "_primAt:" => {
             expect_arity(sel, 1, args.len())?;
@@ -1001,31 +1273,34 @@ fn dispatch_object_primitive(
             })?;
             match indexed {
                 IndexedStorage::Pointer(slots) => {
-                    let borrow = slots.borrow();
-                    if n < 0 || n as usize >= borrow.len() {
+                    let guard = slots.lock();
+                    if n < 0 || n as usize >= guard.len() {
                         return Err(EvalError::TypeError(format!(
-                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                            "{sel}: index {n} out of bounds (size {})",
+                            guard.len()
                         )));
                     }
-                    Ok(borrow[n as usize].clone())
+                    Ok(guard[n as usize].clone())
                 }
                 IndexedStorage::Byte(bytes) => {
-                    let borrow = bytes.borrow();
-                    if n < 0 || n as usize >= borrow.len() {
+                    let guard = bytes.lock();
+                    if n < 0 || n as usize >= guard.len() {
                         return Err(EvalError::TypeError(format!(
-                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                            "{sel}: index {n} out of bounds (size {})",
+                            guard.len()
                         )));
                     }
-                    Ok(Value::Int(borrow[n as usize] as i64))
+                    Ok(Value::Int(guard[n as usize] as i64))
                 }
                 IndexedStorage::Float64(floats) => {
-                    let borrow = floats.borrow();
-                    if n < 0 || n as usize >= borrow.len() {
+                    let guard = floats.lock();
+                    if n < 0 || n as usize >= guard.len() {
                         return Err(EvalError::TypeError(format!(
-                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                            "{sel}: index {n} out of bounds (size {})",
+                            guard.len()
                         )));
                     }
-                    Ok(Value::Float(borrow[n as usize]))
+                    Ok(Value::Float(guard[n as usize]))
                 }
             }
         }
@@ -1038,49 +1313,58 @@ fn dispatch_object_primitive(
             })?;
             match indexed {
                 IndexedStorage::Pointer(slots) => {
-                    let mut borrow = slots.borrow_mut();
-                    if n < 0 || n as usize >= borrow.len() {
+                    let mut guard = slots.lock();
+                    if n < 0 || n as usize >= guard.len() {
                         return Err(EvalError::TypeError(format!(
-                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                            "{sel}: index {n} out of bounds (size {})",
+                            guard.len()
                         )));
                     }
-                    borrow[n as usize] = v.clone();
+                    guard[n as usize] = v.clone();
                     Ok(v)
                 }
                 IndexedStorage::Byte(bytes) => {
                     let b = match &v {
                         Value::Int(i) if *i >= 0 && *i <= 255 => *i as u8,
-                        Value::Int(i) => return Err(EvalError::TypeError(format!(
-                            "{sel}: byte value {i} out of range 0..=255"
-                        ))),
-                        _ => return Err(EvalError::TypeError(format!(
-                            "{sel}: Byte storage requires Int argument in 0..=255"
-                        ))),
+                        Value::Int(i) => {
+                            return Err(EvalError::TypeError(format!(
+                                "{sel}: byte value {i} out of range 0..=255"
+                            )));
+                        }
+                        _ => {
+                            return Err(EvalError::TypeError(format!(
+                                "{sel}: Byte storage requires Int argument in 0..=255"
+                            )));
+                        }
                     };
-                    let mut borrow = bytes.borrow_mut();
-                    if n < 0 || n as usize >= borrow.len() {
+                    let mut guard = bytes.lock();
+                    if n < 0 || n as usize >= guard.len() {
                         return Err(EvalError::TypeError(format!(
-                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                            "{sel}: index {n} out of bounds (size {})",
+                            guard.len()
                         )));
                     }
-                    borrow[n as usize] = b;
+                    guard[n as usize] = b;
                     Ok(v)
                 }
                 IndexedStorage::Float64(floats) => {
                     let f = match &v {
                         Value::Float(f) => *f,
                         Value::Int(i) => *i as f64,
-                        _ => return Err(EvalError::TypeError(format!(
-                            "{sel}: Float64 storage requires Float or Int argument"
-                        ))),
+                        _ => {
+                            return Err(EvalError::TypeError(format!(
+                                "{sel}: Float64 storage requires Float or Int argument"
+                            )));
+                        }
                     };
-                    let mut borrow = floats.borrow_mut();
-                    if n < 0 || n as usize >= borrow.len() {
+                    let mut guard = floats.lock();
+                    if n < 0 || n as usize >= guard.len() {
                         return Err(EvalError::TypeError(format!(
-                            "{sel}: index {n} out of bounds (size {})", borrow.len()
+                            "{sel}: index {n} out of bounds (size {})",
+                            guard.len()
                         )));
                     }
-                    borrow[n as usize] = f;
+                    guard[n as usize] = f;
                     Ok(v)
                 }
             }
@@ -1091,9 +1375,9 @@ fn dispatch_object_primitive(
                 EvalError::TypeError(format!("{sel}: receiver has no indexed storage"))
             })?;
             let len = match indexed {
-                IndexedStorage::Pointer(slots) => slots.borrow().len(),
-                IndexedStorage::Byte(bytes) => bytes.borrow().len(),
-                IndexedStorage::Float64(floats) => floats.borrow().len(),
+                IndexedStorage::Pointer(slots) => slots.lock().len(),
+                IndexedStorage::Byte(bytes) => bytes.lock().len(),
+                IndexedStorage::Float64(floats) => floats.lock().len(),
             };
             Ok(Value::Int(len as i64))
         }
@@ -1103,10 +1387,12 @@ fn dispatch_object_primitive(
                 EvalError::TypeError(format!("{sel}: receiver has no indexed storage"))
             })? {
                 IndexedStorage::Byte(bytes) => {
-                    let s = String::from_utf8_lossy(&bytes.borrow()).into_owned();
+                    let s = String::from_utf8_lossy(&bytes.lock()).into_owned();
                     Ok(Value::Str(Arc::from(s.as_str())))
                 }
-                _ => Err(EvalError::TypeError(format!("{sel}: requires Byte indexed storage"))),
+                _ => Err(EvalError::TypeError(format!(
+                    "{sel}: requires Byte indexed storage"
+                ))),
             }
         }
         "_primSignal:" => {
@@ -1129,6 +1415,30 @@ fn dispatch_object_primitive(
             receiver_kind: "Object",
             selector: sel.clone(),
         }),
+    }
+}
+
+/// Primitive Object dispatch for entity actor objects.
+///
+/// Identical to `dispatch_object_primitive` except that `=` / `~=` compare
+/// using the provided `self_val` (a `Value::Object(EntityHandle)`) rather than
+/// wrapping the raw `Arc<Object>`.
+pub(crate) fn dispatch_object_primitive_as_entity(
+    obj: Arc<Object>,
+    sel: &Arc<str>,
+    mut args: Vec<Value>,
+    self_val: Value,
+) -> Result<Value, EvalError> {
+    match sel.as_ref() {
+        "=" => {
+            expect_arity(sel, 1, args.len())?;
+            Ok(Value::Bool(self_val == args.remove(0)))
+        }
+        "~=" => {
+            expect_arity(sel, 1, args.len())?;
+            Ok(Value::Bool(self_val != args.remove(0)))
+        }
+        _ => dispatch_object_primitive(obj, sel, args),
     }
 }
 
@@ -1157,10 +1467,12 @@ fn dispatch_namespace(
             expect_arity(&selector, 1, args.len())?;
             let block = match args.remove(0) {
                 Value::Block(b) => b,
-                other => return Err(EvalError::TypeError(format!(
-                    "do: requires a Block, got {}",
-                    other.kind()
-                ))),
+                other => {
+                    return Err(EvalError::TypeError(format!(
+                        "do: requires a Block, got {}",
+                        other.kind()
+                    )));
+                }
             };
             ev.with_namespace(ns, |ev| ev.eval_block(&block, vec![], env))
         }
@@ -1170,7 +1482,9 @@ fn dispatch_namespace(
         }
         "printString" => {
             expect_arity(&selector, 0, args.len())?;
-            Ok(Value::Str(Arc::from(format!("Namespace({})", ns.name).as_str())))
+            Ok(Value::Str(Arc::from(
+                format!("Namespace({})", ns.name).as_str(),
+            )))
         }
         _ => Err(EvalError::MessageNotUnderstood {
             receiver_kind: "Namespace",
@@ -1211,7 +1525,9 @@ pub(crate) fn dispatch_class_builtin(
     match selector.as_ref() {
         "=" => {
             expect_arity(&selector, 1, args.len())?;
-            Ok(Value::Bool(Value::Class(class) == args[0]))
+            Ok(Value::Bool(
+                Value::Class(class) == force_value(args[0].clone())?,
+            ))
         }
         "~=" => {
             expect_arity(&selector, 1, args.len())?;
@@ -1219,25 +1535,53 @@ pub(crate) fn dispatch_class_builtin(
         }
         "new" => {
             expect_arity(&selector, 0, args.len())?;
-            let obj = if class.indexed_slot_kind.is_some() {
-                Arc::new(Object::new_with_indexed(class.clone(), 0))
+            if class.inherits_is_value() {
+                // Value class: synchronous allocation + initialize.
+                let obj = if class.indexed_slot_kind.is_some() {
+                    Arc::new(Object::new_with_indexed(class.clone(), 0))
+                } else {
+                    Arc::new(Object::new(class.clone()))
+                };
+                let obj = ev.send_initialize(obj, env)?;
+                Ok(Value::ValueObject(obj))
             } else {
-                Arc::new(Object::new(class.clone()))
-            };
-            let obj = ev.send_initialize(obj, env)?;
-            Ok(Value::Object(obj))
+                // Actor class: spawn entity thread; initialize is queued as the first message.
+                let mut global_env = Env::new();
+                ev.registry.populate_env(&mut global_env);
+                let handle = spawn_entity(class, ev.registry.clone(), global_env, None);
+                Ok(Value::Object(handle))
+            }
         }
         "new:" => {
             expect_arity(&selector, 1, args.len())?;
-            if class.indexed_slot_kind.is_none() {
-                return Err(EvalError::TypeError(
-                    "new: requires class to declare indexedSlots:".into(),
-                ));
-            }
             let n = as_int(args.remove(0), &selector)?;
-            let obj = Arc::new(Object::new_with_indexed(class.clone(), n.max(0) as usize));
-            let obj = ev.send_initialize(obj, env)?;
-            Ok(Value::Object(obj))
+            if class.inherits_is_value() {
+                // Value class: allocate with indexed storage.
+                if class.indexed_slot_kind.is_none() {
+                    return Err(EvalError::TypeError(
+                        "new: requires class to declare indexedSlots:".into(),
+                    ));
+                }
+                let obj = Arc::new(Object::new_with_indexed(class.clone(), n.max(0) as usize));
+                let obj = ev.send_initialize(obj, env)?;
+                Ok(Value::ValueObject(obj))
+            } else {
+                // Actor class with indexed storage.
+                if class.indexed_slot_kind.is_none() {
+                    return Err(EvalError::TypeError(
+                        "new: requires class to declare indexedSlots:".into(),
+                    ));
+                }
+                let mut global_env = Env::new();
+                ev.registry.populate_env(&mut global_env);
+                let handle = spawn_entity(
+                    class,
+                    ev.registry.clone(),
+                    global_env,
+                    Some(n.max(0) as usize),
+                );
+                Ok(Value::Object(handle))
+            }
         }
         "name" => {
             expect_arity(&selector, 0, args.len())?;
@@ -1245,7 +1589,9 @@ pub(crate) fn dispatch_class_builtin(
         }
         "printString" => {
             expect_arity(&selector, 0, args.len())?;
-            Ok(Value::Str(class.name.clone()))
+            let s: Arc<str> = class.name.clone();
+            println!("{:?}", s);
+            Ok(Value::Str(s))
         }
         sel if sel.contains("subclass:") => handle_subclass(ev, class, selector, args, env),
         _ => Err(EvalError::MessageNotUnderstood {
@@ -1279,7 +1625,7 @@ fn handle_subclass(
                 _ => {
                     return Err(EvalError::TypeError(
                         "subclass: argument must be a Symbol".into(),
-                    ))
+                    ));
                 }
             },
             "instanceVariableNames:" => match arg {
@@ -1293,7 +1639,7 @@ fn handle_subclass(
                 _ => {
                     return Err(EvalError::TypeError(
                         "instanceVariableNames: argument must be a String".into(),
-                    ))
+                    ));
                 }
             },
             "classVariableNames:" => match arg {
@@ -1307,7 +1653,7 @@ fn handle_subclass(
                 _ => {
                     return Err(EvalError::TypeError(
                         "classVariableNames: argument must be a String".into(),
-                    ))
+                    ));
                 }
             },
             "indexedSlots:" => match arg {
@@ -1319,13 +1665,13 @@ fn handle_subclass(
                     _ => {
                         return Err(EvalError::TypeError(format!(
                             "indexedSlots: unknown kind #{s}"
-                        )))
+                        )));
                     }
                 },
                 _ => {
                     return Err(EvalError::TypeError(
                         "indexedSlots: argument must be a Symbol".into(),
-                    ))
+                    ));
                 }
             },
             _ => {} // unknown keywords silently ignored
@@ -1345,18 +1691,29 @@ fn handle_subclass(
         }
     }
 
-    let class_var_storage: HashMap<Arc<str>, Value> =
-        class_var_names.iter().map(|n| (n.clone(), Value::Nil)).collect();
+    let class_var_storage: HashMap<Arc<str>, Value> = class_var_names
+        .iter()
+        .map(|n| (n.clone(), Value::Nil))
+        .collect();
+
+    // Inherit is_value from the superclass chain. Mixed-hierarchy subclassing
+    // (actor subclassing a value class or vice versa) is a compile-time error.
+    let super_is_value = superclass.inherits_is_value();
+    // The selector determines whether this is a value or actor declaration.
+    // `Value subclass:` → is_value: true; `Object subclass:` (any non-Value) → inherits.
+    // We detect this by checking if the superclass is the built-in Value class.
+    let declared_is_value = super_is_value; // inherit by default
 
     let new_class = Arc::new(Class {
         name: name.clone(),
         superclass: Some(superclass),
         own_instance_vars: ivar_names,
         own_class_vars: class_var_names,
-        class_var_storage: RefCell::new(class_var_storage),
+        class_var_storage: RwLock::new(class_var_storage),
         indexed_slot_kind,
-        methods: RefCell::new(HashMap::new()),
-        class_methods: RefCell::new(HashMap::new()),
+        methods: RwLock::new(HashMap::new()),
+        class_methods: RwLock::new(HashMap::new()),
+        is_value: declared_is_value,
     });
 
     let active_ns = ev.active_namespace();
@@ -1375,24 +1732,7 @@ fn handle_subclass(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::Evaluator;
-    use crate::parser::Parser;
-
-    fn eval(src: &str) -> Value {
-        let prog = Parser::parse(src).expect("parse");
-        let ev = Evaluator::new();
-        let mut env = crate::env::Env::new();
-        ev.registry.populate_env(&mut env);
-        ev.eval_program(&prog.stmts, &mut env).expect("eval")
-    }
-
-    fn eval_err(src: &str) -> crate::eval::EvalError {
-        let prog = Parser::parse(src).expect("parse");
-        let ev = Evaluator::new();
-        let mut env = crate::env::Env::new();
-        ev.registry.populate_env(&mut env);
-        ev.eval_program(&prog.stmts, &mut env).expect_err("expected error")
-    }
+    use crate::test_helpers::{eval, eval_err};
 
     // ── Float ────────────────────────────────────────────────────────────────
 
@@ -1450,7 +1790,10 @@ mod tests {
         let big = "99999999999999999999";
         assert!(matches!(eval(&format!("{big} // 3")), Value::LargeInt(_)));
         // modulo result may normalise to Int when the remainder fits in i64
-        assert!(matches!(eval(&format!("{big} \\\\ 7")), Value::Int(_) | Value::LargeInt(_)));
+        assert!(matches!(
+            eval(&format!("{big} \\\\ 7")),
+            Value::Int(_) | Value::LargeInt(_)
+        ));
     }
 
     #[test]
@@ -1467,7 +1810,10 @@ mod tests {
     #[test]
     fn largeint_unary() {
         let big = "99999999999999999999";
-        assert!(matches!(eval(&format!("{big} negated")), Value::LargeInt(_)));
+        assert!(matches!(
+            eval(&format!("{big} negated")),
+            Value::LargeInt(_)
+        ));
         assert!(matches!(eval(&format!("{big} abs")), Value::LargeInt(_)));
         assert!(matches!(eval(&format!("{big} printString")), Value::Str(_)));
         assert!(matches!(eval(&format!("{big} asFloat")), Value::Float(_)));
@@ -1476,9 +1822,18 @@ mod tests {
     #[test]
     fn largeint_division_by_zero() {
         let big = "99999999999999999999";
-        assert!(matches!(eval_err(&format!("{big} / 0")), crate::eval::EvalError::TypeError(_)));
-        assert!(matches!(eval_err(&format!("{big} // 0")), crate::eval::EvalError::TypeError(_)));
-        assert!(matches!(eval_err(&format!("{big} \\\\ 0")), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(&format!("{big} / 0")),
+            crate::eval::EvalError::TypeError(_)
+        ));
+        assert!(matches!(
+            eval_err(&format!("{big} // 0")),
+            crate::eval::EvalError::TypeError(_)
+        ));
+        assert!(matches!(
+            eval_err(&format!("{big} \\\\ 0")),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     // ── Int extensions ───────────────────────────────────────────────────────
@@ -1488,7 +1843,10 @@ mod tests {
         assert_eq!(eval("5 negated"), Value::Int(-5));
         assert_eq!(eval("-5 abs"), Value::Int(5));
         // abs of i64::MIN promotes to BigInt (no positive i64 representation)
-        assert!(matches!(eval("-9223372036854775808 abs"), Value::LargeInt(_)));
+        assert!(matches!(
+            eval("-9223372036854775808 abs"),
+            Value::LargeInt(_)
+        ));
     }
 
     #[test]
@@ -1533,9 +1891,18 @@ mod tests {
 
     #[test]
     fn int_division_by_zero_errors() {
-        assert!(matches!(eval_err("5 / 0"), crate::eval::EvalError::TypeError(_)));
-        assert!(matches!(eval_err("5 // 0"), crate::eval::EvalError::TypeError(_)));
-        assert!(matches!(eval_err("5 \\\\ 0"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err("5 / 0"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+        assert!(matches!(
+            eval_err("5 // 0"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+        assert!(matches!(
+            eval_err("5 \\\\ 0"),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     // ── Bool ─────────────────────────────────────────────────────────────────
@@ -1601,7 +1968,10 @@ mod tests {
 
     #[test]
     fn nil_if_nil() {
-        assert_eq!(eval("nil ifNil: ['was nil']"), Value::Str(Arc::from("was nil")));
+        assert_eq!(
+            eval("nil ifNil: ['was nil']"),
+            Value::Str(Arc::from("was nil"))
+        );
         assert_eq!(eval("nil ifNotNil: ['not nil']"), Value::Nil);
     }
 
@@ -1666,7 +2036,10 @@ mod tests {
 
     #[test]
     fn string_copy_from_to() {
-        assert_eq!(eval("'hello' copyFrom: 2 to: 4"), Value::Str(Arc::from("ell")));
+        assert_eq!(
+            eval("'hello' copyFrom: 2 to: 4"),
+            Value::Str(Arc::from("ell"))
+        );
     }
 
     #[test]
@@ -1708,7 +2081,10 @@ mod tests {
 
     #[test]
     fn block_value_three_args() {
-        assert_eq!(eval("[:a :b :c | a + b + c] value: 1 value: 2 value: 3"), Value::Int(6));
+        assert_eq!(
+            eval("[:a :b :c | a + b + c] value: 1 value: 2 value: 3"),
+            Value::Int(6)
+        );
     }
 
     #[test]
@@ -1953,81 +2329,65 @@ ByteBuf new: 8
 
     // ── _primAt: / _primAt:put: / _primSize / _primAsString / error: ──────────
 
-    fn eval_no_kernel(src: &str) -> Value {
-        let prog = Parser::parse(src).expect("parse");
-        let ev = Evaluator::new_without_kernel();
-        let mut env = crate::env::Env::new();
-        ev.registry.populate_env(&mut env);
-        ev.eval_program(&prog.stmts, &mut env).expect("eval")
-    }
-
-    fn eval_no_kernel_err(src: &str) -> crate::eval::EvalError {
-        let prog = Parser::parse(src).expect("parse");
-        let ev = Evaluator::new_without_kernel();
-        let mut env = crate::env::Env::new();
-        ev.registry.populate_env(&mut env);
-        ev.eval_program(&prog.stmts, &mut env).expect_err("expected error")
-    }
-
     #[test]
     fn prim_at_pointer_reads() {
         let src = r#"
-Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+Value subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
 | a |
 a := Arr new: 3.
 a _primAt: 0
 "#;
-        assert_eq!(eval_no_kernel(src), Value::Nil);
+        assert_eq!(eval(src), Value::Nil);
     }
 
     #[test]
     fn prim_at_put_and_at_roundtrip() {
         let src = r#"
-Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+Value subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
 | a |
 a := Arr new: 3.
 a _primAt: 1 put: 42.
 a _primAt: 1
 "#;
-        assert_eq!(eval_no_kernel(src), Value::Int(42));
+        assert_eq!(eval(src), Value::Int(42));
     }
 
     #[test]
     fn prim_size_returns_length() {
         let src = r#"
-Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+Value subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
 (Arr new: 5) _primSize
 "#;
-        assert_eq!(eval_no_kernel(src), Value::Int(5));
+        assert_eq!(eval(src), Value::Int(5));
     }
 
     #[test]
     fn prim_at_byte_returns_int() {
         let src = r#"
-Object subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
+Value subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
 | b |
 b := BA new: 4.
 b _primAt: 0
 "#;
-        assert_eq!(eval_no_kernel(src), Value::Int(0));
+        assert_eq!(eval(src), Value::Int(0));
     }
 
     #[test]
     fn prim_at_put_byte_stores_and_reads() {
         let src = r#"
-Object subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
+Value subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
 | b |
 b := BA new: 4.
 b _primAt: 2 put: 200.
 b _primAt: 2
 "#;
-        assert_eq!(eval_no_kernel(src), Value::Int(200));
+        assert_eq!(eval(src), Value::Int(200));
     }
 
     #[test]
     fn prim_as_string_returns_utf8() {
         let src = r#"
-Object subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
+Value subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
 | b |
 b := BA new: 5.
 b _primAt: 0 put: 104.
@@ -2037,43 +2397,55 @@ b _primAt: 3 put: 108.
 b _primAt: 4 put: 111.
 b _primAsString
 "#;
-        assert_eq!(eval_no_kernel(src), Value::Str(Arc::from("hello")));
+        assert_eq!(eval(src), Value::Str(Arc::from("hello")));
     }
 
     #[test]
     fn prim_at_bounds_error() {
         let src = r#"
-Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+Value subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
 (Arr new: 3) _primAt: 3
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn prim_at_negative_index_error() {
         let src = r#"
-Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+Value subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
 (Arr new: 3) _primAt: -1
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn prim_at_put_byte_out_of_range_error() {
         let src = r#"
-Object subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
+Value subclass: #BA instanceVariableNames: '' indexedSlots: #byte.
 (BA new: 2) _primAt: 0 put: 256
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn prim_at_no_indexed_storage_error() {
         let src = r#"
-Object subclass: #Plain instanceVariableNames: ''.
+Value subclass: #Plain instanceVariableNames: ''.
 Plain new _primAt: 0
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
@@ -2082,7 +2454,7 @@ Plain new _primAt: 0
 Object subclass: #Thing instanceVariableNames: ''.
 Thing new error: 'boom'
 "#;
-        match eval_no_kernel_err(src) {
+        match eval_err(src) {
             crate::eval::EvalError::Signal(msg) => assert!(msg.contains("boom")),
             e => panic!("expected Signal, got {e:?}"),
         }
@@ -2141,42 +2513,51 @@ Thing new error: 'boom'
 ba := ByteArray new: 2.
 ba _primAt: 0 put: 'x'
 "#;
-        assert!(matches!(eval_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn prim_at_put_float64_storage_and_int_coerce() {
         let src = r#"
-Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+Value subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
 | a |
 a := FA new: 2.
 a _primAt: 0 put: 3.
 a _primAt: 1 put: 1.5.
 a _primAt: 0
 "#;
-        assert_eq!(eval_no_kernel(src), Value::Float(3.0));
+        assert_eq!(eval(src), Value::Float(3.0));
     }
 
     #[test]
     fn prim_at_put_float64_wrong_type_errors() {
         let src = r#"
-Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+Value subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
 | a |
 a := FA new: 2.
 a _primAt: 0 put: 'bad'
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn prim_as_string_on_non_byte_storage_errors() {
         let src = r#"
-Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+Value subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
 | a |
 a := FA new: 2.
 a _primAsString
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     // ── Int op LargeInt promotion ─────────────────────────────────────────────
@@ -2223,16 +2604,31 @@ a _primAsString
     #[test]
     fn as_int_type_error() {
         // as_int is called when an Int is expected but another type is given.
-        assert!(matches!(eval_err("1 < 'hello'"), crate::eval::EvalError::TypeError(_)));
-        assert!(matches!(eval_err("1 > true"), crate::eval::EvalError::TypeError(_)));
-        assert!(matches!(eval_err("1 max: 'x'"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err("1 < 'hello'"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+        assert!(matches!(
+            eval_err("1 > true"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+        assert!(matches!(
+            eval_err("1 max: 'x'"),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn as_block_type_error() {
         // as_block is called when a Block is expected but another type is given.
-        assert!(matches!(eval_err("[true] whileTrue: 'notABlock'"), crate::eval::EvalError::TypeError(_)));
-        assert!(matches!(eval_err("[true] whileFalse: 42"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err("[true] whileTrue: 'notABlock'"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+        assert!(matches!(
+            eval_err("[true] whileFalse: 42"),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
@@ -2261,8 +2657,14 @@ a _primAsString
 
     #[test]
     fn float_arithmetic_type_error() {
-        assert!(matches!(eval_err("1.5 + 'bad'"), crate::eval::EvalError::TypeError(_)));
-        assert!(matches!(eval_err("1.5 < nil"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err("1.5 + 'bad'"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+        assert!(matches!(
+            eval_err("1.5 < nil"),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     // ── Bool type errors ──────────────────────────────────────────────────────
@@ -2276,30 +2678,48 @@ a _primAsString
 
     #[test]
     fn bool_pipe_type_error() {
-        assert!(matches!(eval_err("true | 1"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err("true | 1"),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn bool_ampersand_type_error() {
-        assert!(matches!(eval_err("true & 1"), crate::eval::EvalError::TypeError(_)));
-        assert!(matches!(eval_err("true & nil"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err("true & 1"),
+            crate::eval::EvalError::TypeError(_)
+        ));
+        assert!(matches!(
+            eval_err("true & nil"),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn bool_and_colon_non_bool_block_result_errors() {
-        assert!(matches!(eval_err("true and: [1]"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err("true and: [1]"),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn bool_or_colon_non_bool_block_result_errors() {
-        assert!(matches!(eval_err("false or: [1]"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err("false or: [1]"),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     // ── String type errors ────────────────────────────────────────────────────
 
     #[test]
     fn string_concat_type_error() {
-        assert!(matches!(eval_err("'hello' , 42"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err("'hello' , 42"),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
@@ -2345,21 +2765,21 @@ Dog new isKindOf: Cat
     }
 
     #[test]
-    fn object_is_kind_of_non_class_arg_errors() {
+    fn object_is_kind_of_non_class_arg_returns_false() {
         let src = r#"
 Object subclass: #Foo instanceVariableNames: ''.
 Foo new isKindOf: 'notAClass'
 "#;
-        assert!(matches!(eval_err(src), crate::eval::EvalError::TypeError(_)));
+        assert_eq!(eval(src), Value::Bool(false));
     }
 
     #[test]
-    fn object_responds_to_non_symbol_arg_errors() {
+    fn object_responds_to_non_symbol_arg_returns_false() {
         let src = r#"
 Object subclass: #Foo instanceVariableNames: ''.
 Foo new respondsTo: 42
 "#;
-        assert!(matches!(eval_err(src), crate::eval::EvalError::TypeError(_)));
+        assert_eq!(eval(src), Value::Bool(false));
     }
 
     #[test]
@@ -2368,7 +2788,10 @@ Foo new respondsTo: 42
 Object subclass: #Foo instanceVariableNames: ''.
 Foo new completelyUnknownMessage
 "#;
-        assert!(matches!(eval_err(src), crate::eval::EvalError::MessageNotUnderstood { .. }));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::MessageNotUnderstood { .. }
+        ));
     }
 
     #[test]
@@ -2384,19 +2807,22 @@ Foo new error: 42
     fn class_new_indexed_via_plain_new() {
         // `new` (no size) on an indexed class creates a zero-size indexed object.
         let src = r#"
-Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+Value subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
 FA new _primSize
 "#;
-        assert_eq!(eval_no_kernel(src), Value::Int(0));
+        assert_eq!(eval(src), Value::Int(0));
     }
 
     #[test]
     fn class_new_without_indexed_slots_errors() {
         let src = r#"
-Object subclass: #Plain instanceVariableNames: ''.
+Value subclass: #Plain instanceVariableNames: ''.
 Plain new: 3
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
@@ -2415,7 +2841,10 @@ Plain new: 3
 
     #[test]
     fn namespace_do_non_block_arg_errors() {
-        assert!(matches!(eval_err("Kernel do: 1"), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err("Kernel do: 1"),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
@@ -2431,23 +2860,29 @@ Plain new: 3
     #[test]
     fn prim_at_byte_storage_out_of_bounds() {
         let src = r#"
-Object subclass: #BA instanceVariableNames: '' classVariableNames: '' indexedSlots: #byte.
+Value subclass: #BA instanceVariableNames: '' classVariableNames: '' indexedSlots: #byte.
 | a |
 a := BA new: 3.
 a _primAt: 5
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn prim_at_float64_storage_out_of_bounds() {
         let src = r#"
-Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+Value subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
 | a |
 a := FA new: 3.
 a _primAt: 5
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     // ── _primAt:put: no storage, bounds errors ────────────────────────────────
@@ -2455,43 +2890,55 @@ a _primAt: 5
     #[test]
     fn prim_at_put_no_indexed_storage_error() {
         let src = r#"
-Object subclass: #Plain instanceVariableNames: ''.
+Value subclass: #Plain instanceVariableNames: ''.
 Plain new _primAt: 0 put: 1
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn prim_at_put_pointer_bounds_error() {
         let src = r#"
-Object subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
+Value subclass: #Arr instanceVariableNames: '' indexedSlots: #pointer.
 | a |
 a := Arr new: 2.
 a _primAt: 5 put: 42
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn prim_at_put_byte_bounds_error() {
         let src = r#"
-Object subclass: #BA instanceVariableNames: '' classVariableNames: '' indexedSlots: #byte.
+Value subclass: #BA instanceVariableNames: '' classVariableNames: '' indexedSlots: #byte.
 | a |
 a := BA new: 2.
 a _primAt: 5 put: 100
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn prim_at_put_float64_bounds_error() {
         let src = r#"
-Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+Value subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
 | a |
 a := FA new: 2.
 a _primAt: 5 put: 1.0
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     // ── _primSize and _primAsString edge cases ────────────────────────────────
@@ -2499,33 +2946,24 @@ a _primAt: 5 put: 1.0
     #[test]
     fn prim_size_float64_storage() {
         let src = r#"
-Object subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
+Value subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
 | a |
 a := FA new: 4.
 a _primSize
 "#;
-        assert_eq!(eval_no_kernel(src), Value::Int(4));
+        assert_eq!(eval(src), Value::Int(4));
     }
 
     #[test]
     fn prim_as_string_no_indexed_storage_errors() {
         let src = r#"
-Object subclass: #Plain instanceVariableNames: ''.
+Value subclass: #Plain instanceVariableNames: ''.
 Plain new _primAsString
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
-    }
-
-    // ── error: with non-String arg ────────────────────────────────────────────
-
-    #[test]
-    fn object_error_colon_non_string() {
-        // `error: <non-String>` raises Signal with a formatted message
-        let src = r#"
-Object subclass: #Foo instanceVariableNames: ''.
-Foo new error: 42
-"#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::Signal(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     // ── handle_subclass error paths ───────────────────────────────────────────
@@ -2533,31 +2971,46 @@ Foo new error: 42
     #[test]
     fn subclass_bad_class_name_type_errors() {
         let src = r#"Object subclass: 'notASymbol' instanceVariableNames: ''."#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn subclass_bad_ivar_names_type_errors() {
         let src = r#"Object subclass: #Foo instanceVariableNames: 42."#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn subclass_bad_class_var_names_type_errors() {
         let src = r#"Object subclass: #Foo instanceVariableNames: '' classVariableNames: 42."#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn subclass_bad_indexed_slots_type_errors() {
         let src = r#"Object subclass: #Foo instanceVariableNames: '' classVariableNames: '' indexedSlots: 'notASymbol'."#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
     fn subclass_unknown_indexed_kind_errors() {
         let src = r#"Object subclass: #Foo instanceVariableNames: '' classVariableNames: '' indexedSlots: #badKind."#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
     }
 
     #[test]
@@ -2566,6 +3019,109 @@ Foo new error: 42
 Object subclass: #A instanceVariableNames: 'x'.
 A subclass: #B instanceVariableNames: 'x'.
 "#;
-        assert!(matches!(eval_no_kernel_err(src), crate::eval::EvalError::TypeError(_)));
+        assert!(matches!(
+            eval_err(src),
+            crate::eval::EvalError::TypeError(_)
+        ));
+    }
+
+    // ── Universal ifNil: / ifNotNil: family ───────────────────────────────────
+
+    #[test]
+    fn if_nil_on_nil_runs_block() {
+        assert_eq!(eval("nil ifNil: [42]"), Value::Int(42));
+    }
+
+    #[test]
+    fn if_nil_on_non_nil_returns_nil() {
+        assert_eq!(eval("7 ifNil: [42]"), Value::Nil);
+        assert_eq!(eval("'hi' ifNil: [42]"), Value::Nil);
+        assert_eq!(eval("true ifNil: [42]"), Value::Nil);
+        assert_eq!(eval("3.14 ifNil: [42]"), Value::Nil);
+        assert_eq!(eval("#sym ifNil: [42]"), Value::Nil);
+    }
+
+    #[test]
+    fn if_not_nil_on_nil_returns_nil() {
+        assert_eq!(eval("nil ifNotNil: [:v | v]"), Value::Nil);
+    }
+
+    #[test]
+    fn if_not_nil_on_non_nil_passes_receiver_to_block() {
+        assert_eq!(eval("7 ifNotNil: [:v | v + 1]"), Value::Int(8));
+        assert_eq!(eval("'hi' ifNotNil: [:v | v]"), Value::Str(Arc::from("hi")));
+        assert_eq!(eval("true ifNotNil: [:v | v]"), Value::Bool(true));
+    }
+
+    #[test]
+    fn if_nil_if_not_nil_nil_receiver() {
+        assert_eq!(
+            eval("nil ifNil: [1] ifNotNil: [:v | v + 10]"),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn if_nil_if_not_nil_non_nil_receiver() {
+        assert_eq!(eval("5 ifNil: [1] ifNotNil: [:v | v + 10]"), Value::Int(15));
+    }
+
+    #[test]
+    fn if_not_nil_if_nil_nil_receiver() {
+        assert_eq!(
+            eval("nil ifNotNil: [:v | v + 10] ifNil: [99]"),
+            Value::Int(99)
+        );
+    }
+
+    #[test]
+    fn if_not_nil_if_nil_non_nil_receiver() {
+        assert_eq!(
+            eval("5 ifNotNil: [:v | v + 10] ifNil: [99]"),
+            Value::Int(15)
+        );
+    }
+
+    // ── Universal then: ───────────────────────────────────────────────────────
+
+    #[test]
+    fn then_on_non_future_runs_block_synchronously() {
+        assert_eq!(eval("42 then: [99]"), Value::Int(99));
+        assert_eq!(eval("'hi' then: [1]"), Value::Int(1));
+        assert_eq!(eval("nil then: [true]"), Value::Bool(true));
+    }
+
+    // ── Universal error: / _primSignal: on primitive types ────────────────────
+
+    #[test]
+    fn error_colon_on_int_signals() {
+        match eval_err("5 error: 'boom'") {
+            crate::eval::EvalError::Signal(msg) => assert!(msg.contains("boom")),
+            e => panic!("expected Signal, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn error_colon_on_string_signals() {
+        match eval_err("'hi' error: 'bad'") {
+            crate::eval::EvalError::Signal(msg) => assert!(msg.contains("bad")),
+            e => panic!("expected Signal, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn error_colon_on_bool_signals() {
+        match eval_err("true error: 'oops'") {
+            crate::eval::EvalError::Signal(msg) => assert!(msg.contains("oops")),
+            e => panic!("expected Signal, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn prim_signal_on_nil_signals() {
+        match eval_err("nil _primSignal: 'raw'") {
+            crate::eval::EvalError::Signal(msg) => assert!(msg.contains("raw")),
+            e => panic!("expected Signal, got {e:?}"),
+        }
     }
 }

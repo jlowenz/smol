@@ -16,7 +16,6 @@ pub enum Literal {
     Array(Vec<Literal>),
 }
 
-
 /// A single message send. Three levels of precedence match Smalltalk's grammar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {

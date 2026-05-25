@@ -148,7 +148,9 @@ mod tests {
         ChangeEvent {
             subject: crate::id::EntityId(1),
             predicate: Predicate(1),
-            kind: ChangeKind::Asserted { new_object: Term::Int(42) },
+            kind: ChangeKind::Asserted {
+                new_object: Term::Int(42),
+            },
             tx_id: TxId(1),
         }
     }

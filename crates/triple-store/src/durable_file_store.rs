@@ -172,10 +172,16 @@ fn replay_log(path: &Path, storage: &InMemoryStorage) -> io::Result<(u64, Predic
                     max_entity = max_entity.max(s).max(a);
                 }
             }
-            WalRecord::Declaration { name, visibility, cardinality } => {
+            WalRecord::Declaration {
+                name,
+                visibility,
+                cardinality,
+            } => {
                 registry
                     .declare(&name, visibility, cardinality)
-                    .unwrap_or_else(|_| panic!("WAL corruption: conflicting declaration for {name}"));
+                    .unwrap_or_else(|_| {
+                        panic!("WAL corruption: conflicting declaration for {name}")
+                    });
             }
         }
     }
@@ -229,11 +235,7 @@ fn replay_change(change: &CommitChange<StoredFact>, storage: &InMemoryStorage) -
             let _ = storage.close(
                 closed.subject,
                 closed.predicate,
-                |f| {
-                    f.asserter == asserter
-                        && f.object == object
-                        && f.index_key == index_key
-                },
+                |f| f.asserter == asserter && f.object == object && f.index_key == index_key,
                 close_time,
             );
             closed.tx_id.0
@@ -510,7 +512,11 @@ mod tests {
 
         let s2 = DurableFileTripleStore::open(&path).unwrap();
         let facts = s2.query_open(EntityId(1), Predicate(0), None);
-        assert_eq!(facts.len(), 1, "valid record must survive; truncated must be skipped");
+        assert_eq!(
+            facts.len(),
+            1,
+            "valid record must survive; truncated must be skipped"
+        );
         assert_eq!(facts[0].object, Term::Int(42));
     }
 
@@ -545,10 +551,18 @@ mod tests {
         let s2 = DurableFileTripleStore::open(&path).unwrap();
         let facts = s2.query_open(EntityId(1), Predicate(0), None);
         assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].object, Term::Int(20), "replayed state must reflect last asserted value");
+        assert_eq!(
+            facts[0].object,
+            Term::Int(20),
+            "replayed state must reflect last asserted value"
+        );
 
         let history = s2.history(EntityId(1), Predicate(0), None);
-        assert_eq!(history.len(), 2, "full history must be preserved through replay");
+        assert_eq!(
+            history.len(),
+            2,
+            "full history must be preserved through replay"
+        );
     }
 
     // ── Declaration persistence tests ────────────────────────────────────────
@@ -566,7 +580,9 @@ mod tests {
 
         let s2 = DurableFileTripleStore::open(&path).unwrap();
         let reg = s2.recovered_registry();
-        let id = reg.lookup("account.balance").expect("declaration must survive reopen");
+        let id = reg
+            .lookup("account.balance")
+            .expect("declaration must survive reopen");
         let meta = reg.meta(id);
         assert_eq!(meta.visibility, Visibility::Public);
         assert_eq!(meta.cardinality, Cardinality::Single);
@@ -579,8 +595,10 @@ mod tests {
 
         {
             let s = DurableFileTripleStore::create(&path).unwrap();
-            s.persist_declaration("p", Visibility::Private, Cardinality::Single).unwrap();
-            s.persist_declaration("q", Visibility::Shared, Cardinality::Set).unwrap();
+            s.persist_declaration("p", Visibility::Private, Cardinality::Single)
+                .unwrap();
+            s.persist_declaration("q", Visibility::Shared, Cardinality::Set)
+                .unwrap();
         }
 
         let s2 = DurableFileTripleStore::open(&path).unwrap();
@@ -602,12 +620,14 @@ mod tests {
 
         {
             let s = DurableFileTripleStore::create(&path).unwrap();
-            s.persist_declaration("score", Visibility::Public, Cardinality::Single).unwrap();
+            s.persist_declaration("score", Visibility::Public, Cardinality::Single)
+                .unwrap();
             // Intern "score" so Predicate(0) maps to it, then assert a fact.
             let mut tx = s.new_transaction();
             tx.assert_single(mk_fact(1, 1, 99));
             tx.commit().unwrap();
-            s.persist_declaration("label", Visibility::Shared, Cardinality::Set).unwrap();
+            s.persist_declaration("label", Visibility::Shared, Cardinality::Set)
+                .unwrap();
         }
 
         let s2 = DurableFileTripleStore::open(&path).unwrap();
@@ -616,7 +636,11 @@ mod tests {
         assert!(reg.lookup("label").is_some(), "label must survive reopen");
 
         let facts = s2.query_open(EntityId(1), Predicate(0), None);
-        assert_eq!(facts.len(), 1, "fact must survive reopen alongside declarations");
+        assert_eq!(
+            facts.len(),
+            1,
+            "fact must survive reopen alongside declarations"
+        );
     }
 
     #[test]
@@ -626,7 +650,8 @@ mod tests {
 
         {
             let s = DurableFileTripleStore::create(&path).unwrap();
-            s.persist_declaration("p", Visibility::Shared, Cardinality::Set).unwrap();
+            s.persist_declaration("p", Visibility::Shared, Cardinality::Set)
+                .unwrap();
         }
 
         let s2 = DurableFileTripleStore::open(&path).unwrap();
@@ -649,7 +674,8 @@ mod tests {
 
         {
             let s = DurableFileTripleStore::create(&path).unwrap();
-            s.persist_declaration("p", Visibility::Private, Cardinality::Single).unwrap();
+            s.persist_declaration("p", Visibility::Private, Cardinality::Single)
+                .unwrap();
         }
 
         let s2 = Arc::new(DurableFileTripleStore::open(&path).unwrap());
@@ -657,7 +683,10 @@ mod tests {
         let err = store
             .declare("p", Visibility::Public, Cardinality::Single)
             .unwrap_err();
-        assert!(matches!(err, crate::store::StoreError::DeclarationConflict(_)));
+        assert!(matches!(
+            err,
+            crate::store::StoreError::DeclarationConflict(_)
+        ));
     }
 
     #[test]
@@ -667,28 +696,36 @@ mod tests {
 
         let (id1, id2) = {
             let s = Arc::new(DurableFileTripleStore::create(&path).unwrap());
-            s.persist_declaration("p", Visibility::Public, Cardinality::Single).unwrap();
-            let store = crate::store::Store::new(Arc::clone(&s) as Arc<dyn TripleStore<StoredFact>>);
+            s.persist_declaration("p", Visibility::Public, Cardinality::Single)
+                .unwrap();
+            let store =
+                crate::store::Store::new(Arc::clone(&s) as Arc<dyn TripleStore<StoredFact>>);
             let e1 = store.alloc_entity();
             let e2 = store.alloc_entity();
             let ctx = crate::exec_context::ExecContext::System;
             store
-                .assert_single(&ctx, crate::fact::Fact {
-                    subject: e1,
-                    predicate: Predicate(0),
-                    object: crate::term::Term::Int(1),
-                    asserter: e1,
-                    valid: None,
-                })
+                .assert_single(
+                    &ctx,
+                    crate::fact::Fact {
+                        subject: e1,
+                        predicate: Predicate(0),
+                        object: crate::term::Term::Int(1),
+                        asserter: e1,
+                        valid: None,
+                    },
+                )
                 .unwrap();
             store
-                .assert_single(&ctx, crate::fact::Fact {
-                    subject: e2,
-                    predicate: Predicate(0),
-                    object: crate::term::Term::Int(2),
-                    asserter: e2,
-                    valid: None,
-                })
+                .assert_single(
+                    &ctx,
+                    crate::fact::Fact {
+                        subject: e2,
+                        predicate: Predicate(0),
+                        object: crate::term::Term::Int(2),
+                        asserter: e2,
+                        valid: None,
+                    },
+                )
                 .unwrap();
             (e1, e2)
         };
@@ -702,8 +739,20 @@ mod tests {
 
         // Original facts are still queryable by their prior ids.
         let ctx = crate::exec_context::ExecContext::System;
-        assert_eq!(store2.query_open(&ctx, id1, Predicate(0), None).unwrap().len(), 1);
-        assert_eq!(store2.query_open(&ctx, id2, Predicate(0), None).unwrap().len(), 1);
+        assert_eq!(
+            store2
+                .query_open(&ctx, id1, Predicate(0), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store2
+                .query_open(&ctx, id2, Predicate(0), None)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

@@ -134,13 +134,19 @@ fn matches_pattern(fact: &StoredFact, pattern: Option<&Pattern>) -> bool {
     let Some(pat) = pattern else {
         return true;
     };
-    if let Match::Is(s) = &pat.subject && fact.subject != *s {
+    if let Match::Is(s) = &pat.subject
+        && fact.subject != *s
+    {
         return false;
     }
-    if let Match::Is(p) = &pat.predicate && fact.predicate != *p {
+    if let Match::Is(p) = &pat.predicate
+        && fact.predicate != *p
+    {
         return false;
     }
-    if let Match::Is(o) = &pat.object && fact.object != *o {
+    if let Match::Is(o) = &pat.object
+        && fact.object != *o
+    {
         return false;
     }
     match &pat.asserter {
@@ -245,8 +251,7 @@ pub(crate) fn collapse_and_apply(
         HashMap::with_capacity(ops.len());
     let mut last_indexed: HashMap<(EntityId, Predicate, EntityId, OrderingKey), usize> =
         HashMap::with_capacity(ops.len());
-    let mut last_retract_single: HashMap<(EntityId, Predicate, EntityId), usize> =
-        HashMap::new();
+    let mut last_retract_single: HashMap<(EntityId, Predicate, EntityId), usize> = HashMap::new();
     let mut last_retract_set: HashMap<(EntityId, Predicate, EntityId, Term), usize> =
         HashMap::new();
     let mut last_retract_indexed: HashMap<(EntityId, Predicate, EntityId, OrderingKey), usize> =
@@ -365,9 +370,7 @@ pub(crate) fn collapse_and_apply(
                 // the Store API layer serialises writes per entity.
                 let already_open = storage.with_facts(sf.subject, sf.predicate, |facts| {
                     facts.iter().any(|f| {
-                        f.asserted.is_open()
-                            && f.asserter == sf.asserter
-                            && f.object == sf.object
+                        f.asserted.is_open() && f.asserter == sf.asserter && f.object == sf.object
                     })
                 });
                 if !already_open {

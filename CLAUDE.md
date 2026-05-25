@@ -29,6 +29,16 @@ The triple store PRD is found in `docs/triple_store_PRD.md`.
 `kernel.smol` is loaded as an embedded string at runtime; llvm-cov instruments
 Rust source only, so `just cov` numbers say nothing about Smol kernel code coverage.
 
+### Interpreter and `may` coroutines
+
+The current coroutine stack size is set to 128KB, which is a lot (comparatively, BEAM processes start with ~2KB). We should be aware of the Rust interpreter stack depth and try to minimize the stack overhead here, though future VM work may help ameliorate this issue. 
+
+### Futures
+
+Futures are in place for a reason to support the asynchronous-everywhere paradigm and REQUIRE very late resolution. Do NOT try to eagerly resolve futures as a solution to a problem - this is NOT the correct path. Instead, diagnose what part of the interpreter/evaluator made an incorrect assumption with respect to potential futures.
+
+### Other Items
+
 **Interim process (until tooling exists):** whenever kernel.smol is extended, do a
 manual method-by-method audit — every method body should be exercised by at least
 one Rust test in `eval.rs`, including both branches of every conditional. Ask
@@ -60,9 +70,12 @@ kernel grows significantly beyond its current size.
 
 I will add to this list as the project proceeds, but may also ask you to add things here as well. If something seems like it should be a preference or rule, please suggest putting it here. 
 
+- Very long thinking sessions must be avoided (i.e. greater than a couple minutes), I need more incremental feedback on the thought process to help avoid significant distractions and investigations that are off course. 
 - Do your research and provide references. 
 - Do not hallucinate unless otherwise asked for potentially creative solutions.
 - Do not be obsequious. Instead, review and accept valid criticism, or form a careful argument for an opposing view or approach if necessary. However, if I make a specific decision, then that decision must be respected. 
+- Do not assume you know what changes to make if unexpected build or test errors happen; instead, carefully diagnose the situation and present the diagnosis and options for the fix to the user. This is to prevent inadvertent "solutions" that are not correct and end up causing more problems. 
+- After you make edits to a Rust file, make sure to run `cargo fmt` and `cargo lint` to ensure code remains free from obvious issues. 
 - I prefer documentation that clearly states contracts; e.g. a function should clearly specify requirements and what it ensures. requirements and ensure should use code statement if possible, or very clear descriptions otherwise.
 - Contracts (`Requires:` / `Ensures:`) belong on the **method or function they govern**, not on the enclosing struct, enum, trait, or module. Type-level docs describe *purpose and shape*; per-method docs describe *behavior contracts*. If a constraint is a class invariant maintained across multiple methods, document it at the type level; otherwise put it where it is checked or relied upon.
 - Documentation for documentation's sake is not necessary, especially since we should be using clear naming.

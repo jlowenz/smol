@@ -26,16 +26,16 @@ pub enum Token {
     // Operators / punctuation
     /// Binary operator characters: `+ - * / < > <= >= = ~= , @ \ // >>`
     BinOp(Arc<str>),
-    Assign,      // :=
-    ColonColon,  // ::
-    Caret,       // ^
-    Dot,         // .
-    Semi,        // ;
-    Pipe,        // |
-    LParen,      // (
-    RParen,      // )
-    LBracket,    // [
-    RBracket,    // ]
+    Assign,     // :=
+    ColonColon, // ::
+    Caret,      // ^
+    Dot,        // .
+    Semi,       // ;
+    Pipe,       // |
+    LParen,     // (
+    RParen,     // )
+    LBracket,   // [
+    RBracket,   // ]
     /// Block parameter: `:name` inside `[...]`. The leading `:` is consumed by
     /// the lexer when it sees `:` followed by an alphabetic character and no `=`.
     BlockParam(Arc<str>),
@@ -102,7 +102,11 @@ impl<'src> Lexer<'src> {
     }
 
     fn skip_whitespace(&mut self) {
-        while self.peek_char().map(|c| c.is_ascii_whitespace()).unwrap_or(false) {
+        while self
+            .peek_char()
+            .map(|c| c.is_ascii_whitespace())
+            .unwrap_or(false)
+        {
             self.advance();
         }
     }
@@ -161,7 +165,11 @@ impl<'src> Lexer<'src> {
     fn read_number(&mut self, first: char, start: usize) -> Result<Token, LexError> {
         let mut s = String::new();
         s.push(first);
-        while self.peek_char().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        while self
+            .peek_char()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             s.push(self.advance().unwrap());
         }
         // Check for decimal point — only if followed by a digit (i.e. not statement terminator `.`).
@@ -172,7 +180,11 @@ impl<'src> Lexer<'src> {
             it.next(); // the dot
             if it.next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
                 s.push(self.advance().unwrap()); // consume `.`
-                while self.peek_char().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                while self
+                    .peek_char()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                {
                     s.push(self.advance().unwrap());
                 }
                 // Optional exponent.
@@ -181,21 +193,33 @@ impl<'src> Lexer<'src> {
                     if self.peek_char() == Some('+') || self.peek_char() == Some('-') {
                         s.push(self.advance().unwrap());
                     }
-                    if !self.peek_char().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    if !self
+                        .peek_char()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
                         return Err(LexError::InvalidNumber(start));
                     }
-                    while self.peek_char().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    while self
+                        .peek_char()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
                         s.push(self.advance().unwrap());
                     }
                 }
-                return s.parse::<f64>().map(Token::Float).map_err(|_| LexError::InvalidNumber(start));
+                return s
+                    .parse::<f64>()
+                    .map(Token::Float)
+                    .map_err(|_| LexError::InvalidNumber(start));
             }
         }
         match s.parse::<i64>() {
             Ok(n) => Ok(Token::Int(n)),
             Err(_) => {
                 // Only overflows; the string contains only digits so BigInt parse can't fail.
-                let big: num_bigint::BigInt = s.parse().map_err(|_| LexError::InvalidNumber(start))?;
+                let big: num_bigint::BigInt =
+                    s.parse().map_err(|_| LexError::InvalidNumber(start))?;
                 Ok(Token::LargeInt(Arc::new(big)))
             }
         }
@@ -237,8 +261,14 @@ impl<'src> Lexer<'src> {
         if let Some(next) = self.peek_char() {
             let two = matches!(
                 (first, next),
-                ('<', '=') | ('>', '=') | ('>', '>') | ('~', '=') | ('/', '/') | ('\\', '\\')
-                | ('-', '>') | ('~', '~')
+                ('<', '=')
+                    | ('>', '=')
+                    | ('>', '>')
+                    | ('~', '=')
+                    | ('/', '/')
+                    | ('\\', '\\')
+                    | ('-', '>')
+                    | ('~', '~')
             );
             if two {
                 s.push(self.advance().unwrap());
@@ -295,12 +325,20 @@ impl<'src> Lexer<'src> {
                 } else if self.peek_char() == Some(':') {
                     self.advance();
                     Ok(Token::ColonColon)
-                } else if self.peek_char().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
+                } else if self
+                    .peek_char()
+                    .map(|c| c.is_alphabetic() || c == '_')
+                    .unwrap_or(false)
+                {
                     // Block parameter: `:name` inside `[...]`.
                     let first = self.advance().unwrap();
                     let mut s = String::new();
                     s.push(first);
-                    while self.peek_char().map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false) {
+                    while self
+                        .peek_char()
+                        .map(|c| c.is_alphanumeric() || c == '_')
+                        .unwrap_or(false)
+                    {
                         s.push(self.advance().unwrap());
                     }
                     Ok(Token::BlockParam(Arc::from(s.as_str())))
@@ -322,7 +360,11 @@ impl<'src> Lexer<'src> {
                 // A `-` immediately followed by a digit (no whitespace) is a negative
                 // number literal, per ANSI Smalltalk. The sign is folded into the token
                 // so `Int(-3)`, `Float(-1.5)`, etc. are produced directly.
-                if self.peek_char().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                if self
+                    .peek_char()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+                {
                     self.read_number('-', start)
                 } else {
                     Ok(self.read_binop('-'))
@@ -392,7 +434,10 @@ mod tests {
         use num_bigint::BigInt;
         use std::str::FromStr;
         let big = BigInt::from_str("-99999999999999999999").unwrap();
-        assert_eq!(tok("-99999999999999999999"), vec![Token::LargeInt(Arc::new(big)), Token::Eof]);
+        assert_eq!(
+            tok("-99999999999999999999"),
+            vec![Token::LargeInt(Arc::new(big)), Token::Eof]
+        );
     }
 
     #[test]
@@ -408,10 +453,7 @@ mod tests {
             tok("x - 3"),
             vec![ident("x"), binop("-"), Token::Int(3), Token::Eof]
         );
-        assert_eq!(
-            tok("x -3"),
-            vec![ident("x"), Token::Int(-3), Token::Eof]
-        );
+        assert_eq!(tok("x -3"), vec![ident("x"), Token::Int(-3), Token::Eof]);
     }
 
     #[test]

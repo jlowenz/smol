@@ -12,10 +12,10 @@ use triple_store::id::EntityId;
 use triple_store::in_memory_store::InMemoryTripleStore;
 use triple_store::predicate_registry::Visibility;
 use triple_store::predicates::Cardinality;
+use triple_store::queryable::Queryable;
 use triple_store::store::Store;
 use triple_store::term::{Predicate, Term};
 use triple_store::time::{Clock, Timestamp};
-use triple_store::queryable::Queryable;
 use triple_store::triple_store::TripleStore;
 
 // Auto-incrementing clock: each `now()` returns a strictly increasing
@@ -137,8 +137,7 @@ fn bench_durable_assert(c: &mut Criterion) {
             || {
                 let dir = TempDir::new().unwrap();
                 let path = dir.path().join("wal.log");
-                let store =
-                    DurableFileTripleStore::create_with_clock(&path, tick_clock()).unwrap();
+                let store = DurableFileTripleStore::create_with_clock(&path, tick_clock()).unwrap();
                 (dir, store)
             },
             |(dir, store)| {
@@ -158,8 +157,7 @@ fn bench_durable_assert(c: &mut Criterion) {
             || {
                 let dir = TempDir::new().unwrap();
                 let path = dir.path().join("wal.log");
-                let store =
-                    DurableFileTripleStore::create_with_clock(&path, tick_clock()).unwrap();
+                let store = DurableFileTripleStore::create_with_clock(&path, tick_clock()).unwrap();
                 (dir, store)
             },
             |(dir, store)| {
@@ -192,9 +190,8 @@ fn bench_durable_replay(c: &mut Criterion) {
             let template_dir = TempDir::new().unwrap();
             let template_path = template_dir.path().join("template.log");
             {
-                let store =
-                    DurableFileTripleStore::create_with_clock(&template_path, tick_clock())
-                        .unwrap();
+                let store = DurableFileTripleStore::create_with_clock(&template_path, tick_clock())
+                    .unwrap();
                 for i in 0..n as u64 {
                     let mut tx = store.new_transaction();
                     tx.assert_single(mk_fact(i, i as i64));
@@ -237,7 +234,11 @@ fn bench_store_overhead(c: &mut Criterion) {
             |store| {
                 for i in 0..10u32 {
                     store
-                        .declare(&format!("pred.{i}"), Visibility::Public, Cardinality::Single)
+                        .declare(
+                            &format!("pred.{i}"),
+                            Visibility::Public,
+                            Cardinality::Single,
+                        )
                         .unwrap();
                 }
             },

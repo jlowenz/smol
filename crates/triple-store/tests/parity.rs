@@ -5,6 +5,7 @@
 //! outcomes (which `CommitChange` variant, what the query returns) without
 //! checking exact timestamps, so `SystemClock` is sufficient.
 
+use triple_store::DurableFileTripleStore;
 use triple_store::change::{ChangeEvent, ChangeKind};
 use triple_store::fact::{Fact, StoredFact};
 use triple_store::id::EntityId;
@@ -15,7 +16,6 @@ use triple_store::storage::CommitChange;
 use triple_store::term::{Predicate, Term};
 use triple_store::transaction::TxError;
 use triple_store::triple_store::TripleStore;
-use triple_store::DurableFileTripleStore;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -65,7 +65,10 @@ where
     {
         let s = make();
         let tx = s.new_transaction();
-        assert!(tx.commit().unwrap().is_empty(), "empty tx yields no changes");
+        assert!(
+            tx.commit().unwrap().is_empty(),
+            "empty tx yields no changes"
+        );
     }
 
     {
@@ -171,7 +174,11 @@ where
         tx.assert_set(mk_fact(1, 1, 20));
         let changes = tx.commit().unwrap();
         assert_eq!(changes.len(), 2);
-        assert!(changes.iter().all(|c| matches!(c, CommitChange::Asserted { .. })));
+        assert!(
+            changes
+                .iter()
+                .all(|c| matches!(c, CommitChange::Asserted { .. }))
+        );
     }
 
     {
@@ -226,7 +233,9 @@ where
         let mut tx2 = s.new_transaction();
         tx2.retract_single(EntityId(1), Predicate(0), EntityId(1));
         let changes = tx2.commit().unwrap();
-        assert!(matches!(&changes[0], CommitChange::Retracted { closed } if closed.object == Term::Int(42)));
+        assert!(
+            matches!(&changes[0], CommitChange::Retracted { closed } if closed.object == Term::Int(42))
+        );
     }
 
     {
@@ -345,7 +354,9 @@ where
         tx.commit().unwrap();
         let events = drain(&sub);
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0].kind, ChangeKind::Asserted { new_object } if *new_object == Term::Int(42)));
+        assert!(
+            matches!(&events[0].kind, ChangeKind::Asserted { new_object } if *new_object == Term::Int(42))
+        );
     }
 
     {
@@ -381,7 +392,11 @@ where
         tx.assert_set(mk_fact(2, 2, 30));
         let changes = tx.commit().unwrap();
         assert_eq!(changes.len(), 3);
-        assert!(changes.iter().all(|c| matches!(c, CommitChange::Asserted { .. })));
+        assert!(
+            changes
+                .iter()
+                .all(|c| matches!(c, CommitChange::Asserted { .. }))
+        );
     }
 }
 

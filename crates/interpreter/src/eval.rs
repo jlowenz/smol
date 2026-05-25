@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, OnceLock};
 
+use crate::entity::EntityId;
+
 use thiserror::Error;
 
 use crate::ast::*;
@@ -12,7 +14,7 @@ use crate::object::{IndexedStorage, Object};
 use crate::parser::Parser;
 use crate::value::{Block, Value};
 
-#[derive(Debug, Error, Clone)]
+#[derive(Debug, Error, Clone, PartialEq)]
 pub enum EvalError {
     #[error("{receiver_kind} does not understand #{selector}")]
     MessageNotUnderstood {
@@ -40,8 +42,14 @@ pub enum EvalError {
 /// The self-binding for the currently-executing method frame.
 #[derive(Clone)]
 pub enum SelfBinding {
-    Instance { receiver: Arc<Object>, defining_class: Arc<Class> },
-    ClassSide { class: Arc<Class>, defining_class: Arc<Class> },
+    Instance {
+        receiver: Arc<Object>,
+        defining_class: Arc<Class>,
+    },
+    ClassSide {
+        class: Arc<Class>,
+        defining_class: Arc<Class>,
+    },
 }
 
 pub struct Evaluator {
@@ -62,6 +70,12 @@ pub struct Evaluator {
     /// (i.e., evaluating a method body directly). Saved and restored by each
     /// `eval_block` call so nesting is handled correctly.
     current_block_home: Cell<Option<usize>>,
+    /// The `EntityId` of the entity whose message handler is currently executing
+    /// on this evaluator. `None` outside any entity handler. Used for sync
+    /// self-send detection. Stored here (not in a thread-local) because may
+    /// coroutines multiplex over OS threads with work-stealing, so a TLS value
+    /// is not reliably tied to the executing coroutine.
+    pub(crate) current_entity_id: Cell<Option<EntityId>>,
 }
 
 impl Default for Evaluator {
@@ -99,6 +113,7 @@ impl Evaluator {
             method_depth: Cell::new(0),
             active_namespace: RefCell::new(kernel),
             current_block_home: Cell::new(None),
+            current_entity_id: Cell::new(None),
         }
     }
 
@@ -164,7 +179,7 @@ impl Evaluator {
                 }
                 // 3. class variables
                 if let Some(owner) = receiver.class.lookup_class_var_owner(name)
-                    && let Some(v) = owner.class_var_storage.borrow().get(name).cloned()
+                    && let Some(v) = owner.class_var_storage.read().get(name).cloned()
                 {
                     return Some(v);
                 }
@@ -178,7 +193,7 @@ impl Evaluator {
                 }
                 // 2. class variables (no instance variables — class-side has none)
                 if let Some(owner) = class.lookup_class_var_owner(name)
-                    && let Some(v) = owner.class_var_storage.borrow().get(name).cloned()
+                    && let Some(v) = owner.class_var_storage.read().get(name).cloned()
                 {
                     return Some(v);
                 }
@@ -200,8 +215,10 @@ impl Evaluator {
             let top = self.method_stack.borrow().last().cloned();
             match top {
                 Some(SelfBinding::Instance { receiver, .. }) => {
-                    // Check ivar first.
-                    if receiver.slots.borrow().contains_key(name.as_ref()) {
+                    // Extract bool before any other receiver access to avoid holding
+                    // the Mutex guard across a re-entrant lock on the same object.
+                    let has_ivar = receiver.slots.lock().contains_key(name.as_ref());
+                    if has_ivar {
                         let ret = value.clone();
                         receiver.set_slot(name.clone(), value);
                         return Ok(ret);
@@ -209,7 +226,7 @@ impl Evaluator {
                     // Check class var.
                     if let Some(owner) = receiver.class.lookup_class_var_owner(name.as_ref()) {
                         let ret = value.clone();
-                        owner.class_var_storage.borrow_mut().insert(name.clone(), value);
+                        owner.class_var_storage.write().insert(name.clone(), value);
                         return Ok(ret);
                     }
                 }
@@ -217,7 +234,7 @@ impl Evaluator {
                     // No ivar check for class-side.
                     if let Some(owner) = class.lookup_class_var_owner(name.as_ref()) {
                         let ret = value.clone();
-                        owner.class_var_storage.borrow_mut().insert(name.clone(), value);
+                        owner.class_var_storage.write().insert(name.clone(), value);
                         return Ok(ret);
                     }
                 }
@@ -266,7 +283,9 @@ impl Evaluator {
                 // Target the home method for this return. Inside eval_block the home
                 // is the depth of the method that defined the block; at the method body
                 // level current_block_home is None so we use the current method depth.
-                let depth = self.current_block_home.get()
+                let depth = self
+                    .current_block_home
+                    .get()
                     .unwrap_or_else(|| self.method_depth.get());
                 Err(EvalError::Return(v, depth))
             }
@@ -274,9 +293,12 @@ impl Evaluator {
                 // Look up the class from env first (covers non-Kernel namespace classes).
                 let class = match self.lookup_var(&def.class_name, env) {
                     Some(Value::Class(c)) => c,
-                    Some(_) => return Err(EvalError::TypeError(
-                        format!("{} is not a class", def.class_name)
-                    )),
+                    Some(_) => {
+                        return Err(EvalError::TypeError(format!(
+                            "{} is not a class",
+                            def.class_name
+                        )));
+                    }
                     None => return Err(EvalError::UndefinedVariable(def.class_name.clone())),
                 };
                 let method = Arc::new(Method {
@@ -286,9 +308,9 @@ impl Evaluator {
                 });
                 let selector = def.pattern.selector();
                 if def.is_class_side {
-                    class.class_methods.borrow_mut().insert(selector, method);
+                    class.class_methods.write().insert(selector, method);
                 } else {
-                    class.methods.borrow_mut().insert(selector, method);
+                    class.methods.write().insert(selector, method);
                 }
                 Ok(Value::Nil)
             }
@@ -312,11 +334,17 @@ impl Evaluator {
                 let recv = self.eval_expr(receiver, env)?;
                 self.send(recv, message, env)
             }
-            Expr::Block { params, locals, body } => {
+            Expr::Block {
+                params,
+                locals,
+                body,
+            } => {
                 // Blocks inherit the home depth of their creation context: the same method
                 // that an enclosing block targets, or the current method depth if no block
                 // context is active. This ensures nested blocks all point to the right frame.
-                let home_depth = self.current_block_home.get()
+                let home_depth = self
+                    .current_block_home
+                    .get()
                     .unwrap_or_else(|| self.method_depth.get());
                 Ok(Value::Block(Arc::new(Block {
                     params: params.clone(),
@@ -324,6 +352,7 @@ impl Evaluator {
                     body: body.clone(),
                     env: env.clone(),
                     home_depth,
+                    home_entity: self.current_entity_id.get(),
                 })))
             }
             Expr::Cascade { receiver, messages } => {
@@ -334,27 +363,28 @@ impl Evaluator {
                 }
                 Ok(result)
             }
-            Expr::NamespaceRef { namespace_path, name } => {
-                self.eval_namespace_ref(namespace_path, name, env)
-            }
-            Expr::ArrayLiteral(elements) => {
-                self.eval_array_literal(elements, env)
-            }
+            Expr::NamespaceRef {
+                namespace_path,
+                name,
+            } => self.eval_namespace_ref(namespace_path, name, env),
+            Expr::ArrayLiteral(elements) => self.eval_array_literal(elements, env),
         }
     }
 
     fn eval_array_literal(&self, elements: &[Literal], env: &mut Env) -> Result<Value, EvalError> {
-        let array_class = self.registry.kernel()
+        let array_class = self
+            .registry
+            .kernel()
             .lookup_class("Array")
             .ok_or_else(|| EvalError::UndefinedVariable(Arc::from("Array")))?;
         let obj = Arc::new(Object::new_with_indexed(array_class, elements.len()));
         for (i, elem) in elements.iter().enumerate() {
             let v = self.eval_literal_as_value(elem, env)?;
             if let Some(IndexedStorage::Pointer(slots)) = obj.indexed.as_ref() {
-                slots.borrow_mut()[i] = v;
+                slots.lock()[i] = v;
             }
         }
-        Ok(Value::Object(obj))
+        Ok(Value::ValueObject(obj))
     }
 
     /// Evaluate a `Literal` into a runtime `Value`. For `Literal::Array` this
@@ -375,8 +405,11 @@ impl Evaluator {
                 self.dispatch(recv, op.clone(), vec![arg_val], env)
             }
             Message::Keyword { parts } => {
-                let selector: Arc<str> =
-                    parts.iter().map(|(k, _)| k.as_ref()).collect::<String>().into();
+                let selector: Arc<str> = parts
+                    .iter()
+                    .map(|(k, _)| k.as_ref())
+                    .collect::<String>()
+                    .into();
                 let mut args = Vec::with_capacity(parts.len());
                 for (_, expr) in parts {
                     args.push(self.eval_expr(expr, env)?);
@@ -387,7 +420,11 @@ impl Evaluator {
     }
 
     /// Evaluate message args for a super send without evaluating the receiver.
-    fn eval_message_args(&self, message: &Message, env: &mut Env) -> Result<(Arc<str>, Vec<Value>), EvalError> {
+    fn eval_message_args(
+        &self,
+        message: &Message,
+        env: &mut Env,
+    ) -> Result<(Arc<str>, Vec<Value>), EvalError> {
         match message {
             Message::Unary(sel) => Ok((sel.clone(), vec![])),
             Message::Binary { op, arg } => {
@@ -395,7 +432,11 @@ impl Evaluator {
                 Ok((op.clone(), vec![v]))
             }
             Message::Keyword { parts } => {
-                let selector: Arc<str> = parts.iter().map(|(k, _)| k.as_ref()).collect::<String>().into();
+                let selector: Arc<str> = parts
+                    .iter()
+                    .map(|(k, _)| k.as_ref())
+                    .collect::<String>()
+                    .into();
                 let mut args = Vec::with_capacity(parts.len());
                 for (_, expr) in parts {
                     args.push(self.eval_expr(expr, env)?);
@@ -408,31 +449,38 @@ impl Evaluator {
     /// Handle `super send`: look up the selector starting from the superclass of
     /// the defining class and invoke on the current receiver.
     fn send_super(&self, message: &Message, env: &mut Env) -> Result<Value, EvalError> {
-        let defining_class = self.current_defining_class().ok_or_else(|| {
-            EvalError::TypeError("super used outside method context".into())
-        })?;
-        let superclass = defining_class.superclass.as_ref().ok_or_else(|| {
-            EvalError::TypeError(format!(
-                "super sent in {} which has no superclass",
-                defining_class.name
-            ))
-        })?.clone();
+        let defining_class = self
+            .current_defining_class()
+            .ok_or_else(|| EvalError::TypeError("super used outside method context".into()))?;
+        let superclass = defining_class
+            .superclass
+            .as_ref()
+            .ok_or_else(|| {
+                EvalError::TypeError(format!(
+                    "super sent in {} which has no superclass",
+                    defining_class.name
+                ))
+            })?
+            .clone();
         let (selector, args) = self.eval_message_args(message, env)?;
 
         // Clone the top binding to avoid holding the RefCell borrow during invoke.
         let top = self.method_stack.borrow().last().cloned();
         match top {
-            Some(SelfBinding::Instance { receiver, .. }) => {
-                match superclass.lookup(&selector) {
-                    Some((method, def_class)) => {
-                        self.invoke_method(receiver, def_class, method, args, env)
-                    }
-                    None => Err(EvalError::MessageNotUnderstood {
-                        receiver_kind: "Object",
-                        selector,
-                    }),
-                }
-            }
+            Some(SelfBinding::Instance { receiver, .. }) => match superclass.lookup(&selector) {
+                Some((method, def_class)) => self.invoke_method(
+                    receiver.clone(),
+                    def_class,
+                    method,
+                    args,
+                    env,
+                    Value::ValueObject(receiver),
+                ),
+                None => Err(EvalError::MessageNotUnderstood {
+                    receiver_kind: "Object",
+                    selector,
+                }),
+            },
             Some(SelfBinding::ClassSide { class, .. }) => {
                 match superclass.lookup_class_method(&selector) {
                     Some((method, def_class)) => {
@@ -441,10 +489,14 @@ impl Evaluator {
                     // No user-defined super method; fall through to built-in class
                     // dispatch so `super new` / `super new:` reach the Rust primitives
                     // without re-entering the receiver's own `new` override.
-                    None => crate::builtins::dispatch_class_builtin(self, class, selector, args, env),
+                    None => {
+                        crate::builtins::dispatch_class_builtin(self, class, selector, args, env)
+                    }
                 }
             }
-            None => Err(EvalError::TypeError("super used outside method context".into())),
+            None => Err(EvalError::TypeError(
+                "super used outside method context".into(),
+            )),
         }
     }
 
@@ -455,15 +507,17 @@ impl Evaluator {
         name: &Arc<str>,
         env: &mut Env,
     ) -> Result<Value, EvalError> {
-        let first = namespace_path.first().ok_or_else(|| {
-            EvalError::TypeError("empty namespace path".into())
-        })?;
+        let first = namespace_path
+            .first()
+            .ok_or_else(|| EvalError::TypeError("empty namespace path".into()))?;
         let mut ns = match self.lookup_var(first.as_ref(), env) {
             Some(Value::Namespace(ns)) => ns,
-            Some(other) => return Err(EvalError::TypeError(format!(
-                "{first} is not a namespace, got {}",
-                other.kind()
-            ))),
+            Some(other) => {
+                return Err(EvalError::TypeError(format!(
+                    "{first} is not a namespace, got {}",
+                    other.kind()
+                )));
+            }
             None => return Err(EvalError::UndefinedVariable(first.clone())),
         };
         for segment in &namespace_path[1..] {
@@ -476,10 +530,9 @@ impl Evaluator {
         }
         ns.lookup_class(name.as_ref())
             .map(Value::Class)
-            .ok_or_else(|| EvalError::TypeError(format!(
-                "class {name} not found in namespace {}",
-                ns.name
-            )))
+            .ok_or_else(|| {
+                EvalError::TypeError(format!("class {name} not found in namespace {}", ns.name))
+            })
     }
 
     /// Dispatches a message to a value. `selector` is the full selector string.
@@ -528,6 +581,57 @@ impl Evaluator {
         result
     }
 
+    /// Evaluate a `Block` with sync semantics: after each statement any
+    /// `Value::Future` result is awaited before proceeding to the next.
+    ///
+    /// Requires: `args.len() == block.params.len()`.
+    /// Ensures: every statement result is fully resolved before the next
+    ///   statement runs; the final result is fully resolved.
+    pub fn eval_block_sync(
+        &self,
+        block: &Block,
+        args: Vec<Value>,
+        _outer_env: &mut Env,
+    ) -> Result<Value, EvalError> {
+        if args.len() != block.params.len() {
+            return Err(EvalError::ArityMismatch {
+                expected: block.params.len(),
+                got: args.len(),
+            });
+        }
+        let prev_home = self.current_block_home.get();
+        self.current_block_home.set(Some(block.home_depth));
+
+        let mut block_env = block.env.clone();
+        block_env.push_frame();
+        for name in &block.locals {
+            block_env.define(name.clone(), Value::Nil);
+        }
+        for (name, val) in block.params.iter().zip(args) {
+            block_env.define(name.clone(), val);
+        }
+        let result = self.eval_program_sync(&block.body, &mut block_env);
+        block_env.pop_frame();
+        self.current_block_home.set(prev_home);
+        result
+    }
+
+    fn eval_program_sync(&self, stmts: &[Stmt], env: &mut Env) -> Result<Value, EvalError> {
+        for stmt in stmts {
+            if let Stmt::LocalDecl(names) = stmt {
+                for name in names {
+                    env.define(name.clone(), Value::Nil);
+                }
+            }
+        }
+        let mut last = Value::Nil;
+        for stmt in stmts {
+            let v = self.eval_stmt(stmt, env)?;
+            last = crate::builtins::force_value(v)?;
+        }
+        Ok(last)
+    }
+
     /// Invoke a user-defined method on a receiver object.
     ///
     /// Requires: `args.len() == method.pattern.params().len()`.
@@ -541,6 +645,7 @@ impl Evaluator {
         method: Arc<Method>,
         args: Vec<Value>,
         env: &mut Env,
+        self_value: Value,
     ) -> Result<Value, EvalError> {
         let params = method.pattern.params();
         if args.len() != params.len() {
@@ -551,7 +656,7 @@ impl Evaluator {
         }
         let mut method_env = env.clone();
         method_env.push_frame();
-        method_env.define(self_sym(), Value::Object(receiver.clone()));
+        method_env.define(self_sym(), self_value.clone());
         for (param, val) in params.iter().zip(args.iter()) {
             method_env.define(param.clone(), val.clone());
         }
@@ -632,9 +737,33 @@ impl Evaluator {
         env: &mut Env,
     ) -> Result<Arc<Object>, EvalError> {
         if let Some((method, def_class)) = obj.class.lookup("initialize") {
-            self.invoke_method(obj.clone(), def_class, method, vec![], env)?;
+            self.invoke_method(
+                obj.clone(),
+                def_class,
+                method,
+                vec![],
+                env,
+                Value::ValueObject(obj.clone()),
+            )?;
         }
         Ok(obj)
+    }
+
+    /// Create an evaluator from an existing `ClassRegistry`, loading `kernel.smol`.
+    ///
+    /// Ensures: same post-conditions as `new()` but shares the given registry
+    ///   instead of creating a fresh one. Intended for entity message loops so
+    ///   that all entities share a single registry and kernel class set.
+    pub fn with_registry(registry: Arc<ClassRegistry>) -> Self {
+        let kernel = registry.kernel();
+        Self {
+            registry,
+            method_stack: RefCell::new(Vec::new()),
+            method_depth: Cell::new(0),
+            active_namespace: RefCell::new(kernel),
+            current_block_home: Cell::new(None),
+            current_entity_id: Cell::new(None),
+        }
     }
 }
 
@@ -656,30 +785,16 @@ fn eval_literal(lit: &Literal) -> Value {
         Literal::LargeInt(n) => Value::LargeInt(n.clone()),
         // Array literals are always reached via Expr::ArrayLiteral -> eval_array_literal,
         // never via this path. Reaching here is an evaluator bug.
-        Literal::Array(_) => unreachable!("Literal::Array must be evaluated via eval_array_literal"),
+        Literal::Array(_) => {
+            unreachable!("Literal::Array must be evaluated via eval_array_literal")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::Parser;
-
-    fn eval(src: &str) -> Value {
-        let prog = Parser::parse(src).expect("parse");
-        let ev = Evaluator::new();
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
-        ev.eval_program(&prog.stmts, &mut env).expect("eval")
-    }
-
-    fn eval_err(src: &str) -> EvalError {
-        let prog = Parser::parse(src).expect("parse");
-        let ev = Evaluator::new();
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
-        ev.eval_program(&prog.stmts, &mut env).expect_err("expected error")
-    }
+    use crate::test_helpers::{eval, eval_err};
 
     #[test]
     fn integer_arithmetic() {
@@ -714,8 +829,18 @@ mod tests {
     }
 
     #[test]
+    fn block_in_block_value() {
+        let src = r#"
+        | b | b := [ :b | b value + 1 ]. b value: [42]"#;
+        assert_eq!(eval(src), Value::Int(43));
+    }
+
+    #[test]
     fn times_repeat() {
-        assert_eq!(eval("| n | n := 0. 3 timesRepeat: [n := n + 1]. n"), Value::Int(3));
+        assert_eq!(
+            eval("| n | n := 0. 3 timesRepeat: [n := n + 1]. n"),
+            Value::Int(3)
+        );
     }
 
     #[test]
@@ -765,7 +890,10 @@ mod tests {
 
     #[test]
     fn message_not_understood() {
-        matches!(eval_err("42 unknownMsg"), EvalError::MessageNotUnderstood { .. });
+        matches!(
+            eval_err("42 unknownMsg"),
+            EvalError::MessageNotUnderstood { .. }
+        );
     }
 
     #[test]
@@ -778,7 +906,10 @@ mod tests {
 
     #[test]
     fn string_concat() {
-        assert_eq!(eval("'hello' , ' world'"), Value::Str(Arc::from("hello world")));
+        assert_eq!(
+            eval("'hello' , ' world'"),
+            Value::Str(Arc::from("hello world"))
+        );
     }
 
     #[test]
@@ -931,12 +1062,14 @@ result
         ev.registry.populate_env(&mut env);
 
         // Inside MyLib do: [...], Widget is accessible by simple name.
-        let result = ev.eval_program(
-            &Parser::parse(r#"
+        let result = ev
+            .eval_program(
+                &Parser::parse(
+                    r#"
 | result |
 MyLib do: [
     | w |
-    Object subclass: #Widget instanceVariableNames: 'val'.
+    Value subclass: #Widget instanceVariableNames: 'val'.
     Widget >> setVal: v [ val := v ]
     Widget >> val [ ^val ]
     w := Widget new.
@@ -944,23 +1077,30 @@ MyLib do: [
     result := w val
 ].
 result
-"#).expect("parse").stmts,
-            &mut env,
-        ).expect("eval");
+"#,
+                )
+                .expect("parse")
+                .stmts,
+                &mut env,
+            )
+            .expect("eval");
         assert_eq!(result, Value::Int(42));
 
         // After the block, bare Widget is not in scope.
-        let err = ev.eval_program(
-            &Parser::parse("Widget").expect("parse").stmts,
-            &mut env,
-        ).expect_err("Widget should be out of scope after do: block");
+        let err = ev
+            .eval_program(&Parser::parse("Widget").expect("parse").stmts, &mut env)
+            .expect_err("Widget should be out of scope after do: block");
         assert!(matches!(err, EvalError::UndefinedVariable(_)));
 
         // Widget remains accessible via the namespace ref.
-        let via_ns = ev.eval_program(
-            &Parser::parse("MyLib::Widget new printString").expect("parse").stmts,
-            &mut env,
-        ).expect("namespace ref");
+        let via_ns = ev
+            .eval_program(
+                &Parser::parse("MyLib::Widget new printString")
+                    .expect("parse")
+                    .stmts,
+                &mut env,
+            )
+            .expect("namespace ref"); // Widget is Value subclass: — synchronous, no future
         assert_eq!(via_ns, Value::Str(Arc::from("a Widget")));
     }
 
@@ -978,7 +1118,10 @@ result
         ev.registry.populate_env(&mut env);
         assert!(matches!(env.get("Array"), Some(Value::Class(_))));
         assert!(matches!(env.get("ByteArray"), Some(Value::Class(_))));
-        assert!(matches!(env.get("OrderedCollection"), Some(Value::Class(_))));
+        assert!(matches!(
+            env.get("OrderedCollection"),
+            Some(Value::Class(_))
+        ));
     }
 
     // ── Array protocol ────────────────────────────────────────────────────────
@@ -1016,16 +1159,77 @@ result
     }
 
     #[test]
+    fn value_object_update_basic() {
+        assert_eq!(
+            eval("| s | s := ValueObject initialValue: 0. s update: [:old | old + 1]. s get"),
+            Value::Int(1)
+        );
+    }
+
+    // Does a block sent cross-entity see a free variable from an outer block?
+    #[test]
+    fn value_object_update_captures_outer_var() {
+        assert_eq!(
+            eval(
+                "| s | s := ValueObject initialValue: 0. [:x | s update: [:old | old + x]] value: 5. s get"
+            ),
+            Value::Int(5)
+        );
+    }
+
+    #[test]
+    fn await_resolves_future() {
+        assert_eq!(
+            eval("| s | s := ValueObject initialValue: 42. (s get) await"),
+            Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn await_is_noop_on_non_future() {
+        assert_eq!(eval("42 await"), Value::Int(42));
+    }
+
+    #[test]
+    fn sync_value_block_sequences_cross_entity_sends() {
+        assert_eq!(
+            eval(
+                "| s | s := ValueObject initialValue: 0. [s update: [:old | old + 5]. s get] syncValue"
+            ),
+            Value::Int(5)
+        );
+    }
+
+    #[test]
+    fn future_then_chains_after_completion() {
+        assert_eq!(
+            eval(
+                "| a s | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3.
+                s := ValueObject initialValue: 0.
+                (a do: [:e | s update: [:old | old + e]]) then: [s get]"
+            ),
+            Value::Int(6)
+        );
+    }
+
+    #[test]
     fn array_do_iterates() {
         assert_eq!(
-            eval("| a s | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. s := 0. a do: [:e | s := s + e]. s"),
+            eval(
+                "| a s | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3.
+                s := ValueObject initialValue: 0.
+                (a do: [:e | s update: [:old | old + e]]) await.
+                s get"
+            ),
             Value::Int(6)
         );
     }
 
     #[test]
     fn array_collect_maps() {
-        let src = "| a r | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. r := a collect: [:e | e * 2]. r at: 2";
+        let src = "| a r | 
+        a := (Array new: 3) at: 0 put: 1; at: 1 put: 2; at: 2 put: 3; yourself.
+        r := a collect: [:e | e * 2]. r at: 2";
         assert_eq!(eval(src), Value::Int(6));
     }
 
@@ -1077,17 +1281,25 @@ result
 
     #[test]
     fn array_equality() {
-        let src = "| a b | a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2. b := Array new: 2. b at: 0 put: 1. b at: 1 put: 2. a = b";
+        let src = "| a b | 
+        a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2. 
+        b := Array new: 2. b at: 0 put: 1. b at: 1 put: 2. 
+        a = b";
         assert_eq!(eval(src), Value::Bool(true));
-        let src2 = "| a b | a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2. b := Array new: 2. b at: 0 put: 1. b at: 1 put: 9. a = b";
+        let src2 = "| a b | 
+        a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2. 
+        b := Array new: 2. b at: 0 put: 1. b at: 1 put: 9. 
+        a = b";
         assert_eq!(eval(src2), Value::Bool(false));
     }
 
     #[test]
     fn array_not_equal() {
-        let src = "| a b | a := Array new: 1. b := Array new: 1. a at: 0 put: 1. b at: 0 put: 2. a ~= b";
+        let src =
+            "| a b | a := Array new: 1. b := Array new: 1. a at: 0 put: 1. b at: 0 put: 2. a ~= b";
         assert_eq!(eval(src), Value::Bool(true));
-        let src2 = "| a b | a := Array new: 1. b := Array new: 1. a at: 0 put: 5. b at: 0 put: 5. a ~= b";
+        let src2 =
+            "| a b | a := Array new: 1. b := Array new: 1. a at: 0 put: 5. b at: 0 put: 5. a ~= b";
         assert_eq!(eval(src2), Value::Bool(false));
     }
 
@@ -1106,7 +1318,9 @@ result
 
     #[test]
     fn array_print_string() {
-        let src = "| a | a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2. a printString";
+        let src = "| a | 
+        a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2. 
+        a printString";
         assert_eq!(eval(src), Value::Str(Arc::from("(1 2 )")));
     }
 
@@ -1139,7 +1353,13 @@ result
 
     #[test]
     fn bytearray_do() {
-        let src = "| b s | b := ByteArray new: 3. b at: 0 put: 10. b at: 1 put: 20. b at: 2 put: 30. s := 0. b do: [:e | s := s + e]. s";
+        let src = "| b s | 
+        b := ByteArray new: 3. 
+        b at: 0 put: 10. 
+        b at: 1 put: 20. 
+        b at: 2 put: 30. 
+        s := ValueObject initialValue: 0.
+        (b do: [:e | s update: [ :old | old + e ]]) await. s get";
         assert_eq!(eval(src), Value::Int(60));
     }
 
@@ -1174,31 +1394,38 @@ result
 
     #[test]
     fn oc_first_last() {
-        let src = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc first";
+        let src =
+            "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc first";
         assert_eq!(eval(src), Value::Int(10));
-        let src2 = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc last";
+        let src2 =
+            "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc last";
         assert_eq!(eval(src2), Value::Int(30));
     }
 
     #[test]
     fn oc_add_first_prepends() {
-        let src = "| oc | oc := OrderedCollection new. oc add: 2. oc add: 3. oc addFirst: 1. oc at: 0";
+        let src =
+            "| oc | oc := OrderedCollection new. oc add: 2. oc add: 3. oc addFirst: 1. oc at: 0";
         assert_eq!(eval(src), Value::Int(1));
     }
 
     #[test]
     fn oc_remove_first() {
-        let src = "| oc v | oc := OrderedCollection new. oc add: 10. oc add: 20. v := oc removeFirst. v";
+        let src =
+            "| oc v | oc := OrderedCollection new. oc add: 10. oc add: 20. v := oc removeFirst. v";
         assert_eq!(eval(src), Value::Int(10));
-        let src2 = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc removeFirst. oc size";
+        let src2 =
+            "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc removeFirst. oc size";
         assert_eq!(eval(src2), Value::Int(1));
     }
 
     #[test]
     fn oc_remove_last() {
-        let src = "| oc v | oc := OrderedCollection new. oc add: 10. oc add: 20. v := oc removeLast. v";
+        let src =
+            "| oc v | oc := OrderedCollection new. oc add: 10. oc add: 20. v := oc removeLast. v";
         assert_eq!(eval(src), Value::Int(20));
-        let src2 = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc removeLast. oc size";
+        let src2 =
+            "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc removeLast. oc size";
         assert_eq!(eval(src2), Value::Int(1));
     }
 
@@ -1206,13 +1433,16 @@ result
     fn oc_remove_if_absent() {
         let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc remove: 2 ifAbsent: [0]. oc size";
         assert_eq!(eval(src), Value::Int(2));
-        let src2 = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc remove: 9 ifAbsent: [99]";
+        let src2 =
+            "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc remove: 9 ifAbsent: [99]";
         assert_eq!(eval(src2), Value::Int(99));
     }
 
     #[test]
     fn oc_do_iterates() {
-        let src = "| oc s | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. s := 0. oc do: [:e | s := s + e]. s";
+        let src = "| oc s | 
+        oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. s := 0. 
+        (oc do: [:e | s := s + e]) then: [s]";
         assert_eq!(eval(src), Value::Int(6));
     }
 
@@ -1282,7 +1512,8 @@ result
 
     #[test]
     fn oc_detect_no_match_signals() {
-        let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc detect: [:e | e > 10]";
+        let src =
+            "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc detect: [:e | e > 10]";
         assert!(matches!(eval_err(src), EvalError::Signal(_)));
     }
 
@@ -1367,7 +1598,10 @@ result
 
     #[test]
     fn array_literal_mixed_types() {
-        assert_eq!(eval("#(1 'hello' true nil) at: 1"), Value::Str(Arc::from("hello")));
+        assert_eq!(
+            eval("#(1 'hello' true nil) at: 1"),
+            Value::Str(Arc::from("hello"))
+        );
         assert_eq!(eval("#(1 'hello' true nil) at: 2"), Value::Bool(true));
         assert_eq!(eval("#(1 'hello' true nil) at: 3"), Value::Nil);
     }
@@ -1498,7 +1732,27 @@ Foo new error: 'bad'
 Object subclass: #Foo instanceVariableNames: ''.
 [Foo new error: 'caught me'] on: Error do: [:e | e]
 "#;
-        assert_eq!(eval(src), Value::Str(Arc::from("caught me")));
+        assert_eq!(eval_err(src), EvalError::Signal(Arc::from("caught me")));
+    }
+
+    #[test]
+    fn error_in_block_enclosing_value() {
+        let src = r#"
+Value subclass: #Test instanceVariableNames: ''.
+[Test new error: 'what'] value."#;
+        let ret = eval_err(src);
+        println!("error in block: {}", ret);
+        assert!(matches!(ret, EvalError::Signal(_)));
+    }
+
+    #[test]
+    fn error_in_block_enclosing_object() {
+        let src = r#"
+Object subclass: #Test instanceVariableNames: ''.
+[Test new error: 'what'] value."#;
+        let ret = eval_err(src);
+        println!("error in block: {}", ret);
+        assert!(matches!(ret, EvalError::Signal(_)));
     }
 
     // ── _primHash ─────────────────────────────────────────────────────────────
@@ -1664,7 +1918,8 @@ a _primHash = b _primHash
     fn dict_remove_key_if_absent() {
         let src = "| d | d := Dictionary new. d at: 'k' put: 42. d removeKey: 'k' ifAbsent: [0]";
         assert_eq!(eval(src), Value::Int(42));
-        let src2 = "| d | d := Dictionary new. d at: 'k' put: 42. d removeKey: 'k' ifAbsent: [0]. d size";
+        let src2 =
+            "| d | d := Dictionary new. d at: 'k' put: 42. d removeKey: 'k' ifAbsent: [0]. d size";
         assert_eq!(eval(src2), Value::Int(0));
         let src3 = "| d | d := Dictionary new. d removeKey: 'missing' ifAbsent: [99]";
         assert_eq!(eval(src3), Value::Int(99));
@@ -1678,9 +1933,8 @@ d := Dictionary new.
 d at: 'a' put: 1.
 d at: 'b' put: 2.
 d at: 'c' put: 3.
-s := 0.
-d do: [:v | s := s + v].
-s
+s := ValueObject initialValue: 0.
+(d do: [:v | s update: [:old| old + v]]) then: [s get].
 "#;
         assert_eq!(eval(src), Value::Int(6));
     }
@@ -1692,8 +1946,7 @@ s
 d := Dictionary new.
 d at: 'x' put: 0.
 r := OrderedCollection new.
-d keysDo: [:k | r add: k].
-r size
+(d keysDo: [:k | r add: k]) then: [r size].
 "#;
         assert_eq!(eval(src), Value::Int(1));
     }
@@ -1705,7 +1958,7 @@ r size
 d := Dictionary new.
 d at: 'k' put: 7.
 pairs := OrderedCollection new.
-d associationsDo: [:assoc | pairs add: assoc value].
+(d associationsDo: [:assoc | pairs add: assoc value]) await.
 pairs at: 0
 "#;
         assert_eq!(eval(src), Value::Int(7));
@@ -1797,15 +2050,13 @@ d removeKey: 'b' ifAbsent: [0].
         let src = r#"
 | d |
 d := Dictionary new.
-1 to: 12 do: [:i | d at: i put: i * i].
-d size
+(1 to: 12 do: [:i | d at: i put: i * i]) then: [d size]
 "#;
         assert_eq!(eval(src), Value::Int(12));
         let src2 = r#"
 | d |
 d := Dictionary new.
-1 to: 12 do: [:i | d at: i put: i * i].
-d at: 7
+(1 to: 12 do: [:i | d at: i put: i * i]) then: [d at: 7]
 "#;
         assert_eq!(eval(src2), Value::Int(49));
     }
@@ -1821,5 +2072,4 @@ d at: 7
         let src = "| d | d := Dictionary new. d at: #foo put: 42. d at: #foo";
         assert_eq!(eval(src), Value::Int(42));
     }
-
 }

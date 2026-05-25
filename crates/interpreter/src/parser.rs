@@ -36,7 +36,13 @@ pub struct Parser {
 impl Parser {
     pub fn parse(src: &str) -> Result<Program, ParseError> {
         let tokens = Lexer::tokenize(src)?;
-        let mut p = Parser { tokens, pos: 0, comments: Vec::new(), in_method: false, in_block: false };
+        let mut p = Parser {
+            tokens,
+            pos: 0,
+            comments: Vec::new(),
+            in_method: false,
+            in_block: false,
+        };
         p.parse_program()
     }
 
@@ -67,7 +73,11 @@ impl Parser {
         tok
     }
 
-    fn expect(&mut self, expected: &'static str, pred: impl Fn(&Token) -> bool) -> Result<Token, ParseError> {
+    fn expect(
+        &mut self,
+        expected: &'static str,
+        pred: impl Fn(&Token) -> bool,
+    ) -> Result<Token, ParseError> {
         let tok = self.peek().clone();
         if pred(&tok) {
             Ok(self.advance())
@@ -101,7 +111,10 @@ impl Parser {
             stmts.push(self.parse_stmt()?);
             self.eat(&Token::Dot);
         }
-        Ok(Program { stmts, comments: std::mem::take(&mut self.comments) })
+        Ok(Program {
+            stmts,
+            comments: std::mem::take(&mut self.comments),
+        })
     }
 
     fn parse_local_decl(&mut self) -> Result<Stmt, ParseError> {
@@ -128,18 +141,20 @@ impl Parser {
 
         // Method def lookahead: IDENT '>>' (instance-side) or IDENT Ident("class") '>>' (class-side)
         {
-            let is_method_def = matches!(self.tokens[self.pos], Token::Ident(_)) && {
-                let mut i = self.pos + 1;
-                while i < self.tokens.len() && matches!(self.tokens[i], Token::Comment(_)) {
-                    i += 1;
-                }
-                // instance-side: IDENT >>
-                let direct_arrow = matches!(self.tokens.get(i), Some(Token::BinOp(op)) if op.as_ref() == ">>");
-                // class-side: IDENT Ident("class") >>
-                let class_side_arrow = matches!(self.tokens.get(i), Some(Token::Ident(s)) if s.as_ref() == "class")
-                    && matches!(self.tokens.get(i + 1), Some(Token::BinOp(op)) if op.as_ref() == ">>");
-                direct_arrow || class_side_arrow
-            };
+            let is_method_def = matches!(self.tokens[self.pos], Token::Ident(_))
+                && {
+                    let mut i = self.pos + 1;
+                    while i < self.tokens.len() && matches!(self.tokens[i], Token::Comment(_)) {
+                        i += 1;
+                    }
+                    // instance-side: IDENT >>
+                    let direct_arrow =
+                        matches!(self.tokens.get(i), Some(Token::BinOp(op)) if op.as_ref() == ">>");
+                    // class-side: IDENT Ident("class") >>
+                    let class_side_arrow = matches!(self.tokens.get(i), Some(Token::Ident(s)) if s.as_ref() == "class")
+                        && matches!(self.tokens.get(i + 1), Some(Token::BinOp(op)) if op.as_ref() == ">>");
+                    direct_arrow || class_side_arrow
+                };
             if is_method_def {
                 return self.parse_method_def();
             }
@@ -148,19 +163,18 @@ impl Parser {
         // Assignment: lookahead — Ident followed immediately by Assign.
         // We must look at raw tokens (pre-comment-skip) so we don't over-consume.
         {
-            let is_assign = matches!(self.tokens[self.pos], Token::Ident(_))
-                && {
-                    // Skip any comments between ident and next real token.
-                    let mut i = self.pos + 1;
-                    while i < self.tokens.len() {
-                        if matches!(self.tokens[i], Token::Comment(_)) {
-                            i += 1;
-                        } else {
-                            break;
-                        }
+            let is_assign = matches!(self.tokens[self.pos], Token::Ident(_)) && {
+                // Skip any comments between ident and next real token.
+                let mut i = self.pos + 1;
+                while i < self.tokens.len() {
+                    if matches!(self.tokens[i], Token::Comment(_)) {
+                        i += 1;
+                    } else {
+                        break;
                     }
-                    matches!(self.tokens.get(i), Some(Token::Assign))
-                };
+                }
+                matches!(self.tokens.get(i), Some(Token::Assign))
+            };
             if is_assign {
                 let name = match self.advance() {
                     Token::Ident(n) => n,
@@ -208,10 +222,11 @@ impl Parser {
                 let mut parts = Vec::new();
                 while let Token::Keyword(kw) = self.peek().clone() {
                     self.advance();
-                    let param = match self.expect("parameter name", |t| matches!(t, Token::Ident(_)))? {
-                        Token::Ident(n) => n,
-                        _ => unreachable!(),
-                    };
+                    let param =
+                        match self.expect("parameter name", |t| matches!(t, Token::Ident(_)))? {
+                            Token::Ident(n) => n,
+                            _ => unreachable!(),
+                        };
                     parts.push((kw, param));
                 }
                 MethodPattern::Keyword { parts }
@@ -249,7 +264,13 @@ impl Parser {
         self.in_block = prev_in_block;
         self.expect("']'", |t| t == &Token::RBracket)?;
 
-        Ok(Stmt::MethodDef(MethodDef { class_name, pattern, locals, body, is_class_side }))
+        Ok(Stmt::MethodDef(MethodDef {
+            class_name,
+            pattern,
+            locals,
+            body,
+            is_class_side,
+        }))
     }
 
     // ── Precedence levels ─────────────────────────────────────────────────────
@@ -290,13 +311,21 @@ impl Parser {
         // `Send`. Unwrap it so we have the bare receiver + first message.
         let (receiver, first_msg) = match first_receiver {
             Expr::Send { receiver, message } => (*receiver, message),
-            _ => return Err(ParseError::UnexpectedToken(Token::Semi, "message send before ';'")),
+            _ => {
+                return Err(ParseError::UnexpectedToken(
+                    Token::Semi,
+                    "message send before ';'",
+                ));
+            }
         };
         let mut messages = vec![first_msg];
         while self.eat(&Token::Semi) {
             messages.push(self.parse_cascade_message()?);
         }
-        Ok(Expr::Cascade { receiver: Box::new(receiver), messages })
+        Ok(Expr::Cascade {
+            receiver: Box::new(receiver),
+            messages,
+        })
     }
 
     fn parse_cascade_message(&mut self) -> Result<Message, ParseError> {
@@ -317,7 +346,10 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 let arg = self.parse_unary_level()?;
-                Ok(Message::Binary { op, arg: Box::new(arg) })
+                Ok(Message::Binary {
+                    op,
+                    arg: Box::new(arg),
+                })
             }
             Token::Keyword(_) => {
                 // Keyword — collect all parts.
@@ -340,14 +372,23 @@ impl Parser {
             // position; the local-decl uses of `|` are consumed before this level
             // is reached (in `parse_program` and `parse_block`).
             let op: Arc<str> = match self.peek().clone() {
-                Token::BinOp(op) => { self.advance(); op }
-                Token::Pipe => { self.advance(); Arc::from("|") }
+                Token::BinOp(op) => {
+                    self.advance();
+                    op
+                }
+                Token::Pipe => {
+                    self.advance();
+                    Arc::from("|")
+                }
                 _ => break,
             };
             let right = self.parse_unary_level()?;
             left = Expr::Send {
                 receiver: Box::new(left),
-                message: Message::Binary { op, arg: Box::new(right) },
+                message: Message::Binary {
+                    op,
+                    arg: Box::new(right),
+                },
             };
         }
         Ok(left)
@@ -384,15 +425,42 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         let tok = self.peek().clone();
         match tok {
-            Token::Int(n) => { self.advance(); Ok(Expr::Lit(Literal::Int(n))) }
-            Token::Float(f) => { self.advance(); Ok(Expr::Lit(Literal::Float(f))) }
-            Token::True => { self.advance(); Ok(Expr::Lit(Literal::Bool(true))) }
-            Token::False => { self.advance(); Ok(Expr::Lit(Literal::Bool(false))) }
-            Token::Nil => { self.advance(); Ok(Expr::Lit(Literal::Nil)) }
-            Token::Super => { self.advance(); Ok(Expr::Super) }
-            Token::Str(s) => { self.advance(); Ok(Expr::Lit(Literal::Str(s))) }
-            Token::Symbol(s) => { self.advance(); Ok(Expr::Lit(Literal::Symbol(s))) }
-            Token::LargeInt(n) => { self.advance(); Ok(Expr::Lit(Literal::LargeInt(n))) }
+            Token::Int(n) => {
+                self.advance();
+                Ok(Expr::Lit(Literal::Int(n)))
+            }
+            Token::Float(f) => {
+                self.advance();
+                Ok(Expr::Lit(Literal::Float(f)))
+            }
+            Token::True => {
+                self.advance();
+                Ok(Expr::Lit(Literal::Bool(true)))
+            }
+            Token::False => {
+                self.advance();
+                Ok(Expr::Lit(Literal::Bool(false)))
+            }
+            Token::Nil => {
+                self.advance();
+                Ok(Expr::Lit(Literal::Nil))
+            }
+            Token::Super => {
+                self.advance();
+                Ok(Expr::Super)
+            }
+            Token::Str(s) => {
+                self.advance();
+                Ok(Expr::Lit(Literal::Str(s)))
+            }
+            Token::Symbol(s) => {
+                self.advance();
+                Ok(Expr::Lit(Literal::Symbol(s)))
+            }
+            Token::LargeInt(n) => {
+                self.advance();
+                Ok(Expr::Lit(Literal::LargeInt(n)))
+            }
             Token::Ident(name) => {
                 self.advance();
                 // Check for `::` namespace resolution chain.
@@ -405,11 +473,19 @@ impl Parser {
                                 self.advance();
                                 path.push(next);
                             }
-                            tok => return Err(ParseError::UnexpectedToken(tok, "identifier after ::")),
+                            tok => {
+                                return Err(ParseError::UnexpectedToken(
+                                    tok,
+                                    "identifier after ::",
+                                ));
+                            }
                         }
                     }
                     let name = path.pop().unwrap();
-                    return Ok(Expr::NamespaceRef { namespace_path: path, name });
+                    return Ok(Expr::NamespaceRef {
+                        namespace_path: path,
+                        name,
+                    });
                 }
                 Ok(Expr::Var(name))
             }
@@ -445,19 +521,46 @@ impl Parser {
     fn parse_literal_element(&mut self) -> Result<Literal, ParseError> {
         let tok = self.peek().clone();
         match tok {
-            Token::Int(n) =>     { self.advance(); Ok(Literal::Int(n)) }
-            Token::Float(f) =>   { self.advance(); Ok(Literal::Float(f)) }
-            Token::True =>       { self.advance(); Ok(Literal::Bool(true)) }
-            Token::False =>      { self.advance(); Ok(Literal::Bool(false)) }
-            Token::Nil =>        { self.advance(); Ok(Literal::Nil) }
-            Token::Str(s) =>     { self.advance(); Ok(Literal::Str(s)) }
-            Token::Symbol(s) =>  { self.advance(); Ok(Literal::Symbol(s)) }
-            Token::LargeInt(n) =>{ self.advance(); Ok(Literal::LargeInt(n)) }
+            Token::Int(n) => {
+                self.advance();
+                Ok(Literal::Int(n))
+            }
+            Token::Float(f) => {
+                self.advance();
+                Ok(Literal::Float(f))
+            }
+            Token::True => {
+                self.advance();
+                Ok(Literal::Bool(true))
+            }
+            Token::False => {
+                self.advance();
+                Ok(Literal::Bool(false))
+            }
+            Token::Nil => {
+                self.advance();
+                Ok(Literal::Nil)
+            }
+            Token::Str(s) => {
+                self.advance();
+                Ok(Literal::Str(s))
+            }
+            Token::Symbol(s) => {
+                self.advance();
+                Ok(Literal::Symbol(s))
+            }
+            Token::LargeInt(n) => {
+                self.advance();
+                Ok(Literal::LargeInt(n))
+            }
             Token::ArrayLiteralOpen => {
                 self.advance();
                 Ok(Literal::Array(self.parse_array_literal_elements()?))
             }
-            tok => Err(ParseError::UnexpectedToken(tok, "literal element in array literal")),
+            tok => Err(ParseError::UnexpectedToken(
+                tok,
+                "literal element in array literal",
+            )),
         }
     }
 
@@ -492,7 +595,11 @@ impl Parser {
         }
         self.in_block = prev_in_block;
         self.expect("']'", |t| t == &Token::RBracket)?;
-        Ok(Expr::Block { params, locals, body })
+        Ok(Expr::Block {
+            params,
+            locals,
+            body,
+        })
     }
 }
 
@@ -571,7 +678,10 @@ mod tests {
         // `obj at: 1 put: 2` → two-part keyword send, selector `at:put:`
         let e = expr("obj at: 1 put: 2");
         match e {
-            Expr::Send { message: Message::Keyword { parts }, .. } => {
+            Expr::Send {
+                message: Message::Keyword { parts },
+                ..
+            } => {
                 assert_eq!(parts.len(), 2);
                 assert_eq!(parts[0].0, Arc::from("at:"));
                 assert_eq!(parts[1].0, Arc::from("put:"));
@@ -585,7 +695,10 @@ mod tests {
         let prog = parse("x := 42");
         assert_eq!(
             prog.stmts[0],
-            Stmt::Assign { name: Arc::from("x"), value: Expr::Lit(Literal::Int(42)) }
+            Stmt::Assign {
+                name: Arc::from("x"),
+                value: Expr::Lit(Literal::Int(42))
+            }
         );
     }
 
@@ -650,10 +763,16 @@ mod tests {
         // `3 factorial negated` → two unary sends, left-to-right
         let e = expr("3 factorial negated");
         match &e {
-            Expr::Send { receiver, message: Message::Unary(name) } => {
+            Expr::Send {
+                receiver,
+                message: Message::Unary(name),
+            } => {
                 assert_eq!(name.as_ref(), "negated");
                 match receiver.as_ref() {
-                    Expr::Send { message: Message::Unary(inner), .. } => {
+                    Expr::Send {
+                        message: Message::Unary(inner),
+                        ..
+                    } => {
                         assert_eq!(inner.as_ref(), "factorial");
                     }
                     _ => panic!("expected inner unary send"),
@@ -668,11 +787,17 @@ mod tests {
         // `3 factorial + 1` — unary binds tighter than binary
         let e = expr("3 factorial + 1");
         match e {
-            Expr::Send { receiver, message: Message::Binary { op, .. } } => {
+            Expr::Send {
+                receiver,
+                message: Message::Binary { op, .. },
+            } => {
                 assert_eq!(op.as_ref(), "+");
                 // receiver should be `3 factorial`
                 match *receiver {
-                    Expr::Send { message: Message::Unary(name), .. } => {
+                    Expr::Send {
+                        message: Message::Unary(name),
+                        ..
+                    } => {
                         assert_eq!(name.as_ref(), "factorial");
                     }
                     _ => panic!("expected unary receiver"),
@@ -703,7 +828,10 @@ mod tests {
                 assert_eq!(def.class_name.as_ref(), "Vec");
                 assert_eq!(
                     def.pattern,
-                    MethodPattern::Binary { op: Arc::from("+"), param: Arc::from("other") }
+                    MethodPattern::Binary {
+                        op: Arc::from("+"),
+                        param: Arc::from("other")
+                    }
                 );
                 assert_eq!(def.pattern.selector().as_ref(), "+");
                 assert_eq!(def.pattern.params(), vec![Arc::from("other")]);
@@ -819,7 +947,13 @@ mod tests {
     #[test]
     fn namespace_ref_single_level() {
         let e = expr("A::B");
-        assert_eq!(e, Expr::NamespaceRef { namespace_path: vec![Arc::from("A")], name: Arc::from("B") });
+        assert_eq!(
+            e,
+            Expr::NamespaceRef {
+                namespace_path: vec![Arc::from("A")],
+                name: Arc::from("B")
+            }
+        );
     }
 
     #[test]
@@ -837,7 +971,10 @@ mod tests {
     #[test]
     fn unexpected_token_after_colons_is_error() {
         let err = Parser::parse("A:: 123").unwrap_err();
-        assert!(matches!(err, ParseError::UnexpectedToken(_, "identifier after ::")));
+        assert!(matches!(
+            err,
+            ParseError::UnexpectedToken(_, "identifier after ::")
+        ));
     }
 
     // ── Array literals ────────────────────────────────────────────────────────
@@ -877,7 +1014,10 @@ mod tests {
     fn array_literal_invalid_element_is_error() {
         // `[` is not a valid literal element inside an array literal.
         let err = Parser::parse("#([])").unwrap_err();
-        assert!(matches!(err, ParseError::UnexpectedToken(_, "literal element in array literal")));
+        assert!(matches!(
+            err,
+            ParseError::UnexpectedToken(_, "literal element in array literal")
+        ));
     }
 
     // ── Error cases ───────────────────────────────────────────────────────────
@@ -931,7 +1071,10 @@ mod tests {
     #[test]
     fn method_def_invalid_pattern_errors() {
         let err = Parser::parse("Foo >> 123 [ ]").unwrap_err();
-        assert!(matches!(err, ParseError::UnexpectedToken(_, "method pattern")));
+        assert!(matches!(
+            err,
+            ParseError::UnexpectedToken(_, "method pattern")
+        ));
     }
 
     // ── Cascade binary and keyword messages (lines 300-311) ───────────────────
@@ -952,7 +1095,10 @@ mod tests {
     fn cascade_invalid_message_after_semi_errors() {
         // `123` after `;` is not a valid cascade message.
         let err = Parser::parse("3 printString; 123").unwrap_err();
-        assert!(matches!(err, ParseError::UnexpectedToken(_, "cascade message")));
+        assert!(matches!(
+            err,
+            ParseError::UnexpectedToken(_, "cascade message")
+        ));
     }
 
     #[test]
@@ -995,9 +1141,9 @@ mod tests {
         let e = expr("#(99999999999999999999)");
         assert_eq!(
             e,
-            Expr::ArrayLiteral(vec![Literal::LargeInt(
-                Arc::new(BigInt::from_str("99999999999999999999").unwrap())
-            )])
+            Expr::ArrayLiteral(vec![Literal::LargeInt(Arc::new(
+                BigInt::from_str("99999999999999999999").unwrap()
+            ))])
         );
     }
 }
