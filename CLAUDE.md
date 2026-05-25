@@ -75,6 +75,7 @@ I will add to this list as the project proceeds, but may also ask you to add thi
 - Do not hallucinate unless otherwise asked for potentially creative solutions.
 - Do not be obsequious. Instead, review and accept valid criticism, or form a careful argument for an opposing view or approach if necessary. However, if I make a specific decision, then that decision must be respected. 
 - Do not assume you know what changes to make if unexpected build or test errors happen; instead, carefully diagnose the situation and present the diagnosis and options for the fix to the user. This is to prevent inadvertent "solutions" that are not correct and end up causing more problems. 
+- BEFORE you make a fix, report the analysis and proposed solution; do NOT automatically fix unless you are given permission. 
 - After you make edits to a Rust file, make sure to run `cargo fmt` and `cargo lint` to ensure code remains free from obvious issues. 
 - I prefer documentation that clearly states contracts; e.g. a function should clearly specify requirements and what it ensures. requirements and ensure should use code statement if possible, or very clear descriptions otherwise.
 - Contracts (`Requires:` / `Ensures:`) belong on the **method or function they govern**, not on the enclosing struct, enum, trait, or module. Type-level docs describe *purpose and shape*; per-method docs describe *behavior contracts*. If a constraint is a class invariant maintained across multiple methods, document it at the type level; otherwise put it where it is checked or relied upon.

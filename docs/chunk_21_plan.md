@@ -637,3 +637,159 @@ to make this swap clean.
 **Open**: should all entities be independently persistent, or should persistence
 be opt-in? The triple store was intended to replace image-based persistence, but
 may add overhead where unnecessary. Deferred to chunk 22 for experimentation.
+
+---
+
+## Close-out Work (post-refactor pass)
+
+The initial chunk 21 implementation landed the async/actor MVP and test refactor.
+The following items must be completed before chunk 21 is considered done.
+
+### C0 — Commit test refactor and CLAUDE.md
+
+The test refactor (tests moved to `crates/interpreter/src/tests/`) and the
+one-line CLAUDE.md addition are uncommitted. Commit these as a clean baseline
+before any further changes.
+
+### C1 — `_primNew` and `_primNew:` class-side primitives
+
+Add to `dispatch_class_builtin` in `builtins.rs`:
+
+- **`_primNew`** — allocates a new instance WITHOUT calling `initialize` or
+  queuing it as a message. For value classes: allocates `Arc<Object>`, returns
+  `Value::ValueObject`. For actor classes: spawns the entity coroutine (empty
+  mailbox, no `initialize` envelope), returns `Value::Object(EntityHandle)`.
+- **`_primNew:`** — same but accepts an integer size for indexed-slot classes.
+
+These are the allocation primitives that the Smol-level `new` / `new:` will
+delegate to. They satisfy the `_prim*` self-only rule: they will only be called
+as self-sends from within `Object class >> new`.
+
+Tests:
+- Value class `_primNew` returns `ValueObject`; `_primNew: n` returns
+  `ValueObject` with correct indexed size; `initialize` has NOT been called.
+- Actor class `_primNew` returns `Object(EntityHandle)`; `initialize` has NOT
+  been queued (mailbox is empty immediately after return).
+- Sending `_primNew` to a non-self receiver at method installation raises a
+  compile-time error (inherited from existing `_prim*` self-check).
+
+### C2 — Implicit self return
+
+In `invoke_method` and `invoke_class_method`, change the no-explicit-return arm:
+
+```
+// before
+Ok(v) => Ok(v)
+
+// after — return the receiver, not the last evaluated expression
+Ok(_) => Ok(self_value.clone())   // invoke_method: self_value already a param
+Ok(_) => Ok(Value::Class(class.clone()))  // invoke_class_method
+```
+
+Standard Smalltalk semantics: a method without `^` implicitly returns `self`.
+This is required for `initialize` to return the receiver so that
+`^self _primNew initialize` in the Smol `new` method returns the new instance.
+
+Tests:
+- A method with no `^` returns the receiver, not the last expression value.
+- Explicit `^` returns still work unchanged.
+- Audit existing test suite for failures: methods whose last expression was
+  previously relied upon as the return value now return `self`. In practice
+  most such methods are setters or side-effectful methods whose return value is
+  discarded, but any assertion on method return value must be checked.
+
+### C3 — `Object class >> new` and `Object class >> new:` in kernel.smol
+
+Once C1 and C2 are in place, replace the Rust-driven `new`/`new:` allocation
+with Smol-defined methods in `kernel.smol`:
+
+```smalltalk
+Object class >> new [
+    | inst |
+    inst := self _primNew.
+    inst initialize.
+    ^inst
+]
+
+Object class >> new: n [
+    | inst |
+    inst := self _primNew: n.
+    inst initialize.
+    ^inst
+]
+```
+
+For **actor classes**: `_primNew` returns an `EntityHandle` immediately.
+`inst initialize` enqueues `initialize` in the mailbox (async, returns a
+Future — discarded here). `^inst` returns the handle. The FIFO mailbox
+guarantees `initialize` runs before any subsequently queued messages.
+
+For **value classes**: `_primNew` allocates `Arc<Object>`. `inst initialize`
+calls `initialize` synchronously (via self-send on a value object). Implicit
+self return from C2 ensures `initialize` returns the instance. `^inst`
+returns the initialized value object.
+
+Consequences:
+- `send_initialize` in `eval.rs` is no longer called; remove it.
+- The Rust `"new"` / `"new:"` handlers in `dispatch_class_builtin` are dead
+  code once kernel.smol is loaded (user-defined class methods are checked
+  first). Remove them, keeping `_primNew`/`_primNew:` as the only allocation
+  primitives.
+- `Array class >> new: n [^super new: n]` is now redundant (inherited
+  `Object class >> new:` handles it). Remove from kernel.smol.
+
+Tests: all existing `new` / `new:` tests must continue to pass. Add:
+- `SomeValueClass new initialize` was called (check via side effect or ivar).
+- `SomeActorClass new` returns an `EntityHandle`; `initialize` runs before
+  the first user message.
+
+### C4 — Kernel factory method cleanup
+
+`Error class >> signal:` and `Association class >> key:value:` currently call
+`self new` (which calls the no-op inherited `initialize`) then a private setter.
+Now that `_primNew` is available, update these to skip the unnecessary
+`initialize` call and make the intent explicit:
+
+```smalltalk
+Error class >> signal: aString [
+    | e |
+    e := self _primNew.
+    e pvtSetMessage: aString.
+    e signal
+]
+
+Association class >> key: k value: v [
+    | a |
+    a := self _primNew.
+    a pvtKey: k value: v.
+    ^a
+]
+```
+
+Search the rest of kernel.smol and test inline Smol code for any remaining
+patterns where a factory method calls `new` and then immediately overwrites
+all ivars via private setters (bypassing the initialization that `new`
+provides). Each such case should use `_primNew` directly.
+
+Tests: `Error signal: 'msg'` still raises; `Association key: 1 value: 2`
+still produces a correct association. No new behavior — this is a cleanup.
+
+### C5 — `force_value` argument audit
+
+Audit `dispatch_class_builtin` and any builtin dispatch function that
+pattern-matches on argument types without routing through `dispatch`. Confirm
+that any arg which could arrive as a `Value::Future` is passed through
+`force_value` (or a typed helper like `as_int` that calls it) before
+destructuring.
+
+Note: entity and value-object dispatch intentionally pass args to `invoke_method`
+unforced — futures as method arguments are resolved lazily when the method body
+sends a message to them. The audit targets only Rust-side code that destructures
+args directly without going through `dispatch`.
+
+### C6 — Full test suite and coverage pass
+
+- `cargo test` — all tests green.
+- `just cov` — check interpreter coverage; flag any kernel method missing
+  test coverage per the manual audit protocol in CLAUDE.md.
+- Commit chunk 21 close-out work.
