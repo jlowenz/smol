@@ -324,15 +324,15 @@ fn kernel_classes_in_env() {
     use crate::entity::InstanceKind;
     assert!(matches!(
         env.get("Array"),
-        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassObject)
+        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassEntity(_))
     ));
     assert!(matches!(
         env.get("ByteArray"),
-        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassObject)
+        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassEntity(_))
     ));
     assert!(matches!(
         env.get("OrderedCollection"),
-        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassObject)
+        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassEntity(_))
     ));
 }
 
@@ -1380,7 +1380,7 @@ a x
 fn evaluator_default() {
     // Evaluator::default() must delegate to Evaluator::new() and produce a working evaluator.
     let (tx, rx) = std::sync::mpsc::channel();
-    may::config().set_stack_size(0x8000);
+    crate::entity::init_coroutine_stack();
     may::go!(move || {
         let ev = Evaluator::default();
         let mut env = crate::env::Env::new();

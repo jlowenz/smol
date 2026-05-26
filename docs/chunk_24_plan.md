@@ -2,7 +2,7 @@
 
 ## Goal
 
-Make every class object a running actor entity — a singleton `ClassActor` with its
+Make every class object a running actor entity — a singleton `ClassEntity` with its
 own mailbox and coroutine. Class-side message sends become async, returning
 `Value::Future`. Callers are unaffected because `dispatch` already resolves Futures
 transparently (lines 181-184 of `builtins.rs`).
@@ -10,8 +10,8 @@ transparently (lines 181-184 of `builtins.rs`).
 This completes the "everything is an actor" principle: instances are actors, and
 now class objects are actors too.
 
-NOTE: not sure I like the `ClassActor` terminology, why not just `Class` or if that
-might cause confusion, `ClassInstance` or `ClassEntity`?
+Variant name resolved to `ClassEntity` — symmetrical with `Entity`, both carry
+`Box<EntityData>`. See "Implementation decisions" section below.
 
 ---
 
@@ -21,24 +21,24 @@ might cause confusion, `ClassInstance` or `ClassEntity`?
 pub enum InstanceKind {
     Entity(Box<EntityData>),       // user instance actor (unchanged)
     ValueObject(Arc<Object>),      // passive value object (unchanged)
-    ClassActor(Box<EntityData>),   // class-side singleton actor (new)
+    ClassEntity(Box<EntityData>),   // class-side singleton actor (new)
 }
 ```
 
-`ClassObject` is replaced by `ClassActor`. The distinction from `Entity` is that
+`ClassObject` is replaced by `ClassEntity`. The distinction from `Entity` is that
 dispatch uses `class.lookup_class_method` instead of `class.lookup`, and the entity
 has no named instance variable slots (class variables live in `Class.class_var_storage`
 as before — no `Arc<Object>` needed for ivars).
 
-Because `ClassActor` has no `Arc<Object>` for ivar storage, `ivar_storage()` on
-`InstanceHandle` panics for `ClassActor` (as it already does for `ClassObject`).
+Because `ClassEntity` has no `Arc<Object>` for ivar storage, `ivar_storage()` on
+`InstanceHandle` panics for `ClassEntity` (as it already does for `ClassObject`).
 
 ---
 
 ## Entity loop changes (`entity.rs`)
 
 `run_entity_loop` currently calls `dispatch_envelope` which does instance-method
-lookup. With `ClassActor`, the loop must use class-method lookup and class-side
+lookup. With `ClassEntity`, the loop must use class-method lookup and class-side
 builtin fallback.
 
 Add a `dispatch_class_envelope` function alongside `dispatch_envelope`:
@@ -61,7 +61,7 @@ fn dispatch_class_envelope(
 `run_entity_loop` branches on `InstanceKind`:
 ```rust
 InstanceKind::Entity(_) => dispatch_envelope(&ev, handle, selector, args, &mut env),
-InstanceKind::ClassActor(_) => dispatch_class_envelope(&ev, handle, selector, args, &mut env),
+InstanceKind::ClassEntity(_) => dispatch_class_envelope(&ev, handle, selector, args, &mut env),
 ```
 
 ---
@@ -116,7 +116,7 @@ ordering with a test that dispatches to a class immediately after registry creat
 
 ## Bootstrap: `ClassRegistry::new()`
 
-Replace the passive `ClassObject` with spawned `ClassActor` handles:
+Replace the passive `ClassObject` with spawned `ClassEntity` handles:
 
 ```rust
 let object_state = spawn_class_entity(object_class.clone(), Arc::clone(&registry_arc));
@@ -136,13 +136,13 @@ pub fn new() -> Self {
 ```
 
 OR: use a two-phase init — construct the registry with passive ClassObjects first,
-then promote them to ClassActors once the Arc is available. This is less invasive:
+then promote them to ClassEntitys once the Arc is available. This is less invasive:
 
 ```rust
 pub fn new() -> Self {
     let reg = Self { ... };          // passive ClassObjects
     let arc = Arc::new(reg);
-    arc.promote_class_actors();      // convert to ClassActor, set class_object back-refs
+    arc.promote_class_actors();      // convert to ClassEntity, set class_object back-refs
     arc
 }
 ```
@@ -159,7 +159,7 @@ changing the type of `Self`.
 Value::Instance(handle) => match &handle.0.kind {
     InstanceKind::ValueObject(_) => dispatch_object_value(ev, handle, selector, args, env),
     InstanceKind::Entity(_) => dispatch_entity(ev, handle, selector, args, env),
-    InstanceKind::ClassActor(_) => dispatch_class_entity(ev, handle, selector, args, env),
+    InstanceKind::ClassEntity(_) => dispatch_class_entity(ev, handle, selector, args, env),
 },
 ```
 
@@ -175,7 +175,7 @@ need parallel dispatch mechanisms?
 
 ## `handle_subclass` change
 
-When a new class is created via `subclass:`, spawn a `ClassActor` for it immediately:
+When a new class is created via `subclass:`, spawn a `ClassEntity` for it immediately:
 
 ```rust
 let handle = spawn_class_entity(new_class.clone(), ev.registry.clone());
@@ -211,8 +211,8 @@ pub fn ivar_storage(&self) -> &Arc<Object> {
     match &self.0.kind {
         InstanceKind::Entity(d) => &d.data,
         InstanceKind::ValueObject(o) => o,
-        InstanceKind::ClassActor(_) | InstanceKind::ClassObject => {
-            panic!("ClassActor has no instance variable storage")
+        InstanceKind::ClassEntity(_) | InstanceKind::ClassObject => {
+            panic!("ClassEntity has no instance variable storage")
         }
     }
 }
@@ -224,10 +224,10 @@ pub fn ivar_storage(&self) -> &Arc<Object> {
 
 | File | Change |
 |------|--------|
-| `entity.rs` | Add `ClassActor(Box<EntityData>)` variant; add `spawn_class_entity`; `run_entity_loop` branches on kind; add `dispatch_class_envelope`; update `ivar_storage` |
-| `class_registry.rs` | Two-phase init: build registry, then promote ClassObjects to ClassActors; keep `Arc<ClassRegistry>` available for spawn |
-| `builtins.rs` | Replace `ClassObject` arm with `ClassActor`; add `dispatch_class_entity`; audit args for missing `force_value` calls |
-| `eval.rs` | Update `InstanceKind::ClassObject` match arms to `ClassActor`; `Debug` impl updated |
+| `entity.rs` | Add `ClassEntity(Box<EntityData>)` variant; add `spawn_class_entity`; `run_entity_loop` branches on kind; add `dispatch_class_envelope`; update `ivar_storage` |
+| `class_registry.rs` | Two-phase init: build registry, then promote ClassObjects to ClassEntitys; keep `Arc<ClassRegistry>` available for spawn |
+| `builtins.rs` | Replace `ClassObject` arm with `ClassEntity`; add `dispatch_class_entity`; audit args for missing `force_value` calls |
+| `eval.rs` | Update `InstanceKind::ClassObject` match arms to `ClassEntity`; `Debug` impl updated |
 | `tests/builtins.rs` | Tests: class send returns Future; class send result is correct value; class-side self-send is synchronous |
 | `tests/eval.rs` | Tests: `MyClass new` resolves correctly in compound expressions |
 
@@ -239,17 +239,46 @@ pub fn ivar_storage(&self) -> &Arc<Object> {
 - `perform:` / `on:do:` class filtering — separate primitives chunk.
 - AST span tracking — separate chunk.
 - SUnit testing framework — after primitives chunk.
+- **Class variable / instance variable unification** — class vars currently live in
+  `Class.class_var_storage` (a separate `RwLock<HashMap>`) while instance vars live in
+  `EntityData.data` (an `Arc<Object>`). Making class vars the instance vars of the
+  `ClassEntity` actor (so both share the same storage mechanism) would eliminate the
+  parallel dispatch path noted in the plan. Deferred to a dedicated chunk after Chunk 24
+  stabilises, because it requires redesigning `eval.rs` variable read/write paths
+  (`class_var_storage.read/write`) and the `Class` struct simultaneously with the
+  actor promotion work.
+
+---
+
+## Implementation decisions (clarification session 2026-05-25)
+
+- Variant name: **`ClassEntity`** (not `ClassEntity` or `ClassObject`).  Symmetrical
+  with `Entity` — both are actor variants carrying `Box<EntityData>`.
+- `ClassRegistry` API: add **`new_arc() -> Arc<Self>`** as the primary constructor for
+  contexts that need class actors; keep `new() -> Self` for low-level tests that
+  construct the registry without spawning actors.
+- `run_entity_loop` is **generalized**: both `Entity` and `ClassEntity` share the same
+  mailbox machinery; the branch is only at `dispatch_envelope` vs
+  `dispatch_class_envelope`.
+- `ivar_storage()` panic arm covers only `ClassEntity` after `ClassObject` is removed
+  in S1 — no stale `| ClassObject` residue in later steps.
 
 ---
 
 ## Steps
 
-- **S1** Add `ClassActor(Box<EntityData>)` to `InstanceKind`; update all match arms
-         (treat it like `ClassObject` for now — no behavior change yet); cargo test green.
-- **S2** Add `spawn_class_entity`; add `dispatch_class_envelope` in entity.rs.
-- **S3** Two-phase `ClassRegistry::new()`: build with passive ClassObjects, promote
-         to ClassActors after Arc is available. Verify bootstrap test.
-- **S4** `dispatch_class_entity` in builtins.rs (mirrors `dispatch_entity` but class path).
-         Update routing. Audit args for `force_value` gaps.
-- **S5** `handle_subclass` spawns `ClassActor` for new classes.
-- **S6** Full test run; fix any breakage from async class sends; commit.
+- **S1** Add `ClassEntity(Box<EntityData>)` to `InstanceKind`; remove `ClassObject`;
+         update all match arms (treat `ClassEntity` like `ClassObject` for now — no
+         behavior change yet); cargo test green.
+- **S2** Add `spawn_class_entity` and `dispatch_class_envelope` in `entity.rs`;
+         generalize `run_entity_loop` to handle both `Entity` and `ClassEntity` (branch
+         only at dispatch).
+- **S3** Add `ClassRegistry::new_arc() -> Arc<Self>`; two-phase init inside `new_arc`
+         promotes ClassEntities after the Arc is available; update `eval.rs` and
+         `Evaluator::new_without_kernel` to use `new_arc()`.
+- **S4** Add `dispatch_class_entity` in `builtins.rs` (mirrors `dispatch_entity` but
+         uses class-side lookup and `dispatch_class_builtin`); update routing; audit
+         args for `force_value` gaps.
+- **S5** `handle_subclass` spawns a `ClassEntity` for new classes.
+- **S6** Full test run; fix any breakage from async class sends; `cargo fmt`;
+         `cargo clippy`; commit.

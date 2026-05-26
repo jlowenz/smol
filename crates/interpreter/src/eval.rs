@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, OnceLock};
 
-use crate::entity::{EntityId, InstanceHandle};
+use crate::entity::{EntityId, InstanceHandle, InstanceKind, InstanceState};
 
 use thiserror::Error;
 
@@ -55,6 +55,9 @@ pub enum SelfBinding {
 pub struct Evaluator {
     pub registry: Arc<ClassRegistry>,
     method_stack: RefCell<Vec<SelfBinding>>,
+    /// Instance entities (actor objects) spawned during this evaluator's lifetime.
+    /// Signalled via `shutdown()` so their coroutines exit rather than blocking indefinitely.
+    instance_entities: RefCell<Vec<Arc<InstanceState>>>,
     /// Depth of the active method stack. Maintained alongside `method_stack` so
     /// the common case — no active method — can be tested with a plain `Cell`
     /// read instead of a `RefCell` borrow.
@@ -105,7 +108,7 @@ impl Evaluator {
     /// Create an evaluator without loading `kernel.smol`. Intended for low-level
     /// primitive tests that do not require the kernel collection classes.
     pub fn new_without_kernel() -> Self {
-        let registry = Arc::new(ClassRegistry::new());
+        let registry = ClassRegistry::new_arc();
         let kernel = registry.kernel();
         Self {
             registry,
@@ -114,7 +117,15 @@ impl Evaluator {
             active_namespace: RefCell::new(kernel),
             current_block_home: Cell::new(None),
             current_entity_id: Cell::new(None),
+            instance_entities: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Register an instance entity so its coroutine is signalled on `shutdown()`.
+    ///
+    /// Requires: `handle.0.kind` is `InstanceKind::Entity`.
+    pub fn track_entity(&self, handle: &InstanceHandle) {
+        self.instance_entities.borrow_mut().push(handle.0.clone());
     }
 
     // ── Method receiver stack ─────────────────────────────────────────────────
@@ -295,7 +306,9 @@ impl Evaluator {
                 use crate::entity::InstanceKind;
                 // Look up the class from env first (covers non-Kernel namespace classes).
                 let class = match self.lookup_var(&def.class_name, env) {
-                    Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassObject) => {
+                    Some(Value::Instance(h))
+                        if matches!(h.0.kind, InstanceKind::ClassEntity(_)) =>
+                    {
                         h.0.class.clone()
                     }
                     Some(_) => {
@@ -758,6 +771,21 @@ impl Evaluator {
             active_namespace: RefCell::new(kernel),
             current_block_home: Cell::new(None),
             current_entity_id: Cell::new(None),
+            instance_entities: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Signal all tracked entities to terminate.
+    ///
+    /// Ensures: each tracked class entity and instance entity receives a shutdown
+    ///   signal; their coroutines will exit on their next mailbox-wait cycle.
+    pub fn shutdown(&self) {
+        self.registry.shutdown_class_entities();
+        for state in self.instance_entities.borrow().iter() {
+            match &state.kind {
+                InstanceKind::Entity(d) | InstanceKind::ClassEntity(d) => d.signal_shutdown(),
+                InstanceKind::ValueObject(_) => {}
+            }
         }
     }
 }

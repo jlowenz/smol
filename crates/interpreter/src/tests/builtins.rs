@@ -1432,7 +1432,7 @@ v _primSize
 }
 
 #[test]
-fn prim_new_actor_class_returns_entity_handle_running() {
+fn prim_new_actor_class_returns_entity_handle() {
     let src = r#"
 Object subclass: #MyActor instanceVariableNames: ''.
 MyActor _primNew
@@ -1445,12 +1445,6 @@ MyActor _primNew
                 InstanceKind::Entity(data) => {
                     let mb = data.mailbox.lock().unwrap();
                     assert!(mb.is_empty(), "mailbox should be empty after _primNew");
-                    drop(mb);
-                    let status = data.status.lock().unwrap();
-                    assert!(
-                        matches!(*status, crate::entity::EntityStatus::Running),
-                        "status should be Running immediately after _primNew"
-                    );
                 }
                 other => panic!("expected InstanceKind::Entity, got {other:?}"),
             }

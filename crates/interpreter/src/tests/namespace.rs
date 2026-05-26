@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::class::Class;
-use crate::entity::{InstanceHandle, InstanceKind, InstanceState};
+use crate::entity::{InstanceHandle, InstanceKind, InstanceState, new_entity_data};
 use parking_lot::RwLock;
 
 fn bare_handle(name: &str) -> InstanceHandle {
@@ -19,9 +19,10 @@ fn bare_handle(name: &str) -> InstanceHandle {
         is_value: false,
         class_object: std::sync::OnceLock::new(),
     });
+    let data = new_entity_data(&cls);
     InstanceHandle(Arc::new(InstanceState {
         class: cls,
-        kind: InstanceKind::ClassObject,
+        kind: InstanceKind::ClassEntity(Box::new(data)),
     }))
 }
 

@@ -1,7 +1,8 @@
 use may::sync::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::class::Class;
 use crate::class_registry::ClassRegistry;
@@ -10,12 +11,25 @@ use crate::eval::EvalError;
 use crate::object::Object;
 use crate::value::Value;
 
+/// Coroutine stack size for all entity and continuation coroutines.
+/// Set once via `init_coroutine_stack`; sized for deep Rust interpreter recursion.
+const COROUTINE_STACK_SIZE: usize = 0x8000; // 128 KB
+
+/// Set the global `may` stack size exactly once. Idempotent — safe to call from
+/// any spawn site; subsequent calls are a no-op.
+pub(crate) fn init_coroutine_stack() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        may::config().set_stack_size(COROUTINE_STACK_SIZE);
+    });
+}
+
 /// Unique identifier for an actor entity instance.
 pub type EntityId = u64;
 
 static NEXT_ENTITY_ID: AtomicU64 = AtomicU64::new(1);
 
-fn next_entity_id() -> EntityId {
+pub(crate) fn next_entity_id() -> EntityId {
     NEXT_ENTITY_ID.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -134,6 +148,20 @@ pub struct EntityData {
     pub mailbox: Mutex<VecDeque<Envelope>>,
     pub mailbox_ready: Condvar,
     pub status: Mutex<EntityStatus>,
+    /// Set by `signal_shutdown` to request the entity loop to exit cleanly.
+    pub shutdown: AtomicBool,
+}
+
+impl EntityData {
+    /// Request the entity's coroutine to exit. Sets the shutdown flag and wakes
+    /// the mailbox condvar so the loop sees the flag without waiting for a message.
+    ///
+    /// Ensures: the entity loop will transition to `EntityStatus::Terminated` and
+    ///   drain any queued envelopes with a `Signal("entity terminated")` error.
+    pub fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.mailbox_ready.notify_all();
+    }
 }
 
 /// Discriminates the semantics of an object instance.
@@ -142,11 +170,12 @@ pub enum InstanceKind {
     Entity(Box<EntityData>),
     /// Passive value object — synchronous dispatch, safely shared across threads.
     ValueObject(Arc<Object>),
-    /// Class object — synchronous class-side dispatch.
+    /// Class-side singleton actor — async mailbox dispatch, dedicated coroutine.
     ///
-    /// The class descriptor is `InstanceState.class`. Making class objects full
-    /// actors (async dispatch) is deferred to a later chunk.
-    ClassObject,
+    /// Dispatch uses `class.lookup_class_method` rather than `class.lookup`.
+    /// Class variables remain in `Class.class_var_storage`; unification with
+    /// instance variable storage is deferred to a later chunk.
+    ClassEntity(Box<EntityData>),
 }
 
 impl std::fmt::Debug for InstanceKind {
@@ -154,7 +183,7 @@ impl std::fmt::Debug for InstanceKind {
         match self {
             InstanceKind::Entity(data) => write!(f, "Entity(id={})", data.id),
             InstanceKind::ValueObject(_) => write!(f, "ValueObject"),
-            InstanceKind::ClassObject => write!(f, "ClassObject"),
+            InstanceKind::ClassEntity(data) => write!(f, "ClassEntity(id={})", data.id),
         }
     }
 }
@@ -181,7 +210,7 @@ impl InstanceHandle {
         match &self.0.kind {
             InstanceKind::Entity(d) => &d.data,
             InstanceKind::ValueObject(o) => o,
-            InstanceKind::ClassObject => panic!("ClassObject has no instance variable storage"),
+            InstanceKind::ClassEntity(_) => panic!("ClassEntity has no instance variable storage"),
         }
     }
 }
@@ -193,14 +222,62 @@ impl std::fmt::Debug for InstanceHandle {
             InstanceKind::ValueObject(_) => {
                 write!(f, "InstanceHandle::ValueObject({})", self.0.class.name)
             }
-            InstanceKind::ClassObject => {
-                write!(f, "InstanceHandle::ClassObject({})", self.0.class.name)
+            InstanceKind::ClassEntity(_) => {
+                write!(f, "InstanceHandle::ClassEntity({})", self.0.class.name)
             }
         }
     }
 }
 
+// ── Entity data construction ──────────────────────────────────────────────────
+
+/// Allocate a fresh `EntityData` for `class` with an empty mailbox and `Running` status.
+///
+/// Ensures: the returned data has a unique entity ID; no coroutine is spawned.
+pub(crate) fn new_entity_data(class: &Arc<Class>) -> EntityData {
+    EntityData {
+        id: next_entity_id(),
+        data: Arc::new(Object::new(class.clone())),
+        mailbox: Mutex::new(VecDeque::new()),
+        mailbox_ready: Condvar::new(),
+        status: Mutex::new(EntityStatus::Running),
+        shutdown: AtomicBool::new(false),
+    }
+}
+
 // ── Entity spawning ───────────────────────────────────────────────────────────
+
+/// Spawn a class-side singleton actor for `class`.
+///
+/// Requires: `global_env` is built from a fully-populated registry before this
+///   call — the caller must call `registry.populate_env` after all classes are
+///   registered and then pass the result here. This matches `spawn_entity_bare`
+///   and avoids a work-stealing race where the coroutine could call `populate_env`
+///   on a still-incomplete registry.
+/// Ensures: the returned handle has `InstanceKind::ClassEntity`; `class.class_object`
+///   is NOT set here — the caller must set it after this call returns.
+pub fn spawn_class_entity(
+    class: Arc<Class>,
+    registry: Arc<ClassRegistry>,
+    global_env: Env,
+) -> InstanceHandle {
+    let data = new_entity_data(&class);
+    let state = Arc::new(InstanceState {
+        class,
+        kind: InstanceKind::ClassEntity(Box::new(data)),
+    });
+    let handle = InstanceHandle(state.clone());
+
+    let state_clone = state;
+    let registry_clone = registry;
+    let env_clone = global_env;
+    init_coroutine_stack();
+    may::go!(move || {
+        run_entity_loop(state_clone, registry_clone, env_clone);
+    });
+
+    handle
+}
 
 /// Spawn a new actor entity with an empty mailbox and no `initialize` queued.
 ///
@@ -228,6 +305,7 @@ pub fn spawn_entity_bare(
             mailbox: Mutex::new(VecDeque::new()),
             mailbox_ready: Condvar::new(),
             status: Mutex::new(EntityStatus::Running),
+            shutdown: AtomicBool::new(false),
         })),
     });
 
@@ -236,7 +314,7 @@ pub fn spawn_entity_bare(
     let state_clone = state.clone();
     let registry_clone = registry.clone();
     let env_clone = global_env.clone();
-    may::config().set_stack_size(0x4000);
+    init_coroutine_stack();
     may::go!(move || {
         run_entity_loop(state_clone, registry_clone, env_clone);
     });
@@ -268,8 +346,8 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
     use crate::eval::Evaluator;
 
     let data = match &state.kind {
-        InstanceKind::Entity(d) => d.as_ref(),
-        _ => panic!("run_entity_loop called on non-Entity instance"),
+        InstanceKind::Entity(d) | InstanceKind::ClassEntity(d) => d.as_ref(),
+        _ => panic!("run_entity_loop called on ValueObject instance"),
     };
 
     let ev = Evaluator::with_registry(registry);
@@ -278,13 +356,24 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
     let mut env = global_env;
 
     loop {
-        // Wait for an envelope.
+        // Wait for an envelope (or shutdown signal).
         let envelope = {
             let mut mb = data.mailbox.lock().unwrap();
-            while mb.is_empty() {
+            loop {
+                if data.shutdown.load(Ordering::Acquire) {
+                    for pending in mb.drain(..) {
+                        pending
+                            .reply
+                            .resolve_err(EvalError::Signal(Arc::from("entity terminated")));
+                    }
+                    *data.status.lock().unwrap() = EntityStatus::Terminated;
+                    return;
+                }
+                if let Some(env) = mb.pop_front() {
+                    break env;
+                }
                 mb = data.mailbox_ready.wait(mb).unwrap();
             }
-            mb.pop_front().unwrap()
         };
 
         // Reject envelopes if the entity has already faulted.
@@ -298,13 +387,16 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
             }
         }
 
-        let result = dispatch_envelope(
-            &ev,
-            InstanceHandle(state.clone()),
-            &envelope.selector,
-            envelope.args,
-            &mut env,
-        );
+        let handle = InstanceHandle(state.clone());
+        let result = match &state.kind {
+            InstanceKind::Entity(_) => {
+                dispatch_envelope(&ev, handle, &envelope.selector, envelope.args, &mut env)
+            }
+            InstanceKind::ClassEntity(_) => {
+                dispatch_class_envelope(&ev, handle, &envelope.selector, envelope.args, &mut env)
+            }
+            InstanceKind::ValueObject(_) => unreachable!(),
+        };
 
         match result {
             Ok(v) => {
@@ -343,6 +435,23 @@ fn dispatch_envelope(
         return ev.invoke_method(handle.clone(), def_class, method, args, env);
     }
     crate::builtins::dispatch_object_primitive(handle, selector, args)
+}
+
+fn dispatch_class_envelope(
+    ev: &crate::eval::Evaluator,
+    handle: InstanceHandle,
+    selector: &Arc<str>,
+    args: Vec<Value>,
+    env: &mut Env,
+) -> Result<Value, crate::eval::EvalError> {
+    // Refresh env from the registry before each dispatch so class-side methods can
+    // reference classes defined after this actor was spawned (e.g. `ValueHolder new`
+    // inside `ValueHolder class >> initialValue:`).
+    ev.registry.populate_env(env);
+    if let Some((method, def_class)) = handle.0.class.lookup_class_method(selector) {
+        return ev.invoke_class_method(handle.clone(), def_class, method, args, env);
+    }
+    crate::builtins::dispatch_class_builtin(ev, handle, selector.clone(), args, env)
 }
 
 #[cfg(test)]

@@ -136,7 +136,7 @@ pub fn dispatch(
                 let result_future = crate::entity::FutureHandle::new();
                 let result_reply = result_future.clone();
                 let registry = ev.registry.clone();
-                may::config().set_stack_size(0x4000);
+                crate::entity::init_coroutine_stack();
                 may::go!(move || {
                     match future.wait() {
                         Err(e) => result_reply.resolve_err(e),
@@ -176,7 +176,7 @@ pub fn dispatch(
         Value::Instance(handle) => match &handle.0.kind {
             InstanceKind::ValueObject(_) => dispatch_object_value(ev, handle, selector, args, env),
             InstanceKind::Entity(_) => dispatch_entity(ev, handle, selector, args, env),
-            InstanceKind::ClassObject => dispatch_class(ev, handle, selector, args, env),
+            InstanceKind::ClassEntity(_) => dispatch_class(ev, handle, selector, args, env),
         },
         Value::Future(future) => {
             // Transparent future: wait for it to resolve, then re-dispatch to the result.
@@ -1248,7 +1248,7 @@ pub(crate) fn dispatch_object_primitive(
     let obj = match &handle.0.kind {
         InstanceKind::ValueObject(o) => o.clone(),
         InstanceKind::Entity(d) => d.data.clone(),
-        InstanceKind::ClassObject => {
+        InstanceKind::ClassEntity(_) => {
             return Err(EvalError::MessageNotUnderstood {
                 receiver_kind: "Class",
                 selector: sel.clone(),
@@ -1555,6 +1555,7 @@ pub(crate) fn dispatch_class_builtin(
                 let mut global_env = Env::new();
                 ev.registry.populate_env(&mut global_env);
                 let inst = spawn_entity_bare(class, ev.registry.clone(), global_env, indexed_size);
+                ev.track_entity(&inst);
                 Ok(Value::Instance(inst))
             }
         }
@@ -1581,6 +1582,7 @@ pub(crate) fn dispatch_class_builtin(
                     global_env,
                     Some(n.max(0) as usize),
                 );
+                ev.track_entity(&inst);
                 Ok(Value::Instance(inst))
             }
         }
@@ -1722,7 +1724,7 @@ fn handle_subclass(
     });
     let class_state = Arc::new(InstanceState {
         class: new_class.clone(),
-        kind: InstanceKind::ClassObject,
+        kind: InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(&new_class))),
     });
     new_class
         .class_object

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::class::Class;
-use crate::entity::{InstanceHandle, InstanceKind, InstanceState};
+use crate::entity::{InstanceHandle, InstanceKind, InstanceState, new_entity_data};
 use crate::env::Env;
 use crate::object::Object;
 use parking_lot::RwLock;
@@ -25,9 +25,10 @@ fn make_class(name: &str) -> Arc<Class> {
 
 fn class_handle(name: &str) -> InstanceHandle {
     let cls = make_class(name);
+    let data = new_entity_data(&cls);
     InstanceHandle(Arc::new(InstanceState {
         class: cls,
-        kind: InstanceKind::ClassObject,
+        kind: InstanceKind::ClassEntity(Box::new(data)),
     }))
 }
 

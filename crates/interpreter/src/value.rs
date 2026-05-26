@@ -111,7 +111,7 @@ impl std::fmt::Display for Value {
             Value::Block(_) => write!(f, "a Block"),
             Value::LargeInt(n) => write!(f, "{n}"),
             Value::Instance(h) => match &h.0.kind {
-                InstanceKind::ClassObject => write!(f, "{}", h.0.class.name),
+                InstanceKind::ClassEntity(_) => write!(f, "{}", h.0.class.name),
                 _ => write!(f, "a {}", h.0.class.name),
             },
             Value::Future(_) => write!(f, "a Future"),
@@ -134,7 +134,7 @@ impl Value {
             Value::Block(_) => "Block",
             Value::LargeInt(_) => "LargeInt",
             Value::Instance(h) => match &h.0.kind {
-                InstanceKind::ClassObject => "Class",
+                InstanceKind::ClassEntity(_) => "Class",
                 _ => "Object",
             },
             Value::Future(_) => "Future",

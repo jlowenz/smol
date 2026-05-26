@@ -68,6 +68,7 @@ fn instance_handle_entity_debug() {
             mailbox: Mutex::new(VecDeque::new()),
             mailbox_ready: Condvar::new(),
             status: Mutex::new(EntityStatus::Running),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
         })),
     }));
     assert!(format!("{handle:?}").contains("99"));
@@ -127,9 +128,25 @@ fn instance_kind_value_object_debug() {
 }
 
 #[test]
-fn instance_kind_class_object_debug() {
-    let kind = InstanceKind::ClassObject;
-    assert_eq!(format!("{kind:?}"), "ClassObject");
+fn instance_kind_class_entity_debug() {
+    use crate::class::Class;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    let cls = Arc::new(Class {
+        name: Arc::from("MyClass"),
+        superclass: None,
+        own_instance_vars: vec![],
+        own_class_vars: vec![],
+        class_var_storage: RwLock::new(HashMap::new()),
+        indexed_slot_kind: None,
+        methods: RwLock::new(HashMap::new()),
+        class_methods: RwLock::new(HashMap::new()),
+        is_value: false,
+        class_object: std::sync::OnceLock::new(),
+    });
+    let kind = InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(&cls)));
+    let s = format!("{kind:?}");
+    assert!(s.starts_with("ClassEntity(id="), "got: {s}");
 }
 
 #[test]
@@ -160,7 +177,7 @@ fn instance_handle_value_object_debug() {
 }
 
 #[test]
-fn instance_handle_class_object_debug() {
+fn instance_handle_class_entity_debug() {
     use crate::class::Class;
     use parking_lot::RwLock;
     use std::collections::HashMap;
@@ -177,10 +194,10 @@ fn instance_handle_class_object_debug() {
         class_object: std::sync::OnceLock::new(),
     });
     let handle = InstanceHandle(Arc::new(InstanceState {
-        class: cls,
-        kind: InstanceKind::ClassObject,
+        class: cls.clone(),
+        kind: InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(&cls))),
     }));
     let s = format!("{handle:?}");
-    assert!(s.contains("ClassObject"), "got: {s}");
+    assert!(s.contains("ClassEntity"), "got: {s}");
     assert!(s.contains("MyClass"), "got: {s}");
 }

@@ -29,7 +29,7 @@ fn resolve(v: Value) -> Result<Value, EvalError> {
 pub(crate) fn eval(src: &str) -> Value {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
-    may::config().set_stack_size(0x8000);
+    crate::entity::init_coroutine_stack();
     may::go!(move || {
         let prog = Parser::parse(&src).expect("parse");
         let ev = Evaluator::new();
@@ -37,6 +37,7 @@ pub(crate) fn eval(src: &str) -> Value {
         ev.registry.populate_env(&mut env);
         let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
         tx.send(resolve(v).expect("future resolution")).unwrap();
+        ev.shutdown();
     });
     rx.recv().expect("eval coroutine panicked")
 }
@@ -47,7 +48,7 @@ pub(crate) fn eval(src: &str) -> Value {
 pub(crate) fn eval_err(src: &str) -> EvalError {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
-    may::config().set_stack_size(0x8000);
+    crate::entity::init_coroutine_stack();
     may::go!(move || {
         let prog = Parser::parse(&src).expect("parse");
         let ev = Evaluator::new();
@@ -61,6 +62,7 @@ pub(crate) fn eval_err(src: &str) -> EvalError {
             },
         };
         tx.send(err).unwrap();
+        ev.shutdown();
     });
     rx.recv().expect("eval_err coroutine panicked")
 }
