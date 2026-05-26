@@ -72,3 +72,115 @@ fn instance_handle_entity_debug() {
     }));
     assert!(format!("{handle:?}").contains("99"));
 }
+
+#[test]
+fn future_default() {
+    let fut = FutureHandle::default();
+    fut.resolve_ok(Value::Int(1));
+    assert_eq!(fut.wait(), Ok(Value::Int(1)));
+}
+
+#[test]
+fn future_is_resolved() {
+    let fut = FutureHandle::new();
+    assert!(!fut.is_resolved());
+    fut.resolve_ok(Value::Int(5));
+    assert!(fut.is_resolved());
+}
+
+#[test]
+fn future_try_get() {
+    let fut = FutureHandle::new();
+    assert!(fut.try_get().is_none());
+    fut.resolve_ok(Value::Int(7));
+    assert_eq!(fut.try_get(), Some(Ok(Value::Int(7))));
+}
+
+#[test]
+fn future_debug_shows_resolved_state() {
+    let fut = FutureHandle::new();
+    assert!(format!("{fut:?}").contains("resolved=false"));
+    fut.resolve_ok(Value::Int(1));
+    assert!(format!("{fut:?}").contains("resolved=true"));
+}
+
+#[test]
+fn instance_kind_value_object_debug() {
+    use crate::class::Class;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    let cls = Arc::new(Class {
+        name: Arc::from("TestClass"),
+        superclass: None,
+        own_instance_vars: vec![],
+        own_class_vars: vec![],
+        class_var_storage: RwLock::new(HashMap::new()),
+        indexed_slot_kind: None,
+        methods: RwLock::new(HashMap::new()),
+        class_methods: RwLock::new(HashMap::new()),
+        is_value: true,
+        class_object: std::sync::OnceLock::new(),
+    });
+    let obj = Arc::new(crate::object::Object::new(cls.clone()));
+    let kind = InstanceKind::ValueObject(obj);
+    assert_eq!(format!("{kind:?}"), "ValueObject");
+}
+
+#[test]
+fn instance_kind_class_object_debug() {
+    let kind = InstanceKind::ClassObject;
+    assert_eq!(format!("{kind:?}"), "ClassObject");
+}
+
+#[test]
+fn instance_handle_value_object_debug() {
+    use crate::class::Class;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    let cls = Arc::new(Class {
+        name: Arc::from("MyValue"),
+        superclass: None,
+        own_instance_vars: vec![],
+        own_class_vars: vec![],
+        class_var_storage: RwLock::new(HashMap::new()),
+        indexed_slot_kind: None,
+        methods: RwLock::new(HashMap::new()),
+        class_methods: RwLock::new(HashMap::new()),
+        is_value: true,
+        class_object: std::sync::OnceLock::new(),
+    });
+    let obj = Arc::new(crate::object::Object::new(cls.clone()));
+    let handle = InstanceHandle(Arc::new(InstanceState {
+        class: cls,
+        kind: InstanceKind::ValueObject(obj),
+    }));
+    let s = format!("{handle:?}");
+    assert!(s.contains("ValueObject"), "got: {s}");
+    assert!(s.contains("MyValue"), "got: {s}");
+}
+
+#[test]
+fn instance_handle_class_object_debug() {
+    use crate::class::Class;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    let cls = Arc::new(Class {
+        name: Arc::from("MyClass"),
+        superclass: None,
+        own_instance_vars: vec![],
+        own_class_vars: vec![],
+        class_var_storage: RwLock::new(HashMap::new()),
+        indexed_slot_kind: None,
+        methods: RwLock::new(HashMap::new()),
+        class_methods: RwLock::new(HashMap::new()),
+        is_value: false,
+        class_object: std::sync::OnceLock::new(),
+    });
+    let handle = InstanceHandle(Arc::new(InstanceState {
+        class: cls,
+        kind: InstanceKind::ClassObject,
+    }));
+    let s = format!("{handle:?}");
+    assert!(s.contains("ClassObject"), "got: {s}");
+    assert!(s.contains("MyClass"), "got: {s}");
+}

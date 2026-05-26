@@ -1580,3 +1580,134 @@ m _primSignal: m text
         "expected Signal('hello'), got {err:?}"
     );
 }
+
+// ── dispatch_primitive_fallback coverage ─────────────────────────────────────
+
+#[test]
+fn error_non_string_arg_on_primitive() {
+    // Primitive receivers (Int, Float, etc.) use dispatch_primitive_fallback for error:.
+    // Passing a non-String arg hits the `other =>` branch (formats the value).
+    let err = eval_err("42 error: 42");
+    assert!(matches!(err, crate::eval::EvalError::Signal(_)));
+}
+
+#[test]
+fn prim_signal_non_string_arg() {
+    // Same fallback, _primSignal: arm, non-String arg.
+    let err = eval_err("nil _primSignal: 99");
+    assert!(matches!(err, crate::eval::EvalError::Signal(_)));
+}
+
+// ── Int arithmetic overflow and exact division ───────────────────────────────
+
+#[test]
+fn int_subtraction_overflow_promotes_to_largeint() {
+    // i64::MAX - (-1) overflows i64::MAX → normalize_bigint path.
+    let result = eval("9223372036854775807 - 1 negated");
+    assert!(matches!(result, Value::LargeInt(_)));
+}
+
+#[test]
+fn int_exact_division() {
+    assert_eq!(eval("10 / 2"), Value::Int(5));
+}
+
+// ── BigInt floor-division negative-remainder path ────────────────────────────
+
+#[test]
+fn bigint_floor_div_negative_sign_via_int() {
+    // Int // LargeInt where signs differ → bigint_floor_div adjustment branch.
+    // 5 // (-big) = floor(5 / -big) = -1
+    assert_eq!(eval("5 // 99999999999999999999 negated"), Value::Int(-1));
+}
+
+#[test]
+fn bigint_floor_rem_negative_sign_via_int() {
+    // Int \\ LargeInt where signs differ → bigint_floor_rem adjustment branch.
+    // 5 \\ (-big): r = 5 + (-big) = big negative
+    let result = eval("5 \\\\ 99999999999999999999 negated");
+    assert!(matches!(result, Value::LargeInt(_)));
+}
+
+#[test]
+fn bigint_floor_div_negative_via_largeint() {
+    // LargeInt // Int where signs differ → bigint_floor_div adjustment branch.
+    // (-big) // 7 = floor(-big / 7) which needs the q-1 adjustment.
+    let result = eval("99999999999999999999 negated // 7");
+    assert!(matches!(result, Value::LargeInt(_)));
+}
+
+#[test]
+fn bigint_floor_rem_negative_via_largeint() {
+    // LargeInt \\ Int where signs differ → bigint_floor_rem adjustment branch.
+    // (-big) \\ 7: mathematically should be 6 (positive, in range 0..7).
+    assert_eq!(eval("99999999999999999999 negated \\\\ 7"), Value::Int(6));
+}
+
+// ── hash for non-Instance types ───────────────────────────────────────────────
+
+#[test]
+fn hash_false_is_zero() {
+    assert_eq!(eval("false hash"), Value::Int(0));
+}
+
+#[test]
+fn hash_true_is_one() {
+    assert_eq!(eval("true hash"), Value::Int(1));
+}
+
+#[test]
+fn hash_largeint_returns_int() {
+    assert!(matches!(eval("99999999999999999999 hash"), Value::Int(_)));
+}
+
+#[test]
+fn hash_block_returns_int() {
+    assert!(matches!(eval("[1 + 1] hash"), Value::Int(_)));
+}
+
+#[test]
+fn hash_namespace_returns_int() {
+    assert!(matches!(eval("Kernel hash"), Value::Int(_)));
+}
+
+// ── _primSize on object without indexed storage ───────────────────────────────
+
+#[test]
+fn prim_size_no_indexed_storage() {
+    // Value subclass has no indexed slots — _primSize should signal a TypeError.
+    let err = eval_err("Value subclass: #NoIdxV. NoIdxV new _primSize");
+    assert!(matches!(err, crate::eval::EvalError::TypeError(_)));
+}
+
+// ── hash for additional primitive types ──────────────────────────────────────
+
+#[test]
+fn hash_float_returns_int() {
+    assert!(matches!(eval("3.14 hash"), Value::Int(_)));
+}
+
+#[test]
+fn hash_nil_returns_zero() {
+    assert_eq!(eval("nil hash"), Value::Int(0));
+}
+
+#[test]
+fn hash_negative_largeint_returns_int() {
+    // Negative LargeInt triggers the wrapping_neg() branch in hash_value.
+    assert!(matches!(
+        eval("99999999999999999999 negated hash"),
+        Value::Int(_)
+    ));
+}
+
+// ── subclass: with unknown keyword silently ignored ───────────────────────────
+
+#[test]
+fn subclass_unknown_keyword_silently_ignored() {
+    // Unknown keyword pair in subclass: declaration is ignored; class is still defined.
+    assert_eq!(
+        eval("Object subclass: #FooUnknown unknownKeyword: 42. FooUnknown printString"),
+        Value::Str(Arc::from("FooUnknown"))
+    );
+}

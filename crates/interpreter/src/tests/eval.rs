@@ -1373,3 +1373,171 @@ a x
     // We don't assert the identity here, just that x was set correctly
     assert_eq!(eval(src), Value::Int(7));
 }
+
+// ── Evaluator::default ────────────────────────────────────────────────────────
+
+#[test]
+fn evaluator_default() {
+    // Evaluator::default() must delegate to Evaluator::new() and produce a working evaluator.
+    let (tx, rx) = std::sync::mpsc::channel();
+    may::config().set_stack_size(0x8000);
+    may::go!(move || {
+        let ev = Evaluator::default();
+        let mut env = crate::env::Env::new();
+        ev.registry.populate_env(&mut env);
+        let prog = crate::parser::Parser::parse("42").unwrap();
+        let v = ev.eval_program(&prog.stmts, &mut env).unwrap();
+        tx.send(v).unwrap();
+    });
+    assert_eq!(rx.recv().unwrap(), Value::Int(42));
+}
+
+// ── Block arity mismatch ──────────────────────────────────────────────────────
+
+#[test]
+fn eval_block_arity_mismatch() {
+    // Sending value: with 1 arg to a 2-param block triggers ArityMismatch in eval_block.
+    let err = eval_err("[:x :y | x] value: 1");
+    assert!(matches!(
+        err,
+        EvalError::ArityMismatch {
+            expected: 2,
+            got: 1
+        }
+    ));
+}
+
+#[test]
+fn eval_block_sync_arity_mismatch() {
+    // syncValue passes 0 args; a 1-param block triggers ArityMismatch in eval_block_sync.
+    let err = eval_err("[:x | x] syncValue");
+    assert!(matches!(
+        err,
+        EvalError::ArityMismatch {
+            expected: 1,
+            got: 0
+        }
+    ));
+}
+
+// ── syncValue with local declarations ─────────────────────────────────────────
+
+#[test]
+fn eval_program_sync_with_locals() {
+    // A block with locals evaluated via syncValue exercises LocalDecl in eval_program_sync.
+    assert_eq!(eval("[| x | x := 42. x] syncValue"), Value::Int(42));
+}
+
+// ── Class variable read / write ───────────────────────────────────────────────
+
+#[test]
+fn class_variable_read_write() {
+    // Class-side methods reading and writing class variables exercise the
+    // SelfBinding::ClassSide branches in lookup_var and assign_var.
+    let src = r#"
+Object subclass: #Counter classVariableNames: 'count'.
+Counter class >> setCount: n [ count := n ].
+Counter class >> getCount [ ^count ].
+Counter setCount: 42.
+Counter getCount.
+"#;
+    assert_eq!(eval(src), Value::Int(42));
+}
+
+// ── Class-side super dispatch ─────────────────────────────────────────────────
+
+#[test]
+fn super_class_side_method_found() {
+    // super in a class-side method finds a user-defined method in the superclass.
+    // Exercises SelfBinding::ClassSide branch in current_defining_class and
+    // the found-method arm of eval_super_send for class-side.
+    let src = r#"
+Object subclass: #Base.
+Base class >> label [ ^'base' ].
+Base subclass: #Child.
+Child class >> label [ ^super label ].
+Child label.
+"#;
+    assert_eq!(eval(src), Value::Str(Arc::from("base")));
+}
+
+#[test]
+fn super_class_side_fallback_to_builtin() {
+    // super new in a class-side method finds no user method in the superclass chain
+    // and falls through to dispatch_class_builtin — the None arm.
+    let src = r#"
+Object subclass: #Base.
+Base subclass: #Child.
+Child class >> make [ ^super new ].
+Child make.
+"#;
+    assert!(matches!(eval(src), Value::Instance(_)));
+}
+
+// ── super with no superclass ──────────────────────────────────────────────────
+
+#[test]
+fn super_send_in_root_class_errors() {
+    // Object has no superclass — super send produces a TypeError.
+    let src = r#"
+Object >> rootSuper [ ^super yourself ].
+Object new rootSuper.
+"#;
+    let err = eval_err(src);
+    assert!(matches!(err, EvalError::TypeError(_)));
+}
+
+// ── method def: class name is not a class ─────────────────────────────────────
+
+#[test]
+fn method_def_non_class_receiver_errors() {
+    // If the name before >> resolves to a non-class value, eval_method_def errors.
+    let err = eval_err("| Foo | Foo := 42. Foo >> bar [ ^1 ]");
+    assert!(matches!(err, EvalError::TypeError(_)));
+}
+
+// ── Namespace reference errors ────────────────────────────────────────────────
+
+#[test]
+fn namespace_ref_first_segment_not_a_namespace() {
+    // Object is a class, not a namespace — NamespaceRef errors at first segment.
+    let err = eval_err("Object::Array");
+    assert!(matches!(err, EvalError::TypeError(_)));
+}
+
+#[test]
+fn namespace_ref_first_segment_undefined() {
+    let err = eval_err("NonExistentNs::Array");
+    assert!(matches!(err, EvalError::UndefinedVariable(_)));
+}
+
+#[test]
+fn namespace_ref_class_not_found_in_namespace() {
+    let err = eval_err("Kernel::NonExistentClass");
+    assert!(matches!(err, EvalError::TypeError(_)));
+}
+
+// ── _prim cascade receiver check ─────────────────────────────────────────────
+
+#[test]
+fn prim_send_via_cascade_non_self_errors() {
+    // _prim* messages in a cascade sent to a non-self receiver are rejected.
+    let err =
+        eval_err("Object subclass: #CascadeTest. CascadeTest >> bad [ | x | x _primAt: 0; size ]");
+    assert!(matches!(err, EvalError::TypeError(_)));
+}
+
+// ── Instance-side super with no matching method ───────────────────────────────
+
+#[test]
+fn super_instance_method_not_found() {
+    // super send in an instance method where the superclass has no such method.
+    let src = r#"
+Object subclass: #Base.
+Base subclass: #Child.
+Child >> trySuper [ ^super noSuchMethod ].
+Child new trySuper.
+"#;
+    let err = eval_err(src);
+    assert!(matches!(err, EvalError::MessageNotUnderstood { .. }));
+}

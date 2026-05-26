@@ -6,7 +6,7 @@
   test coverage under 90, and we should aim for keeping things as high as reasonably
   possible.
 - Systematic method-by-method audit of `kernel.smol`. Every method body and every
-  conditional branch must be exercised by at least one test in `tests/eval.rs`. Add
+  conditional branch must be exercised by at least one test in `tests/kernel.rs`. Add
   tests for any gap found. Fix a small number of latent bugs discovered during audit.
 
 This chunk has no language changes — it is a quality gate before Chunk 24
@@ -15,18 +15,16 @@ a clean, fully-exercised baseline.
 
 ---
 
-## Known bugs to fix before audit
+## S1 status: complete
 
-**Stray `println!` in `dispatch_class_builtin`** (`builtins.rs` ~line 1594):
-```rust
-"printString" => {
-    let s: Arc<str> = class.name.clone();
-    println!("{:?}", s);  // ← remove
-    Ok(Value::Str(s))
-}
-```
-Add a `tests/builtins.rs` test that sends `printString` to a class and asserts the
-result is a String matching the class name, with no side effects.
+`tests/kernel.rs` has been created with a `class_print_string` test that verifies
+`printString` on a class returns a `String` matching the class name. This covers the
+intended behavior.
+
+The `println!` calls in the `printString` arms of `builtins.rs` (lines ~988, ~1271,
+~1594) are **intentional debug aids**, not bugs. The `true`/`false` println! calls
+at lines ~904/906 are similar. Removing them and designing a proper printString API
+is deferred to a later chunk.
 
 ---
 
@@ -110,22 +108,29 @@ All classes and methods currently in `kernel.smol`, in order:
 
 ## Approach
 
-Ask Claude Code to work through the list section by section, running `cargo test`
-after each section to confirm no regressions. New tests go in `tests/eval.rs` using
-the `eval(prog)` / `eval_err(prog)` helpers - OR - we could create a dedicated `tests/kernel.rs` 
-test file to specifically contain tests that are covering the kernel methods we add -
-I think we should prefer that, unless there's some reason not to. 
+Work through the audit list section by section, running `cargo test` after each
+section to confirm no regressions. New kernel method tests go in `tests/kernel.rs`
+using the `eval` / `eval_err` helpers. Builtin dispatch tests go in `tests/builtins.rs`.
 
-For error branches, use the `eval_err` helper and assert the error message contains
-the expected substring.
+For error branches, use `eval_err` and assert the error message contains the expected
+substring.
 
 ---
 
 ## Steps
 
-- **S1** Fix `println!` bug; add printString-to-class test.
-- **S2** Audit ValueHolder + Array; add gap tests.
-- **S3** Audit ByteArray + OrderedCollection; add gap tests.
-- **S4** Audit Error, Object extensions (error:, hash, initialize, new, new:); add gap tests.
-- **S5** Audit Association + Dictionary; add gap tests.
+- **S0** Run `just cov` to get per-file Rust coverage numbers. For each interpreter
+         source file under 90%, identify uncovered paths and add targeted tests to the
+         appropriate test file (`tests/builtins.rs`, `tests/eval.rs`, etc.). Re-run
+         `just cov` to confirm improvement before proceeding.
+- **S1** ~~Fix `println!` bug~~; add `class_print_string` test to `tests/kernel.rs`. **Done.**
+- **S2** Audit ValueHolder + Array; add gap tests to `tests/kernel.rs`.
+- **S3** Audit ByteArray + OrderedCollection; add gap tests to `tests/kernel.rs`.
+- **S4** Audit Error, Object extensions (error:, hash, initialize, new, new:); add gap tests to `tests/kernel.rs`.
+- **S5** Audit Association + Dictionary; add gap tests to `tests/kernel.rs`.
 - **S6** `cargo fmt`, `cargo clippy`, full test run; commit.
+
+**Test placement rule:** Kernel method behavior tests → `tests/kernel.rs`. Builtin
+dispatch tests (testing primitive dispatch directly) → `tests/builtins.rs`. Kernel
+tests that currently live in `eval.rs` can migrate to `kernel.rs` when their methods
+are audited.

@@ -1,6 +1,10 @@
 #[cfg(test)]
 mod test_helpers;
 
+#[cfg(test)]
+#[path = "tests/kernel.rs"]
+mod kernel_tests;
+
 pub mod ast;
 pub mod builtins;
 pub mod class;
