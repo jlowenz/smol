@@ -537,7 +537,9 @@ fn array_eq_size_mismatch() {
 
 #[test]
 fn array_detect_no_match_signals() {
-    let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a detect: [:e | e > 10]";
+    let src = "| a | a := Array new: 3. 
+    a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. 
+    a detect: [:e | e > 10]";
     assert!(matches!(eval_err(src), EvalError::Signal(_)));
 }
 
@@ -968,7 +970,7 @@ fn on_do_catches_error_colon() {
 Object subclass: #Foo instanceVariableNames: ''.
 [Foo new error: 'caught me'] on: Error do: [:e | e]
 "#;
-    assert_eq!(eval_err(src), EvalError::Signal(Arc::from("caught me")));
+    assert_eq!(eval(src), Value::Str(Arc::from("caught me")));
 }
 
 #[test]
@@ -1001,14 +1003,24 @@ fn hash_delegates_to_prim_hash_for_primitives() {
 }
 
 #[test]
+fn hash_delegates_to_object_hash_for_objects() {
+    let src = r#"
+Object subclass: #Blah instanceVariableNames: 'x'.
+Blah >> initialize [ x := 42 ]
+Blah >> x [^x]
+Blah >> = other [^x = other x]
+Blah >> hash [ ^x hash ]
+Blah new hash.
+"#;
+    assert_eq!(eval(src), Value::Int(42));
+}
+
+#[test]
 fn hash_overridable_on_object() {
     let src = r#"
 Object subclass: #Point instanceVariableNames: 'x y'.
 Point class >> x: anX y: aY [
-    | p |
-    p := self new.
-    p pvtX: anX y: aY.
-    ^p
+    ^self new pvtX: anX y: aY
 ]
 Point >> pvtX: anX y: aY [ x := anX. y := aY ]
 Point >> x [ ^x ]
@@ -1016,6 +1028,9 @@ Point >> y [ ^y ]
 Point >> = other [
     self class = other class ifFalse: [^false].
     ^x = other x and: [y = other y]
+]
+Point >> printString [ 
+    ^(x asString , '-' , y asString) printString
 ]
 Point >> hash [ ^(x hash * 31) + y hash ]
 | d |

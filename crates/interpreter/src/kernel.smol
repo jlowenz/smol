@@ -353,20 +353,25 @@ Value subclass: #Error
     classVariableNames: ''
     indexedSlots: #none.
 
-Error class >> signal: aString [
-    | e |
+Error class >> withMessage: aStr [
+    |e|
     e := self _primNew.
-    e pvtSetMessage: aString.
-    e signal
+    e pvtSetMessage: aStr.
+    ^e
+] 
+
+Error class >> signal: aString [
+    ^(self withMessage: aString) signal await
 ]
 
+Error >> initialize [ message := 'Unknown Error' ]
 Error >> pvtSetMessage: s [ message := s ]
 Error >> message    [ ^message ]
 Error >> messageText [ ^message ]
-Error >> signal     [ self _primSignal: message ]
+Error >> signal     [ ^self _primSignal: message ]
 
 "Override Object >> error: to delegate to Error so it raises Signal."
-Object >> error: aString [ Error signal: aString ]
+Object >> error: aString [ ^(Error signal: aString) await ]
 
 "Default hash delegates to _primHash (identity-based pointer hash).
  Subclasses that override = for value equality must also override hash

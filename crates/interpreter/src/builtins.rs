@@ -7,7 +7,8 @@ use parking_lot::RwLock;
 
 use crate::class::{Class, IndexedSlotKind};
 use crate::entity::{
-    InstanceHandle, InstanceKind, InstanceState, send_to_entity, spawn_entity_bare,
+    InstanceHandle, InstanceKind, InstanceState, send_to_entity, spawn_class_entity,
+    spawn_entity_bare,
 };
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
@@ -51,7 +52,10 @@ pub fn dispatch(
     // `hash` is universal for non-object types (primitive values don't route through
     // Object method lookup). For Value::Instance with Entity/ValueObject kind, the
     // type-specific dispatch runs instead to find any user-defined `hash` override.
-    if selector.as_ref() == "hash" && !matches!(recv, Value::Instance(_)) {
+    // Value::Future is excluded so the transparent-future arm below resolves the
+    // future first; if it resolves to an Instance, hash is re-dispatched through
+    // dispatch_entity so user-defined overrides are found.
+    if selector.as_ref() == "hash" && !matches!(recv, Value::Instance(_) | Value::Future(_)) {
         expect_arity(&selector, 0, args.len())?;
         let v = force_value(recv)?;
         return Ok(Value::Int(hash_value(&v)));
@@ -548,7 +552,9 @@ fn dispatch_int(
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(Arc::from(n.to_string().as_str())))
+            let s = n.to_string();
+            println!("{:?}", s);
+            Ok(Value::Str(Arc::from(s)))
         }
         "asFloat" => {
             expect_arity(sel, 0, args.len())?;
@@ -1153,7 +1159,7 @@ fn dispatch_block(
             expect_arity(sel, 2, args.len())?;
             let _condition = args.remove(0); // class-filtered dispatch deferred to chunk 21+
             let handler = as_block(args.remove(0), sel)?;
-            match ev.eval_block(&blk, vec![], env) {
+            match ev.eval_block_sync(&blk, vec![], env) {
                 Ok(v) => Ok(v),
                 Err(EvalError::Return(v, d)) => Err(EvalError::Return(v, d)),
                 Err(EvalError::Signal(msg)) => {
@@ -1209,6 +1215,13 @@ fn dispatch_entity(
 
     // Self-send: dispatch synchronously on the current thread to avoid deadlock.
     let current = ev.current_entity_id.get();
+    if selector.as_ref() == "hash" {
+        let methods: Vec<String> = handle.0.class.methods.read().keys().map(|k| k.to_string()).collect();
+        println!(
+            "DEBUG dispatch_entity hash: class={} entity_id={} current={:?} self_send={} own_methods={:?}",
+            handle.0.class.name, entity_id, current, current == Some(entity_id), methods
+        );
+    }
     if current == Some(entity_id) {
         let class = handle.0.class.clone();
         if let Some((method, def_class)) = class.lookup(&selector) {
@@ -1502,12 +1515,29 @@ fn dispatch_class(
     args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
-    let class = handle.0.class.clone();
-    // Check user-defined class-side methods BEFORE built-ins.
-    if let Some((method, def_class)) = class.lookup_class_method(&selector) {
-        return ev.invoke_class_method(handle, def_class, method, args, env);
+    let entity_id = match &handle.0.kind {
+        InstanceKind::ClassEntity(d) => d.id,
+        _ => unreachable!("dispatch_class called on non-ClassEntity instance"),
+    };
+
+    // Self-send or structural class-definition message: dispatch synchronously.
+    // `subclass:*` must run in the caller's context so that env bindings and
+    // namespace registration are immediately visible to the next statement.
+    let current = ev.current_entity_id.get();
+    if current == Some(entity_id) || selector.starts_with("subclass:") {
+        let class = handle.0.class.clone();
+        if let Some((method, def_class)) = class.lookup_class_method(&selector) {
+            return ev.invoke_class_method(handle, def_class, method, args, env);
+        }
+        return dispatch_class_builtin(ev, handle, selector, args, env);
     }
-    dispatch_class_builtin(ev, handle, selector, args, env)
+
+    // Cross-entity behavioral send: enqueue and return Future.
+    let future = match &handle.0.kind {
+        InstanceKind::ClassEntity(d) => send_to_entity(d, selector, args),
+        _ => unreachable!(),
+    };
+    Ok(Value::Future(future))
 }
 
 /// Built-in class-side dispatch that bypasses user-defined class methods.
@@ -1722,15 +1752,12 @@ fn handle_subclass(
         is_value: declared_is_value,
         class_object: std::sync::OnceLock::new(),
     });
-    let class_state = Arc::new(InstanceState {
-        class: new_class.clone(),
-        kind: InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(&new_class))),
-    });
+    let class_handle = spawn_class_entity(new_class.clone(), ev.registry.clone(), Env::new());
     new_class
         .class_object
-        .set(Arc::downgrade(&class_state))
+        .set(Arc::downgrade(&class_handle.0))
         .ok();
-    let class_handle = InstanceHandle(class_state);
+    ev.registry.register_class_entity(&class_handle);
 
     let active_ns = ev.active_namespace();
     active_ns.register(class_handle.clone());
