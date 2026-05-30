@@ -361,6 +361,61 @@ on programmer familiarity alone.
 
 ---
 
+### D13: Concurrency and Mutation Model — the Entity / Block Split
+
+**Decision**: Mutation of entity state is only permitted at method level.
+Blocks may only assign to their own declared params and locals. The parser
+enforces this statically (`ParseError::NonLocalBlockAssignment`).
+
+**Background**: Smol's actor model makes every state mutation an async
+operation. A block created inside entity A can be passed to entity B, where
+evaluating it would mutate A's state from B's coroutine — violating the
+single-writer guarantee that makes each entity's state safe without locks.
+Because proving non-escape statically requires full escape analysis (not yet
+available), the rule is conservative and strict.
+
+**Canonical patterns** (detailed in `docs/Smol_Patterns.md`):
+
+1. **Index loops** — replace `whileTrue:` counter loops with `to:do:`, where
+   the index is a block parameter.
+2. **Ivar mutation from a block** — extract to a `pvt` method and use
+   `(self pvtFoo) then: [^result]` to preserve ordering.
+3. **ValueHolder accumulator** — `[self do: [...]] then: [holder get]` —
+   actor message ordering guarantees `get` sees all prior `update:` results.
+4. **Non-local return** — replaces `ok := false` accumulator patterns;
+   `^false` exits the enclosing method on first failure.
+5. **Recursive helper** — for modular or irregular index arithmetic that
+   cannot be expressed with `to:do:`.
+
+**The paradigm-shift tension**: Code that looks sequential executes
+concurrently. `self pvtFoo. ^v` and `(self pvtFoo) then: [^v]` look nearly
+identical but the first races; the second is correct. This is the most likely
+source of subtle bugs until programmers internalise the model. The `then:`
+pattern makes ordering intent explicit.
+
+**Alternatives considered**:
+- *Allow ivar assignment in blocks* — simpler to write but re-introduces
+  cross-entity mutation hazards for any block that escapes. Not acceptable.
+- *Non-escaping block annotation* — a `{...}` or pragma form to mark
+  blocks that cannot be passed to another entity, relaxing the rule locally.
+  Correct approach for performance-critical inline control flow; deferred
+  pending design work.
+- *Implicit `await` at statement boundaries* — automatically force Futures
+  between statements. Breaks the async-everywhere model and hides ordering
+  structure from the programmer. Rejected.
+
+**Deferred**:
+- Non-escaping block annotation (see above).
+- Language-level `private` for `pvt`-prefixed methods.
+- Sync self-send optimisation (route `self pvtFoo` to `invoke_method`
+  directly, bypassing the mailbox). The `then:` pattern is correct either way.
+- Static lint for silently discarded Futures at statement boundaries (catches
+  the `self pvtFoo. ^v` race pattern without requiring full escape analysis).
+
+**Principle**: P4, P6
+
+---
+
 ## Design Tensions to Watch
 
 The following tensions are unresolved and should be revisited as
