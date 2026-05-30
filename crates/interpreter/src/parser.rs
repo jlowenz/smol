@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -20,6 +21,12 @@ pub enum ParseError {
     /// to go and is always a programming error.
     #[error("`^` (non-local return) inside a block requires an enclosing method")]
     NonLocalReturnOutsideMethod,
+    /// Assignment inside a block to a variable not declared in that block's
+    /// own params or locals. Only block-local names may be assigned from within
+    /// a block; assigning to method temps or ivars from a block creates
+    /// cross-entity mutation hazards.
+    #[error("block assigns to `{0}`, which is not declared in this block's params or locals")]
+    NonLocalBlockAssignment(Arc<str>),
 }
 
 pub struct Parser {
@@ -31,6 +38,10 @@ pub struct Parser {
     /// True while parsing any block body. Combined with `in_method` to detect
     /// orphaned non-local returns at parse time.
     in_block: bool,
+    /// Stack of block-local name sets (params ∪ locals). One entry per active
+    /// block nesting level. Assignment to a name not in the top entry is a
+    /// `NonLocalBlockAssignment` error.
+    block_scope_stack: Vec<HashSet<Arc<str>>>,
 }
 
 impl Parser {
@@ -42,6 +53,7 @@ impl Parser {
             comments: Vec::new(),
             in_method: false,
             in_block: false,
+            block_scope_stack: Vec::new(),
         };
         p.parse_program()
     }
@@ -180,6 +192,13 @@ impl Parser {
                     Token::Ident(n) => n,
                     _ => unreachable!(),
                 };
+                if self
+                    .block_scope_stack
+                    .last()
+                    .is_some_and(|scope| !scope.contains(&name))
+                {
+                    return Err(ParseError::NonLocalBlockAssignment(name));
+                }
                 self.skip_comments();
                 self.advance(); // consume `:=`
                 let value = self.parse_expr()?;
@@ -251,8 +270,12 @@ impl Parser {
         }
 
         // Statements until ']' — `^` is valid here and in any nested blocks.
+        // A method body is a new scope root: block assignments inside the method
+        // are validated against the method's own block nesting, not any enclosing
+        // block scope (e.g., a method defined inside a `Namespace do:` block).
         let prev_in_method = self.in_method;
         let prev_in_block = self.in_block;
+        let prev_scope_stack = std::mem::take(&mut self.block_scope_stack);
         self.in_method = true;
         self.in_block = false;
         let mut body = Vec::new();
@@ -262,6 +285,7 @@ impl Parser {
         }
         self.in_method = prev_in_method;
         self.in_block = prev_in_block;
+        self.block_scope_stack = prev_scope_stack;
         self.expect("']'", |t| t == &Token::RBracket)?;
 
         Ok(Stmt::MethodDef(MethodDef {
@@ -588,11 +612,15 @@ impl Parser {
         }
         let prev_in_block = self.in_block;
         self.in_block = true;
+        let mut scope: HashSet<Arc<str>> = params.iter().cloned().collect();
+        scope.extend(locals.iter().cloned());
+        self.block_scope_stack.push(scope);
         let mut body = Vec::new();
         while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
             body.push(self.parse_stmt()?);
             self.eat(&Token::Dot);
         }
+        self.block_scope_stack.pop();
         self.in_block = prev_in_block;
         self.expect("']'", |t| t == &Token::RBracket)?;
         Ok(Expr::Block {

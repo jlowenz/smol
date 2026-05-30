@@ -540,3 +540,48 @@ fn array_literal_largeint_element() {
         ))])
     );
 }
+
+// ── NonLocalBlockAssignment ───────────────────────────────────────────────
+
+#[test]
+fn block_local_assignment_is_legal() {
+    // Assigning to a block param or local is always legal.
+    assert!(Parser::parse("[:x | x := 42. x]").is_ok());
+    assert!(Parser::parse("[| n | n := 1. n]").is_ok());
+    assert!(Parser::parse("[:x | | t | t := x + 1. t]").is_ok());
+}
+
+#[test]
+fn block_assignment_to_method_temp_is_error() {
+    // Assigning to a method temp from inside a block is rejected.
+    let err = Parser::parse("Object >> m [ | n | [n := 1] value ]");
+    assert!(
+        matches!(err, Err(ParseError::NonLocalBlockAssignment(ref name)) if name.as_ref() == "n"),
+        "expected NonLocalBlockAssignment(\"n\"), got {err:?}"
+    );
+}
+
+#[test]
+fn block_assignment_to_outer_block_temp_is_error() {
+    // Assigning to an outer block's local from an inner block is rejected.
+    let err = Parser::parse("Object >> m [ [| n | [n := 1] value] value ]");
+    assert!(
+        matches!(err, Err(ParseError::NonLocalBlockAssignment(ref name)) if name.as_ref() == "n"),
+        "expected NonLocalBlockAssignment(\"n\"), got {err:?}"
+    );
+}
+
+#[test]
+fn nested_block_each_may_assign_own_locals() {
+    // Each nesting level may assign only to its own scope — both legal here.
+    assert!(Parser::parse("Object >> m [ [:x | | t | t := x. t] value: 1 ]").is_ok());
+}
+
+#[test]
+fn method_body_inside_namespace_do_may_assign_ivars() {
+    // A method defined inside a Namespace do: block must be able to assign ivars.
+    assert!(Parser::parse(
+        "MyNS do: [ Value subclass: #Foo instanceVariableNames: 'val'. Foo >> set: v [ val := v ] ]"
+    )
+    .is_ok());
+}

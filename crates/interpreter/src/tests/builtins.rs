@@ -137,15 +137,12 @@ fn int_floor_division_semantics() {
 
 #[test]
 fn int_to_by_do() {
-    assert_eq!(
-        eval("| s | s := 0. 1 to: 10 by: 3 do: [:i | s := s + i]. s"),
-        Value::Int(22) // 1+4+7+10
-    );
-    // Descending
-    assert_eq!(
-        eval("| s | s := 0. 5 to: 1 by: -1 do: [:i | s := s + i]. s"),
-        Value::Int(15)
-    );
+    // ascending: 1+4+7+10 = 22
+    let src = "| oc | oc := OrderedCollection new. 1 to: 10 by: 3 do: [:i | oc add: i]. oc inject: 0 into: [:acc :e | acc + e]";
+    assert_eq!(eval(src), Value::Int(22));
+    // descending: 5+4+3+2+1 = 15
+    let src2 = "| oc | oc := OrderedCollection new. 5 to: 1 by: -1 do: [:i | oc add: i]. oc inject: 0 into: [:acc :e | acc + e]";
+    assert_eq!(eval(src2), Value::Int(15));
 }
 
 #[test]
@@ -356,26 +353,20 @@ fn block_value_three_args() {
 
 #[test]
 fn block_while_false() {
-    assert_eq!(
-        eval("| n | n := 0. [n >= 3] whileFalse: [n := n + 1]. n"),
-        Value::Int(3)
-    );
+    let src = "| oc | oc := OrderedCollection new. [oc size >= 3] whileFalse: [oc add: 1]. oc size";
+    assert_eq!(eval(src), Value::Int(3));
 }
 
 #[test]
 fn block_while_true_no_body() {
-    assert_eq!(
-        eval("| n | n := 0. [n := n + 1. n < 3] whileTrue. n"),
-        Value::Int(3)
-    );
+    let src = "| oc | oc := OrderedCollection new. [oc add: 1. oc size < 3] whileTrue. oc size";
+    assert_eq!(eval(src), Value::Int(3));
 }
 
 #[test]
 fn block_while_false_no_body() {
-    assert_eq!(
-        eval("| n | n := 0. [n := n + 1. n >= 3] whileFalse. n"),
-        Value::Int(3)
-    );
+    let src = "| oc | oc := OrderedCollection new. [oc add: 1. oc size >= 3] whileFalse. oc size";
+    assert_eq!(eval(src), Value::Int(3));
 }
 
 #[test]
@@ -1356,6 +1347,45 @@ fn then_on_non_future_runs_block_synchronously() {
     assert_eq!(eval("42 then: [99]"), Value::Int(99));
     assert_eq!(eval("'hi' then: [1]"), Value::Int(1));
     assert_eq!(eval("nil then: [true]"), Value::Bool(true));
+}
+
+#[test]
+fn then_on_block_evaluates_receiver_then_continuation() {
+    // Receiver block runs first, then continuation runs synchronously (result is not a Future).
+    assert_eq!(eval("[1 + 1] then: [42]"), Value::Int(42));
+    // Continuation can read values established before the receiver block ran.
+    assert_eq!(
+        eval(
+            "| holder | holder := ValueHolder initialValue: 0. [holder set: 7] then: [holder get]"
+        ),
+        Value::Int(7)
+    );
+}
+
+#[test]
+fn then_on_block_with_future_result_chains_async() {
+    // Receiver block returns a Future (cross-entity send); continuation chains after it resolves.
+    let src = r#"
+| holder |
+holder := ValueHolder initialValue: 0.
+[holder set: 99] then: [holder get]
+"#;
+    // holder set: returns a Future (cross-entity send to holder entity);
+    // but since [holder set: 99] evaluates to the Future returned by set:,
+    // the continuation [holder get] chains after it.
+    // The resolved result is 99.
+    assert_eq!(eval(src), Value::Int(99));
+}
+
+#[test]
+fn then_on_block_loop_then_read() {
+    // The canonical [loop] then: [read] pattern: loop queues updates, then read follows.
+    let src = r#"
+| holder |
+holder := ValueHolder initialValue: 0.
+[3 timesRepeat: [holder update: [:n | n + 1]]] then: [holder get]
+"#;
+    assert_eq!(eval(src), Value::Int(3));
 }
 
 // ── Universal error: / _primSignal: on primitive types ────────────────────

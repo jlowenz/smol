@@ -64,10 +64,11 @@ Array >> detect: aBlock ifNone: noneBlock [
 ]
 
 Array >> inject: init into: aBlock [
-    | acc |
-    acc := init.
-    self do: [:each | acc := aBlock value: acc value: each].
-    ^acc
+    | holder |
+    holder := ValueHolder initialValue: init.
+    ^[self do: [:each |
+        holder update: [:acc | aBlock value: acc value: each]
+    ]] then: [holder get]
 ]
 
 Array >> includes: v [
@@ -76,12 +77,10 @@ Array >> includes: v [
 ]
 
 Array >> copyFrom: start to: stop [
-    | result i |
+    | result |
     result := Array new: stop - start + 1.
-    i := 0.
-    [start + i <= stop] whileTrue: [
-        result at: i put: (self _primAt: start + i).
-        i := i + 1
+    0 to: stop - start do: [:i |
+        result at: i put: (self _primAt: start + i)
     ].
     ^result
 ]
@@ -100,14 +99,11 @@ Array >> = other [
 Array >> ~= other [ ^(self = other) not ]
 
 Array >> printString [
-    | s i |
-    s := '('.
-    i := 0.
-    [i < self _primSize] whileTrue: [
-        s := s , (self _primAt: i) printString , ' '.
-        i := i + 1
-    ].
-    ^s , ')'
+    | holder |
+    holder := ValueHolder initialValue: '('.
+    ^[self do: [:each |
+        holder update: [:s | s , each printString , ' ']
+    ]] then: [holder get , ')']
 ]
 
 "ByteArray — fixed-size indexed collection of byte (0..255) slots."
@@ -123,21 +119,16 @@ ByteArray >> isEmpty     [ ^self _primSize = 0 ]
 ByteArray >> notEmpty    [ ^self _primSize > 0 ]
 
 ByteArray >> do: aBlock [
-    | i |
-    i := 0.
-    [i < self _primSize] whileTrue: [
-        aBlock value: (self _primAt: i).
-        i := i + 1
+    0 to: self _primSize - 1 do: [:i |
+        aBlock value: (self _primAt: i)
     ]
 ]
 
 ByteArray >> copyFrom: start to: stop [
-    | result i |
+    | result |
     result := ByteArray new: stop - start + 1.
-    i := 0.
-    [start + i <= stop] whileTrue: [
-        result at: i put: (self _primAt: start + i).
-        i := i + 1
+    0 to: stop - start do: [:i |
+        result at: i put: (self _primAt: start + i)
     ].
     ^result
 ]
@@ -145,14 +136,11 @@ ByteArray >> copyFrom: start to: stop [
 ByteArray >> asString [ ^self _primAsString ]
 
 ByteArray >> printString [
-    | s i |
-    s := '('.
-    i := 0.
-    [i < self _primSize] whileTrue: [
-        s := s , (self _primAt: i) printString , ' '.
-        i := i + 1
-    ].
-    ^s , ')'
+    | holder |
+    holder := ValueHolder initialValue: '('.
+    ^[self do: [:each |
+        holder update: [:s | s , each printString , ' ']
+    ]] then: [holder get , ')']
 ]
 
 "OrderedCollection — growable sequence backed by an Array."
@@ -193,12 +181,9 @@ OrderedCollection >> add: v [
 OrderedCollection >> addLast: v [ ^self add: v ]
 
 OrderedCollection >> addFirst: v [
-    | i |
     size >= storage size ifTrue: [self pvtGrow].
-    i := size.
-    [i > 0] whileTrue: [
-        storage at: i put: (storage at: i - 1).
-        i := i - 1
+    size to: 1 by: -1 do: [:i |
+        storage at: i put: (storage at: i - 1)
     ].
     storage at: 0 put: v.
     size := size + 1.
@@ -206,13 +191,11 @@ OrderedCollection >> addFirst: v [
 ]
 
 OrderedCollection >> removeFirst [
-    | v i |
+    | v |
     size = 0 ifTrue: [self error: 'removeFirst: collection is empty'].
     v := storage at: 0.
-    i := 1.
-    [i < size] whileTrue: [
-        storage at: i - 1 put: (storage at: i).
-        i := i + 1
+    1 to: size - 1 do: [:i |
+        storage at: i - 1 put: (storage at: i)
     ].
     size := size - 1.
     ^v
@@ -226,40 +209,33 @@ OrderedCollection >> removeLast [
     ^v
 ]
 
+OrderedCollection >> pvtRemoveAt: idx [
+    idx + 1 to: size - 1 do: [:j |
+        storage at: j - 1 put: (storage at: j)
+    ].
+    size := size - 1
+]
+
 OrderedCollection >> remove: v ifAbsent: aBlock [
-    | i j |
-    i := 0.
-    [i < size] whileTrue: [
+    0 to: size - 1 do: [:i |
         (storage at: i) = v ifTrue: [
-            j := i + 1.
-            [j < size] whileTrue: [
-                storage at: j - 1 put: (storage at: j).
-                j := j + 1
-            ].
-            size := size - 1.
-            ^v
-        ].
-        i := i + 1
+            (self pvtRemoveAt: i) then: [^v]
+        ]
     ].
     ^aBlock value
 ]
 
 OrderedCollection >> do: aBlock [
-    | i |
-    i := 0.
-    [i < size] whileTrue: [
-        aBlock value: (storage at: i).
-        i := i + 1
+    0 to: size - 1 do: [:i |
+        aBlock value: (storage at: i)
     ]
 ]
 
 OrderedCollection >> collect: aBlock [
-    | result i |
+    | result |
     result := OrderedCollection new.
-    i := 0.
-    [i < size] whileTrue: [
-        result add: (aBlock value: (storage at: i)).
-        i := i + 1
+    0 to: size - 1 do: [:i |
+        result add: (aBlock value: (storage at: i))
     ].
     ^result
 ]
@@ -289,10 +265,11 @@ OrderedCollection >> detect: aBlock ifNone: noneBlock [
 ]
 
 OrderedCollection >> inject: init into: aBlock [
-    | acc |
-    acc := init.
-    self do: [:each | acc := aBlock value: acc value: each].
-    ^acc
+    | holder |
+    holder := ValueHolder initialValue: init.
+    ^[self do: [:each |
+        holder update: [:acc | aBlock value: acc value: each]
+    ]] then: [holder get]
 ]
 
 OrderedCollection >> includes: v [
@@ -301,24 +278,19 @@ OrderedCollection >> includes: v [
 ]
 
 OrderedCollection >> copyFrom: start to: stop [
-    | result i |
+    | result |
     result := OrderedCollection new.
-    i := start.
-    [i <= stop] whileTrue: [
-        result add: (self at: i).
-        i := i + 1
+    start to: stop do: [:i |
+        result add: (self at: i)
     ].
     ^result
 ]
 
 OrderedCollection >> = other [
-    | i |
     self class = other class ifFalse: [^false].
     size = other size ifFalse: [^false].
-    i := 0.
-    [i < size] whileTrue: [
-        (self at: i) = (other at: i) ifFalse: [^false].
-        i := i + 1
+    0 to: size - 1 do: [:i |
+        (self at: i) = (other at: i) ifFalse: [^false]
     ].
     ^true
 ]
@@ -326,23 +298,18 @@ OrderedCollection >> = other [
 OrderedCollection >> ~= other [ ^(self = other) not ]
 
 OrderedCollection >> printString [
-    | s i |
-    s := 'OrderedCollection ('.
-    i := 0.
-    [i < size] whileTrue: [
-        s := s , (storage at: i) printString , ' '.
-        i := i + 1
-    ].
-    ^s , ')'
+    | holder |
+    holder := ValueHolder initialValue: 'OrderedCollection ('.
+    ^[self do: [:each |
+        holder update: [:s | s , each printString , ' ']
+    ]] then: [holder get , ')']
 ]
 
 OrderedCollection >> pvtGrow [
-    | newStorage i |
+    | newStorage |
     newStorage := Array new: storage size * 2.
-    i := 0.
-    [i < size] whileTrue: [
-        newStorage at: i put: (storage at: i).
-        i := i + 1
+    0 to: size - 1 do: [:i |
+        newStorage at: i put: (storage at: i)
     ].
     storage := newStorage
 ]
@@ -428,15 +395,15 @@ Dictionary >> initialize [
 
 "Returns the slot index for key — nil slot means absent, matching slot means present."
 Dictionary >> pvtSlotFor: key [
-    | cap h i slot |
+    | cap h i |
     cap := table size.
     h := key hash \\ cap.
-    h < 0 ifTrue: [h := h + cap].
-    i := h.
-    [true] whileTrue: [
-        slot := table at: i.
-        (slot isNil or: [slot key = key]) ifTrue: [^i].
-        i := (i + 1) \\ cap
+    i := h < 0 ifTrue: [h + cap] ifFalse: [h].
+    i to: (i + table size - 1) do: [ :i | 
+        |slot j|
+        j := i \\ cap. 
+        slot := table at: j.
+        (slot isNil or: [slot key = key]) ifTrue: [^j]
     ]
 ]
 
@@ -445,11 +412,13 @@ Dictionary >> at: key put: value [
     (size * 4) >= (table size * 3) ifTrue: [self pvtRehash].
     i := self pvtSlotFor: key.
     slot := table at: i.
-    slot isNil
+    size := slot isNil
         ifTrue: [
             table at: i put: (Association key: key value: value).
-            size := size + 1]
-        ifFalse: [slot value: value].
+            size + 1]
+        ifFalse: [
+            slot value: value.
+            size].
     ^value
 ]
 
@@ -474,7 +443,7 @@ Dictionary >> includesKey: key [
 "Removes key; returns value if present, block result if absent.
  Uses full-table rebuild to preserve open-addressing invariants."
 Dictionary >> removeKey: key ifAbsent: aBlock [
-    | i slot removedValue oldTable oldSize s |
+    | i slot removedValue oldTable oldSize |
     i := self pvtSlotFor: key.
     slot := table at: i.
     slot isNil ifTrue: [^aBlock value].
@@ -483,11 +452,10 @@ Dictionary >> removeKey: key ifAbsent: aBlock [
     oldSize := oldTable size.
     table := Array new: oldSize.
     size := 0.
-    i := 0.
-    [i < oldSize] whileTrue: [
-        s := oldTable at: i.
-        (s notNil and: [s key ~= key]) ifTrue: [self at: s key put: s value].
-        i := i + 1
+    0 to: oldSize - 1 do: [:i |
+        (oldTable at: i) ifNotNil: [:s |
+            (s key ~= key) ifTrue: [self at: s key put: s value]
+        ]
     ].
     ^removedValue
 ]
@@ -497,35 +465,26 @@ Dictionary >> isEmpty  [ ^size = 0 ]
 Dictionary >> notEmpty [ ^size > 0 ]
 
 Dictionary >> do: aBlock [
-    | i cap slot |
+    | cap |
     cap := table size.
-    i := 0.
-    [i < cap] whileTrue: [
-        slot := table at: i.
-        slot isNil ifFalse: [aBlock value: slot value].
-        i := i + 1
+    0 to: cap - 1 do: [:i |
+        (table at: i) ifNotNil: [:slot | aBlock value: slot value]
     ]
 ]
 
 Dictionary >> keysDo: aBlock [
-    | i cap slot |
+    | cap |
     cap := table size.
-    i := 0.
-    [i < cap] whileTrue: [
-        slot := table at: i.
-        slot isNil ifFalse: [aBlock value: slot key].
-        i := i + 1
+    0 to: cap - 1 do: [:i |
+        (table at: i) ifNotNil: [:slot | aBlock value: slot key]
     ]
 ]
 
 Dictionary >> associationsDo: aBlock [
-    | i cap slot |
+    | cap |
     cap := table size.
-    i := 0.
-    [i < cap] whileTrue: [
-        slot := table at: i.
-        slot isNil ifFalse: [aBlock value: slot].
-        i := i + 1
+    0 to: cap - 1 do: [:i |
+        (table at: i) ifNotNil: [:slot | aBlock value: slot]
     ]
 ]
 
@@ -544,35 +503,29 @@ Dictionary >> values [
 ]
 
 Dictionary >> = other [
-    | ok |
     self class = other class ifFalse: [^false].
     size = other size ifFalse: [^false].
-    ok := true.
     self associationsDo: [:assoc |
-        (other at: assoc key ifAbsent: [ok := false. nil]) = assoc value
-            ifFalse: [ok := false]
+        (other at: assoc key ifAbsent: [^false]) = assoc value
+            ifFalse: [^false]
     ].
-    ^ok
+    ^true
 ]
 
 Dictionary >> printString [
-    | s |
-    s := 'Dictionary ('.
-    self associationsDo: [:assoc |
-        s := s , assoc printString , ' '
-    ].
-    ^s , ')'
+    | holder |
+    holder := ValueHolder initialValue: 'Dictionary ('.
+    ^[self associationsDo: [:assoc |
+        holder update: [:s | s , assoc printString , ' ']
+    ]] then: [holder get , ')']
 ]
 
 Dictionary >> pvtRehash [
-    | old i slot |
+    | old |
     old := table.
     table := Array new: old size * 2.
     size := 0.
-    i := 0.
-    [i < old size] whileTrue: [
-        slot := old at: i.
-        slot isNil ifFalse: [self at: slot key put: slot value].
-        i := i + 1
+    0 to: old size - 1 do: [:i |
+        (old at: i) ifNotNil: [:slot | self at: slot key put: slot value]
     ]
 ]

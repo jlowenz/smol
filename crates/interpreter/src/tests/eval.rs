@@ -42,18 +42,14 @@ fn block_in_block_value() {
 
 #[test]
 fn times_repeat() {
-    assert_eq!(
-        eval("| n | n := 0. 3 timesRepeat: [n := n + 1]. n"),
-        Value::Int(3)
-    );
+    let src = "| oc | oc := OrderedCollection new. 3 timesRepeat: [oc add: 1]. oc size";
+    assert_eq!(eval(src), Value::Int(3));
 }
 
 #[test]
 fn while_true() {
-    assert_eq!(
-        eval("| n | n := 0. [n < 5] whileTrue: [n := n + 1]. n"),
-        Value::Int(5)
-    );
+    let src = "| oc | oc := OrderedCollection new. [oc size < 5] whileTrue: [oc add: 1]. oc size";
+    assert_eq!(eval(src), Value::Int(5));
 }
 
 #[test]
@@ -103,10 +99,8 @@ fn message_not_understood() {
 
 #[test]
 fn to_do_loop() {
-    assert_eq!(
-        eval("| sum | sum := 0. 1 to: 5 do: [:i | sum := sum + i]. sum"),
-        Value::Int(15)
-    );
+    let src = "| oc | oc := OrderedCollection new. 1 to: 5 do: [:i | oc add: i]. oc inject: 0 into: [:acc :e | acc + e]";
+    assert_eq!(eval(src), Value::Int(15));
 }
 
 #[test]
@@ -248,10 +242,10 @@ Kernel::Object new printString
 #[test]
 fn namespace_do_scopes_class() {
     let src = r#"
-| result |
-result := 0.
-Kernel do: [ result := 1 ].
-result
+| oc |
+oc := OrderedCollection new.
+Kernel do: [ oc add: 1 ].
+oc size
 "#;
     assert_eq!(eval(src), Value::Int(1));
 }
@@ -271,7 +265,6 @@ fn non_kernel_class_scoped_to_namespace() {
         .eval_program(
             &Parser::parse(
                 r#"
-| result |
 MyLib do: [
     | w |
     Value subclass: #Widget instanceVariableNames: 'val'.
@@ -279,9 +272,8 @@ MyLib do: [
     Widget >> val [ ^val ]
     w := Widget new.
     w setVal: 42.
-    result := w val
-].
-result
+    w val
+]
 "#,
             )
             .expect("parse")
@@ -662,9 +654,7 @@ fn oc_remove_if_absent() {
 
 #[test]
 fn oc_do_iterates() {
-    let src = "| oc s |
-    oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. s := 0.
-    (oc do: [:e | s := s + e]) then: [s]";
+    let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc inject: 0 into: [:acc :e | acc + e]";
     assert_eq!(eval(src), Value::Int(6));
 }
 
@@ -851,7 +841,7 @@ fn array_literal_symbols() {
 
 #[test]
 fn array_literal_passed_to_do() {
-    let src = "| s | s := 0. #(1 2 3 4) do: [:e | s := s + e]. s";
+    let src = "#(1 2 3 4) inject: 0 into: [:acc :e | acc + e]";
     assert_eq!(eval(src), Value::Int(10));
 }
 
@@ -904,11 +894,11 @@ s top
 #[test]
 fn nested_array_literal_with_do() {
     let src = r#"
-| outer s |
+| outer oc |
 outer := #(#(1 2) #(3 4)).
-s := 0.
-outer do: [:row | row do: [:e | s := s + e]].
-s
+oc := OrderedCollection new.
+outer do: [:row | row do: [:e | oc add: e]].
+oc inject: 0 into: [:acc :e | acc + e]
 "#;
     assert_eq!(eval(src), Value::Int(10));
 }
@@ -917,6 +907,21 @@ s
 fn block_with_locals() {
     let prog = "b := [:i | | a | a := 42. a := a + i. a]. (b value: 42) printString.";
     assert_eq!(eval(prog), Value::Str(Arc::from("84")));
+}
+
+// ── Parser: strict block assignment ──────────────────────────────────────
+
+#[test]
+fn non_local_block_assignment_is_parse_error() {
+    use crate::parser::{ParseError, Parser};
+    // Assigning a method temp from inside a block is rejected at parse time.
+    let err = Parser::parse("Object >> m [ | n | [n := 1] value ]");
+    assert!(
+        matches!(err, Err(ParseError::NonLocalBlockAssignment(ref name)) if name.as_ref() == "n"),
+        "expected NonLocalBlockAssignment(\"n\"), got {err:?}"
+    );
+    // Assigning a block param or local is legal.
+    assert!(Parser::parse("Object >> m [ [:x | x := 1. x] value: 0 ]").is_ok());
 }
 
 // ── Signal / Error ────────────────────────────────────────────────────────
@@ -1029,10 +1034,8 @@ Point >> = other [
     self class = other class ifFalse: [^false].
     ^x = other x and: [y = other y]
 ]
-Point >> printString [ 
-    ^(x asString , '-' , y asString) printString
-]
 Point >> hash [ ^(x hash * 31) + y hash ]
+
 | d |
 d := Dictionary new.
 d at: (Point x: 1 y: 2) put: 'origin-ish'.

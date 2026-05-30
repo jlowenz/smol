@@ -128,9 +128,13 @@ pub fn dispatch(
     }
     // `then:` — chains a block after this value resolves.
     // Future: spawns an async continuation and returns a new Future.
+    // Block: evaluates the receiver block synchronously (≡ `value`), then — if the
+    //   result is a Future, chains the continuation asynchronously; otherwise runs it
+    //   synchronously. This is the canonical `[loop] then: [result]` combinator: the
+    //   receiver block runs first (queuing any actor messages), then the continuation
+    //   is guaranteed to execute after it.
     // Any other value: the value is already resolved; the block is run synchronously.
-    // The block receives no arguments in either case — use `await` + a regular send
-    // when the resolved value is needed inside the block.
+    // The continuation block receives no arguments in any case.
     if selector.as_ref() == "then:" {
         expect_arity(&selector, 1, args.len())?;
         let blk_val = args.into_iter().next().unwrap();
@@ -160,6 +164,38 @@ pub fn dispatch(
                     }
                 });
                 Ok(Value::Future(result_future))
+            }
+            Value::Block(recv_blk) => {
+                let cont_blk = as_block(blk_val, &selector)?;
+                let result = ev.eval_block(&recv_blk, vec![], env)?;
+                match result {
+                    Value::Future(future) => {
+                        let result_future = crate::entity::FutureHandle::new();
+                        let result_reply = result_future.clone();
+                        let registry = ev.registry.clone();
+                        crate::entity::init_coroutine_stack();
+                        may::go!(move || {
+                            match future.wait() {
+                                Err(e) => result_reply.resolve_err(e),
+                                Ok(_) => {
+                                    let then_ev = Evaluator::with_registry(registry);
+                                    let mut dummy_env = crate::env::Env::new();
+                                    let r = then_ev.eval_block(&cont_blk, vec![], &mut dummy_env);
+                                    match r {
+                                        Ok(v) => match force_value(v) {
+                                            Ok(forced) => result_reply.resolve_ok(forced),
+                                            Err(e) => result_reply.resolve_err(e),
+                                        },
+                                        Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
+                                        Err(e) => result_reply.resolve_err(e),
+                                    }
+                                }
+                            }
+                        });
+                        Ok(Value::Future(result_future))
+                    }
+                    _ => ev.eval_block(&cont_blk, vec![], env),
+                }
             }
             _ => {
                 let blk = as_block(blk_val, &selector)?;
@@ -550,6 +586,10 @@ fn dispatch_int(
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Int(n.min(as_int(args.remove(0), sel)?)))
         }
+        "asString" => {
+            expect_arity(sel, 0, args.len())?;
+            Ok(Value::Str(Arc::from(n.to_string())))
+        }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
             let s = n.to_string();
@@ -686,6 +726,10 @@ fn dispatch_largeint(
             expect_arity(sel, 0, args.len())?;
             use num_traits::Signed;
             Ok(normalize_bigint(n.abs()))
+        }
+        "asString" => {
+            expect_arity(sel, 0, args.len())?;
+            Ok(Value::Str(Arc::from(n.to_string())))
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
@@ -1215,13 +1259,6 @@ fn dispatch_entity(
 
     // Self-send: dispatch synchronously on the current thread to avoid deadlock.
     let current = ev.current_entity_id.get();
-    if selector.as_ref() == "hash" {
-        let methods: Vec<String> = handle.0.class.methods.read().keys().map(|k| k.to_string()).collect();
-        println!(
-            "DEBUG dispatch_entity hash: class={} entity_id={} current={:?} self_send={} own_methods={:?}",
-            handle.0.class.name, entity_id, current, current == Some(entity_id), methods
-        );
-    }
     if current == Some(entity_id) {
         let class = handle.0.class.clone();
         if let Some((method, def_class)) = class.lookup(&selector) {
