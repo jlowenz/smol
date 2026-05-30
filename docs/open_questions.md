@@ -1,0 +1,213 @@
+# Open Design Questions
+
+Design questions that arise during implementation work and require a dedicated
+design session before they can be resolved. Broader open issues (error handling
+model, capability model, gradual typing, etc.) remain in `Project_Summary.md`.
+
+Each entry records: what the question is, why it matters, the tensions to resolve,
+and its current status. Questions should be marked **Resolved** (with a pointer to
+the decision record) once settled, not deleted.
+
+---
+
+## Q1: Multi-version live entities
+
+**Status**: Open — needs design session  
+**Raised**: C27 design discussion
+
+The bitemporal store records the full history of every entity's ivar values. The
+question is whether the system should allow multiple *live, message-receiving*
+versions of the same entity to coexist — e.g. "AccountEntity as it was on
+2026-05-15" running alongside the current version for comparison, debugging,
+replay, or branching.
+
+**Tensions to resolve:**
+- **Identity**: is a versioned entity the same `EntityId` as its origin, or a new
+  one? If new, how is the origin relationship expressed in the store?
+- **Mutability**: is a past-version entity read-only (frozen replay) or can it
+  diverge (a branch that can receive messages and evolve independently)?
+- **Actor semantics**: does a versioned entity have its own mailbox and coroutine,
+  or is it a read-only projection with no scheduler presence?
+- **Relationship to resume-from-store**: reconstructing a past state from durable
+  facts is a prerequisite; the resume mechanism (planned C27.5/C28) likely needs
+  to be designed with versioning in mind.
+- **Relationship to cross-entity transactions**: if a versioned entity can diverge,
+  how do branched versions that later need to be reconciled interact with the saga
+  model?
+
+Note: `historyOf:` (C27) is read-only temporal access and is distinct from this.
+
+---
+
+## Q2: Cross-entity transaction model — saga sufficiency
+
+**Status**: Open — needs design session (C28 prerequisite)  
+**Raised**: C27 design discussion
+
+Message-handler boundaries are the natural within-entity transaction unit. For
+operations spanning multiple entities (e.g. fund transfer between two accounts),
+the saga pattern (forward steps with compensating messages) is the primary
+candidate, but it may not be sufficient for all cases.
+
+**Tensions to resolve:**
+- Which cross-entity scenarios cannot be expressed as sagas, and what alternative
+  model covers them?
+- What does the condition/signal system need to provide for saga compensation to be
+  reliable? (Error propagation, idempotency guarantees, timeout/cancellation.)
+- How do the parameterised transaction modes (`#atomic`, `#saga`, `#stm`,
+  `#bestEffort`) map to concrete implementation strategies?
+- STM-like optimistic concurrency (per-triple version numbers, message-based
+  version negotiation) is mentioned in the design — is this the implementation
+  path for `#stm`, and how does it interact with the actor model?
+
+---
+
+## Q3: Value object GC and structural sharing
+
+**Status**: Open — implementation deferred past C27  
+**Raised**: C27 design discussion
+
+Value objects are stored in the triple store using content-hash identity. Because
+they are immutable and potentially shared across many entities, they should ideally
+be stored once (structural sharing) and removed when no entity references them.
+C27 does not implement either optimisation; facts accumulate indefinitely.
+
+**Tensions to resolve:**
+- **Structural sharing**: an "already stored?" check on every value object
+  assertion adds a store read per ivar set. Options: Bloom filter, session-scoped
+  `HashSet<EntityId>`, or accept re-assertion idempotency without the check.
+- **GC**: value objects have no owning entity. Reference counting requires tracking
+  every `Term::EntityRef` that points to a value hash ID — non-trivial across the
+  full fact space. Mark-and-sweep over value IDs is simpler but requires a full
+  store scan. Generational GC (most value objects are short-lived within a handler)
+  is a third option.
+- **Interaction with history**: a value referenced in a historical ivar fact should
+  arguably be retained even if no current ivar points to it. What is the retention
+  policy for values in historical (closed-interval) facts?
+
+---
+
+## Q4: Schema evolution — ivar changes in a live system
+
+**Status**: Open — not addressed in C27  
+**Raised**: C27 design discussion; also noted in `Project_Summary.md`
+
+When a class's ivar set changes (slot renamed, added, or removed), existing entities
+have historical facts recorded under the old predicate names and no facts (or stale
+facts) under the new ones.
+
+**Tensions to resolve:**
+- **Rename**: should a rename create a new predicate and migrate historical facts,
+  or alias the old predicate to the new name?
+- **Remove**: orphan predicates accumulate. Should the store enforce that no
+  live entity holds open facts for a removed predicate, or is that the programmer's
+  responsibility?
+- **Add**: new slots have no historical facts. Queries over time return absence
+  for the period before the slot existed — is that the right semantic, or should
+  there be a "default value" mechanism?
+- **Versioned class definitions**: the store could record class definitions as
+  facts themselves (code as facts), making schema changes auditable and replayable.
+  This aligns with the project's "code is data" goal but requires block/AST storage.
+
+---
+
+## Q5: Visibility model for cross-entity store queries
+
+**Status**: Open — deferred from C27  
+**Raised**: C27 design discussion
+
+In C27 all entity ivars are registered as `Visibility::Private`. This means
+`World class >> entity:historyOf:` is blocked by the store's access check for any
+entity other than the querying entity. A visibility model is needed for shared
+queries to be useful.
+
+**Tensions to resolve:**
+- What Smol syntax expresses that a slot is `Shared` or `Public`? A pragma, a
+  keyword in the class definition, or a convention?
+- Who can promote a predicate's visibility — only the defining class, or any entity?
+- Does visibility apply to current state only, or to history as well? (A slot
+  might be publicly readable now but have private historical values.)
+- How does visibility interact with external assertions (facts asserted by one
+  entity about another, which the store already supports via `asserter != subject`)?
+
+---
+
+## Q6: Transient entities
+
+**Status**: Open — needs careful design  
+**Raised**: C27 design discussion
+
+Some entities may be purely computational — created for the duration of a
+computation, with no need for temporal history in the store. Clojure's transients
+are an analogue: a performance optimisation that doesn't change observable semantics.
+
+**Tensions to resolve:**
+- **P5 (State Has History)**: does exempting an entity from store assertions violate
+  the principle, or is "no history needed" a legitimate, explicit declaration?
+- **Declaration mechanism**: a pragma (`transient: true` in the class definition),
+  a superclass convention, or a runtime hint?
+- **Observability**: transient entities would not appear in `World instancesOf:`
+  queries and would leave no trace after termination. Is this acceptable, or should
+  they at least record their existence and lifetime?
+- **Interaction with value objects**: value objects are already "history-free" from
+  the entity perspective (they use content-hash IDs, not temporal facts). Is there
+  a unified concept here, or are transient entities semantically distinct?
+
+---
+
+## Q8: Implementation/responsibility split and self-hosting boundary
+
+**Status**: Open — not urgent; needs design session when self-hosting becomes a near-term goal  
+**Raised**: C27 design discussion (surfaced by `content_hash_id` placement)
+
+Where should the boundary sit between what is implemented in Rust (interpreter
+primitives), what lives in the Smol kernel, and what is user-overridable? And how
+far does self-hosting go — should the system eventually be able to host its own
+interpreter/compiler, in the spirit of Smalltalk's image?
+
+**Current working model (C27-era):**
+- **Rust `_prim*` methods**: operations requiring direct struct access, or whose
+  correctness depends on being non-overridable (e.g. `content_hash_id`, object
+  allocation, identity comparison).
+- **Smol kernel (`kernel.smol`)**: standard library behavior expressible purely
+  from primitives; can in principle be overridden by user code.
+- **System internals**: Rust functions never exposed as message sends (e.g. store
+  bridge, hash for content-addressing); migrate to VM kernel functions during
+  self-hosting, not to user-visible methods.
+
+**Tensions to resolve:**
+- How far does self-hosting go? Smalltalk hosts its entire environment in the image,
+  including the compiler and debugger. Is that the goal here, or is a hybrid
+  (Rust VM + Smol kernel + Smol standard library) the intended end state?
+- Which `_prim*` methods eventually become expressible in Smol (and thus migrate to
+  `kernel.smol`), and which remain permanent VM intrinsics?
+- For content-hash specifically: the store's hash must be stable across sessions and
+  non-overridable. Even in a self-hosted system this should remain a VM intrinsic,
+  not a user method. This is a useful concrete example of a *permanent* primitive.
+- How does the migration path work in practice? Rust `_prim*` → VM intrinsic →
+  (optionally) Smol kernel method. When is each step taken?
+
+---
+
+## Q7: Block and namespace storage (code as facts)
+
+**Status**: Open — deferred from C27  
+**Raised**: C27 design discussion
+
+Blocks (AST + captured environment) and namespaces are storable in principle and
+important for the "code as facts" and notebook/literate programming goals.
+
+**For blocks:**
+- Requires `serde::Serialize/Deserialize` on `Expr`/`Stmt` in `ast.rs`.
+- A stored block captures entity references — these become `Term::EntityRef` values
+  that must resolve on load (interaction with Q1 resume-from-store).
+- Method definitions are a special case: they are blocks with a selector and
+  belong to a class. Storing them as facts makes the class definition auditable
+  and diff-able.
+
+**For namespaces:**
+- A namespace is a collection of class bindings and sub-namespaces.
+- Storing it supports the notebook capability: a namespace can carry documentation,
+  literate examples, and runnable snippets as first-class facts.
+- Requires designing how namespace facts relate to class definition facts (avoiding
+  duplication while maintaining a single source of truth).
