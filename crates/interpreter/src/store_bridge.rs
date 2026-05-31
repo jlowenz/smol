@@ -13,7 +13,8 @@ use crate::eval::Evaluator;
 use crate::value::Value;
 use triple_store::fact::Fact;
 use triple_store::predicates::OrderingKey;
-use triple_store::term::{Predicate, Term};
+use triple_store::term::{Predicate, SymbolId, Term};
+use triple_store::value_store::StoredValue;
 
 // ── BridgeResult ──────────────────────────────────────────────────────────────
 
@@ -151,6 +152,97 @@ pub fn content_hash_id(v: &Value) -> EntityId {
     EntityId(hash | VALUE_OBJECT_HIGH_BIT)
 }
 
+// ── collect_value_subtree ─────────────────────────────────────────────────────
+
+/// Collect the full value sub-tree rooted at `v` into `buf`, bottom-up.
+///
+/// Requires: `v` is a `Value::Instance` with `InstanceKind::ValueObject`.
+/// Ensures: `buf` contains one entry per distinct value id in the sub-tree,
+///   innermost values first. Duplicate ids (shared nested values) produce one
+///   entry. The returned `EntityId` is the root's hash id.
+pub(crate) fn collect_value_subtree(v: &Value, buf: &mut Vec<(EntityId, StoredValue)>) -> EntityId {
+    let Value::Instance(h) = v else {
+        panic!("collect_value_subtree: not a Value::Instance");
+    };
+    let InstanceKind::ValueObject(obj) = &h.0.kind else {
+        panic!("collect_value_subtree: not a ValueObject");
+    };
+
+    let class_name: Arc<str> = h.0.class.name.clone();
+
+    let mut named_fields: Vec<(Arc<str>, Term)> = Vec::new();
+    {
+        let slots = obj.slots.lock();
+        for ivar_name in h.0.class.all_instance_vars() {
+            let val = slots.get(ivar_name.as_ref()).cloned().unwrap_or(Value::Nil);
+            if let Value::Instance(inner) = &val {
+                if matches!(inner.0.kind, InstanceKind::ValueObject(_)) {
+                    let nested_id = collect_value_subtree(&val, buf);
+                    named_fields.push((ivar_name, Term::ValueRef(nested_id)));
+                    continue;
+                }
+            }
+            match value_to_bridge(&val) {
+                BridgeResult::Assert(term) => named_fields.push((ivar_name, term)),
+                BridgeResult::Retract | BridgeResult::Skip => {}
+            }
+        }
+    }
+
+    let mut indexed_fields: Vec<Term> = Vec::new();
+    if let Some(indexed) = &obj.indexed {
+        use crate::object::IndexedStorage;
+        match indexed {
+            IndexedStorage::Pointer(slots) => {
+                for val in slots.lock().iter() {
+                    if let Value::Instance(inner) = val {
+                        if matches!(inner.0.kind, InstanceKind::ValueObject(_)) {
+                            let nested_id = collect_value_subtree(val, buf);
+                            indexed_fields.push(Term::ValueRef(nested_id));
+                            continue;
+                        }
+                    }
+                    match value_to_bridge(val) {
+                        BridgeResult::Assert(term) => indexed_fields.push(term),
+                        // nil in an indexed slot: store InternedSymbol(0) which round-trips to Nil.
+                        BridgeResult::Retract => {
+                            indexed_fields.push(Term::InternedSymbol(SymbolId(0)))
+                        }
+                        BridgeResult::Skip => {
+                            indexed_fields.push(Term::InternedSymbol(SymbolId(0)))
+                        }
+                    }
+                }
+            }
+            IndexedStorage::Byte(slots) => {
+                for &b in slots.lock().iter() {
+                    indexed_fields.push(Term::Int(b as i64));
+                }
+            }
+            IndexedStorage::Float64(slots) => {
+                for &f in slots.lock().iter() {
+                    indexed_fields.push(Term::Float(f));
+                }
+            }
+        }
+    }
+
+    let root_id = content_hash_id(v);
+
+    if !buf.iter().any(|(id, _)| *id == root_id) {
+        buf.push((
+            root_id,
+            StoredValue {
+                class_name,
+                named_fields,
+                indexed_fields,
+            },
+        ));
+    }
+
+    root_id
+}
+
 // ── Store buffer helpers ──────────────────────────────────────────────────────
 
 /// Buffer a named-ivar fact into the entity's current transaction.
@@ -177,6 +269,8 @@ pub(crate) fn buffer_ivar(
 ///   `value` is the value actually stored (caller converts Byte/Float64 before calling).
 /// Ensures: if `current_tx` is `None` (outside a handler), this is a no-op.
 ///   Nil values produce a retract; non-storable values are skipped.
+///   For value objects, the structural record is staged via `buffer_value` before
+///   the `Term::ValueRef` fact is buffered.
 pub(crate) fn buffer_indexed_slot(
     ev: &Evaluator,
     entity_id: EntityId,
@@ -187,6 +281,27 @@ pub(crate) fn buffer_indexed_slot(
     let key = OrderingKey::new(index as f64).expect("index as f64 is always finite");
     let mut tx_ref = ev.current_tx.borrow_mut();
     let Some(tx) = tx_ref.as_mut() else { return };
+    // For value objects, collect the full subtree and stage structural records.
+    if let Value::Instance(h) = value {
+        if matches!(h.0.kind, InstanceKind::ValueObject(_)) {
+            let mut val_buf = Vec::new();
+            let hash_id = collect_value_subtree(value, &mut val_buf);
+            for (id, sv) in val_buf {
+                tx.buffer_value(id, sv);
+            }
+            let _ = tx.assert_indexed(
+                Fact {
+                    subject: entity_id,
+                    predicate: pred,
+                    object: Term::ValueRef(hash_id),
+                    asserter: entity_id,
+                    valid: None,
+                },
+                key,
+            );
+            return;
+        }
+    }
     match value_to_bridge(value) {
         BridgeResult::Assert(term) => {
             let _ = tx.assert_indexed(
@@ -210,6 +325,24 @@ pub(crate) fn buffer_indexed_slot(
 fn buffer_fact(ev: &Evaluator, entity_id: EntityId, pred: Predicate, value: &Value) {
     let mut tx_ref = ev.current_tx.borrow_mut();
     let Some(tx) = tx_ref.as_mut() else { return };
+    // For value objects, collect the full subtree and stage structural records.
+    if let Value::Instance(h) = value {
+        if matches!(h.0.kind, InstanceKind::ValueObject(_)) {
+            let mut val_buf = Vec::new();
+            let hash_id = collect_value_subtree(value, &mut val_buf);
+            for (id, sv) in val_buf {
+                tx.buffer_value(id, sv);
+            }
+            let _ = tx.assert_single(Fact {
+                subject: entity_id,
+                predicate: pred,
+                object: Term::ValueRef(hash_id),
+                asserter: entity_id,
+                valid: None,
+            });
+            return;
+        }
+    }
     match value_to_bridge(value) {
         BridgeResult::Assert(term) => {
             let _ = tx.assert_single(Fact {
@@ -474,6 +607,247 @@ mod tests {
         } else {
             panic!("expected Assert(ValueRef)");
         }
+    }
+
+    // ── collect_value_subtree ─────────────────────────────────────────────────
+
+    #[test]
+    fn collect_flat_value_primitive_ivars() {
+        let h = make_value_object("Point", &[("x", Value::Int(3)), ("y", Value::Int(4))]);
+        let v = Value::Instance(h);
+        let mut buf = Vec::new();
+        let id = collect_value_subtree(&v, &mut buf);
+        assert_eq!(buf.len(), 1, "one entry for the flat value");
+        let (bid, sv) = &buf[0];
+        assert_eq!(*bid, id);
+        assert_eq!(sv.class_name.as_ref(), "Point");
+        assert_eq!(sv.named_fields.len(), 2);
+        assert!(
+            sv.named_fields
+                .iter()
+                .any(|(n, t)| n.as_ref() == "x" && *t == Term::Int(3))
+        );
+        assert!(
+            sv.named_fields
+                .iter()
+                .any(|(n, t)| n.as_ref() == "y" && *t == Term::Int(4))
+        );
+        assert!(sv.indexed_fields.is_empty());
+    }
+
+    #[test]
+    fn collect_nested_value_bottom_up() {
+        // Inner: Money(amount: 100)
+        let inner = make_value_object("Money", &[("amount", Value::Int(100))]);
+        let inner_val = Value::Instance(inner);
+        let inner_id = content_hash_id(&inner_val);
+
+        // Outer: LineItem(price: <Money>)
+        let outer_cls = {
+            use crate::class::Class;
+            use parking_lot::RwLock;
+            Arc::new(Class {
+                name: Arc::from("LineItem"),
+                superclass: None,
+                own_instance_vars: vec![Arc::from("price")],
+                own_class_vars: vec![],
+                class_var_storage: RwLock::new(Default::default()),
+                indexed_slot_kind: None,
+                methods: RwLock::new(Default::default()),
+                class_methods: RwLock::new(Default::default()),
+                is_value: true,
+                class_object: std::sync::OnceLock::new(),
+            })
+        };
+        let outer_obj = Arc::new(crate::object::Object::new(outer_cls.clone()));
+        outer_obj.set_slot(Arc::from("price"), inner_val.clone());
+        let outer_state = Arc::new(InstanceState {
+            class: outer_cls,
+            kind: InstanceKind::ValueObject(outer_obj),
+        });
+        let outer_val = Value::Instance(InstanceHandle(outer_state));
+        let outer_id = content_hash_id(&outer_val);
+
+        let mut buf = Vec::new();
+        let root_id = collect_value_subtree(&outer_val, &mut buf);
+
+        assert_eq!(root_id, outer_id);
+        assert_eq!(buf.len(), 2, "inner + outer = 2 entries");
+        // inner is first (bottom-up)
+        assert_eq!(buf[0].0, inner_id, "inner must come first");
+        assert_eq!(buf[1].0, outer_id, "outer must come second");
+        // outer's price field is a ValueRef to inner
+        let outer_sv = &buf[1].1;
+        assert!(
+            outer_sv
+                .named_fields
+                .iter()
+                .any(|(n, t)| { n.as_ref() == "price" && *t == Term::ValueRef(inner_id) }),
+            "outer must reference inner via ValueRef"
+        );
+    }
+
+    #[test]
+    fn collect_shared_nested_value_deduplicates() {
+        // point appears twice as fields of Container
+        let point = make_value_object("Point", &[("x", Value::Int(1)), ("y", Value::Int(1))]);
+        let point_val = Value::Instance(point);
+        let point_id = content_hash_id(&point_val);
+
+        use crate::class::Class;
+        use parking_lot::RwLock;
+        let cls = Arc::new(Class {
+            name: Arc::from("Container"),
+            superclass: None,
+            own_instance_vars: vec![Arc::from("a"), Arc::from("b")],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(Default::default()),
+            indexed_slot_kind: None,
+            methods: RwLock::new(Default::default()),
+            class_methods: RwLock::new(Default::default()),
+            is_value: true,
+            class_object: std::sync::OnceLock::new(),
+        });
+        let obj = Arc::new(crate::object::Object::new(cls.clone()));
+        obj.set_slot(Arc::from("a"), point_val.clone());
+        obj.set_slot(Arc::from("b"), point_val.clone());
+        let container = Value::Instance(InstanceHandle(Arc::new(InstanceState {
+            class: cls,
+            kind: InstanceKind::ValueObject(obj),
+        })));
+
+        let mut buf = Vec::new();
+        collect_value_subtree(&container, &mut buf);
+
+        let point_count = buf.iter().filter(|(id, _)| *id == point_id).count();
+        assert_eq!(
+            point_count, 1,
+            "shared nested value must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn collect_value_with_indexed_slots() {
+        use crate::class::Class;
+        use crate::class::IndexedSlotKind;
+        use parking_lot::RwLock;
+
+        let cls = Arc::new(Class {
+            name: Arc::from("ImmTuple"),
+            superclass: None,
+            own_instance_vars: vec![],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(Default::default()),
+            indexed_slot_kind: Some(IndexedSlotKind::Pointer),
+            methods: RwLock::new(Default::default()),
+            class_methods: RwLock::new(Default::default()),
+            is_value: true,
+            class_object: std::sync::OnceLock::new(),
+        });
+        let obj = Arc::new(crate::object::Object::new_with_indexed(cls.clone(), 2));
+        if let Some(crate::object::IndexedStorage::Pointer(slots)) = &obj.indexed {
+            let mut guard = slots.lock();
+            guard[0] = Value::Int(10);
+            guard[1] = Value::Int(20);
+        }
+        let v = Value::Instance(InstanceHandle(Arc::new(InstanceState {
+            class: cls,
+            kind: InstanceKind::ValueObject(obj),
+        })));
+
+        let mut buf = Vec::new();
+        collect_value_subtree(&v, &mut buf);
+
+        assert_eq!(buf.len(), 1);
+        let sv = &buf[0].1;
+        assert_eq!(sv.indexed_fields, vec![Term::Int(10), Term::Int(20)]);
+    }
+
+    // ── S5 integration: buffer_ivar → commit → lookup_value ──────────────────
+
+    #[test]
+    fn buffer_ivar_value_object_commits_structural_record() {
+        use triple_store::exec_context::ExecContext;
+        use triple_store::predicate_registry::Visibility;
+        use triple_store::predicates::Cardinality;
+
+        let ev = Evaluator::new_without_kernel();
+
+        // Declare the ivar predicate so buffer_ivar can look it up.
+        ev.registry
+            .store
+            .declare("price", Visibility::Private, Cardinality::Single)
+            .unwrap();
+
+        let entity_id = EntityId(42);
+        let point = make_value_object("Money", &[("amount", Value::Int(100))]);
+        let point_val = Value::Instance(point);
+        let expected_hash = content_hash_id(&point_val);
+
+        // Set up a transaction on the evaluator (as entity loop does).
+        let store = ev.registry.store.clone_handle();
+        let tx = store.begin_owned(ExecContext::Entity(entity_id));
+        *ev.current_tx.borrow_mut() = Some(tx);
+
+        buffer_ivar(&ev, entity_id, &Arc::from("price"), &point_val);
+
+        // Commit the transaction.
+        let tx = ev.current_tx.borrow_mut().take().unwrap();
+        tx.commit().expect("commit must succeed");
+
+        let sv = store
+            .lookup_value(expected_hash)
+            .expect("StoredValue must be present after commit");
+        assert_eq!(sv.class_name.as_ref(), "Money");
+        assert!(
+            sv.named_fields
+                .iter()
+                .any(|(n, t)| { n.as_ref() == "amount" && *t == Term::Int(100) })
+        );
+    }
+
+    #[test]
+    fn buffer_ivar_reassign_value_object_adds_new_record_old_remains() {
+        use triple_store::exec_context::ExecContext;
+        use triple_store::predicate_registry::Visibility;
+        use triple_store::predicates::Cardinality;
+
+        let ev = Evaluator::new_without_kernel();
+        ev.registry
+            .store
+            .declare("color", Visibility::Private, Cardinality::Single)
+            .unwrap();
+
+        let entity_id = EntityId(43);
+        let store = ev.registry.store.clone_handle();
+
+        // First assignment.
+        let v1 = Value::Instance(make_value_object("Color", &[("r", Value::Int(255))]));
+        let id1 = content_hash_id(&v1);
+        let tx1 = store.begin_owned(ExecContext::Entity(entity_id));
+        *ev.current_tx.borrow_mut() = Some(tx1);
+        buffer_ivar(&ev, entity_id, &Arc::from("color"), &v1);
+        ev.current_tx.borrow_mut().take().unwrap().commit().unwrap();
+
+        // Second assignment with a different value.
+        let v2 = Value::Instance(make_value_object("Color", &[("r", Value::Int(0))]));
+        let id2 = content_hash_id(&v2);
+        assert_ne!(id1, id2, "different values must have different hash ids");
+
+        let tx2 = store.begin_owned(ExecContext::Entity(entity_id));
+        *ev.current_tx.borrow_mut() = Some(tx2);
+        buffer_ivar(&ev, entity_id, &Arc::from("color"), &v2);
+        ev.current_tx.borrow_mut().take().unwrap().commit().unwrap();
+
+        // Both records must be present.
+        assert!(
+            store.lookup_value(id1).is_some(),
+            "old value record must still exist"
+        );
+        assert!(
+            store.lookup_value(id2).is_some(),
+            "new value record must exist"
+        );
     }
 
     // ── EntityRef resolution ──────────────────────────────────────────────────

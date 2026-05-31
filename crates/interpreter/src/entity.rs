@@ -11,7 +11,7 @@ use crate::eval::EvalError;
 use crate::object::Object;
 use crate::value::Value;
 use triple_store::exec_context::ExecContext;
-use triple_store::store::Store;
+use triple_store::store::{OwnedStoreTransaction, Store, StoreError};
 
 pub use triple_store::id::EntityId;
 
@@ -352,6 +352,27 @@ pub fn send_to_entity(data: &EntityData, selector: Arc<str>, args: Vec<Value>) -
 
 // ── Entity message loop ───────────────────────────────────────────────────────
 
+/// Commit a transaction, treating `FactNotFound` as a non-fatal warning.
+///
+/// `FactNotFound` arises when nil is assigned to an ivar that was never set —
+/// the retraction targets a non-existent open fact, but the desired state
+/// (no value for this ivar) is already achieved, so no action is needed.
+///
+/// Ensures: returns `Ok(())` on success or on `FactNotFound`; returns `Err`
+///   for all other `StoreError` variants so the caller can fault the entity.
+fn commit_or_warn(tx: OwnedStoreTransaction) -> Result<(), StoreError> {
+    match tx.commit() {
+        Ok(_) => Ok(()),
+        Err(StoreError::FactNotFound) => {
+            eprintln!(
+                "[smol] commit warning: FactNotFound — nil assigned to never-set ivar; ignored"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, global_env: Env) {
     use crate::eval::EvalError;
     use crate::eval::Evaluator;
@@ -415,14 +436,40 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
         match result {
             Ok(v) => {
                 if let Some(tx) = ev.current_tx.borrow_mut().take() {
-                    let _ = tx.commit();
+                    if let Err(e) = commit_or_warn(tx) {
+                        let msg = e.to_string();
+                        *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
+                        envelope
+                            .reply
+                            .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                        let mut mb = data.mailbox.lock().unwrap();
+                        for pending in mb.drain(..) {
+                            pending
+                                .reply
+                                .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                        }
+                        break;
+                    }
                 }
                 envelope.reply.resolve_ok(v);
             }
             Err(EvalError::Return(v, _)) => {
                 // Non-local return from a cross-entity block: resolve with v.
                 if let Some(tx) = ev.current_tx.borrow_mut().take() {
-                    let _ = tx.commit();
+                    if let Err(e) = commit_or_warn(tx) {
+                        let msg = e.to_string();
+                        *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
+                        envelope
+                            .reply
+                            .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                        let mut mb = data.mailbox.lock().unwrap();
+                        for pending in mb.drain(..) {
+                            pending
+                                .reply
+                                .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                        }
+                        break;
+                    }
                 }
                 envelope.reply.resolve_ok(v);
             }

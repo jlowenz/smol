@@ -40,5 +40,7 @@ pub mod term;
 pub mod time;
 pub mod transaction;
 pub mod triple_store;
+pub mod value_store;
 
 pub use durable_file_store::DurableFileTripleStore;
+pub use value_store::StoredValue;

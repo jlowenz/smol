@@ -19,6 +19,7 @@ use crate::term::{Predicate, Term};
 use crate::time::Timestamp;
 use crate::transaction::{Transaction, TxError};
 use crate::triple_store::TripleStore;
+use crate::value_store::{StoredValue, ValueStore};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StoreError {
@@ -29,6 +30,19 @@ pub enum StoreError {
     DeclarationConflict(PredicateError),
     FactNotFound,
     Internal(&'static str),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::AccessDenied { predicate, reason } => {
+                write!(f, "access denied on predicate {:?}: {}", predicate, reason)
+            }
+            StoreError::DeclarationConflict(e) => write!(f, "declaration conflict: {e:?}"),
+            StoreError::FactNotFound => write!(f, "fact not found"),
+            StoreError::Internal(msg) => write!(f, "internal store error: {msg}"),
+        }
+    }
 }
 
 impl From<AccessError> for StoreError {
@@ -64,6 +78,8 @@ pub struct Store {
     declare_lock: Arc<Mutex<()>>,
     /// Monotonic entity ID counter; shared across all handles in a group.
     next_entity: Arc<AtomicU64>,
+    /// Content-addressed atemporal registry for value object structures.
+    value_store: Arc<ValueStore>,
 }
 
 impl Store {
@@ -78,6 +94,7 @@ impl Store {
             registry: Arc::new(ArcSwap::from_pointee(initial_registry)),
             declare_lock: Arc::new(Mutex::new(())),
             next_entity: Arc::new(AtomicU64::new(next_entity)),
+            value_store: Arc::new(ValueStore::new()),
         }
     }
 
@@ -167,7 +184,19 @@ impl Store {
             registry: Arc::clone(&self.registry),
             declare_lock: Arc::clone(&self.declare_lock),
             next_entity: Arc::clone(&self.next_entity),
+            value_store: Arc::clone(&self.value_store),
         }
+    }
+
+    // ── Value store ──────────────────────────────────────────────────────────
+
+    /// Look up a previously committed value object by its content-hash id.
+    ///
+    /// Requires: `id.0 & 0x8000_0000_0000_0000 != 0`.
+    /// Ensures: returns `Some(v)` iff a `StoredValue` was committed with this `id`
+    ///   (via `OwnedStoreTransaction::buffer_value` + `commit`); otherwise `None`.
+    pub fn lookup_value(&self, id: EntityId) -> Option<Arc<StoredValue>> {
+        self.value_store.lookup(id)
     }
 
     // ── Clock ─────────────────────────────────────────────────────────────────
@@ -342,6 +371,7 @@ impl Store {
             store: self.clone_handle(),
             ctx,
             tx: self.backend.new_transaction(),
+            value_buf: Vec::new(),
         }
     }
 
@@ -551,6 +581,8 @@ pub struct OwnedStoreTransaction {
     store: Store,
     ctx: ExecContext,
     tx: Transaction<StoredFact>,
+    /// Values staged for commit; flushed only after the triple-store commit succeeds.
+    value_buf: Vec<(EntityId, StoredValue)>,
 }
 
 impl OwnedStoreTransaction {
@@ -625,17 +657,39 @@ impl OwnedStoreTransaction {
         Ok(())
     }
 
-    /// Commit all buffered operations atomically.
+    /// Stage a value for commit. Infallible; the value is not yet in the store.
     ///
-    /// Ensures: all buffered ops applied or none (per shard); change events
-    ///   dispatched to matching subscribers before returning.
-    pub fn commit(self) -> Result<Vec<CommitChange<StoredFact>>, StoreError> {
-        self.tx.commit().map_err(Into::into)
+    /// Requires: `id.0 & 0x8000_0000_0000_0000 != 0` (content-hash id space).
+    /// Ensures: if `commit()` returns `Ok`, `store.lookup_value(id)` returns `Some`.
+    ///   If `commit()` returns `Err`, the value is discarded with no side effects.
+    pub fn buffer_value(&mut self, id: EntityId, value: StoredValue) {
+        debug_assert!(
+            id.0 & 0x8000_0000_0000_0000 != 0,
+            "buffer_value: id is not in content-hash space"
+        );
+        self.value_buf.push((id, value));
     }
 
-    /// Discard all buffered operations.
+    /// Commit all buffered ivar facts and staged values.
+    ///
+    /// Ordering: facts are committed first; on `Err` the value buffer is dropped
+    /// and the error propagates with no values stored. On `Ok`, the value buffer
+    /// is flushed to the permanent value store (infallible for in-memory backends).
+    ///
+    /// Ensures: every `Term::ValueRef(id)` in a committed fact resolves via
+    ///   `store.lookup_value(id)` immediately after this call returns `Ok`.
+    pub fn commit(self) -> Result<Vec<CommitChange<StoredFact>>, StoreError> {
+        let changes = self.tx.commit().map_err(StoreError::from)?;
+        for (id, value) in self.value_buf {
+            self.store.value_store.commit_value(id, value);
+        }
+        Ok(changes)
+    }
+
+    /// Discard all buffered operations. The value buffer is also dropped.
     pub fn rollback(self) {
         self.tx.rollback();
+        // value_buf dropped here — no values are committed.
     }
 }
 
@@ -978,6 +1032,74 @@ mod tests {
             ids.insert(store_b.alloc_entity());
         }
         assert_eq!(ids.len(), 6, "all 6 allocated entity ids must be distinct");
+    }
+
+    // ── OwnedStoreTransaction value buffer ────────────────────────────────────
+
+    const HIGH_BIT: u64 = 0x8000_0000_0000_0000;
+
+    fn hash_id(n: u64) -> EntityId {
+        EntityId(n | HIGH_BIT)
+    }
+
+    fn dummy_stored_value(class: &str) -> crate::value_store::StoredValue {
+        crate::value_store::StoredValue {
+            class_name: Arc::from(class),
+            named_fields: vec![],
+            indexed_fields: vec![],
+        }
+    }
+
+    #[test]
+    fn buffer_value_commit_makes_value_available_via_lookup() {
+        let store = Store::in_memory();
+        let ctx = ExecContext::System;
+        let mut tx = store.begin_owned(ctx);
+
+        let id = hash_id(1);
+        tx.buffer_value(id, dummy_stored_value("Point"));
+        tx.commit().unwrap();
+
+        let got = store
+            .lookup_value(id)
+            .expect("value must be present after commit");
+        assert_eq!(got.class_name.as_ref(), "Point");
+    }
+
+    #[test]
+    fn buffer_value_rollback_leaves_store_empty() {
+        let store = Store::in_memory();
+        let ctx = ExecContext::System;
+        let mut tx = store.begin_owned(ctx);
+
+        let id = hash_id(2);
+        tx.buffer_value(id, dummy_stored_value("Money"));
+        tx.rollback();
+
+        assert!(
+            store.lookup_value(id).is_none(),
+            "rollback must not commit values"
+        );
+    }
+
+    #[test]
+    fn buffer_value_fact_commit_failure_discards_values() {
+        let (store, prv, _, _) = store_3();
+        let ctx = ExecContext::System;
+        let mut tx = store.begin_owned(ctx);
+
+        // Buffer a retraction that will fail (no prior open fact).
+        tx.retract_single(e(1), prv, e(1)).unwrap();
+
+        let id = hash_id(3);
+        tx.buffer_value(id, dummy_stored_value("Color"));
+
+        // Commit must fail on FactNotFound; value must not be stored.
+        assert_eq!(tx.commit().unwrap_err(), StoreError::FactNotFound);
+        assert!(
+            store.lookup_value(id).is_none(),
+            "value must not be stored when facts fail"
+        );
     }
 
     #[test]
