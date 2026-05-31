@@ -19,7 +19,7 @@ fn bare_handle(name: &str) -> InstanceHandle {
         is_value: false,
         class_object: std::sync::OnceLock::new(),
     });
-    let data = new_entity_data(&cls);
+    let data = new_entity_data(&cls, triple_store::store::Store::in_memory());
     InstanceHandle(Arc::new(InstanceState {
         class: cls,
         kind: InstanceKind::ClassEntity(Box::new(data)),

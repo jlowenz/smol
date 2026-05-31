@@ -23,11 +23,20 @@ pub enum Term {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Symbol(SymbolId),
+    /// Interned-symbol handle (Phase 2). For uninterned Smol symbols use `Symbol`.
+    InternedSymbol(SymbolId),
+    /// Smol symbol stored as its string value (e.g. `#foo`). Distinct from `Str`.
+    Symbol(Arc<str>),
+    /// Arbitrary-precision integer in decimal string encoding.
+    LargeInt(Arc<str>),
     Str(Arc<str>),
     Bytes(Arc<[u8]>),
     Timestamp(Timestamp),
+    /// Reference to a live actor entity (allocated by `next_entity_id`).
     EntityRef(EntityId),
+    /// Reference to a content-addressed value object (high bit set in the ID).
+    /// Distinct from `EntityRef` so `resolve_term` can dispatch without inspecting bits.
+    ValueRef(EntityId),
 }
 
 // Index policy for `Float`: bit-pattern equality and hashing. This means
@@ -40,11 +49,14 @@ impl PartialEq for Term {
             (Self::Int(a), Self::Int(b)) => a == b,
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
             (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::InternedSymbol(a), Self::InternedSymbol(b)) => a == b,
             (Self::Symbol(a), Self::Symbol(b)) => a == b,
+            (Self::LargeInt(a), Self::LargeInt(b)) => a == b,
             (Self::Str(a), Self::Str(b)) => a == b,
             (Self::Bytes(a), Self::Bytes(b)) => a == b,
             (Self::Timestamp(a), Self::Timestamp(b)) => a == b,
             (Self::EntityRef(a), Self::EntityRef(b)) => a == b,
+            (Self::ValueRef(a), Self::ValueRef(b)) => a == b,
             _ => false,
         }
     }
@@ -59,11 +71,14 @@ impl std::hash::Hash for Term {
             Self::Int(v) => v.hash(state),
             Self::Float(v) => v.to_bits().hash(state),
             Self::Bool(v) => v.hash(state),
+            Self::InternedSymbol(v) => v.hash(state),
             Self::Symbol(v) => v.hash(state),
+            Self::LargeInt(v) => v.hash(state),
             Self::Str(v) => v.hash(state),
             Self::Bytes(v) => v.hash(state),
             Self::Timestamp(v) => v.hash(state),
             Self::EntityRef(v) => v.hash(state),
+            Self::ValueRef(v) => v.hash(state),
         }
     }
 }
@@ -96,7 +111,7 @@ mod tests {
         set.insert(Term::Int(0));
         set.insert(Term::Float(0.0));
         set.insert(Term::Bool(false));
-        set.insert(Term::Symbol(SymbolId(0)));
+        set.insert(Term::InternedSymbol(SymbolId(0)));
         set.insert(Term::Timestamp(Timestamp(0)));
         set.insert(Term::EntityRef(EntityId(0)));
         assert_eq!(set.len(), 6);
@@ -121,13 +136,47 @@ mod tests {
     }
 
     #[test]
-    fn symbol_equality_and_hash() {
-        assert_eq!(Term::Symbol(SymbolId(1)), Term::Symbol(SymbolId(1)));
-        assert_ne!(Term::Symbol(SymbolId(1)), Term::Symbol(SymbolId(2)));
+    fn interned_symbol_equality_and_hash() {
+        assert_eq!(
+            Term::InternedSymbol(SymbolId(1)),
+            Term::InternedSymbol(SymbolId(1))
+        );
+        assert_ne!(
+            Term::InternedSymbol(SymbolId(1)),
+            Term::InternedSymbol(SymbolId(2))
+        );
 
         let mut set = HashSet::new();
-        set.insert(Term::Symbol(SymbolId(10)));
-        set.insert(Term::Symbol(SymbolId(10)));
+        set.insert(Term::InternedSymbol(SymbolId(10)));
+        set.insert(Term::InternedSymbol(SymbolId(10)));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn symbol_equality_and_hash() {
+        let a = Term::Symbol(Arc::from("foo"));
+        let b = Term::Symbol(Arc::from("foo"));
+        let c = Term::Symbol(Arc::from("bar"));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+
+        let mut set = HashSet::new();
+        set.insert(Term::Symbol(Arc::from("foo")));
+        set.insert(Term::Symbol(Arc::from("foo")));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn large_int_equality_and_hash() {
+        let a = Term::LargeInt(Arc::from("12345678901234567890"));
+        let b = Term::LargeInt(Arc::from("12345678901234567890"));
+        let c = Term::LargeInt(Arc::from("99999999999999999999"));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+
+        let mut set = HashSet::new();
+        set.insert(Term::LargeInt(Arc::from("12345678901234567890")));
+        set.insert(Term::LargeInt(Arc::from("12345678901234567890")));
         assert_eq!(set.len(), 1);
     }
 
@@ -176,12 +225,30 @@ mod tests {
     }
 
     #[test]
+    fn value_ref_distinct_from_entity_ref() {
+        let id = EntityId(42);
+        assert_ne!(Term::ValueRef(id), Term::EntityRef(id));
+        assert_eq!(Term::ValueRef(id), Term::ValueRef(id));
+
+        let mut set = std::collections::HashSet::new();
+        set.insert(Term::EntityRef(id));
+        set.insert(Term::ValueRef(id));
+        assert_eq!(
+            set.len(),
+            2,
+            "EntityRef and ValueRef with same id must be distinct hash keys"
+        );
+    }
+
+    #[test]
     fn cross_variant_inequality() {
         // The `_ => false` branch in PartialEq covers all cross-variant pairs.
         assert_ne!(Term::Int(0), Term::Float(0.0));
         assert_ne!(Term::Int(0), Term::Bool(false));
         assert_ne!(Term::Bool(false), Term::Int(0));
-        assert_ne!(Term::Str(Arc::from("0")), Term::Symbol(SymbolId(0)));
+        assert_ne!(Term::Str(Arc::from("0")), Term::InternedSymbol(SymbolId(0)));
+        assert_ne!(Term::Str(Arc::from("foo")), Term::Symbol(Arc::from("foo")));
+        assert_ne!(Term::Symbol(Arc::from("0")), Term::LargeInt(Arc::from("0")));
         assert_ne!(
             Term::Bytes(Arc::from([].as_ref())),
             Term::Str(Arc::from(""))

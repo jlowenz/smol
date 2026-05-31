@@ -529,3 +529,13 @@ Dictionary >> pvtRehash [
         (old at: i) ifNotNil: [:slot | self at: slot key put: slot value]
     ]
 ]
+
+"World — environment-level queries over the live entity registry."
+Object subclass: #World
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+World class >> instancesOf: aClass [
+    ^self _primInstancesOf: aClass
+]

@@ -487,6 +487,7 @@ dependencies = [
  "num-traits",
  "parking_lot",
  "thiserror",
+ "triple-store",
 ]
 
 [[package]]

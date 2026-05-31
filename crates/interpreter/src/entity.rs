@@ -10,6 +10,10 @@ use crate::env::Env;
 use crate::eval::EvalError;
 use crate::object::Object;
 use crate::value::Value;
+use triple_store::exec_context::ExecContext;
+use triple_store::store::Store;
+
+pub use triple_store::id::EntityId;
 
 /// Coroutine stack size for all entity and continuation coroutines.
 /// Set once via `init_coroutine_stack`; sized for deep Rust interpreter recursion.
@@ -24,13 +28,10 @@ pub(crate) fn init_coroutine_stack() {
     });
 }
 
-/// Unique identifier for an actor entity instance.
-pub type EntityId = u64;
-
 static NEXT_ENTITY_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn next_entity_id() -> EntityId {
-    NEXT_ENTITY_ID.fetch_add(1, Ordering::Relaxed)
+    EntityId(NEXT_ENTITY_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 // ── FutureHandle ──────────────────────────────────────────────────────────────
@@ -150,6 +151,9 @@ pub struct EntityData {
     pub status: Mutex<EntityStatus>,
     /// Set by `signal_shutdown` to request the entity loop to exit cleanly.
     pub shutdown: AtomicBool,
+    /// Shared store handle for temporal fact recording. All entities share the
+    /// same underlying store; this is a cheap clone of the shared handle.
+    pub store: Store,
 }
 
 impl EntityData {
@@ -181,9 +185,9 @@ pub enum InstanceKind {
 impl std::fmt::Debug for InstanceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InstanceKind::Entity(data) => write!(f, "Entity(id={})", data.id),
+            InstanceKind::Entity(data) => write!(f, "Entity(id={})", data.id.0),
             InstanceKind::ValueObject(_) => write!(f, "ValueObject"),
-            InstanceKind::ClassEntity(data) => write!(f, "ClassEntity(id={})", data.id),
+            InstanceKind::ClassEntity(data) => write!(f, "ClassEntity(id={})", data.id.0),
         }
     }
 }
@@ -218,7 +222,7 @@ impl InstanceHandle {
 impl std::fmt::Debug for InstanceHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0.kind {
-            InstanceKind::Entity(data) => write!(f, "InstanceHandle::Entity(id={})", data.id),
+            InstanceKind::Entity(data) => write!(f, "InstanceHandle::Entity(id={})", data.id.0),
             InstanceKind::ValueObject(_) => {
                 write!(f, "InstanceHandle::ValueObject({})", self.0.class.name)
             }
@@ -233,8 +237,9 @@ impl std::fmt::Debug for InstanceHandle {
 
 /// Allocate a fresh `EntityData` for `class` with an empty mailbox and `Running` status.
 ///
+/// Requires: `store` is a handle to the shared store for this session.
 /// Ensures: the returned data has a unique entity ID; no coroutine is spawned.
-pub(crate) fn new_entity_data(class: &Arc<Class>) -> EntityData {
+pub(crate) fn new_entity_data(class: &Arc<Class>, store: Store) -> EntityData {
     EntityData {
         id: next_entity_id(),
         data: Arc::new(Object::new(class.clone())),
@@ -242,6 +247,7 @@ pub(crate) fn new_entity_data(class: &Arc<Class>) -> EntityData {
         mailbox_ready: Condvar::new(),
         status: Mutex::new(EntityStatus::Running),
         shutdown: AtomicBool::new(false),
+        store,
     }
 }
 
@@ -254,14 +260,16 @@ pub(crate) fn new_entity_data(class: &Arc<Class>) -> EntityData {
 ///   registered and then pass the result here. This matches `spawn_entity_bare`
 ///   and avoids a work-stealing race where the coroutine could call `populate_env`
 ///   on a still-incomplete registry.
+/// Requires: `store` is a handle to the shared store for this session.
 /// Ensures: the returned handle has `InstanceKind::ClassEntity`; `class.class_object`
 ///   is NOT set here — the caller must set it after this call returns.
 pub fn spawn_class_entity(
     class: Arc<Class>,
     registry: Arc<ClassRegistry>,
     global_env: Env,
+    store: Store,
 ) -> InstanceHandle {
-    let data = new_entity_data(&class);
+    let data = new_entity_data(&class, store);
     let state = Arc::new(InstanceState {
         class,
         kind: InstanceKind::ClassEntity(Box::new(data)),
@@ -282,6 +290,7 @@ pub fn spawn_class_entity(
 /// Spawn a new actor entity with an empty mailbox and no `initialize` queued.
 ///
 /// Requires: `class.inherits_is_value()` is `false`.
+/// Requires: `store` is a handle to the shared store for this session.
 /// Ensures: the entity's coroutine is running in `Running` state; the mailbox
 ///   is empty; `initialize` has NOT been enqueued.
 pub fn spawn_entity_bare(
@@ -289,6 +298,7 @@ pub fn spawn_entity_bare(
     registry: Arc<ClassRegistry>,
     global_env: Env,
     indexed_size: Option<usize>,
+    store: Store,
 ) -> InstanceHandle {
     let id = next_entity_id();
     let obj = if let Some(n) = indexed_size {
@@ -306,6 +316,7 @@ pub fn spawn_entity_bare(
             mailbox_ready: Condvar::new(),
             status: Mutex::new(EntityStatus::Running),
             shutdown: AtomicBool::new(false),
+            store,
         })),
     });
 
@@ -387,6 +398,9 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
             }
         }
 
+        let tx = data.store.begin_owned(ExecContext::Entity(data.id));
+        *ev.current_tx.borrow_mut() = Some(tx);
+
         let handle = InstanceHandle(state.clone());
         let result = match &state.kind {
             InstanceKind::Entity(_) => {
@@ -400,13 +414,22 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
 
         match result {
             Ok(v) => {
+                if let Some(tx) = ev.current_tx.borrow_mut().take() {
+                    let _ = tx.commit();
+                }
                 envelope.reply.resolve_ok(v);
             }
             Err(EvalError::Return(v, _)) => {
                 // Non-local return from a cross-entity block: resolve with v.
+                if let Some(tx) = ev.current_tx.borrow_mut().take() {
+                    let _ = tx.commit();
+                }
                 envelope.reply.resolve_ok(v);
             }
             Err(e) => {
+                if let Some(tx) = ev.current_tx.borrow_mut().take() {
+                    tx.rollback();
+                }
                 let msg = e.to_string();
                 *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
                 envelope.reply.resolve_err(e);
@@ -434,7 +457,7 @@ fn dispatch_envelope(
     if let Some((method, def_class)) = handle.0.class.lookup(selector) {
         return ev.invoke_method(handle.clone(), def_class, method, args, env);
     }
-    crate::builtins::dispatch_object_primitive(handle, selector, args)
+    crate::builtins::dispatch_object_primitive(ev, handle, selector, args)
 }
 
 fn dispatch_class_envelope(

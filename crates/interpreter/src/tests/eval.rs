@@ -1559,3 +1559,130 @@ Child new trySuper.
     let err = eval_err(src);
     assert!(matches!(err, EvalError::MessageNotUnderstood { .. }));
 }
+
+// ── S7: historyOf: / historyOf:from:to: ──────────────────────────────────────
+
+#[test]
+fn history_of_records_ivar_assignments() {
+    // Two assignments to `x` produce two history entries.
+    let src = r#"
+Object subclass: #Recorder
+    instanceVariableNames: 'x'
+    classVariableNames: ''
+    indexedSlots: #none.
+Recorder >> setX: v [ x := v ]
+Recorder >> histX [ ^self historyOf: #x ]
+| r hist |
+r := Recorder new.
+r setX: 1.
+r setX: 2.
+hist := r histX.
+hist size
+"#;
+    assert_eq!(eval(src), Value::Int(2));
+}
+
+#[test]
+fn history_of_associations_have_timestamp_key() {
+    // The first association's key is an Int (epoch-milliseconds).
+    let src = r#"
+Object subclass: #Stamped
+    instanceVariableNames: 'n'
+    classVariableNames: ''
+    indexedSlots: #none.
+Stamped >> setN: v [ n := v ]
+Stamped >> histN [ ^self historyOf: #n ]
+| s hist assoc |
+s := Stamped new.
+s setN: 42.
+hist := s histN.
+assoc := hist at: 0.
+assoc key isNil not
+"#;
+    assert_eq!(eval(src), Value::Bool(true));
+}
+
+#[test]
+fn history_of_association_value_matches_stored() {
+    // The association value matches the last stored value.
+    let src = r#"
+Object subclass: #Logged
+    instanceVariableNames: 'v'
+    classVariableNames: ''
+    indexedSlots: #none.
+Logged >> setV: val [ v := val ]
+Logged >> histV [ ^self historyOf: #v ]
+| obj hist |
+obj := Logged new.
+obj setV: 99.
+hist := obj histV.
+(hist at: 0) value
+"#;
+    assert_eq!(eval(src), Value::Int(99));
+}
+
+#[test]
+fn history_of_from_to_filters_by_range() {
+    // historyOf:from:to: with a range that includes 0..max returns all entries.
+    let src = r#"
+Object subclass: #Filtered
+    instanceVariableNames: 'x'
+    classVariableNames: ''
+    indexedSlots: #none.
+Filtered >> setX: v [ x := v ]
+Filtered >> histXFromTo [ ^self historyOf: #x from: 0 to: 9999999999999 ]
+| f hist |
+f := Filtered new.
+f setX: 1.
+f setX: 2.
+hist := f histXFromTo.
+hist size
+"#;
+    assert_eq!(eval(src), Value::Int(2));
+}
+
+#[test]
+fn history_of_unknown_predicate_errors() {
+    let src = r#"
+Object subclass: #H.
+H >> badHist [ ^self historyOf: #noSuchVar ]
+H new badHist.
+"#;
+    let err = eval_err(src);
+    assert!(matches!(err, EvalError::TypeError(_)));
+}
+
+// ── S8: World instancesOf: ───────────────────────────────────────────────────
+
+#[test]
+fn world_instances_of_finds_spawned_entity() {
+    // World instancesOf: SomeClass returns an Array containing the spawned instance.
+    // `await` ensures Widget new completes (and track_entity runs) before the query.
+    let src = r#"
+Object subclass: #Widget.
+Widget new await.
+(World instancesOf: Widget) size
+"#;
+    assert_eq!(eval(src), Value::Int(1));
+}
+
+#[test]
+fn world_instances_of_empty_when_none_spawned() {
+    // No instances of Gadget have been spawned.
+    let src = r#"
+Object subclass: #Gadget.
+(World instancesOf: Gadget) size
+"#;
+    assert_eq!(eval(src), Value::Int(0));
+}
+
+#[test]
+fn world_instances_of_multiple_instances() {
+    // Each `await` ensures track_entity has run before the next spawn or the query.
+    let src = r#"
+Object subclass: #Thing.
+Thing new await. Thing new await. Thing new await.
+(World instancesOf: Thing) size
+"#;
+    assert_eq!(eval(src), Value::Int(3));
+}

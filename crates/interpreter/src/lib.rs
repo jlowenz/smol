@@ -16,4 +16,5 @@ pub mod lexer;
 pub mod namespace;
 pub mod object;
 pub mod parser;
+pub mod store_bridge;
 pub mod value;

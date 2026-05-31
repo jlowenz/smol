@@ -16,6 +16,7 @@ num-bigint = { workspace = true }
 num-traits = { workspace = true }
 parking_lot = { workspace = true }
 may = { workspace = true }
+triple-store = { path = "../triple-store" }
 
 [dev-dependencies]
 criterion = { workspace = true }

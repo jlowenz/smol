@@ -63,12 +63,13 @@ fn instance_handle_entity_debug() {
     let handle = InstanceHandle(Arc::new(InstanceState {
         class: cls,
         kind: InstanceKind::Entity(Box::new(EntityData {
-            id: 99,
+            id: EntityId(99),
             data: obj,
             mailbox: Mutex::new(VecDeque::new()),
             mailbox_ready: Condvar::new(),
             status: Mutex::new(EntityStatus::Running),
             shutdown: std::sync::atomic::AtomicBool::new(false),
+            store: triple_store::store::Store::in_memory(),
         })),
     }));
     assert!(format!("{handle:?}").contains("99"));
@@ -144,7 +145,10 @@ fn instance_kind_class_entity_debug() {
         is_value: false,
         class_object: std::sync::OnceLock::new(),
     });
-    let kind = InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(&cls)));
+    let kind = InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(
+        &cls,
+        triple_store::store::Store::in_memory(),
+    )));
     let s = format!("{kind:?}");
     assert!(s.starts_with("ClassEntity(id="), "got: {s}");
 }
@@ -195,7 +199,10 @@ fn instance_handle_class_entity_debug() {
     });
     let handle = InstanceHandle(Arc::new(InstanceState {
         class: cls.clone(),
-        kind: InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(&cls))),
+        kind: InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(
+            &cls,
+            triple_store::store::Store::in_memory(),
+        ))),
     }));
     let s = format!("{handle:?}");
     assert!(s.contains("ClassEntity"), "got: {s}");

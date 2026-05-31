@@ -1,4 +1,4 @@
-# Chunk 27: Triple Store Integration — Within-Entity State and History
+# Chunk 27: Triple Store Integration — Within-Entity State
 
 ## Goal
 
@@ -62,49 +62,63 @@ Every Smol primitive type has a faithful `Term` representation. Non-storable val
 silently discarded as "not domain data." Nil is distinguished from "skip" via an
 explicit `BridgeResult` enum (see S4).
 
-| Value | Term |
-|-------|------|
-| `Int(i64)` | `Term::Int(i64)` |
-| `Float(f64)` | `Term::Float(f64)` |
-| `Bool(bool)` | `Term::Bool(bool)` |
-| `Str(Arc<str>)` | `Term::Str(Arc<str>)` |
-| `Symbol(Arc<str>)` | `Term::Symbol(Arc<str>)` — new variant; distinct from Str |
-| `LargeInt(Arc<BigInt>)` | `Term::LargeInt(Arc<str>)` — decimal encoding; new variant |
-| `Nil` | *(retract the open fact)* |
-| `Instance` (Entity/ClassEntity) | `Term::EntityRef(entity_id)` |
-| `Instance` (ValueObject) | `Term::EntityRef(content_hash_id)` — see below |
-| `Block` | *(deferred — requires AST serialization)* |
-| `Future` | *(skip — transient, no meaningful persistent representation)* |
-| `Namespace` | *(deferred — requires design for notebook/artifact storage)* |
+| Value                           | Term                                                          |
+| ------------------------------- | ------------------------------------------------------------- |
+| `Int(i64)`                      | `Term::Int(i64)`                                              |
+| `Float(f64)`                    | `Term::Float(f64)`                                            |
+| `Bool(bool)`                    | `Term::Bool(bool)`                                            |
+| `Str(Arc<str>)`                 | `Term::Str(Arc<str>)`                                         |
+| `Symbol(Arc<str>)`              | `Term::Symbol(Arc<str>)` — new variant; distinct from Str     |
+| `LargeInt(Arc<BigInt>)`         | `Term::LargeInt(Arc<str>)` — decimal encoding; new variant    |
+| `Nil`                           | *(retract the open fact)*                                     |
+| `Instance` (Entity/ClassEntity) | `Term::EntityRef(entity_id)`                                  |
+| `Instance` (ValueObject)        | `Term::ValueRef(content_hash_id)` — new variant; see below    |
+| `Block`                         | *(deferred — requires AST serialization)*                     |
+| `Future`                        | *(skip — transient, no meaningful persistent representation)* |
+| `Namespace`                     | *(deferred — requires design for notebook/artifact storage)*  |
 
 For `historyOf:` results, the reverse bridge resolves `EntityRef` terms back to live
 `InstanceHandle`s via a unified entity registry (see S3). If an ID is not found (e.g.
 the entity was terminated or from a prior session not yet resumed), the fallback is
 `Value::Int(id.0 as i64)` with a runtime warning.
 
-### Value object storage — content-hash identity
+### Value object storage — content-hash identity (C27 scope)
 
-Value objects (immutable, identity-free) are stored using content-hash identity:
+Value objects (immutable, identity-free) are referenced using content-hash identity:
 a deterministic `u64` hash of the class name and all ivar values (recursively).
 The high bit marks the ID as a value-storage ID rather than a live entity ID:
-`EntityId(hash | 0x8000_0000_0000_0000)`, preventing collision with `alloc_entity`.
+`EntityId(hash | 0x8000_0000_0000_0000)`, preventing collision with `next_entity_id`.
 
-When a value object appears as an ivar value:
+When a value object appears as an entity ivar value:
+
 1. Compute `content_hash_id` from class name + ordered ivar values (recursively).
-2. Buffer the value's own ivar facts into the current transaction under that ID
-   using `ExecContext::System`.
-3. Return `Term::EntityRef(content_hash_id)` for the referencing entity's ivar.
+2. Return `Term::ValueRef(content_hash_id)` for the referencing entity's ivar fact.
 
-`assert_single` is idempotent for already-stored facts (supersedes with the same
-value), so no "already stored?" guard is needed for correctness. Value facts
-participate in the handler's transaction: if the handler rolls back, value storage
-rolls back too.
+`Term::ValueRef` is a distinct variant from `Term::EntityRef` — both carry an
+`EntityId` payload, but `ValueRef` signals "reference to a content-addressed value"
+while `EntityRef` signals "reference to a live actor entity". This avoids magic
+high-bit checks in `resolve_term` and makes the distinction durable in the store.
 
-The hash function must be deterministic across runs for persistence. FNV-1a (64-bit)
-is implemented inline — no new dependency — and is stable across Rust versions.
+Value object *structural* facts (the value's own ivars: `Point.x = 1`, etc.) are
+**deferred to C27.5**: they require an atemporal orthogonal value store separate from
+the bi-temporal triple store. Asserting value structural facts into the bi-temporal
+store is wrong because values are eternal/definitional, not temporal assertions.
+For C27, value objects are referenced by hash ID but their internal structure is not
+persisted. In-session resolution uses the `value_objects` in-memory registry.
 
-Reference counting / structural sharing optimisation (store each unique value only
-once) is deferred; the idempotent re-assert approach is correct if slightly wasteful.
+### Indexed slot storage
+
+Entity ivars cover named slots (`balance`, `name`, …). Many kernel classes use
+*indexed* slots (Array, OrderedCollection, ByteArray, …). These must also be
+journalled or C27 integration covers almost nothing.
+
+A single canonical predicate `"__indexed_slots__"` is registered at startup with
+`Cardinality::Indexed`. All entity indexed-slot assignments assert facts under this
+predicate using `OrderingKey::new(index as f64)` as the positional key. Because the
+`(subject, predicate, asserter, index_key)` tuple is unique per entity per slot,
+one shared predicate suffices — subjects disambiguate.
+
+Hook point: `_primAt:put:` (the indexed slot write primitive in `builtins.rs`).
 
 ### Class variables
 
@@ -119,22 +133,28 @@ ivars are solid.
 - **S1** Add `triple-store` dependency to `crates/interpreter/Cargo.toml`. Retire
   `pub type EntityId = u64` in `entity.rs`; re-export
   `pub use triple_store::id::EntityId`. Update all call sites:
+  
   - The monotonic counter now produces `EntityId(fetch_add(...))` rather than a bare `u64`.
   - `Block.home_entity: Option<EntityId>` picks up the new type automatically.
   - Comparisons and `From`/`Into` uses throughout `eval.rs`, `builtins.rs`, etc.
-  `cargo build` and `cargo test` green.
+    `cargo build` and `cargo test` green.
 
 - **S2** Extend `Term` and add `OwnedStoreTransaction` to the triple-store crate.
-
-  **Term extension** (`term.rs`): add two new variants to ensure complete Smol round-trip:
+  
+  **Term extension** (`term.rs`): add three new variants to ensure complete Smol round-trip:
+  
   - `Term::Symbol(Arc<str>)` — distinct from `Term::Str`; required for correct Symbol
     reconstruction on read-back.
   - `Term::LargeInt(Arc<str>)` — decimal string encoding of arbitrary-precision integers,
     replacing the lossy `Str(to_string())` workaround in the bridge.
-  Update `PartialEq`, `Hash`, and any match exhaustiveness sites in `term.rs` and
-  callers. `cargo test` for triple-store green.
-
+  - `Term::ValueRef(EntityId)` — reference to a content-addressed value object (distinct
+    from `Term::EntityRef` which references live actor entities). Enables `resolve_term`
+    to dispatch correctly without magic high-bit inspection.
+    Update `PartialEq`, `Hash`, and any match exhaustiveness sites in `term.rs` and
+    callers. `cargo test` for triple-store green.
+  
   **`OwnedStoreTransaction`** (`store.rs`): new type alongside `StoreTransaction`:
+  
   ```rust
   pub struct OwnedStoreTransaction {
       store: Store,   // clone_handle() — not a borrow
@@ -142,30 +162,34 @@ ivars are solid.
       tx: Transaction<StoredFact>,
   }
   ```
+  
   `Store::begin_owned(ctx: ExecContext) -> OwnedStoreTransaction` calls
   `self.clone_handle()` internally; mirrors `begin` but without the `'store` lifetime.
-  Exposes `assert_single`, `assert_set`, `retract_single` (access-checked eagerly,
-  buffered) and `commit(self)` / `rollback(self)`.
+  Exposes `assert_single`, `assert_set`, `retract_single`, `assert_indexed`,
+  `retract_indexed` (all access-checked eagerly, buffered) and `commit(self)` / `rollback(self)`.
   `cargo test` for the triple-store crate green.
 
 - **S3** Build the entity registry and thread `Store` through the interpreter.
-
+  
   **Entity registry**: the interpreter has two existing collections that need upgrading
   from `Vec` to `HashMap<EntityId, Arc<InstanceState>>`:
+  
   - `Evaluator::instance_entities: RefCell<Vec<...>>` →
     `RefCell<HashMap<EntityId, Arc<InstanceState>>>`.
   - `ClassRegistry::class_entities: RwLock<Vec<...>>` →
     `RwLock<HashMap<EntityId, Arc<InstanceState>>>`.
-
+  
   Add a third registry for content-hash-addressed value objects:
+  
   - `Evaluator::value_objects: RefCell<HashMap<EntityId, Arc<InstanceState>>>`.
-
+  
   Insertion points: `spawn_entity_bare` registers into `instance_entities`;
   `spawn_class_entity` registers into `class_entities`; `ensure_value_buffered`
   (S4) registers into `value_objects`. All insertions key on the instance's `EntityId`
   (or content-hash ID for value objects).
-
+  
   **Store threading**:
+  
   - Add `store: Store` to `EntityData`.
   - Add `store: Store` parameter to `spawn_entity_bare`, `spawn_class_entity`, and
     `ClassRegistry::new`.
@@ -177,81 +201,92 @@ ivars are solid.
   - `main.rs`: initialize with `Store::in_memory()` by default; pass to registry
     and evaluator setup.
   - Test setup in `eval.rs` tests: initialize a store and inject it.
-  `cargo test` green.
-
+    `cargo test` green.
+  
   Note: `ClassRegistry::new()` currently spawns bootstrap class entities (Object, Value)
   inline. Pass `store: Store` to `new()` and thread through to
   `new_entity_data`/`spawn_class_entity` calls inside.
 
 - **S4** Add the `Value ↔ Term` bridge.
+  
   - New `store_bridge.rs` in the interpreter crate.
   - `enum BridgeResult { Assert(Term), Retract, Skip }` — distinguishes nil-retract
     from non-storable-skip.
   - `fn value_to_bridge(v: &Value) -> BridgeResult` per the bridge table above.
     For `Instance(ValueObject)`: calls `content_hash_id(v)` and returns
-    `Assert(Term::EntityRef(hash_id))`. For `Future`: `Skip`. For `Block`,
-    `Namespace`: `Skip` with a `#[allow(unreachable_patterns)]`-free match arm that
-    documents the deferral explicitly.
+    `Assert(Term::ValueRef(hash_id))`. For `Future`: `Skip`. For `Block`,
+    `Namespace`: `Skip` with explicit deferral comment.
   - `fn content_hash_id(v: &Value) -> EntityId` — FNV-1a over a canonical byte
     sequence: class name length + class name bytes + for each ivar in definition
     order: name bytes + recursive `content_hash_id` or primitive bytes. Sets the
     high bit. Panics (debug_assert) if called on a non-ValueObject.
-  - `fn ensure_value_buffered(tx: &mut OwnedStoreTransaction, hash_id: EntityId, handle: &InstanceHandle)`
-    — buffers the value object's ivar facts into `tx` under `hash_id` using
-    `ExecContext::System`. Recurses for nested ValueObject ivars. Only touches
-    facts, never commits — the surrounding handler transaction handles that.
-  - `fn term_to_primitive(t: &Term) -> Value` in `store_bridge.rs` — handles all
-    non-EntityRef terms: `Symbol(s)` → `Value::Symbol(s)`, `LargeInt(s)` → parse,
-    `Timestamp` → `Value::Int(epoch_millis)`, etc. `EntityRef` is deliberately
-    excluded; callers that need full resolution use `Evaluator::resolve_term`.
-  - `fn resolve_term(&self, t: &Term) -> Value` on `Evaluator` — calls
-    `term_to_primitive` for non-EntityRef terms. For `EntityRef(id)`:
-    1. If high bit set → look up in `self.value_objects` → return
-       `Value::Instance(handle)` if found.
-    2. Else → look up in `self.instance_entities`, then `self.registry.class_entities`
-       → return `Value::Instance(handle)` if found.
-    3. Fallback → `Value::Int(id.0 as i64)` with a `eprintln!` debug warning
-       (entity not found in live registry — terminated or from prior session).
+  - `ensure_value_buffered` is **omitted** — value structural storage is deferred
+    to C27.5 (orthogonal atemporal value store).
+  - `fn term_to_primitive(t: &Term) -> Value` — handles all non-ref terms:
+    `Symbol(s)` → `Value::Symbol(s)`, `LargeInt(s)` → parse,
+    `Timestamp` → `Value::Int(epoch_millis)`, etc. Both `EntityRef` and `ValueRef`
+    panic if called directly; callers that need full resolution use `resolve_term`.
+  - `fn resolve_term(&self, t: &Term) -> Value` on `Evaluator`:
+    - `EntityRef(id)` → look up in `instance_entities`, then `class_entities`; fallback Int + warning.
+    - `ValueRef(id)` → look up in `value_objects`; fallback Int + warning.
+    - All others → `term_to_primitive`.
   - Unit tests: all primitive round-trips; nil (Retract); Block/Namespace (Skip);
-    ValueObject hash stability (same object hashes identically on two calls);
-    nested ValueObject produces correct EntityRef chain; EntityRef resolves to
-    Instance when the handle is registered.
+    ValueObject hash stability; `value_to_bridge` on ValueObject returns
+    `Assert(Term::ValueRef(_))`; EntityRef and ValueRef resolve correctly.
 
 - **S5** Register predicates at class definition time.
+  
+  - At store init time, register one canonical `"__indexed_slots__"` predicate with
+    `Cardinality::Indexed` and `Visibility::Private`. Store its `Predicate` id in
+    `ClassRegistry` so `buffer_indexed_slot` can access it without a lookup per call.
   - In `ClassRegistry`: when a class is installed (bootstrap or user-defined via
     `handle_subclass`), iterate `class.own_instance_vars` and call
     `store.declare(ivar_name, Visibility::Private, Cardinality::Single)` for each.
     Use `ExecContext::System` for all bootstrap declarations. Idempotency means
     re-declaration with identical metadata is a safe no-op.
   - Add `ivar_predicates: HashMap<Arc<str>, Predicate>` to `Class` — populated at
-    definition time so `set_named_slot` assertions need no `store.lookup()` per call.
+    definition time so ivar assertions need no `store.lookup()` per call.
+  - Skip predicate registration for value classes (`class.is_value == true`):
+    value objects are immutable and not journalled in the bi-temporal store.
   - `cargo test` green.
-
+  
   Note: inherited vars were registered when the superclass was installed; no
-  duplicate declarations needed. Schema evolution (renaming/removing ivars) is a
-  known hard problem deferred to a later design chunk.
+  duplicate declarations needed.
 
-- **S6** Hook ivar-set to buffer into the current transaction.
-  - In `eval.rs`, at the `Stmt::Assign` site where a named ivar is written (the point
-    that calls `object.set_named_slot`), buffer a store operation when the receiver is
-    an `Entity` (not a `ValueObject` — those are immutable).
+- **S6** Hook ivar-set and indexed-slot-set to buffer into the current transaction.
+  
+  **Named ivars** (in `eval.rs` at the `Stmt::Assign` ivar-write site):
+  
+  - Buffer a store operation when the receiver is an `Entity` (not `ValueObject` — immutable).
   - Helper `fn buffer_ivar(ev: &Evaluator, entity_id: EntityId, predicate: Predicate, value: &Value)`:
     - Borrows `ev.current_tx` via `RefCell::borrow_mut()`.
-    - If `None` (called outside a handler context, e.g. from a test): no-op.
+    - If `None` (outside handler context): no-op.
     - Calls `value_to_bridge(value)`:
-      - `Assert(Term::EntityRef(hash_id))` where value is a ValueObject: first calls
-        `ensure_value_buffered(tx, hash_id, instance_handle)` to buffer the value's
-        own ivar facts, then asserts the `EntityRef` for the entity's ivar.
-      - `Assert(other_term)`: calls `tx.assert_single(Fact { subject: entity_id, predicate, object: other_term, asserter: entity_id, valid: None })`.
-      - `Retract`: calls `tx.retract_single(entity_id, predicate, entity_id)`.
+      - `Assert(Term::ValueRef(_))` (ValueObject reference): assert the `ValueRef` term;
+        value structural facts are deferred (C27.5).
+      - `Assert(other_term)`: `tx.assert_single(Fact { subject, predicate, object, asserter=entity_id, valid: None })`.
+      - `Retract`: `tx.retract_single(entity_id, predicate, entity_id)`.
       - `Skip`: no-op.
-  - `cargo test` green.
-
-  Note: `object.rs` itself is not modified — it stays a pure data structure.
-  The buffer call lives in `eval.rs` alongside the in-memory slot update, keeping
-  the two operations visually paired.
+  
+  **Indexed slots** (in `builtins.rs` at `_primAt:put:`):
+  
+  - Helper `fn buffer_indexed_slot(ev: &Evaluator, entity_id: EntityId, index: usize, value: &Value)`:
+    - Borrows `ev.current_tx`.
+    - If `None`: no-op.
+    - Calls `value_to_bridge(value)`:
+      - `Assert(term)`: `tx.assert_indexed(Fact { subject: entity_id, predicate: INDEXED_SLOTS_PRED, object: term, asserter: entity_id, valid: None }, OrderingKey::new(index as f64).unwrap())`.
+      - `Retract`: `tx.retract_indexed(entity_id, INDEXED_SLOTS_PRED, entity_id, OrderingKey::new(index as f64).unwrap())`.
+      - `Skip`: no-op.
+  - Only called when the receiver is an `Entity` (not `ValueObject`).
+  - `INDEXED_SLOTS_PRED` is retrieved from `ev.registry.indexed_slots_pred`.
+  
+  `cargo test` green.
+  
+  Note: `object.rs` is not modified — it stays a pure data structure. Both buffer
+  helpers live alongside their respective in-memory slot updates.
 
 - **S7** Add `historyOf:` and `historyOf:from:to:` primitives in `builtins.rs`.
+  
   - Both are instance-side primitives on `Object`, dispatched when the receiver is
     an Entity.
   - `historyOf: slotName` — queries `(self_entity_id, predicate, *)` with
@@ -265,6 +300,7 @@ ivars are solid.
     the second entry.
 
 - **S8** Add `World` class entity.
+  
   - `kernel.smol`: declare `World` as a class (subclass of Object). The `World`
     singleton class entity is bootstrapped with a reference to the shared store.
   - At entity spawn time, assert a class-membership fact:
@@ -288,21 +324,21 @@ ivars are solid.
 
 ## Files changed
 
-| File | Change |
-|------|--------|
-| `crates/triple-store/src/term.rs` | Add `Term::Symbol(Arc<str>)` and `Term::LargeInt(Arc<str>)` variants |
-| `crates/triple-store/src/store.rs` | Add `OwnedStoreTransaction`; `Store::begin_owned` |
-| `crates/interpreter/Cargo.toml` | Add `triple-store` path dependency |
-| `crates/interpreter/src/entity.rs` | Re-export `EntityId`; add `store: Store` to `EntityData`; update spawn fns |
-| `crates/interpreter/src/class.rs` | Add `ivar_predicates: HashMap<Arc<str>, Predicate>` |
-| `crates/interpreter/src/class_registry.rs` | `class_entities` Vec→HashMap; add `store: Store` to `new()`; register predicates at class install |
-| `crates/interpreter/src/store_bridge.rs` | New: `BridgeResult`, `value_to_bridge`, `term_to_value` |
-| `crates/interpreter/src/eval.rs` | `instance_entities` Vec→HashMap; add `value_objects` registry; `current_tx`; `resolve_term`; `buffer_ivar`; ivar-set hook; store init in tests |
-| `crates/interpreter/src/entity.rs` | `run_entity_loop`: open/commit/rollback transaction around each dispatch |
-| `crates/interpreter/src/builtins.rs` | `historyOf:` / `historyOf:from:to:` primitives; `#instanceOf` assert at spawn |
-| `crates/interpreter/src/main.rs` | `Store::in_memory()` default; thread to registry and evaluator |
-| `crates/interpreter/src/kernel.smol` | `World` class definition; `instancesOf:` / `entity:historyOf:` methods |
-| `crates/interpreter/tests/eval.rs` | Tests for ivar assertions, history queries, World methods |
+| File                                       | Change                                                                                                                                         |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/triple-store/src/term.rs`          | Add `Term::Symbol(Arc<str>)` and `Term::LargeInt(Arc<str>)` variants                                                                           |
+| `crates/triple-store/src/store.rs`         | Add `OwnedStoreTransaction`; `Store::begin_owned`                                                                                              |
+| `crates/interpreter/Cargo.toml`            | Add `triple-store` path dependency                                                                                                             |
+| `crates/interpreter/src/entity.rs`         | Re-export `EntityId`; add `store: Store` to `EntityData`; update spawn fns                                                                     |
+| `crates/interpreter/src/class.rs`          | Add `ivar_predicates: HashMap<Arc<str>, Predicate>`                                                                                            |
+| `crates/interpreter/src/class_registry.rs` | `class_entities` Vec→HashMap; add `store: Store` to `new()`; register predicates at class install                                              |
+| `crates/interpreter/src/store_bridge.rs`   | New: `BridgeResult`, `value_to_bridge`, `term_to_value`                                                                                        |
+| `crates/interpreter/src/eval.rs`           | `instance_entities` Vec→HashMap; add `value_objects` registry; `current_tx`; `resolve_term`; `buffer_ivar`; ivar-set hook; store init in tests |
+| `crates/interpreter/src/entity.rs`         | `run_entity_loop`: open/commit/rollback transaction around each dispatch                                                                       |
+| `crates/interpreter/src/builtins.rs`       | `historyOf:` / `historyOf:from:to:` primitives; `#instanceOf` assert at spawn                                                                  |
+| `crates/interpreter/src/main.rs`           | `Store::in_memory()` default; thread to registry and evaluator                                                                                 |
+| `crates/interpreter/src/kernel.smol`       | `World` class definition; `instancesOf:` / `entity:historyOf:` methods                                                                         |
+| `crates/interpreter/tests/eval.rs`         | Tests for ivar assertions, history queries, World methods                                                                                      |
 
 ---
 

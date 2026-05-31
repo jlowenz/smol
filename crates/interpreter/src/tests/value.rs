@@ -25,7 +25,7 @@ fn make_class(name: &str) -> Arc<Class> {
 
 fn class_handle(name: &str) -> InstanceHandle {
     let cls = make_class(name);
-    let data = new_entity_data(&cls);
+    let data = new_entity_data(&cls, triple_store::store::Store::in_memory());
     InstanceHandle(Arc::new(InstanceState {
         class: cls,
         kind: InstanceKind::ClassEntity(Box::new(data)),

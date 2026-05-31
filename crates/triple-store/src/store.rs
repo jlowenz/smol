@@ -329,6 +329,22 @@ impl Store {
         }
     }
 
+    /// Begin a multi-operation transaction without borrowing `self`.
+    ///
+    /// Clones a cheap handle to the store internally, so the returned
+    /// `OwnedStoreTransaction` has no lifetime parameter and can be stored
+    /// in a `RefCell` or moved across coroutine boundaries.
+    ///
+    /// Ensures: returned transaction has an empty buffer; shares the same
+    ///   backend, registry, and entity counter as `self`.
+    pub fn begin_owned(&self, ctx: ExecContext) -> OwnedStoreTransaction {
+        OwnedStoreTransaction {
+            store: self.clone_handle(),
+            ctx,
+            tx: self.backend.new_transaction(),
+        }
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// All currently asserted-open facts at `(subject, predicate)`.
@@ -489,6 +505,105 @@ impl<'store> StoreTransaction<'store> {
         let meta = self.store.registry.load().meta(predicate);
         self.ctx.check_assert(subject, meta)?;
         self.tx.retract_set(subject, predicate, asserter, object);
+        Ok(())
+    }
+
+    /// Buffer an `Indexed`-cardinality retraction.
+    ///
+    /// Requires: `ctx` permits assert on `subject` for `predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
+    pub fn retract_indexed(
+        &mut self,
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
+        index_key: OrderingKey,
+    ) -> Result<(), StoreError> {
+        let meta = self.store.registry.load().meta(predicate);
+        self.ctx.check_assert(subject, meta)?;
+        self.tx
+            .retract_indexed(subject, predicate, asserter, index_key);
+        Ok(())
+    }
+
+    /// Commit all buffered operations atomically.
+    ///
+    /// Ensures: all buffered ops applied or none (per shard); change events
+    ///   dispatched to matching subscribers before returning.
+    pub fn commit(self) -> Result<Vec<CommitChange<StoredFact>>, StoreError> {
+        self.tx.commit().map_err(Into::into)
+    }
+
+    /// Discard all buffered operations.
+    pub fn rollback(self) {
+        self.tx.rollback();
+    }
+}
+
+// ── OwnedStoreTransaction ─────────────────────────────────────────────────────
+
+/// An access-checked, multi-operation transaction that owns its store handle.
+///
+/// Unlike `StoreTransaction<'store>`, this type borrows no lifetime from the
+/// store. It is `'static` and can be stored in a `RefCell` or moved across
+/// coroutine boundaries. Obtained from `Store::begin_owned`.
+pub struct OwnedStoreTransaction {
+    store: Store,
+    ctx: ExecContext,
+    tx: Transaction<StoredFact>,
+}
+
+impl OwnedStoreTransaction {
+    /// Buffer a `Single`-cardinality assertion.
+    ///
+    /// Requires: `ctx` (captured at `begin_owned`) permits assert on
+    ///   `fact.subject` for `fact.predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, the buffer
+    ///   is unchanged; the transaction remains usable.
+    pub fn assert_single(&mut self, fact: Fact) -> Result<(), StoreError> {
+        let meta = self.store.registry.load().meta(fact.predicate);
+        self.ctx.check_assert(fact.subject, meta)?;
+        self.tx.assert_single(fact);
+        Ok(())
+    }
+
+    /// Buffer a `Set`-cardinality assertion.
+    ///
+    /// Requires: `ctx` permits assert on `fact.subject` for `fact.predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
+    pub fn assert_set(&mut self, fact: Fact) -> Result<(), StoreError> {
+        let meta = self.store.registry.load().meta(fact.predicate);
+        self.ctx.check_assert(fact.subject, meta)?;
+        self.tx.assert_set(fact);
+        Ok(())
+    }
+
+    /// Buffer an `Indexed`-cardinality assertion.
+    ///
+    /// Requires: `ctx` permits assert on `fact.subject` for `fact.predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
+    pub fn assert_indexed(&mut self, fact: Fact, index_key: OrderingKey) -> Result<(), StoreError> {
+        let meta = self.store.registry.load().meta(fact.predicate);
+        self.ctx.check_assert(fact.subject, meta)?;
+        self.tx.assert_indexed(fact, index_key);
+        Ok(())
+    }
+
+    /// Buffer a `Single`-cardinality retraction.
+    ///
+    /// Requires: `ctx` permits assert on `subject` for `predicate`.
+    /// Ensures: on `Ok(())`, op is appended to the buffer. On `Err`, unchanged.
+    ///   `StoreError::FactNotFound` is returned at `commit` time if no
+    ///   asserted-open fact exists; it cannot be detected at buffer time.
+    pub fn retract_single(
+        &mut self,
+        subject: EntityId,
+        predicate: Predicate,
+        asserter: EntityId,
+    ) -> Result<(), StoreError> {
+        let meta = self.store.registry.load().meta(predicate);
+        self.ctx.check_assert(subject, meta)?;
+        self.tx.retract_single(subject, predicate, asserter);
         Ok(())
     }
 

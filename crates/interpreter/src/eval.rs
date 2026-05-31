@@ -1,7 +1,9 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use crate::entity::{EntityId, InstanceHandle, InstanceKind, InstanceState};
+use triple_store::store::{OwnedStoreTransaction, Store};
 
 use thiserror::Error;
 
@@ -54,10 +56,17 @@ pub enum SelfBinding {
 
 pub struct Evaluator {
     pub registry: Arc<ClassRegistry>,
+    /// Shared store handle. Cloned from the registry's store; all evaluators and
+    /// entities sharing the same registry share the same underlying store.
+    pub store: Store,
     method_stack: RefCell<Vec<SelfBinding>>,
-    /// Instance entities (actor objects) spawned during this evaluator's lifetime.
-    /// Signalled via `shutdown()` so their coroutines exit rather than blocking indefinitely.
-    instance_entities: RefCell<Vec<Arc<InstanceState>>>,
+    /// Content-hash-addressed value objects registered during this evaluator's lifetime.
+    /// Used for EntityRef resolution of ValueObject facts.
+    pub(crate) value_objects: RefCell<HashMap<EntityId, Arc<InstanceState>>>,
+    /// In-flight store transaction for the currently-executing entity handler.
+    /// Set to `Some` by `run_entity_loop` before each dispatch; cleared on commit/rollback.
+    /// `None` outside entity handler context (e.g. test-thread evaluations).
+    pub(crate) current_tx: RefCell<Option<OwnedStoreTransaction>>,
     /// Depth of the active method stack. Maintained alongside `method_stack` so
     /// the common case — no active method — can be tested with a plain `Cell`
     /// read instead of a `RefCell` borrow.
@@ -109,15 +118,18 @@ impl Evaluator {
     /// primitive tests that do not require the kernel collection classes.
     pub fn new_without_kernel() -> Self {
         let registry = ClassRegistry::new_arc();
+        let store = registry.store.clone_handle();
         let kernel = registry.kernel();
         Self {
             registry,
+            store,
             method_stack: RefCell::new(Vec::new()),
             method_depth: Cell::new(0),
             active_namespace: RefCell::new(kernel),
             current_block_home: Cell::new(None),
             current_entity_id: Cell::new(None),
-            instance_entities: RefCell::new(Vec::new()),
+            value_objects: RefCell::new(HashMap::new()),
+            current_tx: RefCell::new(None),
         }
     }
 
@@ -125,7 +137,14 @@ impl Evaluator {
     ///
     /// Requires: `handle.0.kind` is `InstanceKind::Entity`.
     pub fn track_entity(&self, handle: &InstanceHandle) {
-        self.instance_entities.borrow_mut().push(handle.0.clone());
+        let id = match &handle.0.kind {
+            InstanceKind::Entity(d) => d.id,
+            _ => panic!("track_entity called on non-entity"),
+        };
+        self.registry
+            .instance_entities
+            .write()
+            .insert(id, handle.0.clone());
     }
 
     // ── Method receiver stack ─────────────────────────────────────────────────
@@ -232,6 +251,9 @@ impl Evaluator {
                     // guard across a re-entrant lock on the same object.
                     let has_ivar = obj.slots.lock().contains_key(name.as_ref());
                     if has_ivar {
+                        if let InstanceKind::Entity(d) = &handle.0.kind {
+                            crate::store_bridge::buffer_ivar(self, d.id, name, &value);
+                        }
                         let ret = value.clone();
                         obj.set_slot(name.clone(), value);
                         return Ok(ret);
@@ -763,15 +785,18 @@ impl Evaluator {
     ///   instead of creating a fresh one. Intended for entity message loops so
     ///   that all entities share a single registry and kernel class set.
     pub fn with_registry(registry: Arc<ClassRegistry>) -> Self {
+        let store = registry.store.clone_handle();
         let kernel = registry.kernel();
         Self {
             registry,
+            store,
             method_stack: RefCell::new(Vec::new()),
             method_depth: Cell::new(0),
             active_namespace: RefCell::new(kernel),
             current_block_home: Cell::new(None),
             current_entity_id: Cell::new(None),
-            instance_entities: RefCell::new(Vec::new()),
+            value_objects: RefCell::new(HashMap::new()),
+            current_tx: RefCell::new(None),
         }
     }
 
@@ -780,13 +805,8 @@ impl Evaluator {
     /// Ensures: each tracked class entity and instance entity receives a shutdown
     ///   signal; their coroutines will exit on their next mailbox-wait cycle.
     pub fn shutdown(&self) {
+        // Instance entities are tracked in the shared registry — signals all of them.
         self.registry.shutdown_class_entities();
-        for state in self.instance_entities.borrow().iter() {
-            match &state.kind {
-                InstanceKind::Entity(d) | InstanceKind::ClassEntity(d) => d.signal_shutdown(),
-                InstanceKind::ValueObject(_) => {}
-            }
-        }
     }
 }
 

@@ -7,14 +7,17 @@ use parking_lot::RwLock;
 
 use crate::class::{Class, IndexedSlotKind};
 use crate::entity::{
-    InstanceHandle, InstanceKind, InstanceState, send_to_entity, spawn_class_entity,
+    EntityId, InstanceHandle, InstanceKind, InstanceState, send_to_entity, spawn_class_entity,
     spawn_entity_bare,
 };
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
 use crate::namespace::Namespace;
-use crate::object::Object;
+use crate::object::{IndexedStorage, Object};
 use crate::value::{Block, Value};
+use triple_store::exec_context::ExecContext;
+use triple_store::fact::{Fact, StoredFact};
+use triple_store::term::Term;
 
 /// Entry point for all built-in method dispatch.
 pub fn dispatch(
@@ -1236,7 +1239,7 @@ fn dispatch_object_value(
     if let Some((method, def_class)) = class.lookup(&selector) {
         return ev.invoke_method(handle.clone(), def_class, method, args, env);
     }
-    dispatch_object_primitive(handle, &selector, args)
+    dispatch_object_primitive(ev, handle, &selector, args)
 }
 
 /// Dispatch a message to an actor entity. Checks for sync self-send
@@ -1264,7 +1267,7 @@ fn dispatch_entity(
         if let Some((method, def_class)) = class.lookup(&selector) {
             return ev.invoke_method(handle.clone(), def_class, method, args, env);
         }
-        return dispatch_object_primitive(handle, &selector, args);
+        return dispatch_object_primitive(ev, handle, &selector, args);
     }
 
     // Cross-entity or non-entity-context send: enqueue and return Future.
@@ -1290,11 +1293,16 @@ fn class_handle_of(obj: &Arc<Object>) -> Result<InstanceHandle, EvalError> {
 }
 
 pub(crate) fn dispatch_object_primitive(
+    ev: &Evaluator,
     handle: InstanceHandle,
     sel: &Arc<str>,
     mut args: Vec<Value>,
 ) -> Result<Value, EvalError> {
     use crate::object::IndexedStorage;
+    let entity_id = match &handle.0.kind {
+        InstanceKind::Entity(d) => Some(d.id),
+        _ => None,
+    };
     let obj = match &handle.0.kind {
         InstanceKind::ValueObject(o) => o.clone(),
         InstanceKind::Entity(d) => d.data.clone(),
@@ -1395,6 +1403,10 @@ pub(crate) fn dispatch_object_primitive(
                         )));
                     }
                     guard[n as usize] = v.clone();
+                    drop(guard);
+                    if let Some(eid) = entity_id {
+                        crate::store_bridge::buffer_indexed_slot(ev, eid, n as usize, &v);
+                    }
                     Ok(v)
                 }
                 IndexedStorage::Byte(bytes) => {
@@ -1419,6 +1431,15 @@ pub(crate) fn dispatch_object_primitive(
                         )));
                     }
                     guard[n as usize] = b;
+                    drop(guard);
+                    if let Some(eid) = entity_id {
+                        crate::store_bridge::buffer_indexed_slot(
+                            ev,
+                            eid,
+                            n as usize,
+                            &Value::Int(b as i64),
+                        );
+                    }
                     Ok(v)
                 }
                 IndexedStorage::Float64(floats) => {
@@ -1439,6 +1460,15 @@ pub(crate) fn dispatch_object_primitive(
                         )));
                     }
                     guard[n as usize] = f;
+                    drop(guard);
+                    if let Some(eid) = entity_id {
+                        crate::store_bridge::buffer_indexed_slot(
+                            ev,
+                            eid,
+                            n as usize,
+                            &Value::Float(f),
+                        );
+                    }
                     Ok(v)
                 }
             }
@@ -1485,6 +1515,70 @@ pub(crate) fn dispatch_object_primitive(
             };
             Err(EvalError::Signal(msg))
         }
+        "historyOf:" => {
+            expect_arity(sel, 1, args.len())?;
+            let eid = entity_id.ok_or_else(|| {
+                EvalError::TypeError("historyOf: requires an entity receiver".into())
+            })?;
+            let pred_name = match force_value(args.remove(0))? {
+                Value::Symbol(s) | Value::Str(s) => s,
+                other => {
+                    return Err(EvalError::TypeError(format!(
+                        "historyOf: argument must be a Symbol, got {}",
+                        other.kind()
+                    )));
+                }
+            };
+            let pred = ev.registry.store.lookup(&pred_name).ok_or_else(|| {
+                EvalError::TypeError(format!("historyOf: unknown predicate '{pred_name}'"))
+            })?;
+            let ctx = ExecContext::Entity(eid);
+            let facts = ev.store.history(&ctx, eid, pred, None).map_err(|e| {
+                EvalError::Signal(Arc::from(format!("historyOf: store error: {e:?}").as_str()))
+            })?;
+            history_facts_to_array(ev, &facts)
+        }
+        "historyOf:from:to:" => {
+            expect_arity(sel, 3, args.len())?;
+            let eid = entity_id.ok_or_else(|| {
+                EvalError::TypeError("historyOf:from:to: requires an entity receiver".into())
+            })?;
+            let pred_name = match force_value(args.remove(0))? {
+                Value::Symbol(s) | Value::Str(s) => s,
+                other => {
+                    return Err(EvalError::TypeError(format!(
+                        "historyOf:from:to: first argument must be a Symbol, got {}",
+                        other.kind()
+                    )));
+                }
+            };
+            let from_ms = as_int(args.remove(0), sel)?;
+            let to_ms = as_int(args.remove(0), sel)?;
+            let pred = ev.registry.store.lookup(&pred_name).ok_or_else(|| {
+                EvalError::TypeError(format!(
+                    "historyOf:from:to: unknown predicate '{pred_name}'"
+                ))
+            })?;
+            let ctx = ExecContext::Entity(eid);
+            let all_facts = ev.store.history(&ctx, eid, pred, None).map_err(|e| {
+                EvalError::Signal(Arc::from(
+                    format!("historyOf:from:to: store error: {e:?}").as_str(),
+                ))
+            })?;
+            let facts: Vec<StoredFact> = all_facts
+                .into_iter()
+                .filter(|f| {
+                    let start_ms = (f.valid.start.0 / 1_000_000) as i64;
+                    let end_ms = f
+                        .valid
+                        .end
+                        .map(|t| (t.0 / 1_000_000) as i64)
+                        .unwrap_or(i64::MAX);
+                    start_ms <= to_ms && end_ms >= from_ms
+                })
+                .collect();
+            history_facts_to_array(ev, &facts)
+        }
         _ => Err(EvalError::MessageNotUnderstood {
             receiver_kind: "Object",
             selector: sel.clone(),
@@ -1501,6 +1595,110 @@ fn is_kind_of(class: &Arc<Class>, target: &Arc<Class>) -> bool {
     } else {
         false
     }
+}
+
+/// Assert `(entity, __instance_of__, class_entity)` in a fresh one-shot transaction.
+///
+/// Requires: `inst` is an Entity kind handle.
+/// Ensures: a `__instance_of__` fact is committed to the shared store. Silent no-op
+///   if the class has no backing class-entity (e.g. during bootstrap).
+fn assert_instance_of(ev: &Evaluator, inst: &InstanceHandle, class: &Arc<Class>) {
+    let entity_id = match &inst.0.kind {
+        InstanceKind::Entity(d) => d.id,
+        _ => return,
+    };
+    let Some(class_eid) = class_entity_id_of(class) else {
+        return;
+    };
+    let mut tx = ev.store.begin_owned(ExecContext::Entity(entity_id));
+    let _ = tx.assert_single(Fact {
+        subject: entity_id,
+        predicate: ev.registry.instance_of_pred,
+        object: Term::EntityRef(class_eid),
+        asserter: entity_id,
+        valid: None,
+    });
+    let _ = tx.commit();
+}
+
+/// Extract the EntityId of the class-entity backing `class`, if available.
+fn class_entity_id_of(class: &Arc<Class>) -> Option<EntityId> {
+    class
+        .class_object
+        .get()
+        .and_then(|w| w.upgrade())
+        .and_then(|s| match &s.kind {
+            InstanceKind::ClassEntity(d) => Some(d.id),
+            _ => None,
+        })
+}
+
+/// Build an `Array` entity pre-filled with `values`.
+///
+/// Allocates a fresh Array entity, fills its indexed Pointer slots directly at
+/// the Rust level (no cross-entity dispatch), tracks it with the evaluator, and
+/// returns it. Used by `historyOf:` and `_primInstancesOf:`.
+fn build_array(ev: &Evaluator, values: Vec<Value>) -> Result<Value, EvalError> {
+    let array_class_handle = ev
+        .registry
+        .kernel()
+        .lookup_class("Array")
+        .ok_or_else(|| EvalError::TypeError("Array not in kernel".into()))?;
+    let array_class = array_class_handle.0.class.clone();
+
+    let mut global_env = crate::env::Env::new();
+    ev.registry.populate_env(&mut global_env);
+    let arr = spawn_entity_bare(
+        array_class,
+        ev.registry.clone(),
+        global_env,
+        Some(values.len()),
+        ev.store.clone_handle(),
+    );
+    ev.track_entity(&arr);
+
+    if let InstanceKind::Entity(d) = &arr.0.kind
+        && let Some(IndexedStorage::Pointer(slots)) = &d.data.indexed
+    {
+        let mut guard = slots.lock();
+        for (i, v) in values.into_iter().enumerate() {
+            guard[i] = v;
+        }
+    }
+
+    Ok(Value::Instance(arr))
+}
+
+/// Convert a slice of `StoredFact` to an `Array` of `Association(ts_ms → value)`.
+///
+/// Each Association has `key = epoch-milliseconds (Int)` and `value = resolved object`.
+fn history_facts_to_array(ev: &Evaluator, facts: &[StoredFact]) -> Result<Value, EvalError> {
+    let assocs: Vec<Value> = facts
+        .iter()
+        .map(|f| {
+            let ts_ms = Value::Int((f.valid.start.0 / 1_000_000) as i64);
+            let val = ev.resolve_term(&f.object);
+            make_association(ev, ts_ms, val)
+        })
+        .collect::<Result<_, _>>()?;
+    build_array(ev, assocs)
+}
+
+/// Build an Association ValueObject with `key` and `value` set.
+fn make_association(ev: &Evaluator, key: Value, value: Value) -> Result<Value, EvalError> {
+    let assoc_class_handle = ev
+        .registry
+        .kernel()
+        .lookup_class("Association")
+        .ok_or_else(|| EvalError::TypeError("Association not in kernel".into()))?;
+    let assoc_class = assoc_class_handle.0.class.clone();
+    let obj = Arc::new(Object::new(assoc_class.clone()));
+    obj.set_slot(Arc::from("key"), key);
+    obj.set_slot(Arc::from("value"), value);
+    Ok(Value::Instance(InstanceHandle(Arc::new(InstanceState {
+        class: assoc_class,
+        kind: InstanceKind::ValueObject(obj),
+    }))))
 }
 
 // ── Namespace ─────────────────────────────────────────────────────────────────
@@ -1621,8 +1819,15 @@ pub(crate) fn dispatch_class_builtin(
             } else {
                 let mut global_env = Env::new();
                 ev.registry.populate_env(&mut global_env);
-                let inst = spawn_entity_bare(class, ev.registry.clone(), global_env, indexed_size);
+                let inst = spawn_entity_bare(
+                    class.clone(),
+                    ev.registry.clone(),
+                    global_env,
+                    indexed_size,
+                    ev.store.clone_handle(),
+                );
                 ev.track_entity(&inst);
+                assert_instance_of(ev, &inst, &class);
                 Ok(Value::Instance(inst))
             }
         }
@@ -1644,14 +1849,38 @@ pub(crate) fn dispatch_class_builtin(
                 let mut global_env = Env::new();
                 ev.registry.populate_env(&mut global_env);
                 let inst = spawn_entity_bare(
-                    class,
+                    class.clone(),
                     ev.registry.clone(),
                     global_env,
                     Some(n.max(0) as usize),
+                    ev.store.clone_handle(),
                 );
                 ev.track_entity(&inst);
+                assert_instance_of(ev, &inst, &class);
                 Ok(Value::Instance(inst))
             }
+        }
+        "_primInstancesOf:" => {
+            expect_arity(&selector, 1, args.len())?;
+            let target_handle = match force_value(args.remove(0))? {
+                Value::Instance(h) => h,
+                other => {
+                    return Err(EvalError::TypeError(format!(
+                        "_primInstancesOf: argument must be a class, got {}",
+                        other.kind()
+                    )));
+                }
+            };
+            let target_class = target_handle.0.class.clone();
+            let instances: Vec<Value> = ev
+                .registry
+                .instance_entities
+                .read()
+                .values()
+                .filter(|state| Arc::ptr_eq(&state.class, &target_class))
+                .map(|state| Value::Instance(InstanceHandle(state.clone())))
+                .collect();
+            build_array(ev, instances)
         }
         "name" => {
             expect_arity(&selector, 0, args.len())?;
@@ -1789,12 +2018,18 @@ fn handle_subclass(
         is_value: declared_is_value,
         class_object: std::sync::OnceLock::new(),
     });
-    let class_handle = spawn_class_entity(new_class.clone(), ev.registry.clone(), Env::new());
+    let class_handle = spawn_class_entity(
+        new_class.clone(),
+        ev.registry.clone(),
+        Env::new(),
+        ev.store.clone_handle(),
+    );
     new_class
         .class_object
         .set(Arc::downgrade(&class_handle.0))
         .ok();
     ev.registry.register_class_entity(&class_handle);
+    ev.registry.register_class_predicates(&new_class);
 
     let active_ns = ev.active_namespace();
     active_ns.register(class_handle.clone());
