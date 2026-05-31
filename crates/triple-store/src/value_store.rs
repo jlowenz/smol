@@ -70,11 +70,6 @@ impl ValueStore {
         );
         self.permanent.read().get(&id).cloned()
     }
-
-    /// All currently stored value IDs. Entry point for a future glacier pass.
-    pub(crate) fn all_ids(&self) -> Vec<EntityId> {
-        self.permanent.read().keys().copied().collect()
-    }
 }
 
 #[cfg(test)]
@@ -120,15 +115,5 @@ mod tests {
         vs.commit_value(id, simple_value("Second")); // must not overwrite
         let got = vs.lookup(id).unwrap();
         assert_eq!(got.class_name.as_ref(), "First");
-    }
-
-    #[test]
-    fn all_ids_returns_all_committed() {
-        let vs = ValueStore::new();
-        vs.commit_value(hash_id(10), simple_value("A"));
-        vs.commit_value(hash_id(11), simple_value("B"));
-        let mut ids = vs.all_ids();
-        ids.sort_by_key(|e| e.0);
-        assert_eq!(ids, vec![hash_id(10), hash_id(11)]);
     }
 }

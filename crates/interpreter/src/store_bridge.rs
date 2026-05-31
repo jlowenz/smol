@@ -175,12 +175,12 @@ pub(crate) fn collect_value_subtree(v: &Value, buf: &mut Vec<(EntityId, StoredVa
         let slots = obj.slots.lock();
         for ivar_name in h.0.class.all_instance_vars() {
             let val = slots.get(ivar_name.as_ref()).cloned().unwrap_or(Value::Nil);
-            if let Value::Instance(inner) = &val {
-                if matches!(inner.0.kind, InstanceKind::ValueObject(_)) {
-                    let nested_id = collect_value_subtree(&val, buf);
-                    named_fields.push((ivar_name, Term::ValueRef(nested_id)));
-                    continue;
-                }
+            if let Value::Instance(inner) = &val
+                && matches!(inner.0.kind, InstanceKind::ValueObject(_))
+            {
+                let nested_id = collect_value_subtree(&val, buf);
+                named_fields.push((ivar_name, Term::ValueRef(nested_id)));
+                continue;
             }
             match value_to_bridge(&val) {
                 BridgeResult::Assert(term) => named_fields.push((ivar_name, term)),
@@ -195,12 +195,12 @@ pub(crate) fn collect_value_subtree(v: &Value, buf: &mut Vec<(EntityId, StoredVa
         match indexed {
             IndexedStorage::Pointer(slots) => {
                 for val in slots.lock().iter() {
-                    if let Value::Instance(inner) = val {
-                        if matches!(inner.0.kind, InstanceKind::ValueObject(_)) {
-                            let nested_id = collect_value_subtree(val, buf);
-                            indexed_fields.push(Term::ValueRef(nested_id));
-                            continue;
-                        }
+                    if let Value::Instance(inner) = val
+                        && matches!(inner.0.kind, InstanceKind::ValueObject(_))
+                    {
+                        let nested_id = collect_value_subtree(val, buf);
+                        indexed_fields.push(Term::ValueRef(nested_id));
+                        continue;
                     }
                     match value_to_bridge(val) {
                         BridgeResult::Assert(term) => indexed_fields.push(term),
@@ -282,25 +282,25 @@ pub(crate) fn buffer_indexed_slot(
     let mut tx_ref = ev.current_tx.borrow_mut();
     let Some(tx) = tx_ref.as_mut() else { return };
     // For value objects, collect the full subtree and stage structural records.
-    if let Value::Instance(h) = value {
-        if matches!(h.0.kind, InstanceKind::ValueObject(_)) {
-            let mut val_buf = Vec::new();
-            let hash_id = collect_value_subtree(value, &mut val_buf);
-            for (id, sv) in val_buf {
-                tx.buffer_value(id, sv);
-            }
-            let _ = tx.assert_indexed(
-                Fact {
-                    subject: entity_id,
-                    predicate: pred,
-                    object: Term::ValueRef(hash_id),
-                    asserter: entity_id,
-                    valid: None,
-                },
-                key,
-            );
-            return;
+    if let Value::Instance(h) = value
+        && matches!(h.0.kind, InstanceKind::ValueObject(_))
+    {
+        let mut val_buf = Vec::new();
+        let hash_id = collect_value_subtree(value, &mut val_buf);
+        for (id, sv) in val_buf {
+            tx.buffer_value(id, sv);
         }
+        let _ = tx.assert_indexed(
+            Fact {
+                subject: entity_id,
+                predicate: pred,
+                object: Term::ValueRef(hash_id),
+                asserter: entity_id,
+                valid: None,
+            },
+            key,
+        );
+        return;
     }
     match value_to_bridge(value) {
         BridgeResult::Assert(term) => {
@@ -326,22 +326,22 @@ fn buffer_fact(ev: &Evaluator, entity_id: EntityId, pred: Predicate, value: &Val
     let mut tx_ref = ev.current_tx.borrow_mut();
     let Some(tx) = tx_ref.as_mut() else { return };
     // For value objects, collect the full subtree and stage structural records.
-    if let Value::Instance(h) = value {
-        if matches!(h.0.kind, InstanceKind::ValueObject(_)) {
-            let mut val_buf = Vec::new();
-            let hash_id = collect_value_subtree(value, &mut val_buf);
-            for (id, sv) in val_buf {
-                tx.buffer_value(id, sv);
-            }
-            let _ = tx.assert_single(Fact {
-                subject: entity_id,
-                predicate: pred,
-                object: Term::ValueRef(hash_id),
-                asserter: entity_id,
-                valid: None,
-            });
-            return;
+    if let Value::Instance(h) = value
+        && matches!(h.0.kind, InstanceKind::ValueObject(_))
+    {
+        let mut val_buf = Vec::new();
+        let hash_id = collect_value_subtree(value, &mut val_buf);
+        for (id, sv) in val_buf {
+            tx.buffer_value(id, sv);
         }
+        let _ = tx.assert_single(Fact {
+            subject: entity_id,
+            predicate: pred,
+            object: Term::ValueRef(hash_id),
+            asserter: entity_id,
+            valid: None,
+        });
+        return;
     }
     match value_to_bridge(value) {
         BridgeResult::Assert(term) => {

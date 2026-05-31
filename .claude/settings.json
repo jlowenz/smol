@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CMD=$(jq -r '.tool_input.command' 2>/dev/null); echo \"$CMD\" | grep -qE 'git\\s+commit' || exit 0; cd /Users/jlowens/Documents/dev/smol && cargo fmt --check 2>&1 && cargo clippy --all-targets 2>&1 || echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\"},\"reason\":\"cargo fmt or clippy failed — fix issues before committing\"}'",
+            "timeout": 120,
+            "statusMessage": "Running fmt + clippy..."
+          }
+        ]
+      }
+    ]
+  }
+}

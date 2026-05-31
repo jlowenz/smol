@@ -435,41 +435,41 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
 
         match result {
             Ok(v) => {
-                if let Some(tx) = ev.current_tx.borrow_mut().take() {
-                    if let Err(e) = commit_or_warn(tx) {
-                        let msg = e.to_string();
-                        *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
-                        envelope
+                if let Some(tx) = ev.current_tx.borrow_mut().take()
+                    && let Err(e) = commit_or_warn(tx)
+                {
+                    let msg = e.to_string();
+                    *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
+                    envelope
+                        .reply
+                        .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                    let mut mb = data.mailbox.lock().unwrap();
+                    for pending in mb.drain(..) {
+                        pending
                             .reply
                             .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
-                        let mut mb = data.mailbox.lock().unwrap();
-                        for pending in mb.drain(..) {
-                            pending
-                                .reply
-                                .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
-                        }
-                        break;
                     }
+                    break;
                 }
                 envelope.reply.resolve_ok(v);
             }
             Err(EvalError::Return(v, _)) => {
                 // Non-local return from a cross-entity block: resolve with v.
-                if let Some(tx) = ev.current_tx.borrow_mut().take() {
-                    if let Err(e) = commit_or_warn(tx) {
-                        let msg = e.to_string();
-                        *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
-                        envelope
+                if let Some(tx) = ev.current_tx.borrow_mut().take()
+                    && let Err(e) = commit_or_warn(tx)
+                {
+                    let msg = e.to_string();
+                    *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
+                    envelope
+                        .reply
+                        .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                    let mut mb = data.mailbox.lock().unwrap();
+                    for pending in mb.drain(..) {
+                        pending
                             .reply
                             .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
-                        let mut mb = data.mailbox.lock().unwrap();
-                        for pending in mb.drain(..) {
-                            pending
-                                .reply
-                                .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
-                        }
-                        break;
                     }
+                    break;
                 }
                 envelope.reply.resolve_ok(v);
             }

@@ -15,3 +15,6 @@ lcov.info
 .idea/
 .vscode/
 *.swp
+
+# Claude Code local settings (personal overrides, not team config)
+.claude/settings.local.json
