@@ -12,6 +12,7 @@ use crate::id::{EntityId, TxId};
 use crate::predicates::OrderingKey;
 use crate::storage::{CommitChange, Error as StorageError};
 use crate::term::{Predicate, Term};
+use crate::value_store::StoredValue;
 
 /// Errors from transaction operations.
 #[derive(Debug, PartialEq, Eq)]
@@ -70,24 +71,26 @@ pub(crate) enum TentativeOp {
 /// called the transaction delegates here, keeping `Transaction` independent
 /// of any concrete store type.
 pub(crate) trait Applier<TFact>: Send + Sync {
-    /// Apply `ops` as transaction `tx_id` and return the resulting change set.
+    /// Apply `ops` and `values` as transaction `tx_id` and return the resulting change set.
     ///
     /// Requires: `tx_id` is unique within this store instance.
-    /// Ensures: all ops are applied atomically (per shard); change events are
-    ///   dispatched to matching subscribers before returning.
+    /// Ensures: `ops` and `values` are committed atomically — if `ops` processing
+    ///   returns `Err`, `values` are not stored; change events are dispatched to
+    ///   matching subscribers before returning.
     fn apply(
         &self,
         tx_id: TxId,
         ops: Vec<TentativeOp>,
+        values: Vec<(EntityId, StoredValue)>,
     ) -> Result<Vec<CommitChange<TFact>>, TxError>;
 }
 
-/// A unit of work: buffers assertions and retractions, then commits or rolls
-/// back atomically.
+/// A unit of work: buffers assertions, retractions, and value records, then
+/// commits or rolls back atomically.
 ///
-/// Buffer methods (`assert_*`, `retract_*`) are infallible — they simply record
-/// intent. All cardinality enforcement and fact-existence checks occur at
-/// `commit` time.
+/// Buffer methods (`assert_*`, `retract_*`, `buffer_value`) are infallible —
+/// they simply record intent. All cardinality enforcement and fact-existence
+/// checks occur at `commit` time.
 ///
 /// Precondition: no identity key may appear in both an assert and a retract
 /// within the same transaction (same commit timestamp, same slot → undefined
@@ -96,6 +99,7 @@ pub struct Transaction<TFact> {
     applier: Arc<dyn Applier<TFact>>,
     tx_id: TxId,
     ops: Vec<TentativeOp>,
+    value_buf: Vec<(EntityId, StoredValue)>,
 }
 
 impl<TFact> Transaction<TFact> {
@@ -104,6 +108,7 @@ impl<TFact> Transaction<TFact> {
             applier,
             tx_id,
             ops: Vec::new(),
+            value_buf: Vec::new(),
         }
     }
 
@@ -182,14 +187,29 @@ impl<TFact> Transaction<TFact> {
         });
     }
 
+    // === Value buffer ===
+
+    /// Stage a value object for atomic commit alongside the buffered facts.
+    ///
+    /// Requires: `id.0 & 0x8000_0000_0000_0000 != 0` (content-hash id space).
+    /// Ensures: if `commit()` returns `Ok`, the value is durable in the backend.
+    ///   If `commit()` returns `Err`, the value is discarded with no side effects.
+    pub fn buffer_value(&mut self, id: EntityId, value: StoredValue) {
+        debug_assert!(
+            id.0 & 0x8000_0000_0000_0000 != 0,
+            "buffer_value: id is not in content-hash space"
+        );
+        self.value_buf.push((id, value));
+    }
+
     // === Terminal operations (consume self) ===
 
-    /// Apply all buffered operations atomically.
+    /// Apply all buffered operations and staged values atomically.
     ///
-    /// Ensures: all ops committed or none (per shard); change events dispatched
-    ///   to matching subscribers before returning.
+    /// Ensures: all ops and values committed or none (per shard); if ops fail
+    ///   no values are stored; change events dispatched before returning.
     pub fn commit(self) -> Result<Vec<CommitChange<TFact>>, TxError> {
-        self.applier.apply(self.tx_id, self.ops)
+        self.applier.apply(self.tx_id, self.ops, self.value_buf)
     }
 
     /// Discard all buffered operations. Consumes the transaction.

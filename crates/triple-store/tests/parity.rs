@@ -5,7 +5,10 @@
 //! outcomes (which `CommitChange` variant, what the query returns) without
 //! checking exact timestamps, so `SystemClock` is sufficient.
 
+use std::sync::Arc;
+
 use triple_store::DurableFileTripleStore;
+use triple_store::StoredValue;
 use triple_store::change::{ChangeEvent, ChangeKind};
 use triple_store::fact::{Fact, StoredFact};
 use triple_store::id::EntityId;
@@ -396,6 +399,76 @@ where
             changes
                 .iter()
                 .all(|c| matches!(c, CommitChange::Asserted { .. }))
+        );
+    }
+
+    // ── Value store: lookup_value ────────────────────────────────────────
+
+    {
+        let s = make();
+        let id = EntityId(0x8000_0000_0000_0001);
+        assert!(
+            s.lookup_value(id).is_none(),
+            "fresh store must have no values"
+        );
+    }
+
+    {
+        let s = make();
+        let id = EntityId(0x8000_0000_0000_0002);
+        let sv = StoredValue {
+            class_name: Arc::from("Point"),
+            named_fields: vec![(Arc::from("x"), Term::Int(3))],
+            indexed_fields: vec![],
+        };
+        let mut tx = s.new_transaction();
+        tx.buffer_value(id, sv);
+        tx.commit().unwrap();
+        let got = s
+            .lookup_value(id)
+            .expect("value must be present after commit");
+        assert_eq!(got.class_name.as_ref(), "Point");
+        assert!(
+            got.named_fields
+                .iter()
+                .any(|(n, t)| n.as_ref() == "x" && *t == Term::Int(3))
+        );
+    }
+
+    {
+        let s = make();
+        let id = EntityId(0x8000_0000_0000_0003);
+        let sv = StoredValue {
+            class_name: Arc::from("Color"),
+            named_fields: vec![],
+            indexed_fields: vec![],
+        };
+        let mut tx = s.new_transaction();
+        tx.buffer_value(id, sv);
+        tx.rollback();
+        assert!(
+            s.lookup_value(id).is_none(),
+            "rollback must not commit values"
+        );
+    }
+
+    {
+        // Fact commit failure must discard buffered values.
+        let s = make();
+        let id = EntityId(0x8000_0000_0000_0004);
+        let sv = StoredValue {
+            class_name: Arc::from("Money"),
+            named_fields: vec![],
+            indexed_fields: vec![],
+        };
+        let mut tx = s.new_transaction();
+        // Buffer a retraction with no prior fact — will fail at commit.
+        tx.retract_single(EntityId(1), Predicate(0), EntityId(1));
+        tx.buffer_value(id, sv);
+        assert_eq!(tx.commit().unwrap_err(), TxError::OpenFactNotFound);
+        assert!(
+            s.lookup_value(id).is_none(),
+            "failed commit must not store values"
         );
     }
 }

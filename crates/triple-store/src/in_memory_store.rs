@@ -30,6 +30,7 @@ use crate::term::{Predicate, Term};
 use crate::time::{Clock, SystemClock, Timestamp};
 use crate::transaction::{Applier, TentativeOp, Transaction, TxError};
 use crate::triple_store::TripleStore;
+use crate::value_store::{StoredValue, ValueStore};
 
 const DEFAULT_SHARD_COUNT: usize = 16;
 
@@ -499,6 +500,7 @@ pub(crate) fn dispatch_changes(
 /// without borrowing the store.
 pub(crate) struct Inner {
     storage: InMemoryStorage,
+    value_store: ValueStore,
     clock: Arc<dyn Clock>,
     next_tx: AtomicU64,
     next_subscription: AtomicU64,
@@ -509,6 +511,7 @@ impl Inner {
     fn new(shard_count: usize, clock: Arc<dyn Clock>) -> Self {
         Self {
             storage: InMemoryStorage::new(shard_count),
+            value_store: ValueStore::new(),
             clock,
             next_tx: AtomicU64::new(1),
             next_subscription: AtomicU64::new(1),
@@ -522,9 +525,13 @@ impl Applier<StoredFact> for Inner {
         &self,
         tx_id: TxId,
         ops: Vec<TentativeOp>,
+        values: Vec<(EntityId, StoredValue)>,
     ) -> Result<Vec<CommitChange<StoredFact>>, TxError> {
         let changes = collapse_and_apply(tx_id, ops, &*self.clock, &self.storage)?;
         dispatch_changes(tx_id, &changes, &self.subscribers);
+        for (id, value) in values {
+            self.value_store.commit_value(id, value);
+        }
         Ok(changes)
     }
 }
@@ -686,6 +693,10 @@ impl TripleStore<StoredFact> for InMemoryTripleStore {
 
     fn unsubscribe(&self, id: SubscriptionId) {
         self.inner.subscribers.write().retain(|s| s.id != id);
+    }
+
+    fn lookup_value(&self, id: EntityId) -> Option<std::sync::Arc<StoredValue>> {
+        self.inner.value_store.lookup(id)
     }
 }
 

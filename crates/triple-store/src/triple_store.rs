@@ -7,6 +7,7 @@
 //! (`Arc<dyn TripleStore<StoredFact>>`).
 
 use std::io;
+use std::sync::Arc;
 
 use crate::change::{EventFilter, Subscription};
 use crate::fact::BitemporalFact;
@@ -18,6 +19,7 @@ use crate::queryable::Queryable;
 use crate::term::Predicate;
 use crate::time::Timestamp;
 use crate::transaction::Transaction;
+use crate::value_store::StoredValue;
 
 /// The top-level triple store interface.
 ///
@@ -51,6 +53,13 @@ pub trait TripleStore<TFact: BitemporalFact>: Queryable<TFact> + Send + Sync {
 
     /// Cancel a subscription. No-op if `id` is unknown.
     fn unsubscribe(&self, id: SubscriptionId);
+
+    /// Look up a previously committed value object by its content-hash id.
+    ///
+    /// Requires: `id.0 & 0x8000_0000_0000_0000 != 0`.
+    /// Ensures: `Some(v)` iff the value was committed in this session or recovered
+    ///   from a prior session; `None` otherwise.
+    fn lookup_value(&self, id: EntityId) -> Option<Arc<StoredValue>>;
 
     /// Persist a declaration record so it survives process restart.
     ///

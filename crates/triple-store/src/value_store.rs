@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 use crate::id::EntityId;
 use crate::term::Term;
@@ -18,6 +19,7 @@ use crate::term::Term;
 /// Both named and indexed fields are stored as `Term` values. Nested value
 /// objects appear as `Term::ValueRef(hash_id)`, establishing recursive
 /// structure by reference rather than nesting.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredValue {
     pub class_name: Arc<str>,
     /// Named ivars, ordered by class definition.

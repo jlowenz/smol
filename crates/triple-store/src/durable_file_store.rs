@@ -36,6 +36,7 @@ use crate::term::Predicate;
 use crate::time::{Clock, SystemClock, Timestamp};
 use crate::transaction::{Applier, TentativeOp, TxError};
 use crate::triple_store::TripleStore;
+use crate::value_store::{StoredValue, ValueStore};
 
 const DEFAULT_SHARD_COUNT: usize = 16;
 
@@ -43,11 +44,17 @@ const DEFAULT_SHARD_COUNT: usize = 16;
 
 #[derive(Serialize, Deserialize)]
 enum WalRecord {
+    /// Legacy variant — reads of pre-C27.6 WAL files. No value records.
     FactBatch(Vec<CommitChange<StoredFact>>),
     Declaration {
         name: String,
         visibility: Visibility,
         cardinality: Cardinality,
+    },
+    /// Atomic commit of facts and value objects together (C27.6+).
+    Commit {
+        facts: Vec<CommitChange<StoredFact>>,
+        values: Vec<(EntityId, StoredValue)>,
     },
 }
 
@@ -64,6 +71,7 @@ fn write_wal_record(log: &mut BufWriter<File>, record: &WalRecord) -> io::Result
 
 pub(crate) struct DurableInner {
     storage: InMemoryStorage,
+    value_store: ValueStore,
     recovered_registry: PredicateRegistry,
     next_entity_start: u64,
     clock: Arc<dyn Clock>,
@@ -81,6 +89,7 @@ impl DurableInner {
             .open(path)?;
         Ok(Self {
             storage: InMemoryStorage::new(DEFAULT_SHARD_COUNT),
+            value_store: ValueStore::new(),
             recovered_registry: PredicateRegistry::new(),
             next_entity_start: 1,
             clock,
@@ -93,10 +102,12 @@ impl DurableInner {
 
     fn open(path: &Path, clock: Arc<dyn Clock>) -> io::Result<Self> {
         let storage = InMemoryStorage::new(DEFAULT_SHARD_COUNT);
-        let (max_tx, recovered_registry, max_entity) = replay_log(path, &storage)?;
+        let value_store = ValueStore::new();
+        let (max_tx, recovered_registry, max_entity) = replay_log(path, &storage, &value_store)?;
         let file = OpenOptions::new().append(true).open(path)?;
         Ok(Self {
             storage,
+            value_store,
             recovered_registry,
             next_entity_start: max_entity + 1,
             clock,
@@ -109,12 +120,11 @@ impl DurableInner {
 }
 
 impl Applier<StoredFact> for DurableInner {
-    /// Apply `ops` atomically to in-memory storage, persist to the WAL, then
-    /// dispatch change events.
+    /// Apply `ops` and `values` atomically to in-memory storage, persist to the
+    /// WAL as a single `Commit` record, then dispatch change events.
     ///
     /// Requires: `tx_id` is unique within this store instance.
-    /// Ensures: if this returns `Ok`, the changes are durable on stable storage
-    ///   and visible to subsequent queries.
+    /// Ensures: if this returns `Ok`, facts and values are durable on stable storage.
     ///
     /// Note: if the WAL write fails after in-memory storage has been updated,
     ///   the in-memory state diverges from the durable log for this session.
@@ -124,23 +134,34 @@ impl Applier<StoredFact> for DurableInner {
         &self,
         tx_id: TxId,
         ops: Vec<TentativeOp>,
+        values: Vec<(EntityId, StoredValue)>,
     ) -> Result<Vec<CommitChange<StoredFact>>, TxError> {
         let changes = collapse_and_apply(tx_id, ops, &*self.clock, &self.storage)?;
 
-        if !changes.is_empty() {
-            let record = WalRecord::FactBatch(changes.clone());
+        if !changes.is_empty() || !values.is_empty() {
+            let record = WalRecord::Commit {
+                facts: changes.clone(),
+                values: values.clone(),
+            };
             write_wal_record(&mut self.log.lock(), &record)
                 .map_err(|_| TxError::Internal("log write failed"))?;
         }
 
         dispatch_changes(tx_id, &changes, &self.subscribers);
+        for (id, value) in values {
+            self.value_store.commit_value(id, value);
+        }
         Ok(changes)
     }
 }
 
 // ── WAL replay ────────────────────────────────────────────────────────────────
 
-fn replay_log(path: &Path, storage: &InMemoryStorage) -> io::Result<(u64, PredicateRegistry, u64)> {
+fn replay_log(
+    path: &Path,
+    storage: &InMemoryStorage,
+    value_store: &ValueStore,
+) -> io::Result<(u64, PredicateRegistry, u64)> {
     let mut file = File::open(path)?;
     let mut max_tx = 0u64;
     let mut max_entity = 0u64;
@@ -166,6 +187,7 @@ fn replay_log(path: &Path, storage: &InMemoryStorage) -> io::Result<(u64, Predic
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         match record {
             WalRecord::FactBatch(changes) => {
+                // Legacy pre-C27.6 records: replay facts only, no values.
                 for change in &changes {
                     max_tx = max_tx.max(replay_change(change, storage));
                     let (s, a) = entity_ids_in_change(change);
@@ -182,6 +204,16 @@ fn replay_log(path: &Path, storage: &InMemoryStorage) -> io::Result<(u64, Predic
                     .unwrap_or_else(|_| {
                         panic!("WAL corruption: conflicting declaration for {name}")
                     });
+            }
+            WalRecord::Commit { facts, values } => {
+                for change in &facts {
+                    max_tx = max_tx.max(replay_change(change, storage));
+                    let (s, a) = entity_ids_in_change(change);
+                    max_entity = max_entity.max(s).max(a);
+                }
+                for (id, value) in values {
+                    value_store.commit_value(id, value);
+                }
             }
         }
     }
@@ -367,6 +399,10 @@ impl TripleStore<StoredFact> for DurableFileTripleStore {
 
     fn unsubscribe(&self, id: SubscriptionId) {
         self.inner.subscribers.write().retain(|s| s.id != id);
+    }
+
+    fn lookup_value(&self, id: EntityId) -> Option<std::sync::Arc<StoredValue>> {
+        self.inner.value_store.lookup(id)
     }
 
     fn persist_declaration(
@@ -782,6 +818,103 @@ mod tests {
             s2.history(EntityId(1), Predicate(0), None).len(),
             1,
             "retracted fact must still appear in history"
+        );
+    }
+
+    // ── Value persistence across reopen ──────────────────────────────────────
+
+    #[test]
+    fn value_object_persists_across_reopen() {
+        use crate::value_store::StoredValue;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.wal");
+        let id = EntityId(0x8000_0000_0000_0001);
+
+        {
+            let s = DurableFileTripleStore::create(&path).unwrap();
+            let sv = StoredValue {
+                class_name: Arc::from("Point"),
+                named_fields: vec![],
+                indexed_fields: vec![],
+            };
+            let mut tx = s.new_transaction();
+            tx.buffer_value(id, sv);
+            tx.commit().unwrap();
+        }
+
+        let s2 = DurableFileTripleStore::open(&path).unwrap();
+        let got = s2
+            .lookup_value(id)
+            .expect("value must be present after reopen");
+        assert_eq!(got.class_name.as_ref(), "Point");
+    }
+
+    #[test]
+    fn value_object_with_facts_persists_across_reopen() {
+        use crate::term::Term;
+        use crate::value_store::StoredValue;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.wal");
+        let val_id = EntityId(0x8000_0000_0000_0002);
+
+        {
+            let s = DurableFileTripleStore::create(&path).unwrap();
+            let sv = StoredValue {
+                class_name: Arc::from("Money"),
+                named_fields: vec![(Arc::from("amount"), Term::Int(100))],
+                indexed_fields: vec![],
+            };
+            let mut tx = s.new_transaction();
+            tx.assert_single(mk_fact(1, 1, 42));
+            tx.buffer_value(val_id, sv);
+            tx.commit().unwrap();
+        }
+
+        let s2 = DurableFileTripleStore::open(&path).unwrap();
+        // Fact must survive.
+        assert_eq!(s2.query_open(EntityId(1), Predicate(0), None).len(), 1);
+        // Value must survive.
+        let got = s2
+            .lookup_value(val_id)
+            .expect("value must be present after reopen");
+        assert_eq!(got.class_name.as_ref(), "Money");
+        assert!(
+            got.named_fields
+                .iter()
+                .any(|(n, t)| n.as_ref() == "amount" && *t == Term::Int(100))
+        );
+    }
+
+    #[test]
+    fn value_only_commit_with_empty_facts_persists_across_reopen() {
+        use crate::value_store::StoredValue;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.wal");
+        let id = EntityId(0x8000_0000_0000_0003);
+
+        {
+            let s = DurableFileTripleStore::create(&path).unwrap();
+            let sv = StoredValue {
+                class_name: Arc::from("Color"),
+                named_fields: vec![],
+                indexed_fields: vec![],
+            };
+            // Commit a value with no associated facts.
+            let mut tx = s.new_transaction();
+            tx.buffer_value(id, sv);
+            tx.commit().unwrap();
+        }
+
+        let s2 = DurableFileTripleStore::open(&path).unwrap();
+        assert!(
+            s2.lookup_value(id).is_some(),
+            "value-only commit must survive reopen"
         );
     }
 }

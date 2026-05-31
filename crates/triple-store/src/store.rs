@@ -19,7 +19,7 @@ use crate::term::{Predicate, Term};
 use crate::time::Timestamp;
 use crate::transaction::{Transaction, TxError};
 use crate::triple_store::TripleStore;
-use crate::value_store::{StoredValue, ValueStore};
+use crate::value_store::StoredValue;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StoreError {
@@ -78,8 +78,6 @@ pub struct Store {
     declare_lock: Arc<Mutex<()>>,
     /// Monotonic entity ID counter; shared across all handles in a group.
     next_entity: Arc<AtomicU64>,
-    /// Content-addressed atemporal registry for value object structures.
-    value_store: Arc<ValueStore>,
 }
 
 impl Store {
@@ -94,7 +92,6 @@ impl Store {
             registry: Arc::new(ArcSwap::from_pointee(initial_registry)),
             declare_lock: Arc::new(Mutex::new(())),
             next_entity: Arc::new(AtomicU64::new(next_entity)),
-            value_store: Arc::new(ValueStore::new()),
         }
     }
 
@@ -184,7 +181,6 @@ impl Store {
             registry: Arc::clone(&self.registry),
             declare_lock: Arc::clone(&self.declare_lock),
             next_entity: Arc::clone(&self.next_entity),
-            value_store: Arc::clone(&self.value_store),
         }
     }
 
@@ -196,7 +192,7 @@ impl Store {
     /// Ensures: returns `Some(v)` iff a `StoredValue` was committed with this `id`
     ///   (via `OwnedStoreTransaction::buffer_value` + `commit`); otherwise `None`.
     pub fn lookup_value(&self, id: EntityId) -> Option<Arc<StoredValue>> {
-        self.value_store.lookup(id)
+        self.backend.lookup_value(id)
     }
 
     // ── Clock ─────────────────────────────────────────────────────────────────
@@ -371,7 +367,6 @@ impl Store {
             store: self.clone_handle(),
             ctx,
             tx: self.backend.new_transaction(),
-            value_buf: Vec::new(),
         }
     }
 
@@ -581,8 +576,6 @@ pub struct OwnedStoreTransaction {
     store: Store,
     ctx: ExecContext,
     tx: Transaction<StoredFact>,
-    /// Values staged for commit; flushed only after the triple-store commit succeeds.
-    value_buf: Vec<(EntityId, StoredValue)>,
 }
 
 impl OwnedStoreTransaction {
@@ -657,39 +650,27 @@ impl OwnedStoreTransaction {
         Ok(())
     }
 
-    /// Stage a value for commit. Infallible; the value is not yet in the store.
+    /// Stage a value for atomic commit alongside the buffered facts.
     ///
     /// Requires: `id.0 & 0x8000_0000_0000_0000 != 0` (content-hash id space).
     /// Ensures: if `commit()` returns `Ok`, `store.lookup_value(id)` returns `Some`.
     ///   If `commit()` returns `Err`, the value is discarded with no side effects.
     pub fn buffer_value(&mut self, id: EntityId, value: StoredValue) {
-        debug_assert!(
-            id.0 & 0x8000_0000_0000_0000 != 0,
-            "buffer_value: id is not in content-hash space"
-        );
-        self.value_buf.push((id, value));
+        self.tx.buffer_value(id, value);
     }
 
-    /// Commit all buffered ivar facts and staged values.
-    ///
-    /// Ordering: facts are committed first; on `Err` the value buffer is dropped
-    /// and the error propagates with no values stored. On `Ok`, the value buffer
-    /// is flushed to the permanent value store (infallible for in-memory backends).
+    /// Commit all buffered ivar facts and staged values atomically.
     ///
     /// Ensures: every `Term::ValueRef(id)` in a committed fact resolves via
     ///   `store.lookup_value(id)` immediately after this call returns `Ok`.
+    ///   On `Err`, no values are stored.
     pub fn commit(self) -> Result<Vec<CommitChange<StoredFact>>, StoreError> {
-        let changes = self.tx.commit().map_err(StoreError::from)?;
-        for (id, value) in self.value_buf {
-            self.store.value_store.commit_value(id, value);
-        }
-        Ok(changes)
+        self.tx.commit().map_err(StoreError::from)
     }
 
-    /// Discard all buffered operations. The value buffer is also dropped.
+    /// Discard all buffered operations and staged values.
     pub fn rollback(self) {
         self.tx.rollback();
-        // value_buf dropped here — no values are committed.
     }
 }
 
