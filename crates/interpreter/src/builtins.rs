@@ -2106,15 +2106,19 @@ pub(crate) fn dispatch_class_builtin(
                 None
             };
             if class.inherits_is_value() {
+                // Value subclasses: create and freeze immediately. Any post-construction
+                // ivar write will fail with the frozen error. Correct code uses _primNewValue:.
                 let obj = match indexed_size {
                     Some(n) => Arc::new(Object::new_with_indexed(class.clone(), n)),
                     None => Arc::new(Object::new(class.clone())),
                 };
-                Ok(Value::Instance(InstanceHandle(Arc::new(InstanceState {
+                obj.freeze();
+                return Ok(Value::Instance(InstanceHandle(Arc::new(InstanceState {
                     class,
                     kind: InstanceKind::ValueObject(obj),
-                }))))
-            } else {
+                }))));
+            }
+            {
                 let mut global_env = Env::new();
                 ev.registry.populate_env(&mut global_env);
                 let inst = spawn_entity_bare(
@@ -2196,11 +2200,13 @@ pub(crate) fn dispatch_class_builtin(
             }
             if class.inherits_is_value() {
                 let obj = Arc::new(Object::new_with_indexed(class.clone(), n.max(0) as usize));
-                Ok(Value::Instance(InstanceHandle(Arc::new(InstanceState {
+                obj.freeze();
+                return Ok(Value::Instance(InstanceHandle(Arc::new(InstanceState {
                     class,
                     kind: InstanceKind::ValueObject(obj),
-                }))))
-            } else {
+                }))));
+            }
+            {
                 let mut global_env = Env::new();
                 ev.registry.populate_env(&mut global_env);
                 let inst = spawn_entity_bare(

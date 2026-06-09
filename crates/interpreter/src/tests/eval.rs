@@ -1092,9 +1092,26 @@ fn association_arrow_syntax() {
 }
 
 #[test]
-fn association_value_mutator() {
-    let src = "| a | a := 'k' -> 1. a value: 2. a value";
+fn association_value_returns_new_association() {
+    // value: is a functional update — returns a new Association; original unchanged.
+    let src = "| a b | a := 'k' -> 1. b := a value: 2. b value";
     assert_eq!(eval(src), Value::Int(2));
+}
+
+#[test]
+fn association_original_unchanged_after_value() {
+    let src = "| a b | a := 'k' -> 1. b := a value: 2. a value";
+    assert_eq!(eval(src), Value::Int(1));
+}
+
+#[test]
+fn association_is_immutable() {
+    // Direct post-construction ivar write raises frozen error.
+    let err = eval_err("| a | a := 'k' -> 1. a pvtKey: 'x' value: 2");
+    assert!(
+        err.to_string().contains("frozen"),
+        "expected frozen error, got: {err}"
+    );
 }
 
 #[test]

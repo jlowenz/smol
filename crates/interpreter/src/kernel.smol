@@ -350,16 +350,13 @@ Value subclass: #Association
     indexedSlots: #none.
 
 Association class >> key: k value: v [
-    | a |
-    a := self _primNew.
-    a pvtKey: k value: v.
-    ^a
+    ^self _primNewValue: [:a | a pvtKey: k value: v]
 ]
 
 Association >> pvtKey: k value: v [ key := k. value := v ]
-Association >> key              [ ^key ]
-Association >> value            [ ^value ]
-Association >> value: v         [ value := v ]
+Association >> key      [ ^key ]
+Association >> value    [ ^value ]
+Association >> value: v [ ^self class key: key value: v ]
 Association >> = other [
     self class = other class ifFalse: [^false].
     ^key = other key
@@ -436,7 +433,7 @@ Dictionary >> at: key put: value [
             table at: i put: (Association key: key value: value).
             size + 1]
         ifFalse: [
-            slot value: value.
+            table at: i put: (Association key: key value: value).
             size].
     ^value
 ]
