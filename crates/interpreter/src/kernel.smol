@@ -380,13 +380,11 @@ Value subclass: #Cons
 
 Cons class >> with: anObject rest: aList [
     ^self _primNewValue: [:c |
-        c pvtSetHead: anObject.
-        c pvtSetTail: aList
+        c pvtHead: anObject tail: aList.
     ]
 ]
 
-Cons >> pvtSetHead: h [ head := h ]
-Cons >> pvtSetTail: t [ tail := t ]
+Cons >> pvtHead: h tail: t [ head := h. tail := t. ]
 Cons >> head           [ ^head ]
 Cons >> tail           [ ^tail ]
 Cons >> isEmpty        [ ^false ]

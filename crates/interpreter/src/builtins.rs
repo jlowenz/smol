@@ -7,8 +7,8 @@ use parking_lot::RwLock;
 
 use crate::class::{Class, IndexedSlotKind};
 use crate::entity::{
-    EntityId, InstanceHandle, InstanceKind, InstanceState, send_to_entity, spawn_class_entity,
-    spawn_entity_bare,
+    EntityId, InstanceHandle, InstanceKind, InstanceState, send_to_entity_with_chain,
+    spawn_class_entity, spawn_entity_bare,
 };
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
@@ -1332,8 +1332,18 @@ fn dispatch_entity(
     }
 
     // Cross-entity or non-entity-context send: enqueue and return Future.
+    // Snapshot the caller's handler_chain so the receiving entity can run inherited
+    // HC handlers if it signals a condition.
+    let chain_snapshot = {
+        let chain = ev.handler_chain.borrow();
+        if chain.is_empty() {
+            vec![]
+        } else {
+            chain.clone()
+        }
+    };
     let future = match &handle.0.kind {
-        InstanceKind::Entity(d) => send_to_entity(d, selector, args),
+        InstanceKind::Entity(d) => send_to_entity_with_chain(d, selector, args, chain_snapshot),
         _ => unreachable!(),
     };
     Ok(Value::Future(future))
@@ -2045,8 +2055,19 @@ fn dispatch_class(
     }
 
     // Cross-entity behavioral send: enqueue and return Future.
+    // Snapshot the caller's handler_chain so inherited HC handlers propagate.
+    let chain_snapshot = {
+        let chain = ev.handler_chain.borrow();
+        if chain.is_empty() {
+            vec![]
+        } else {
+            chain.clone()
+        }
+    };
     let future = match &handle.0.kind {
-        InstanceKind::ClassEntity(d) => send_to_entity(d, selector, args),
+        InstanceKind::ClassEntity(d) => {
+            send_to_entity_with_chain(d, selector, args, chain_snapshot)
+        }
         _ => unreachable!(),
     };
     Ok(Value::Future(future))

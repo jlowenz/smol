@@ -9,7 +9,7 @@ use crate::class_registry::ClassRegistry;
 use crate::env::Env;
 use crate::eval::EvalError;
 use crate::object::Object;
-use crate::value::Value;
+use crate::value::{Block, Value};
 use triple_store::exec_context::ExecContext;
 use triple_store::store::{OwnedStoreTransaction, Store, StoreError};
 
@@ -136,6 +136,10 @@ pub struct Envelope {
     pub args: Vec<Value>,
     /// The calling entity (or test) waits on this future for the reply.
     pub reply: FutureHandle,
+    /// HandlerContext handler pairs inherited from the sender's evaluator.
+    /// Empty for ordinary sends; populated by cross-entity sends that originate
+    /// inside a HandlerContext body.
+    pub inherited_chain: Vec<(Arc<Class>, Arc<Block>)>,
 }
 
 /// Per-entity isolated data: instance variables, mailbox, status.
@@ -339,12 +343,27 @@ pub fn spawn_entity_bare(
 /// Ensures: the envelope is appended to the mailbox; the returned
 ///   `FutureHandle` resolves when the entity completes the handler.
 pub fn send_to_entity(data: &EntityData, selector: Arc<str>, args: Vec<Value>) -> FutureHandle {
+    send_to_entity_with_chain(data, selector, args, vec![])
+}
+
+/// Enqueue a message carrying an inherited HC handler chain.
+///
+/// Requires: `data.status` is `Running`; called from outside the entity's own coroutine.
+/// Ensures: the envelope is appended to the mailbox with `chain` attached;
+///   the returned `FutureHandle` resolves when the entity completes the handler.
+pub fn send_to_entity_with_chain(
+    data: &EntityData,
+    selector: Arc<str>,
+    args: Vec<Value>,
+    chain: Vec<(Arc<Class>, Arc<Block>)>,
+) -> FutureHandle {
     let future = FutureHandle::new();
     let mut mb = data.mailbox.lock().unwrap();
     mb.push_back(Envelope {
         selector,
         args,
         reply: future.clone(),
+        inherited_chain: chain,
     });
     data.mailbox_ready.notify_one();
     future
@@ -423,16 +442,56 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
         let tx = data.store.begin_owned(ExecContext::Entity(data.id));
         *ev.current_tx.borrow_mut() = Some(tx);
 
+        // Push inherited HC handlers so signal_condition can walk them.
+        // Entity-local handlers (from _primHCRun: inside this dispatch) are
+        // pushed on top of these and popped by _primHCRun: itself, so only
+        // the inherited entries remain when the dispatch returns.
+        //
+        // Requires: ev.handler_chain is empty at message dispatch start.
+        // Ensures: inherited handlers are visible during this dispatch and are
+        //   cleared after dispatch completes regardless of outcome.
+        let inherited_len = envelope.inherited_chain.len();
+        if inherited_len > 0 {
+            let mut chain = ev.handler_chain.borrow_mut();
+            for pair in &envelope.inherited_chain {
+                chain.push(pair.clone());
+            }
+        }
+
         let handle = InstanceHandle(state.clone());
-        let result = match &state.kind {
-            InstanceKind::Entity(_) => {
-                dispatch_envelope(&ev, handle, &envelope.selector, envelope.args, &mut env)
+
+        // Wrap dispatch in a retry loop; also convert ReturnFromBlock → Ok at
+        // the entity dispatch level (return: exits handler context to caller).
+        let result = loop {
+            let r = match &state.kind {
+                InstanceKind::Entity(_) => dispatch_envelope(
+                    &ev,
+                    handle.clone(),
+                    &envelope.selector,
+                    envelope.args.clone(),
+                    &mut env,
+                ),
+                InstanceKind::ClassEntity(_) => dispatch_class_envelope(
+                    &ev,
+                    handle.clone(),
+                    &envelope.selector,
+                    envelope.args.clone(),
+                    &mut env,
+                ),
+                InstanceKind::ValueObject(_) => unreachable!(),
+            };
+            match r {
+                Err(EvalError::Retry) => continue,
+                Err(EvalError::ReturnFromBlock(v)) => break Ok(v),
+                other => break other,
             }
-            InstanceKind::ClassEntity(_) => {
-                dispatch_class_envelope(&ev, handle, &envelope.selector, envelope.args, &mut env)
-            }
-            InstanceKind::ValueObject(_) => unreachable!(),
         };
+
+        // Clear inherited handlers (entity-local handlers have already been
+        // popped by _primHCRun:).
+        if inherited_len > 0 {
+            ev.handler_chain.borrow_mut().clear();
+        }
 
         match result {
             Ok(v) => {

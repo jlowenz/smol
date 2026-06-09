@@ -1830,7 +1830,7 @@ fn cons_is_frozen_after_construction() {
     let src = r#"
 | c |
 c := Cons with: 1 rest: nil.
-c pvtSetHead: 99
+c pvtHead: 99 tail: nil.
 "#;
     let err = eval_err(src);
     assert!(
@@ -2044,6 +2044,120 @@ hc run: [
 ]
 "#;
     assert_eq!(eval(src), Value::Int(99));
+}
+
+// ── Chunk 28b: Cross-entity HandlerContext propagation ────────────────────────
+
+#[test]
+fn cross_entity_hc_resume_delivers_value() {
+    // HC registered in the test evaluator propagates into a separate actor.
+    // resume: resolves the actor future with the given value.
+    let src = r#"
+Object subclass: #CrossEntitySignaler
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+CrossEntitySignaler >> fireError [
+    ^Error signal: 'from actor'
+]
+| actor hc |
+actor := CrossEntitySignaler new.
+hc := HandlerContext new on: Error do: [:e | e resume: 99].
+hc run: [actor fireError]
+"#;
+    assert_eq!(eval(src), Value::Int(99));
+}
+
+#[test]
+fn cross_entity_hc_return_exits_run() {
+    // return: from an inherited handler resolves the actor future and exits run:.
+    let src = r#"
+Object subclass: #CrossEntitySignaler2
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+CrossEntitySignaler2 >> fireError [
+    ^Error signal: 'from actor'
+]
+| actor hc |
+actor := CrossEntitySignaler2 new.
+hc := HandlerContext new on: Error do: [:e | e return: 'done'].
+hc run: [actor fireError]
+"#;
+    assert_eq!(eval(src), Value::Str(Arc::from("done")));
+}
+
+#[test]
+fn cross_entity_hc_retry_reruns_entity_message() {
+    // retry from an inherited handler re-runs the actor's entire message handler.
+    // The actor's ivar count persists across retries.
+    let src = r#"
+Object subclass: #RetryActor
+    instanceVariableNames: 'count'
+    classVariableNames: ''
+    indexedSlots: #none.
+RetryActor >> initialize [ count := 0 ]
+RetryActor >> signalTwiceThenReturn [
+    count := count + 1.
+    count < 3 ifTrue: [ Error signal: 'retry me' ].
+    ^count
+]
+| actor hc |
+actor := RetryActor new.
+hc := HandlerContext new on: Error do: [:e | e retry].
+hc run: [actor signalTwiceThenReturn]
+"#;
+    assert_eq!(eval(src), Value::Int(3));
+}
+
+#[test]
+fn cross_entity_hc_inner_handler_takes_priority() {
+    // Actor registers an inner HC handler for Error. Entity-local handlers (pushed
+    // later, higher in the chain) take priority over inherited ones.
+    let src = r#"
+Object subclass: #NestedHCActor
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+NestedHCActor >> signalWithInnerHC [
+    | inner |
+    inner := HandlerContext new on: Error do: [:e | e resume: 'inner'].
+    ^inner run: [ Error signal: 'x' ]
+]
+| actor outerHC |
+actor := NestedHCActor new.
+outerHC := HandlerContext new on: Error do: [:e | e resume: 'outer'].
+outerHC run: [actor signalWithInnerHC]
+"#;
+    assert_eq!(eval(src), Value::Str(Arc::from("inner")));
+}
+
+#[test]
+fn cross_entity_retry_targets_nearest_hcrun_boundary() {
+    // retry from an inherited handler targets the nearest _primHCRun: in the
+    // signaling entity's stack, not the outer sender's run: boundary.
+    let src = r#"
+Object subclass: #BoundaryActor
+    instanceVariableNames: 'count'
+    classVariableNames: ''
+    indexedSlots: #none.
+BoundaryActor >> initialize [ count := 0 ]
+BoundaryActor >> tickAndSignalIfNeeded [
+    count := count + 1.
+    count < 3 ifTrue: [ Error signal: 'retry' ] ifFalse: [ ^count ]
+]
+BoundaryActor >> signalInInnerBoundary [
+    "Inner HC handles Warning only; Error retry from inherited chain targets this boundary."
+    | inner |
+    inner := HandlerContext new on: Warning do: [:w | w resume: 'warn'].
+    ^inner run: [ ^self tickAndSignalIfNeeded ]
+]
+| actor outerHC |
+actor := BoundaryActor new.
+outerHC := HandlerContext new on: Error do: [:e | e retry].
+outerHC run: [actor signalInInnerBoundary]
+"#;
+    assert_eq!(eval(src), Value::Int(3));
 }
 
 // ── Chunk 28: Unhandled Warning policy (S8) ──────────────────────────────────
