@@ -1,4 +1,4 @@
-# Open Design Questions
+### Open Design Questions
 
 Design questions that arise during implementation work and require a dedicated
 design session before they can be resolved. Broader open issues (error handling
@@ -22,6 +22,7 @@ versions of the same entity to coexist — e.g. "AccountEntity as it was on
 replay, or branching.
 
 **Tensions to resolve:**
+
 - **Identity**: is a versioned entity the same `EntityId` as its origin, or a new
   one? If new, how is the origin relationship expressed in the store?
 - **Mutability**: is a past-version entity read-only (frozen replay) or can it
@@ -50,6 +51,7 @@ the saga pattern (forward steps with compensating messages) is the primary
 candidate, but it may not be sufficient for all cases.
 
 **Tensions to resolve:**
+
 - Which cross-entity scenarios cannot be expressed as sagas, and what alternative
   model covers them?
 - What does the condition/signal system need to provide for saga compensation to be
@@ -73,6 +75,7 @@ be stored once (structural sharing) and removed when no entity references them.
 C27 does not implement either optimisation; facts accumulate indefinitely.
 
 **Tensions to resolve:**
+
 - **Structural sharing**: an "already stored?" check on every value object
   assertion adds a store read per ivar set. Options: Bloom filter, session-scoped
   `HashSet<EntityId>`, or accept re-assertion idempotency without the check.
@@ -97,6 +100,7 @@ have historical facts recorded under the old predicate names and no facts (or st
 facts) under the new ones.
 
 **Tensions to resolve:**
+
 - **Rename**: should a rename create a new predicate and migrate historical facts,
   or alias the old predicate to the new name?
 - **Remove**: orphan predicates accumulate. Should the store enforce that no
@@ -122,6 +126,7 @@ entity other than the querying entity. A visibility model is needed for shared
 queries to be useful.
 
 **Tensions to resolve:**
+
 - What Smol syntax expresses that a slot is `Shared` or `Public`? A pragma, a
   keyword in the class definition, or a convention?
 - Who can promote a predicate's visibility — only the defining class, or any entity?
@@ -142,6 +147,7 @@ computation, with no need for temporal history in the store. Clojure's transient
 are an analogue: a performance optimisation that doesn't change observable semantics.
 
 **Tensions to resolve:**
+
 - **P5 (State Has History)**: does exempting an entity from store assertions violate
   the principle, or is "no history needed" a legitimate, explicit declaration?
 - **Declaration mechanism**: a pragma (`transient: true` in the class definition),
@@ -166,6 +172,7 @@ far does self-hosting go — should the system eventually be able to host its ow
 interpreter/compiler, in the spirit of Smalltalk's image?
 
 **Current working model (C27-era):**
+
 - **Rust `_prim*` methods**: operations requiring direct struct access, or whose
   correctness depends on being non-overridable (e.g. `content_hash_id`, object
   allocation, identity comparison).
@@ -176,6 +183,7 @@ interpreter/compiler, in the spirit of Smalltalk's image?
   self-hosting, not to user-visible methods.
 
 **Tensions to resolve:**
+
 - How far does self-hosting go? Smalltalk hosts its entire environment in the image,
   including the compiler and debugger. Is that the goal here, or is a hybrid
   (Rust VM + Smol kernel + Smol standard library) the intended end state?
@@ -198,6 +206,7 @@ Blocks (AST + captured environment) and namespaces are storable in principle and
 important for the "code as facts" and notebook/literate programming goals.
 
 **For blocks:**
+
 - Requires `serde::Serialize/Deserialize` on `Expr`/`Stmt` in `ast.rs`.
 - A stored block captures entity references — these become `Term::EntityRef` values
   that must resolve on load (interaction with Q1 resume-from-store).
@@ -206,8 +215,23 @@ important for the "code as facts" and notebook/literate programming goals.
   and diff-able.
 
 **For namespaces:**
+
 - A namespace is a collection of class bindings and sub-namespaces.
 - Storing it supports the notebook capability: a namespace can carry documentation,
   literate examples, and runnable snippets as first-class facts.
 - Requires designing how namespace facts relate to class definition facts (avoiding
   duplication while maintaining a single source of truth).
+
+----
+
+## Q8. Supporting ultra lightweight objects and massive parallelism on GPU
+
+**Status**: Open - Research - Experimental
+
+**Raised**: External discussions
+
+Can the system support designs where 10-100s millions of objects are run in a kind of SIMD architecture, potentially on GPU. This would require interesting optimizations that may not be readily available within the current constructs of the Smol architecture. Cache coherence, method caching, message broadcast, gpu/cpu transfers, etc. 
+
+Example: large, complex, constructive solid geometry models and real-time raytracing or analysis. 
+
+This concept is very ambiguous, but worth recording for future consideration.

@@ -374,6 +374,7 @@ fn commit_or_warn(tx: OwnedStoreTransaction) -> Result<(), StoreError> {
 }
 
 fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, global_env: Env) {
+    use crate::builtins::make_error_value;
     use crate::eval::EvalError;
     use crate::eval::Evaluator;
 
@@ -393,10 +394,11 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
             let mut mb = data.mailbox.lock().unwrap();
             loop {
                 if data.shutdown.load(Ordering::Acquire) {
+                    let term_val = make_error_value(&ev.registry, "entity terminated");
                     for pending in mb.drain(..) {
                         pending
                             .reply
-                            .resolve_err(EvalError::Signal(Arc::from("entity terminated")));
+                            .resolve_err(EvalError::Signal(term_val.clone()));
                     }
                     *data.status.lock().unwrap() = EntityStatus::Terminated;
                     return;
@@ -412,9 +414,8 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
         {
             let status = data.status.lock().unwrap();
             if let EntityStatus::Faulted(msg) = &*status {
-                envelope
-                    .reply
-                    .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                let fault_val = make_error_value(&ev.registry, msg);
+                envelope.reply.resolve_err(EvalError::Signal(fault_val));
                 continue;
             }
         }
@@ -440,14 +441,15 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
                 {
                     let msg = e.to_string();
                     *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
+                    let fault_val = make_error_value(&ev.registry, &msg);
                     envelope
                         .reply
-                        .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                        .resolve_err(EvalError::Signal(fault_val.clone()));
                     let mut mb = data.mailbox.lock().unwrap();
                     for pending in mb.drain(..) {
                         pending
                             .reply
-                            .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                            .resolve_err(EvalError::Signal(fault_val.clone()));
                     }
                     break;
                 }
@@ -460,18 +462,55 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
                 {
                     let msg = e.to_string();
                     *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
+                    let fault_val = make_error_value(&ev.registry, &msg);
                     envelope
                         .reply
-                        .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                        .resolve_err(EvalError::Signal(fault_val.clone()));
                     let mut mb = data.mailbox.lock().unwrap();
                     for pending in mb.drain(..) {
                         pending
                             .reply
-                            .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                            .resolve_err(EvalError::Signal(fault_val.clone()));
                     }
                     break;
                 }
                 envelope.reply.resolve_ok(v);
+            }
+            Err(EvalError::Signal(cond)) => {
+                // Unhandled signal. ClassEntities (e.g. Error class, Condition class) resolve
+                // the reply with the error and continue — they must not terminate because they
+                // are stateless dispatch targets used for every signal in the system.
+                // Instance entities log and terminate (actor "let it crash" policy).
+                if let Some(tx) = ev.current_tx.borrow_mut().take() {
+                    tx.rollback();
+                }
+                let is_class_entity = matches!(&state.kind, InstanceKind::ClassEntity(_));
+                let class_name = state.class.name.clone();
+                let msg = crate::builtins::condition_message(&cond);
+                let fault_val = make_error_value(&ev.registry, &msg);
+                if is_class_entity {
+                    // Class entity: pass the error back to the caller and continue.
+                    envelope.reply.resolve_err(EvalError::Signal(fault_val));
+                } else {
+                    // Instance entity: log, terminate, notify pending waiters.
+                    eprintln!(
+                        "Entity {} ({}) terminated by unhandled signal: {}",
+                        data.id.0, class_name, msg
+                    );
+                    *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
+                    envelope
+                        .reply
+                        .resolve_err(EvalError::Signal(fault_val.clone()));
+                    // TODO C29: notify supervisor entity (EntityData.supervisor not yet present).
+                    data.signal_shutdown();
+                    let mut mb = data.mailbox.lock().unwrap();
+                    for pending in mb.drain(..) {
+                        pending
+                            .reply
+                            .resolve_err(EvalError::Signal(fault_val.clone()));
+                    }
+                    break;
+                }
             }
             Err(e) => {
                 if let Some(tx) = ev.current_tx.borrow_mut().take() {
@@ -482,11 +521,12 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
                 envelope.reply.resolve_err(e);
                 // Drain all already-queued messages so their futures resolve immediately
                 // rather than parking forever.
+                let fault_val = make_error_value(&ev.registry, &msg);
                 let mut mb = data.mailbox.lock().unwrap();
                 for pending in mb.drain(..) {
                     pending
                         .reply
-                        .resolve_err(EvalError::Signal(Arc::from(msg.as_str())));
+                        .resolve_err(EvalError::Signal(fault_val.clone()));
                 }
                 break;
             }
@@ -504,7 +544,7 @@ fn dispatch_envelope(
     if let Some((method, def_class)) = handle.0.class.lookup(selector) {
         return ev.invoke_method(handle.clone(), def_class, method, args, env);
     }
-    crate::builtins::dispatch_object_primitive(ev, handle, selector, args)
+    crate::builtins::dispatch_object_primitive(ev, handle, selector, args, env)
 }
 
 fn dispatch_class_envelope(

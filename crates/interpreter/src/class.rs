@@ -158,6 +158,21 @@ impl Class {
         }
     }
 
+    /// Returns `true` if `child` is `parent` or any ancestor of `child` is `parent`.
+    ///
+    /// Requires: both classes are fully constructed (not mid-definition).
+    /// Ensures: `is_subclass_of(c, c)` is `true`; `is_subclass_of(Sub, Super)` is `true`
+    ///   iff `Super` appears in `Sub`'s superclass chain.
+    pub fn is_subclass_of(child: &Arc<Class>, parent: &Arc<Class>) -> bool {
+        if Arc::ptr_eq(child, parent) {
+            return true;
+        }
+        match &child.superclass {
+            Some(sc) => Class::is_subclass_of(sc, parent),
+            None => false,
+        }
+    }
+
     /// Returns `true` if this class (or any ancestor) has `is_value: true`.
     pub fn inherits_is_value(&self) -> bool {
         if self.is_value {

@@ -63,6 +63,8 @@ pub enum Expr {
     },
     /// `#(elem0 elem1 ...)` — array literal with recursively-evaluated elements.
     ArrayLiteral(Vec<Literal>),
+    /// `{ expr. expr. ... }` — dynamic array: elements evaluated at runtime.
+    DynamicArray(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

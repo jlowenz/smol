@@ -524,9 +524,30 @@ impl Parser {
                 self.advance();
                 Ok(Expr::ArrayLiteral(self.parse_array_literal_elements()?))
             }
+            Token::LBrace => self.parse_dynamic_array(),
             Token::Eof => Err(ParseError::UnexpectedEof("expression")),
             tok => Err(ParseError::UnexpectedToken(tok, "expression")),
         }
+    }
+
+    /// Parse a dynamic array literal `{ expr. expr. ... }`.
+    ///
+    /// Requires: the opening `{` has already been consumed.
+    /// Ensures: each element expression is fully parsed; a trailing `.` before `}` is allowed;
+    ///   returns `Expr::DynamicArray` with zero or more element expressions.
+    fn parse_dynamic_array(&mut self) -> Result<Expr, ParseError> {
+        self.advance(); // consume `{`
+        let mut elements = Vec::new();
+        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
+            elements.push(self.parse_expr()?);
+            if self.peek() == &Token::Dot {
+                self.advance(); // consume optional `.` separator
+            } else {
+                break;
+            }
+        }
+        self.expect("'}' to close dynamic array", |t| t == &Token::RBrace)?;
+        Ok(Expr::DynamicArray(elements))
     }
 
     /// Parse the element list of an array literal up to (but not consuming) `)`.

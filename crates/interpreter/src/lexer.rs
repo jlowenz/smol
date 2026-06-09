@@ -36,6 +36,8 @@ pub enum Token {
     RParen,     // )
     LBracket,   // [
     RBracket,   // ]
+    LBrace,     // {
+    RBrace,     // }
     /// Block parameter: `:name` inside `[...]`. The leading `:` is consumed by
     /// the lexer when it sees `:` followed by an alphabetic character and no `=`.
     BlockParam(Arc<str>),
@@ -354,6 +356,8 @@ impl<'src> Lexer<'src> {
             ')' => Ok(Token::RParen),
             '[' => Ok(Token::LBracket),
             ']' => Ok(Token::RBracket),
+            '{' => Ok(Token::LBrace),
+            '}' => Ok(Token::RBrace),
             c if c.is_ascii_digit() => self.read_number(c, start),
             c if c.is_alphabetic() || c == '_' => Ok(self.read_ident_or_keyword(c)),
             '-' => {

@@ -3,6 +3,26 @@ use crate::eval::{EvalError, Evaluator};
 use crate::parser::Parser;
 use crate::value::Value;
 
+/// Extract the message text from an `EvalError::Signal(Value)` condition.
+/// Returns `None` if the error is not a Signal.
+pub(crate) fn signal_message(err: &EvalError) -> Option<String> {
+    if let EvalError::Signal(v) = err {
+        Some(crate::builtins::condition_message(v))
+    } else {
+        None
+    }
+}
+
+/// Assert that an `EvalError` is a Signal whose message contains `substring`.
+#[allow(dead_code)]
+pub(crate) fn assert_signal_contains(err: &EvalError, substring: &str) {
+    let msg = signal_message(err).unwrap_or_else(|| panic!("expected Signal, got {err:?}"));
+    assert!(
+        msg.contains(substring),
+        "expected signal message to contain {substring:?}, got {msg:?}"
+    );
+}
+
 /// Recursively resolves a `Value::Future` chain, propagating any error.
 ///
 /// Requires: called from a may coroutine so that `FutureHandle::wait()` parks
