@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 use crate::entity::{EntityId, InstanceHandle, InstanceKind, InstanceState};
@@ -29,16 +30,27 @@ pub enum EvalError {
     ArityMismatch { expected: usize, got: usize },
     #[error("type error: {0}")]
     TypeError(String),
-    /// Smol-raised signal (from `_primSignal:` / `Error signal:`). Carries a
-    /// clean message string, distinct from `TypeError` so `on:do:` can surface
-    /// it without the "type error: " prefix.
-    #[error("signal: {0}")]
-    Signal(Arc<str>),
+    /// Smol-raised signal. Carries the condition object (a Condition instance).
+    /// `on:do:` catches this by class hierarchy matching.
+    #[error("signal")]
+    Signal(Value),
     /// Non-local `^`-return carrying the value and the method-stack depth of the
     /// frame that should catch it. Only the `invoke_method` / `invoke_class_method`
     /// whose depth matches will unwrap this; all others propagate it unchanged.
     #[error("non-local return")]
     Return(Value, usize),
+    /// `resume: v` from a condition handler — delivers `v` back to the `_primSignalCondition:`
+    /// call site. Only meaningful from non-unwinding (HandlerContext) handlers; from
+    /// unwinding `on:do:` handlers this is equivalent to `return:`.
+    #[error("resume")]
+    Resume(Value),
+    /// `return: v` from a condition handler — makes the `on:do:` or `_primHCRun:` expression
+    /// return `v` immediately.
+    #[error("return from handler")]
+    ReturnFromBlock(Value),
+    /// `retry` from a condition handler — re-executes the protected body.
+    #[error("retry")]
+    Retry,
 }
 
 /// The self-binding for the currently-executing method frame.
@@ -88,6 +100,11 @@ pub struct Evaluator {
     /// coroutines multiplex over OS threads with work-stealing, so a TLS value
     /// is not reliably tied to the executing coroutine.
     pub(crate) current_entity_id: Cell<Option<EntityId>>,
+    /// Non-unwinding handler chain for `HandlerContext`. Each entry is a
+    /// `(condition_class, handler_block)` pair. `_primSignalCondition:` walks this
+    /// in reverse (most-recently-pushed first) before raising `EvalError::Signal`.
+    /// Pushed/popped by `_primHCRun:`; always empty outside a `HandlerContext run:`.
+    pub handler_chain: RefCell<Vec<(Arc<crate::class::Class>, Arc<crate::value::Block>)>>,
 }
 
 impl Default for Evaluator {
@@ -130,6 +147,7 @@ impl Evaluator {
             current_entity_id: Cell::new(None),
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
+            handler_chain: RefCell::new(Vec::new()),
         }
     }
 
@@ -251,6 +269,14 @@ impl Evaluator {
                     // guard across a re-entrant lock on the same object.
                     let has_ivar = obj.slots.lock().contains_key(name.as_ref());
                     if has_ivar {
+                        if matches!(&handle.0.kind, InstanceKind::ValueObject(_))
+                            && obj.frozen.load(Ordering::Acquire)
+                        {
+                            return Err(EvalError::TypeError(format!(
+                                "cannot assign to ivar '{}': Value object is frozen",
+                                name
+                            )));
+                        }
                         if let InstanceKind::Entity(d) = &handle.0.kind {
                             crate::store_bridge::buffer_ivar(self, d.id, name, &value);
                         }
@@ -409,6 +435,7 @@ impl Evaluator {
                 name,
             } => self.eval_namespace_ref(namespace_path, name, env),
             Expr::ArrayLiteral(elements) => self.eval_array_literal(elements, env),
+            Expr::DynamicArray(elements) => self.eval_dynamic_array(elements, env),
         }
     }
 
@@ -426,6 +453,30 @@ impl Evaluator {
         ));
         for (i, elem) in elements.iter().enumerate() {
             let v = self.eval_literal_as_value(elem, env)?;
+            if let Some(IndexedStorage::Pointer(slots)) = obj.indexed.as_ref() {
+                slots.lock()[i] = v;
+            }
+        }
+        Ok(Value::Instance(InstanceHandle(Arc::new(InstanceState {
+            class: array_class,
+            kind: InstanceKind::ValueObject(obj),
+        }))))
+    }
+
+    fn eval_dynamic_array(&self, elements: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
+        use crate::entity::{InstanceHandle, InstanceKind, InstanceState};
+        let array_handle = self
+            .registry
+            .kernel()
+            .lookup_class("Array")
+            .ok_or_else(|| EvalError::UndefinedVariable(Arc::from("Array")))?;
+        let array_class = array_handle.0.class.clone();
+        let obj = Arc::new(Object::new_with_indexed(
+            array_class.clone(),
+            elements.len(),
+        ));
+        for (i, elem_expr) in elements.iter().enumerate() {
+            let v = self.eval_expr(elem_expr, env)?;
             if let Some(IndexedStorage::Pointer(slots)) = obj.indexed.as_ref() {
                 slots.lock()[i] = v;
             }
@@ -797,6 +848,7 @@ impl Evaluator {
             current_entity_id: Cell::new(None),
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
+            handler_chain: RefCell::new(Vec::new()),
         }
     }
 
@@ -880,6 +932,12 @@ fn check_prim_sends_in_expr(expr: &Expr) -> Result<(), EvalError> {
             Ok(())
         }
         Expr::Block { body, .. } => check_prim_sends_in_body(body),
+        Expr::DynamicArray(elements) => {
+            for elem in elements {
+                check_prim_sends_in_expr(elem)?;
+            }
+            Ok(())
+        }
         Expr::Lit(_)
         | Expr::Var(_)
         | Expr::Super

@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_helpers::{eval, eval_err};
+use crate::test_helpers::{assert_signal_contains, eval, eval_err};
 
 // ── Float ────────────────────────────────────────────────────────────────
 
@@ -371,10 +371,9 @@ fn block_while_false_no_body() {
 
 #[test]
 fn block_on_do_catches_error() {
-    // `Error` class is not defined in the bootstrap; use `Object` (always in scope).
-    // The condition class is ignored by `on:do:` — any value works.
+    // on:do: catches EvalError::Signal whose condition class matches the catch class.
     assert_eq!(
-        eval("[1 unknownMsg] on: Object do: [:e | 'caught']"),
+        eval("[Error signal: 'oops'] on: Error do: [:e | 'caught']"),
         Value::Str(Arc::from("caught"))
     );
 }
@@ -712,10 +711,7 @@ fn error_colon_raises_signal() {
 Object subclass: #Thing instanceVariableNames: ''.
 Thing new error: 'boom'
 "#;
-    match eval_err(src) {
-        crate::eval::EvalError::Signal(msg) => assert!(msg.contains("boom")),
-        e => panic!("expected Signal, got {e:?}"),
-    }
+    assert_signal_contains(&eval_err(src), "boom");
 }
 
 // ── String edge cases ─────────────────────────────────────────────────────
@@ -995,7 +991,7 @@ fn block_on_do_passes_through_non_local_return() {
     let src = r#"
 Object subclass: #Foo instanceVariableNames: ''.
 Foo >> test [
-    [^42] on: nil do: [:e | 'caught'].
+    [^42] on: Error do: [:e | 'caught'].
 ]
 Foo new test
 "#;
@@ -1388,38 +1384,21 @@ holder := ValueHolder initialValue: 0.
     assert_eq!(eval(src), Value::Int(3));
 }
 
-// ── Universal error: / _primSignal: on primitive types ────────────────────
+// ── Universal error: on primitive types ──────────────────────────────────────
 
 #[test]
 fn error_colon_on_int_signals() {
-    match eval_err("5 error: 'boom'") {
-        crate::eval::EvalError::Signal(msg) => assert!(msg.contains("boom")),
-        e => panic!("expected Signal, got {e:?}"),
-    }
+    assert_signal_contains(&eval_err("5 error: 'boom'"), "boom");
 }
 
 #[test]
 fn error_colon_on_string_signals() {
-    match eval_err("'hi' error: 'bad'") {
-        crate::eval::EvalError::Signal(msg) => assert!(msg.contains("bad")),
-        e => panic!("expected Signal, got {e:?}"),
-    }
+    assert_signal_contains(&eval_err("'hi' error: 'bad'"), "bad");
 }
 
 #[test]
 fn error_colon_on_bool_signals() {
-    match eval_err("true error: 'oops'") {
-        crate::eval::EvalError::Signal(msg) => assert!(msg.contains("oops")),
-        e => panic!("expected Signal, got {e:?}"),
-    }
-}
-
-#[test]
-fn prim_signal_on_nil_signals() {
-    match eval_err("nil _primSignal: 'raw'") {
-        crate::eval::EvalError::Signal(msg) => assert!(msg.contains("raw")),
-        e => panic!("expected Signal, got {e:?}"),
-    }
+    assert_signal_contains(&eval_err("true error: 'oops'"), "oops");
 }
 
 // ── _primNew / _primNew: ──────────────────────────────────────────────────────
@@ -1585,26 +1564,6 @@ a ~= (a self)
     assert_eq!(eval(src), Value::Bool(false));
 }
 
-#[test]
-fn prim_signal_forces_future_arg() {
-    // _primSignal: should resolve a future string arg before signalling.
-    // The actor m is the receiver; m text returns a future that must be forced
-    // to 'hello'. Without force_value the signal message would be something like
-    // "FutureHandle(resolved=true)" instead of the actual string.
-    let src = r#"
-Object subclass: #Msg instanceVariableNames: ''.
-Msg >> text [ ^'hello' ]
-| m |
-m := Msg new.
-m _primSignal: m text
-"#;
-    let err = eval_err(src);
-    assert!(
-        matches!(&err, crate::eval::EvalError::Signal(s) if s.as_ref() == "hello"),
-        "expected Signal('hello'), got {err:?}"
-    );
-}
-
 // ── dispatch_primitive_fallback coverage ─────────────────────────────────────
 
 #[test]
@@ -1612,13 +1571,6 @@ fn error_non_string_arg_on_primitive() {
     // Primitive receivers (Int, Float, etc.) use dispatch_primitive_fallback for error:.
     // Passing a non-String arg hits the `other =>` branch (formats the value).
     let err = eval_err("42 error: 42");
-    assert!(matches!(err, crate::eval::EvalError::Signal(_)));
-}
-
-#[test]
-fn prim_signal_non_string_arg() {
-    // Same fallback, _primSignal: arm, non-String arg.
-    let err = eval_err("nil _primSignal: 99");
     assert!(matches!(err, crate::eval::EvalError::Signal(_)));
 }
 

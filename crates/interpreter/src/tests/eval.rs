@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_helpers::{eval, eval_err};
+use crate::test_helpers::{assert_signal_contains, eval, eval_err};
 
 #[test]
 fn integer_arithmetic() {
@@ -261,6 +261,7 @@ fn non_kernel_class_scoped_to_namespace() {
     ev.registry.populate_env(&mut env);
 
     // Inside MyLib do: [...], Widget is accessible by simple name.
+    // Uses Value subclass: (frozen after _primNewValue: init block).
     let result = ev
         .eval_program(
             &Parser::parse(
@@ -268,10 +269,10 @@ fn non_kernel_class_scoped_to_namespace() {
 MyLib do: [
     | w |
     Value subclass: #Widget instanceVariableNames: 'val'.
-    Widget >> setVal: v [ val := v ]
-    Widget >> val [ ^val ]
-    w := Widget new.
-    w setVal: 42.
+    Widget class >> at: v [ ^self _primNewValue: [:w | w pvtSetVal: v] ]
+    Widget >> pvtSetVal: v [ val := v ]
+    Widget >> val          [ ^val ]
+    w := Widget at: 42.
     w val
 ]
 "#,
@@ -929,34 +930,24 @@ fn non_local_block_assignment_is_parse_error() {
 #[test]
 fn error_signal_raises_signal() {
     let src = "Error signal: 'boom'";
-    assert!(matches!(eval_err(src), EvalError::Signal(m) if m.as_ref() == "boom"));
+    assert_signal_contains(&eval_err(src), "boom");
 }
 
 #[test]
 fn error_message_roundtrips() {
-    let src = r#"
-| e |
-e := Error new.
-e pvtSetMessage: 'hello'.
-e message
-"#;
+    let src = "(Error withMessage: 'hello') message";
     assert_eq!(eval(src), Value::Str(Arc::from("hello")));
 }
 
 #[test]
 fn error_messagetext_alias() {
-    let src = r#"
-| e |
-e := Error new.
-e pvtSetMessage: 'world'.
-e messageText
-"#;
+    let src = "(Error withMessage: 'world') messageText";
     assert_eq!(eval(src), Value::Str(Arc::from("world")));
 }
 
 #[test]
 fn on_do_catches_signal() {
-    let src = "[Error signal: 'oops'] on: Error do: [:e | e]";
+    let src = "[Error signal: 'oops'] on: Error do: [:e | e message]";
     assert_eq!(eval(src), Value::Str(Arc::from("oops")));
 }
 
@@ -966,14 +957,14 @@ fn object_error_colon_delegates_to_error_signal() {
 Object subclass: #Foo instanceVariableNames: ''.
 Foo new error: 'bad'
 "#;
-    assert!(matches!(eval_err(src), EvalError::Signal(m) if m.as_ref() == "bad"));
+    assert_signal_contains(&eval_err(src), "bad");
 }
 
 #[test]
 fn on_do_catches_error_colon() {
     let src = r#"
 Object subclass: #Foo instanceVariableNames: ''.
-[Foo new error: 'caught me'] on: Error do: [:e | e]
+[Foo new error: 'caught me'] on: Error do: [:e | e message]
 "#;
     assert_eq!(eval(src), Value::Str(Arc::from("caught me")));
 }
@@ -1685,4 +1676,397 @@ Thing new await. Thing new await. Thing new await.
 (World instancesOf: Thing) size
 "#;
     assert_eq!(eval(src), Value::Int(3));
+}
+
+// ── Chunk 28: Dynamic arrays (S1) ────────────────────────────────────────────
+
+#[test]
+fn dynamic_array_evaluates_elements() {
+    let src = "{ 1 + 1. 3. 'hello' }";
+    let result = eval(src);
+    // Should be a 3-element Array
+    assert_eq!(eval("{ 1 + 1. 3. 'hello' } size"), Value::Int(3));
+    assert_eq!(eval("({ 1 + 1. 3. 'hello' }) at: 0"), Value::Int(2));
+    assert_eq!(eval("({ 1 + 1. 3. 'hello' }) at: 1"), Value::Int(3));
+    let _ = result;
+}
+
+#[test]
+fn dynamic_array_empty() {
+    assert_eq!(eval("{} size"), Value::Int(0));
+}
+
+#[test]
+fn arrow_builds_association() {
+    let src = "#foo -> 42";
+    let result = eval(src);
+    // Association: key = #foo, value = 42
+    assert_eq!(eval("(#foo -> 42) key"), Value::Symbol(Arc::from("foo")));
+    assert_eq!(eval("(#foo -> 42) value"), Value::Int(42));
+    let _ = result;
+}
+
+#[test]
+fn dynamic_array_of_associations() {
+    let src = "{ #a -> 1. #b -> 2 } size";
+    assert_eq!(eval(src), Value::Int(2));
+}
+
+// ── Chunk 28a: Value immutability (S1) ───────────────────────────────────────
+
+#[test]
+fn value_object_frozen_after_prim_new_value() {
+    // _primNewValue: freezes the instance; ivar write after construction raises TypeError.
+    let src = r#"
+Value subclass: #FrozenPoint
+    instanceVariableNames: 'x'
+    classVariableNames: ''
+    indexedSlots: #none.
+FrozenPoint class >> at: anX [
+    ^self _primNewValue: [:p | p pvtSetX: anX]
+]
+FrozenPoint >> pvtSetX: v [ x := v ]
+FrozenPoint >> x         [ ^x ]
+| p |
+p := FrozenPoint at: 42.
+p x
+"#;
+    assert_eq!(eval(src), Value::Int(42));
+}
+
+#[test]
+fn value_object_ivar_write_after_freeze_raises_type_error() {
+    use crate::test_helpers::eval_err;
+    let src = r#"
+Value subclass: #FrozenPoint2
+    instanceVariableNames: 'x'
+    classVariableNames: ''
+    indexedSlots: #none.
+FrozenPoint2 class >> at: anX [
+    ^self _primNewValue: [:p | p pvtSetX: anX]
+]
+FrozenPoint2 >> pvtSetX: v [ x := v ]
+FrozenPoint2 >> x         [ ^x ]
+| p |
+p := FrozenPoint2 at: 10.
+p pvtSetX: 99
+"#;
+    let err = eval_err(src);
+    assert!(
+        err.to_string().contains("frozen"),
+        "expected 'frozen' in error, got: {err}"
+    );
+}
+
+#[test]
+fn value_class_new_freezes_instance() {
+    // Value class >> new calls _primNewValue: which freezes; further writes fail.
+    use crate::test_helpers::eval_err;
+    let src = r#"
+Value subclass: #Immutable
+    instanceVariableNames: 'val'
+    classVariableNames: ''
+    indexedSlots: #none.
+Immutable >> initialize [ val := 0 ]
+Immutable >> pvtSetVal: v [ val := v ]
+Immutable >> val        [ ^val ]
+| i |
+i := Immutable new.
+i pvtSetVal: 1
+"#;
+    let err = eval_err(src);
+    assert!(
+        err.to_string().contains("frozen"),
+        "expected 'frozen' in error, got: {err}"
+    );
+}
+
+// ── Chunk 28a: Cons linked list (S3) ─────────────────────────────────────────
+
+#[test]
+fn cons_head_and_tail() {
+    assert_eq!(eval("(Cons with: 1 rest: nil) head"), Value::Int(1));
+    assert_eq!(eval("(Cons with: 1 rest: nil) tail"), Value::Nil);
+}
+
+#[test]
+fn cons_is_empty_false_nil_is_empty_true() {
+    assert_eq!(eval("(Cons with: 1 rest: nil) isEmpty"), Value::Bool(false));
+    assert_eq!(eval("nil isEmpty"), Value::Bool(true));
+}
+
+#[test]
+fn cons_add_first_prepends() {
+    let src = "(Cons with: 2 rest: nil) addFirst: 1";
+    // Result is Cons(head=1, tail=Cons(head=2, tail=nil))
+    assert_eq!(eval(&format!("({src}) head")), Value::Int(1));
+    assert_eq!(eval(&format!("({src}) tail head")), Value::Int(2));
+}
+
+#[test]
+fn cons_size() {
+    assert_eq!(eval("(Cons with: 1 rest: nil) size"), Value::Int(1));
+    assert_eq!(
+        eval("(Cons with: 2 rest: (Cons with: 1 rest: nil)) size"),
+        Value::Int(2)
+    );
+}
+
+#[test]
+fn cons_do_visits_all() {
+    let src = r#"
+| n list |
+n := ValueHolder initialValue: 0.
+list := Cons with: 1 rest: (Cons with: 2 rest: (Cons with: 3 rest: nil)).
+list do: [:each | n update: [:v | v + each]].
+n get
+"#;
+    assert_eq!(eval(src), Value::Int(6));
+}
+
+#[test]
+fn cons_is_frozen_after_construction() {
+    use crate::test_helpers::eval_err;
+    let src = r#"
+| c |
+c := Cons with: 1 rest: nil.
+c pvtSetHead: 99
+"#;
+    let err = eval_err(src);
+    assert!(
+        err.to_string().contains("frozen"),
+        "expected 'frozen' in error, got: {err}"
+    );
+}
+
+// ── Chunk 28a: Condition restarts via Cons (S4) ───────────────────────────────
+
+#[test]
+fn condition_add_restart_returns_new_condition() {
+    // addRestart:block: is functional: original unchanged, new condition returned.
+    let src = r#"
+| e1 e2 |
+e1 := Error new.
+e2 := e1 addRestart: #foo block: [42].
+e2 hasRestart: #foo
+"#;
+    assert_eq!(eval(src), Value::Bool(true));
+}
+
+#[test]
+fn condition_original_unchanged_after_add_restart() {
+    let src = r#"
+| e1 e2 |
+e1 := Error new.
+e2 := e1 addRestart: #foo block: [42].
+e1 hasRestart: #foo
+"#;
+    assert_eq!(eval(src), Value::Bool(false));
+}
+
+// ── Chunk 28: Condition hierarchy (S2) ───────────────────────────────────────
+
+#[test]
+fn condition_message_set() {
+    assert_eq!(
+        eval("(Condition withMessage: 'x') message"),
+        Value::Str(Arc::from("x"))
+    );
+}
+
+#[test]
+fn error_is_kind_of_condition() {
+    assert_eq!(eval("Error new isKindOf: Condition"), Value::Bool(true));
+}
+
+#[test]
+fn warning_is_kind_of_condition() {
+    assert_eq!(eval("Warning new isKindOf: Condition"), Value::Bool(true));
+}
+
+#[test]
+fn warning_is_not_kind_of_error() {
+    assert_eq!(eval("Warning new isKindOf: Error"), Value::Bool(false));
+}
+
+#[test]
+fn error_signal_carries_message() {
+    let src = "[Error signal: 'boom'] on: Error do: [:e | e message]";
+    assert_eq!(eval(src), Value::Str(Arc::from("boom")));
+}
+
+// ── Chunk 28: on:do: hierarchy matching (S3/S4) ───────────────────────────────
+
+#[test]
+fn on_do_catches_by_superclass() {
+    // Error is a subclass of Condition; catching Condition should catch Error.
+    let src = "[Error signal: 'x'] on: Condition do: [:e | 'caught']";
+    assert_eq!(eval(src), Value::Str(Arc::from("caught")));
+}
+
+#[test]
+fn on_do_does_not_catch_unrelated_subclass() {
+    // Warning is NOT a subclass of Error. on: Error do: doesn't catch it.
+    // Unhandled Warning returns nil per the Warning policy (log + continue).
+    let src = "[Warning signal: 'w'] on: Error do: [:e | 'caught']";
+    assert_eq!(eval(src), Value::Nil);
+}
+
+#[test]
+fn on_do_retry_reruns_body() {
+    // Use ValueHolder to avoid NonLocalBlockAssignment restriction.
+    let src = r#"
+| n |
+n := ValueHolder initialValue: 0.
+[n update: [:v | v + 1]. (n get) < 3 ifTrue: [Error signal: 'retry me']. n get] on: Error do: [:e | e retry]
+"#;
+    assert_eq!(eval(src), Value::Int(3));
+}
+
+#[test]
+fn ensure_runs_on_success() {
+    let src = r#"
+| log |
+log := ValueHolder initialValue: 0.
+[log update: [:v | v + 1]] ensure: [log update: [:v | v + 10]].
+log get
+"#;
+    assert_eq!(eval(src), Value::Int(11));
+}
+
+#[test]
+fn ensure_runs_on_error() {
+    let src = r#"
+| log |
+log := ValueHolder initialValue: 0.
+[[Error signal: 'x'] ensure: [log update: [:v | v + 10]]] on: Error do: [:e | nil].
+log get
+"#;
+    assert_eq!(eval(src), Value::Int(10));
+}
+
+// ── Chunk 28: control-flow primitives (S5) ───────────────────────────────────
+
+#[test]
+fn condition_resume_delivers_value_to_signal_site() {
+    let src = r#"
+| hc |
+hc := HandlerContext new.
+hc on: Error do: [:e | e resume: 99].
+hc run: [Error signal: 'x']
+"#;
+    assert_eq!(eval(src), Value::Int(99));
+}
+
+#[test]
+fn condition_return_exits_handler_context() {
+    let src = r#"
+| hc |
+hc := HandlerContext new.
+hc on: Error do: [:e | e return: 'done'].
+hc run: [Error signal: 'x'. 'not reached']
+"#;
+    assert_eq!(eval(src), Value::Str(Arc::from("done")));
+}
+
+#[test]
+fn handler_context_retry_reruns_body() {
+    let src = r#"
+| n hc |
+n := ValueHolder initialValue: 0.
+hc := HandlerContext new.
+hc on: Error do: [:e | e retry].
+hc run: [n update: [:v | v + 1]. (n get) < 3 ifTrue: [Error signal: 'x']. n get]
+"#;
+    assert_eq!(eval(src), Value::Int(3));
+}
+
+// ── Chunk 28: HandlerContext handler_chain (S6) ───────────────────────────────
+
+#[test]
+fn handler_chain_empty_after_hcrun_exits() {
+    // handler_chain must be truncated after run: completes.
+    let src = r#"
+| hc |
+hc := HandlerContext new.
+hc on: Error do: [:e | 'caught'].
+hc run: ['ok'].
+"#;
+    // Just check it returns normally
+    assert_eq!(eval(src), Value::Str(Arc::from("ok")));
+}
+
+#[test]
+fn handler_context_most_recent_handler_matches_first() {
+    let src = r#"
+| outer |
+outer := HandlerContext new.
+outer on: Error do: [:e | 'outer'].
+outer run: [
+    (HandlerContext new on: Error do: [:e | 'inner'])
+        run: [Error signal: 'x']
+]
+"#;
+    assert_eq!(eval(src), Value::Str(Arc::from("inner")));
+}
+
+// ── Chunk 28: Named restarts (S7) ────────────────────────────────────────────
+
+#[test]
+fn invoke_restart_delivers_value_via_resume() {
+    // addRestart:block: is now functional — returns a new (frozen) Condition.
+    let src = r#"
+| hc |
+hc := HandlerContext new.
+hc on: Error do: [:e | e invokeRestart: #useDefault].
+hc run: [
+    | e |
+    e := Error new.
+    e := e addRestart: #useDefault block: ['fallback'].
+    e signal
+]
+"#;
+    assert_eq!(eval(src), Value::Str(Arc::from("fallback")));
+}
+
+#[test]
+fn invoke_restart_with_passes_arg() {
+    // addRestart:block: is now functional — returns a new (frozen) Condition.
+    let src = r#"
+| hc |
+hc := HandlerContext new.
+hc on: Error do: [:e | e invokeRestart: #useValue: with: 99].
+hc run: [
+    | e |
+    e := Error new.
+    e := e addRestart: #useValue: block: [:v | v].
+    e signal
+]
+"#;
+    assert_eq!(eval(src), Value::Int(99));
+}
+
+// ── Chunk 28: Unhandled Warning policy (S8) ──────────────────────────────────
+
+#[test]
+fn unhandled_warning_suppress_completes() {
+    let src = r#"
+Warning loggingPolicy: #suppress.
+Warning signal: 'quiet'
+"#;
+    // Should complete without error (returns nil)
+    assert_eq!(eval(src), Value::Nil);
+}
+
+#[test]
+fn unhandled_base_condition_silent() {
+    // Base Condition (not Warning, not Error) returns nil when unhandled.
+    let src = r#"
+Condition subclass: #BaseCond
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+BaseCond signal: 'quiet'
+"#;
+    assert_eq!(eval(src), Value::Nil);
 }

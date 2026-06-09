@@ -383,6 +383,28 @@ fn hash_value(v: &Value) -> i64 {
     }
 }
 
+/// Construct a bare `Error` instance without calling kernel methods (`initialize`, `pvtInit`).
+///
+/// Requires: None — if the `Error` class is unavailable (e.g. pre-bootstrap), returns
+///   `Value::Str(message)` as a degenerate fallback.
+/// Ensures: returns a `Value::Instance` of class `Error` with `message` ivar set;
+///   `restarts` ivar is nil (no restarts — internal signals are not resumable).
+pub(crate) fn make_error_value(
+    registry: &crate::class_registry::ClassRegistry,
+    message: &str,
+) -> Value {
+    let Some(handle) = registry.kernel().lookup_class("Error") else {
+        return Value::Str(Arc::from(message));
+    };
+    let error_class = handle.0.class.clone();
+    let obj = Arc::new(crate::object::Object::new(error_class.clone()));
+    obj.set_slot(Arc::from("message"), Value::Str(Arc::from(message)));
+    Value::Instance(InstanceHandle(Arc::new(InstanceState {
+        class: error_class,
+        kind: InstanceKind::ValueObject(obj),
+    })))
+}
+
 /// Fallback dispatch for primitive value types (Int, Float, Bool, Nil, Str,
 /// Symbol, Block, LargeInt). Called from the `_` arm of each type-specific
 /// dispatch function after type-specific cases are exhausted.
@@ -392,10 +414,13 @@ fn hash_value(v: &Value) -> i64 {
 /// `dispatch()`). Object/ValueObject instances never reach this function —
 /// they have their own fallback in `dispatch_object_primitive`.
 fn dispatch_primitive_fallback(
+    ev: &Evaluator,
     kind: &'static str,
     sel: &Arc<str>,
     mut args: Vec<Value>,
 ) -> Result<Value, EvalError> {
+    // NOTE: primitive types (Int, Float, etc.) don't carry an Env — handler_chain
+    // checking is skipped here. Use dispatch_object_primitive for Condition instances.
     match sel.as_ref() {
         "error:" => {
             expect_arity(sel, 1, args.len())?;
@@ -403,15 +428,7 @@ fn dispatch_primitive_fallback(
                 Value::Str(s) => s,
                 other => Arc::from(format!("{other}").as_str()),
             };
-            Err(EvalError::Signal(msg))
-        }
-        "_primSignal:" => {
-            expect_arity(sel, 1, args.len())?;
-            let msg = match args.remove(0) {
-                Value::Str(s) => s,
-                other => Arc::from(format!("{other}").as_str()),
-            };
-            Err(EvalError::Signal(msg))
+            Err(EvalError::Signal(make_error_value(&ev.registry, &msg)))
         }
         _ => Err(mnu(kind, sel)),
     }
@@ -639,14 +656,14 @@ fn dispatch_int(
             }
             Ok(Value::Nil)
         }
-        _ => dispatch_primitive_fallback("Int", sel, args),
+        _ => dispatch_primitive_fallback(ev, "Int", sel, args),
     }
 }
 
 // ── LargeInt ──────────────────────────────────────────────────────────────────
 
 fn dispatch_largeint(
-    _ev: &Evaluator,
+    ev: &Evaluator,
     n: Arc<BigInt>,
     sel: &Arc<str>,
     mut args: Vec<Value>,
@@ -743,7 +760,7 @@ fn dispatch_largeint(
             let f = n.to_f64().unwrap_or(f64::INFINITY);
             Ok(Value::Float(f))
         }
-        _ => dispatch_primitive_fallback("LargeInt", sel, args),
+        _ => dispatch_primitive_fallback(ev, "LargeInt", sel, args),
     }
 }
 
@@ -760,7 +777,7 @@ fn as_float_coerce(v: Value, sel: &Arc<str>) -> Result<f64, EvalError> {
 }
 
 fn dispatch_float(
-    _ev: &Evaluator,
+    ev: &Evaluator,
     f: f64,
     sel: &Arc<str>,
     mut args: Vec<Value>,
@@ -839,7 +856,7 @@ fn dispatch_float(
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from(format!("{f:?}").as_str())))
         }
-        _ => dispatch_primitive_fallback("Float", sel, args),
+        _ => dispatch_primitive_fallback(ev, "Float", sel, args),
     }
 }
 
@@ -960,14 +977,14 @@ fn dispatch_bool(
             }
             Ok(Value::Str(Arc::from(if b { "true" } else { "false" })))
         }
-        _ => dispatch_primitive_fallback("Bool", sel, args),
+        _ => dispatch_primitive_fallback(ev, "Bool", sel, args),
     }
 }
 
 // ── Nil ───────────────────────────────────────────────────────────────────────
 
 fn dispatch_nil(
-    _ev: &Evaluator,
+    ev: &Evaluator,
     sel: &Arc<str>,
     mut args: Vec<Value>,
     _env: &mut Env,
@@ -991,14 +1008,18 @@ fn dispatch_nil(
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from("nil")))
         }
-        _ => dispatch_primitive_fallback("Nil", sel, args),
+        "isEmpty" => {
+            expect_arity(sel, 0, args.len())?;
+            Ok(Value::Bool(true))
+        }
+        _ => dispatch_primitive_fallback(ev, "Nil", sel, args),
     }
 }
 
 // ── String ────────────────────────────────────────────────────────────────────
 
 fn dispatch_str(
-    _ev: &Evaluator,
+    ev: &Evaluator,
     s: Arc<str>,
     sel: &Arc<str>,
     mut args: Vec<Value>,
@@ -1068,14 +1089,14 @@ fn dispatch_str(
                 ))),
             }
         }
-        _ => dispatch_primitive_fallback("String", sel, args),
+        _ => dispatch_primitive_fallback(ev, "String", sel, args),
     }
 }
 
 // ── Symbol ────────────────────────────────────────────────────────────────────
 
 fn dispatch_symbol(
-    _ev: &Evaluator,
+    ev: &Evaluator,
     s: Arc<str>,
     sel: &Arc<str>,
     mut args: Vec<Value>,
@@ -1106,7 +1127,7 @@ fn dispatch_symbol(
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Symbol(s))
         }
-        _ => dispatch_primitive_fallback("Symbol", sel, args),
+        _ => dispatch_primitive_fallback(ev, "Symbol", sel, args),
     }
 }
 
@@ -1203,26 +1224,66 @@ fn dispatch_block(
             Ok(Value::Nil)
         }
         "on:do:" => {
+            // Unwinding handler. Catches EvalError::Signal whose condition class is a
+            // subclass of the given catch class.
+            //
+            // Requires: args[0] is a class (subclass of Condition); args[1] is a Block.
+            // Ensures: body is evaluated; if a matching Signal propagates, the handler is
+            //   called with the condition; Resume/ReturnFromBlock both return the value;
+            //   Retry re-executes the body; other errors propagate unchanged.
             expect_arity(sel, 2, args.len())?;
-            let _condition = args.remove(0); // class-filtered dispatch deferred to chunk 21+
+            let catch_class_val = force_value(args.remove(0))?;
             let handler = as_block(args.remove(0), sel)?;
-            match ev.eval_block_sync(&blk, vec![], env) {
-                Ok(v) => Ok(v),
-                Err(EvalError::Return(v, d)) => Err(EvalError::Return(v, d)),
-                Err(EvalError::Signal(msg)) => {
-                    ev.eval_block(&handler, vec![Value::Str(msg.clone())], env)
+            let catch_class = match &catch_class_val {
+                Value::Instance(h) => h.0.class.clone(),
+                _ => {
+                    return Err(EvalError::TypeError(
+                        "on:do: first argument must be a class".into(),
+                    ));
                 }
-                Err(e) => {
-                    let msg = Value::Str(Arc::from(e.to_string().as_str()));
-                    ev.eval_block(&handler, vec![msg], env)
+            };
+            loop {
+                match ev.eval_block_sync(&blk, vec![], env) {
+                    Ok(v) => return Ok(v),
+                    Err(EvalError::Return(v, d)) => return Err(EvalError::Return(v, d)),
+                    Err(EvalError::Signal(cond)) => {
+                        let signal_class = match &cond {
+                            Value::Instance(h) => h.0.class.clone(),
+                            _ => return Err(EvalError::Signal(cond)),
+                        };
+                        if crate::class::Class::is_subclass_of(&signal_class, &catch_class) {
+                            match ev.eval_block(&handler, vec![cond], env) {
+                                Ok(v) => return Ok(v),
+                                Err(EvalError::Resume(v)) => return Ok(v),
+                                Err(EvalError::ReturnFromBlock(v)) => return Ok(v),
+                                Err(EvalError::Retry) => continue,
+                                Err(e) => return Err(e),
+                            }
+                        } else {
+                            return Err(EvalError::Signal(cond));
+                        }
+                    }
+                    Err(e) => return Err(e),
                 }
             }
+        }
+        "ensure:" => {
+            // Unconditional cleanup.
+            //
+            // Requires: args[0] is a Block (the ensure block).
+            // Ensures: body is evaluated; ensure block always runs regardless of outcome;
+            //   body's result is returned after ensure runs.
+            expect_arity(sel, 1, args.len())?;
+            let ensure_blk = as_block(args.remove(0), sel)?;
+            let result = ev.eval_block_sync(&blk, vec![], env);
+            let _ = ev.eval_block(&ensure_blk, vec![], env);
+            result
         }
         "syncValue" => {
             expect_arity(sel, 0, args.len())?;
             ev.eval_block_sync(&blk, vec![], env)
         }
-        _ => dispatch_primitive_fallback("Block", sel, args),
+        _ => dispatch_primitive_fallback(ev, "Block", sel, args),
     }
 }
 
@@ -1239,7 +1300,7 @@ fn dispatch_object_value(
     if let Some((method, def_class)) = class.lookup(&selector) {
         return ev.invoke_method(handle.clone(), def_class, method, args, env);
     }
-    dispatch_object_primitive(ev, handle, &selector, args)
+    dispatch_object_primitive(ev, handle, &selector, args, env)
 }
 
 /// Dispatch a message to an actor entity. Checks for sync self-send
@@ -1267,7 +1328,7 @@ fn dispatch_entity(
         if let Some((method, def_class)) = class.lookup(&selector) {
             return ev.invoke_method(handle.clone(), def_class, method, args, env);
         }
-        return dispatch_object_primitive(ev, handle, &selector, args);
+        return dispatch_object_primitive(ev, handle, &selector, args, env);
     }
 
     // Cross-entity or non-entity-context send: enqueue and return Future.
@@ -1297,6 +1358,7 @@ pub(crate) fn dispatch_object_primitive(
     handle: InstanceHandle,
     sel: &Arc<str>,
     mut args: Vec<Value>,
+    env: &mut Env,
 ) -> Result<Value, EvalError> {
     use crate::object::IndexedStorage;
     let entity_id = match &handle.0.kind {
@@ -1313,7 +1375,7 @@ pub(crate) fn dispatch_object_primitive(
             });
         }
     };
-    let self_val = Value::Instance(handle);
+    let self_val = Value::Instance(handle.clone());
     match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;
@@ -1499,21 +1561,138 @@ pub(crate) fn dispatch_object_primitive(
                 ))),
             }
         }
-        "_primSignal:" => {
-            expect_arity(sel, 1, args.len())?;
-            let msg = match force_value(args.remove(0))? {
-                Value::Str(s) => s,
-                other => Arc::from(format!("{other}").as_str()),
-            };
-            Err(EvalError::Signal(msg))
-        }
         "error:" => {
             expect_arity(sel, 1, args.len())?;
             let msg = match force_value(args.remove(0))? {
                 Value::Str(s) => s,
                 other => Arc::from(format!("error: argument was {}", other.kind()).as_str()),
             };
-            Err(EvalError::Signal(msg))
+            signal_condition(ev, make_error_value(&ev.registry, &msg), env)
+        }
+        "_primSignalCondition:" => {
+            expect_arity(sel, 1, args.len())?;
+            let condition = force_value(args.remove(0))?;
+            if !matches!(&condition, Value::Instance(_)) {
+                return Err(EvalError::TypeError(
+                    "_primSignalCondition: requires a Condition instance".into(),
+                ));
+            }
+            signal_condition(ev, condition, env)
+        }
+        "_primResume:" => {
+            expect_arity(sel, 1, args.len())?;
+            let v = args.remove(0);
+            Err(EvalError::Resume(v))
+        }
+        "_primReturn:" => {
+            expect_arity(sel, 1, args.len())?;
+            let v = args.remove(0);
+            Err(EvalError::ReturnFromBlock(v))
+        }
+        "_primRetry" => {
+            expect_arity(sel, 0, args.len())?;
+            Err(EvalError::Retry)
+        }
+        "_primHCRun:" => {
+            // Run a block with this HandlerContext's handler pairs registered.
+            //
+            // Requires: args[0] is a Block; self's `pairs` ivar is an OrderedCollection
+            //   of Associations (key = condition class, value = handler block).
+            // Ensures: handler pairs are pushed onto ev.handler_chain for the duration of
+            //   body execution and popped when body completes (success, error, or retry).
+            expect_arity(sel, 1, args.len())?;
+            let body = as_block(args.remove(0), sel)?;
+
+            // Extract pairs from self's `pairs` ivar.
+            // HandlerContext is a Value subclass (ValueObject); Entity arm is kept as
+            // a defensive fallback only.
+            let pairs_val = match &handle.0.kind {
+                InstanceKind::ValueObject(o) => o.get_slot("pairs").unwrap_or(Value::Nil),
+                InstanceKind::Entity(d) => d.data.get_slot("pairs").unwrap_or(Value::Nil),
+                InstanceKind::ClassEntity(_) => {
+                    return Err(EvalError::TypeError(
+                        "_primHCRun: requires a HandlerContext instance".into(),
+                    ));
+                }
+            };
+
+            // Walk the Cons-of-Association linked list:
+            //   Cons(head: cls -> blk, tail: rest)
+            // Newest pair is at the head; we collect then reverse so that
+            // handler_chain is ordered oldest-first, making the reverse walk in
+            // signal_condition match newest (innermost) first.
+            let mut handler_pairs: Vec<(Arc<Class>, Arc<crate::value::Block>)> = Vec::new();
+            let mut node = force_value(pairs_val)?;
+            while let Value::Instance(node_h) = node {
+                let node_obj = match &node_h.0.kind {
+                    InstanceKind::ValueObject(o) => o.clone(),
+                    InstanceKind::Entity(d) => d.data.clone(),
+                    InstanceKind::ClassEntity(_) => break,
+                };
+                // head is an Association(key=cls, value=blk); tail is rest.
+                let head_val = force_value(node_obj.get_slot("head").unwrap_or(Value::Nil))?;
+                let tail = force_value(node_obj.get_slot("tail").unwrap_or(Value::Nil))?;
+
+                let assoc_h = match head_val {
+                    Value::Instance(h) => h,
+                    _ => {
+                        node = tail;
+                        continue;
+                    }
+                };
+                let assoc_obj = match &assoc_h.0.kind {
+                    InstanceKind::ValueObject(o) => o.clone(),
+                    InstanceKind::Entity(d) => d.data.clone(),
+                    InstanceKind::ClassEntity(_) => {
+                        node = tail;
+                        continue;
+                    }
+                };
+                let cls_val = force_value(assoc_obj.get_slot("key").unwrap_or(Value::Nil))?;
+                let blk_val = force_value(assoc_obj.get_slot("value").unwrap_or(Value::Nil))?;
+
+                let cls = match cls_val {
+                    Value::Instance(ch) => ch.0.class.clone(),
+                    _ => {
+                        node = tail;
+                        continue;
+                    }
+                };
+                let blk = match blk_val {
+                    Value::Block(b) => b,
+                    _ => {
+                        node = tail;
+                        continue;
+                    }
+                };
+                handler_pairs.push((cls, blk));
+                node = tail;
+            }
+            // Reverse so oldest pair is pushed first; signal_condition's reverse
+            // walk then matches the most-recently-registered handler first.
+            handler_pairs.reverse();
+
+            // Push handler pairs onto handler_chain.
+            let chain_start_len = ev.handler_chain.borrow().len();
+            {
+                let mut chain = ev.handler_chain.borrow_mut();
+                for (cls, blk) in handler_pairs.iter() {
+                    chain.push((cls.clone(), blk.clone()));
+                }
+            }
+
+            // Execute body in a loop (for Retry). Always truncate chain on exit.
+            let result = loop {
+                match ev.eval_block(&body, vec![], env) {
+                    Ok(v) => break Ok(v),
+                    Err(EvalError::ReturnFromBlock(v)) => break Ok(v),
+                    Err(EvalError::Retry) => continue,
+                    Err(EvalError::Return(v, d)) => break Err(EvalError::Return(v, d)),
+                    Err(other) => break Err(other),
+                }
+            };
+            ev.handler_chain.borrow_mut().truncate(chain_start_len);
+            result
         }
         "historyOf:" => {
             expect_arity(sel, 1, args.len())?;
@@ -1534,7 +1713,10 @@ pub(crate) fn dispatch_object_primitive(
             })?;
             let ctx = ExecContext::Entity(eid);
             let facts = ev.store.history(&ctx, eid, pred, None).map_err(|e| {
-                EvalError::Signal(Arc::from(format!("historyOf: store error: {e:?}").as_str()))
+                EvalError::Signal(make_error_value(
+                    &ev.registry,
+                    &format!("historyOf: store error: {e:?}"),
+                ))
             })?;
             history_facts_to_array(ev, &facts)
         }
@@ -1561,8 +1743,9 @@ pub(crate) fn dispatch_object_primitive(
             })?;
             let ctx = ExecContext::Entity(eid);
             let all_facts = ev.store.history(&ctx, eid, pred, None).map_err(|e| {
-                EvalError::Signal(Arc::from(
-                    format!("historyOf:from:to: store error: {e:?}").as_str(),
+                EvalError::Signal(make_error_value(
+                    &ev.registry,
+                    &format!("historyOf:from:to: store error: {e:?}"),
                 ))
             })?;
             let facts: Vec<StoredFact> = all_facts
@@ -1584,6 +1767,94 @@ pub(crate) fn dispatch_object_primitive(
             selector: sel.clone(),
         }),
     }
+}
+
+/// Core signal dispatch: walk the handler_chain, then apply unhandled policy.
+///
+/// Requires: `condition` is a `Value::Instance` whose class is a subclass of Condition.
+/// Ensures: if a matching non-unwinding handler is found its return value is returned;
+///   if none match, applies unhandled policy (Condition → nil, Warning → log+nil,
+///   Error → raise EvalError::Signal).
+pub(crate) fn signal_condition(
+    ev: &Evaluator,
+    condition: Value,
+    env: &mut Env,
+) -> Result<Value, EvalError> {
+    let cond_class = match &condition {
+        Value::Instance(h) => h.0.class.clone(),
+        _ => return Err(EvalError::Signal(condition)),
+    };
+
+    // Walk handler_chain in reverse (most-recently-pushed first).
+    let chain_snapshot = ev.handler_chain.borrow().clone();
+    let mut re_signaled = false;
+    for (handler_class, handler_block) in chain_snapshot.iter().rev() {
+        if crate::class::Class::is_subclass_of(&cond_class, handler_class) {
+            match ev.eval_block(handler_block, vec![condition.clone()], env) {
+                Ok(v) => return Ok(v),
+                Err(EvalError::Resume(v)) => return Ok(v),
+                Err(EvalError::ReturnFromBlock(v)) => return Err(EvalError::ReturnFromBlock(v)),
+                Err(EvalError::Retry) => return Err(EvalError::Retry),
+                Err(EvalError::Signal(_)) => {
+                    re_signaled = true;
+                    break;
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+    if re_signaled {
+        return Err(EvalError::Signal(condition));
+    }
+
+    // No handler matched — apply unhandled policy by condition class.
+    let kernel = ev.registry.kernel();
+    let is_error = kernel
+        .lookup_class("Error")
+        .map(|h| crate::class::Class::is_subclass_of(&cond_class, &h.0.class))
+        .unwrap_or(false);
+    let is_warning = !is_error
+        && kernel
+            .lookup_class("Warning")
+            .map(|h| crate::class::Class::is_subclass_of(&cond_class, &h.0.class))
+            .unwrap_or(false);
+
+    if is_error {
+        Err(EvalError::Signal(condition))
+    } else if is_warning {
+        let policy = kernel
+            .lookup_class("Warning")
+            .and_then(|h| h.0.class.lookup_class_var_owner("LoggingPolicy"))
+            .and_then(|owner| owner.class_var_storage.read().get("LoggingPolicy").cloned());
+        let message = condition_message(&condition);
+        match policy.as_ref() {
+            Some(Value::Symbol(s)) if s.as_ref() == "suppress" => {}
+            Some(Value::Symbol(s)) if s.as_ref() == "stdout" => {
+                println!("WARNING: {message}");
+            }
+            _ => {
+                eprintln!("WARNING: {message}");
+            }
+        }
+        Ok(Value::Nil)
+    } else {
+        Ok(Value::Nil)
+    }
+}
+
+/// Extract the `message` ivar from a condition instance, or fall back to a string representation.
+pub(crate) fn condition_message(condition: &Value) -> String {
+    if let Value::Instance(h) = condition {
+        let obj = match &h.0.kind {
+            InstanceKind::ValueObject(o) => o.get_slot("message"),
+            InstanceKind::Entity(d) => d.data.get_slot("message"),
+            InstanceKind::ClassEntity(_) => None,
+        };
+        if let Some(Value::Str(s)) = obj {
+            return s.to_string();
+        }
+    }
+    format!("{condition}")
 }
 
 fn is_kind_of(class: &Arc<Class>, target: &Arc<Class>) -> bool {
@@ -1758,8 +2029,14 @@ fn dispatch_class(
     // Self-send or structural class-definition message: dispatch synchronously.
     // `subclass:*` must run in the caller's context so that env bindings and
     // namespace registration are immediately visible to the next statement.
+    // Value-class methods (classes whose instances are passive ValueObjects) are also
+    // dispatched synchronously: they carry no actor-mailbox semantics, so
+    // cross-entity dispatch would be wrong.
     let current = ev.current_entity_id.get();
-    if current == Some(entity_id) || selector.starts_with("subclass:") {
+    if current == Some(entity_id)
+        || selector.starts_with("subclass:")
+        || handle.0.class.inherits_is_value()
+    {
         let class = handle.0.class.clone();
         if let Some((method, def_class)) = class.lookup_class_method(&selector) {
             return ev.invoke_class_method(handle, def_class, method, args, env);
@@ -1830,6 +2107,63 @@ pub(crate) fn dispatch_class_builtin(
                 assert_instance_of(ev, &inst, &class);
                 Ok(Value::Instance(inst))
             }
+        }
+        "_primNewValue:" => {
+            // Construct a frozen Value-subclass instance via an initialization block.
+            //
+            // Requires: args[0] is a 1-arg Block; receiver class inherits is_value.
+            // Ensures: creates a new (unfrozen) ValueObject (zero-size indexed storage
+            //   for indexed classes), evaluates the block with the instance as argument
+            //   (mutations permitted during block), freezes on block return, returns
+            //   the frozen instance.
+            expect_arity(&selector, 1, args.len())?;
+            if !class.inherits_is_value() {
+                return Err(EvalError::TypeError(
+                    "_primNewValue: requires a Value subclass".into(),
+                ));
+            }
+            let blk = as_block(args.remove(0), &selector)?;
+            let obj = if class.indexed_slot_kind.is_some() {
+                Arc::new(Object::new_with_indexed(class.clone(), 0))
+            } else {
+                Arc::new(Object::new(class.clone()))
+            };
+            let inst = InstanceHandle(Arc::new(InstanceState {
+                class,
+                kind: InstanceKind::ValueObject(obj.clone()),
+            }));
+            ev.eval_block(&blk, vec![Value::Instance(inst.clone())], env)?;
+            obj.freeze();
+            Ok(Value::Instance(inst))
+        }
+        "_primNewValueIndexed:init:" => {
+            // Construct a frozen indexed Value-subclass instance via an initialization block.
+            //
+            // Requires: args[0] is an Int size; args[1] is a 1-arg Block;
+            //   receiver class inherits is_value and declares indexedSlots:.
+            // Ensures: creates an indexed ValueObject of the given size, evaluates
+            //   the block with the instance as argument, freezes on block return.
+            expect_arity(&selector, 2, args.len())?;
+            if !class.inherits_is_value() {
+                return Err(EvalError::TypeError(
+                    "_primNewValueIndexed:init: requires a Value subclass".into(),
+                ));
+            }
+            if class.indexed_slot_kind.is_none() {
+                return Err(EvalError::TypeError(
+                    "_primNewValueIndexed:init: requires class to declare indexedSlots:".into(),
+                ));
+            }
+            let n = as_int(args.remove(0), &selector)?;
+            let blk = as_block(args.remove(0), &selector)?;
+            let obj = Arc::new(Object::new_with_indexed(class.clone(), n.max(0) as usize));
+            let inst = InstanceHandle(Arc::new(InstanceState {
+                class,
+                kind: InstanceKind::ValueObject(obj.clone()),
+            }));
+            ev.eval_block(&blk, vec![Value::Instance(inst.clone())], env)?;
+            obj.freeze();
+            Ok(Value::Instance(inst))
         }
         "_primNew:" => {
             expect_arity(&selector, 1, args.len())?;

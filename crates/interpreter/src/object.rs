@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
@@ -26,12 +27,19 @@ pub enum IndexedStorage {
 /// entity threads. In practice the mutex is uncontended: value objects are
 /// immutable after construction and entity objects are owned by a single
 /// entity thread.
+///
+/// For `ValueObject` instances, `frozen` is set to `true` by `_primNewValue:`
+/// after the initialization block returns. Once frozen, ivar writes via
+/// `assign_var` raise `EvalError::TypeError`.
 pub struct Object {
     pub class: Arc<Class>,
     /// Named instance variable storage (own + inherited), keyed by variable name.
     pub slots: Mutex<HashMap<Arc<str>, Value>>,
     /// Present iff `class.indexed_slot_kind` is `Some(_)`.
     pub indexed: Option<IndexedStorage>,
+    /// Set to `true` by `freeze()` after `_primNewValue:` initialization completes.
+    /// Checked by `assign_var` before any ivar write on a `ValueObject`.
+    pub frozen: AtomicBool,
 }
 
 impl Object {
@@ -49,6 +57,7 @@ impl Object {
             class,
             slots: Mutex::new(slots),
             indexed: None,
+            frozen: AtomicBool::new(false),
         }
     }
 
@@ -76,7 +85,22 @@ impl Object {
             class,
             slots: Mutex::new(slots),
             indexed: Some(indexed),
+            frozen: AtomicBool::new(false),
         }
+    }
+
+    /// Permanently prevent ivar writes on this object.
+    ///
+    /// Requires: called exactly once, after `_primNewValue:` initialization block returns.
+    /// Ensures: `frozen.load(Ordering::Acquire)` is `true`; subsequent `assign_var`
+    ///   calls on the owning `ValueObject` raise `EvalError::TypeError`.
+    pub fn freeze(&self) {
+        self.frozen.store(true, Ordering::Release);
+    }
+
+    /// Returns `true` if this object has been frozen by `freeze()`.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
     }
 
     /// Returns a clone of the named instance variable, or `None` if unknown.

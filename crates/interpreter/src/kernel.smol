@@ -314,31 +314,6 @@ OrderedCollection >> pvtGrow [
     storage := newStorage
 ]
 
-"Error — thin wrapper over _primSignal: that makes signaling a message send."
-Value subclass: #Error
-    instanceVariableNames: 'message'
-    classVariableNames: ''
-    indexedSlots: #none.
-
-Error class >> withMessage: aStr [
-    |e|
-    e := self _primNew.
-    e pvtSetMessage: aStr.
-    ^e
-] 
-
-Error class >> signal: aString [
-    ^(self withMessage: aString) signal await
-]
-
-Error >> initialize [ message := 'Unknown Error' ]
-Error >> pvtSetMessage: s [ message := s ]
-Error >> message    [ ^message ]
-Error >> messageText [ ^message ]
-Error >> signal     [ ^self _primSignal: message ]
-
-"Override Object >> error: to delegate to Error so it raises Signal."
-Object >> error: aString [ ^(Error signal: aString) await ]
 
 "Default hash delegates to _primHash (identity-based pointer hash).
  Subclasses that override = for value equality must also override hash
@@ -348,12 +323,24 @@ Object >> hash [ ^self _primHash ]
 "Default initialize is a no-op."
 Object >> initialize []
 
+"Default isEmpty returns false; collection subclasses override."
+Object >> isEmpty [ ^false ]
+
 Object class >> new [
     ^[self _primNew initialize] syncValue
 ]
 
 Object class >> new: n [
     ^[(self _primNew: n) initialize] syncValue
+]
+
+"Value class >> new freezes the instance after initialize."
+Value class >> new [
+    ^self _primNewValue: [:inst | inst initialize]
+]
+
+Value class >> new: n [
+    ^self _primNewValueIndexed: n init: [:inst | inst initialize]
 ]
 
 "Association — immutable key / mutable value pair."
@@ -379,6 +366,40 @@ Association >> = other [
 ]
 Association >> printString [
     ^key printString , ' -> ' , value printString
+]
+
+"Shorthand for building Associations via binary message -> ."
+Object >> -> aVal [ ^Association key: self value: aVal ]
+
+"Cons — immutable singly-linked list node.
+ nil is the empty list; isNil / isEmpty are the emptiness checks."
+Value subclass: #Cons
+    instanceVariableNames: 'head tail'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Cons class >> with: anObject rest: aList [
+    ^self _primNewValue: [:c |
+        c pvtSetHead: anObject.
+        c pvtSetTail: aList
+    ]
+]
+
+Cons >> pvtSetHead: h [ head := h ]
+Cons >> pvtSetTail: t [ tail := t ]
+Cons >> head           [ ^head ]
+Cons >> tail           [ ^tail ]
+Cons >> isEmpty        [ ^false ]
+
+Cons >> addFirst: x [ ^Cons with: x rest: self ]
+
+Cons >> do: aBlock [
+    aBlock value: head.
+    tail isNil ifFalse: [tail do: aBlock]
+]
+
+Cons >> size [
+    ^1 + (tail isNil ifTrue: [0] ifFalse: [tail size])
 ]
 
 "Dictionary — open-addressing hash map over a flat Array of Association slots.
@@ -529,6 +550,105 @@ Dictionary >> pvtRehash [
         (old at: i) ifNotNil: [:slot | self at: slot key put: slot value]
     ]
 ]
+
+"Condition hierarchy — CL-inspired non-local condition/restart system."
+
+Value subclass: #Condition
+    instanceVariableNames: 'message restarts'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Condition class >> withMessage: aString [
+    ^self _primNewValue: [:c |
+        c pvtSetMessage: aString
+    ]
+]
+
+"Factory for functional updates: preserves polymorphism across Condition subclasses."
+Condition class >> pvtMessage: msg restarts: r [
+    ^self _primNewValue: [:c |
+        c pvtSetMessage: msg.
+        c pvtSetRestarts: r
+    ]
+]
+
+Condition class >> signal: aString [ ^(self withMessage: aString) signal ]
+
+"restarts is a Cons-of-Association (or nil). Frozen after construction."
+Condition >> initialize         [ message := '' ]
+Condition >> pvtSetMessage: s   [ message := s ]
+Condition >> pvtSetRestarts: r  [ restarts := r ]
+Condition >> message            [ ^message ]
+Condition >> messageText        [ ^message ]
+
+"Returns a new Condition with this restart prepended; self is unchanged (frozen)."
+Condition >> addRestart: name block: aBlock [
+    ^self class pvtMessage: message restarts: (Cons with: (name -> aBlock) rest: restarts)
+]
+
+Condition >> pvtFindRestart: name in: node [
+    node isNil ifTrue: [^nil].
+    node head key = name ifTrue: [^node head value].
+    ^self pvtFindRestart: name in: node tail
+]
+
+Condition >> hasRestart: name [ ^(self pvtFindRestart: name in: restarts) notNil ]
+Condition >> availableRestarts [ ^#() ]
+
+Condition >> invokeRestart: name [
+    | blk |
+    blk := self pvtFindRestart: name in: restarts.
+    blk isNil ifTrue: [self error: 'no restart named: ', name].
+    ^self resume: blk value
+]
+
+Condition >> invokeRestart: name with: arg [
+    | blk |
+    blk := self pvtFindRestart: name in: restarts.
+    blk isNil ifTrue: [self error: 'no restart named: ', name].
+    ^self resume: (blk value: arg)
+]
+
+Condition >> signal    [ ^self _primSignalCondition: self ]
+Condition >> resume: v [ ^self _primResume: v ]
+Condition >> return: v [ ^self _primReturn: v ]
+Condition >> retry     [ ^self _primRetry ]
+
+Condition subclass: #Warning
+    instanceVariableNames: ''
+    classVariableNames: 'LoggingPolicy'
+    indexedSlots: #none.
+
+Warning class >> initialize         [ LoggingPolicy := #stderr ]
+Warning class >> loggingPolicy: sym [ LoggingPolicy := sym ]
+Warning class >> loggingPolicy      [ ^LoggingPolicy ]
+
+Condition subclass: #Error
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+"HandlerContext — non-unwinding handler registration (CL handler-bind analog).
+pairs is a Cons-of-Association linked list (or nil):
+  Cons(head: cls -> blk, tail: rest)
+Newest pair is at the head. Using pure-Value Cons nodes avoids cross-entity reads
+in _primHCRun:, which executes as a self-send in the entity's own coroutine."
+Object subclass: #HandlerContext
+    instanceVariableNames: 'pairs'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+HandlerContext >> initialize       [ pairs := nil ]
+HandlerContext >> on: cls do: blk  [
+    pairs := Cons with: (cls -> blk) rest: pairs.
+    ^self
+]
+HandlerContext >> on: anArray run: body [
+    anArray do: [:assoc | self on: assoc key do: assoc value].
+    ^self run: body
+]
+HandlerContext >> pairs            [ ^pairs ]
+HandlerContext >> run: body        [ ^self _primHCRun: body ]
 
 "World — environment-level queries over the live entity registry."
 Object subclass: #World
