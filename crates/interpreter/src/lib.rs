@@ -12,6 +12,7 @@ pub mod class_registry;
 pub mod entity;
 pub mod env;
 pub mod eval;
+pub(crate) mod eval_iterative;
 pub mod lexer;
 pub mod namespace;
 pub mod object;

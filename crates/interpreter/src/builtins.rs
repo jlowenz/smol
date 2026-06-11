@@ -232,6 +232,75 @@ pub fn dispatch(
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Result of a user-method lookup for the iterative evaluator's step loop.
+///
+/// When `Some`, the step loop should push a `CallFrame` instead of calling
+/// `builtins::dispatch`. When `None`, the dispatch falls through to builtins.
+#[allow(dead_code)]
+pub(crate) enum UserMethodFound {
+    /// Instance or entity self-send: invoke `method` with `handle` as receiver.
+    Instance {
+        handle: InstanceHandle,
+        method: Arc<crate::class::Method>,
+        def_class: Arc<crate::class::Class>,
+    },
+    /// Primitive receiver (e.g. nil): invoke `method` with `self_value` as receiver.
+    Primitive {
+        self_value: Value,
+        method: Arc<crate::class::Method>,
+        def_class: Arc<crate::class::Class>,
+    },
+}
+
+/// Look up a user-defined method that the step loop should dispatch as a `CallFrame`.
+///
+/// Requires: `ev` is the current evaluator.
+/// Ensures: returns `Some` only for synchronous user-method calls — ValueObject
+///   instance methods, entity self-sends, and nil methods. Cross-entity sends and
+///   class-entity dispatch return `None` (handled by `builtins::dispatch`).
+#[allow(dead_code)]
+pub(crate) fn lookup_user_method(
+    ev: &Evaluator,
+    recv: &Value,
+    selector: &Arc<str>,
+) -> Option<UserMethodFound> {
+    match recv {
+        Value::Instance(handle) => match &handle.0.kind {
+            InstanceKind::ValueObject(_) => {
+                let (method, def_class) = handle.0.class.lookup(selector)?;
+                Some(UserMethodFound::Instance {
+                    handle: handle.clone(),
+                    method,
+                    def_class,
+                })
+            }
+            InstanceKind::Entity(d) => {
+                // Only intercept self-sends; cross-entity sends stay async via builtins.
+                if ev.current_entity_id.get() != Some(d.id) {
+                    return None;
+                }
+                let (method, def_class) = handle.0.class.lookup(selector)?;
+                Some(UserMethodFound::Instance {
+                    handle: handle.clone(),
+                    method,
+                    def_class,
+                })
+            }
+            InstanceKind::ClassEntity(_) => None, // class-side dispatch handled by builtins
+        },
+        Value::Nil => {
+            let nil_handle = ev.registry.kernel().lookup_class("Nil")?;
+            let (method, def_class) = nil_handle.0.class.lookup(selector)?;
+            Some(UserMethodFound::Primitive {
+                self_value: Value::Nil,
+                method,
+                def_class,
+            })
+        }
+        _ => None, // Int, Float, Bool, Str, Symbol, Block, LargeInt, Future, Namespace
+    }
+}
+
 fn mnu(recv_kind: &'static str, selector: &Arc<str>) -> EvalError {
     EvalError::MessageNotUnderstood {
         receiver_kind: recv_kind,
@@ -379,7 +448,7 @@ fn hash_value(v: &Value) -> i64 {
         Value::Instance(h) => fmix64(Arc::as_ptr(&h.0) as usize as u64) as i64,
         Value::Future(f) => fmix64(Arc::as_ptr(&f.0) as usize as u64) as i64,
         Value::Block(b) => fmix64(Arc::as_ptr(b) as usize as u64) as i64,
-        Value::Namespace(ns) => fmix64(Arc::as_ptr(ns) as usize as u64) as i64,
+        Value::Namespace(ns) => fnv1a_hash(&ns.name),
     }
 }
 
@@ -987,8 +1056,14 @@ fn dispatch_nil(
     ev: &Evaluator,
     sel: &Arc<str>,
     mut args: Vec<Value>,
-    _env: &mut Env,
+    env: &mut Env,
 ) -> Result<Value, EvalError> {
+    // User-defined methods on the Nil class take priority over builtins.
+    if let Some(nil_handle) = ev.registry.kernel().lookup_class("Nil")
+        && let Some((method, def_class)) = nil_handle.0.class.lookup(sel)
+    {
+        return ev.invoke_primitive_method(Value::Nil, def_class, method, args, env);
+    }
     match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;

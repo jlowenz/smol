@@ -381,6 +381,12 @@ Cons class >> with: anObject rest: aList [
     ]
 ]
 
+Cons class >> singleton: anObject [
+    ^self _primNewValue: [:c |
+        c pvtHead: anObject tail: nil.
+    ]
+]
+
 Cons >> pvtHead: h tail: t [ head := h. tail := t. ]
 Cons >> head           [ ^head ]
 Cons >> tail           [ ^tail ]
@@ -395,6 +401,13 @@ Cons >> do: aBlock [
 
 Cons >> size [
     ^1 + (tail isNil ifTrue: [0] ifFalse: [tail size])
+]
+
+Nil >> isEmpty [ ^true ]
+Nil >> inject: aValue into: aBlock [ ^aValue ]
+
+Cons >> inject: aValue into: aBlock [
+    ^tail inject: (aBlock value: aValue value: head) into: aBlock
 ]
 
 "Dictionary — open-addressing hash map over a flat Array of Association slots.

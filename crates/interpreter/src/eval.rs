@@ -64,6 +64,12 @@ pub enum SelfBinding {
         handle: InstanceHandle,
         defining_class: Arc<Class>,
     },
+    /// Method invoked on a primitive receiver (e.g. `nil`). No `InstanceHandle`;
+    /// `self_value` is bound directly as `self` in the method frame.
+    Primitive {
+        defining_class: Arc<Class>,
+        self_value: Value,
+    },
 }
 
 pub struct Evaluator {
@@ -71,7 +77,7 @@ pub struct Evaluator {
     /// Shared store handle. Cloned from the registry's store; all evaluators and
     /// entities sharing the same registry share the same underlying store.
     pub store: Store,
-    method_stack: RefCell<Vec<SelfBinding>>,
+    pub(crate) method_stack: RefCell<Vec<SelfBinding>>,
     /// Content-hash-addressed value objects registered during this evaluator's lifetime.
     /// Used for EntityRef resolution of ValueObject facts.
     pub(crate) value_objects: RefCell<HashMap<EntityId, Arc<InstanceState>>>,
@@ -82,7 +88,7 @@ pub struct Evaluator {
     /// Depth of the active method stack. Maintained alongside `method_stack` so
     /// the common case — no active method — can be tested with a plain `Cell`
     /// read instead of a `RefCell` borrow.
-    method_depth: Cell<usize>,
+    pub(crate) method_depth: Cell<usize>,
     /// Currently active namespace. Defaults to `Kernel`. Temporarily swapped by
     /// `Namespace do: [...]` for the duration of the block.
     ///
@@ -93,7 +99,7 @@ pub struct Evaluator {
     /// should target with a `^`-return. `None` when not inside any `eval_block`
     /// (i.e., evaluating a method body directly). Saved and restored by each
     /// `eval_block` call so nesting is handled correctly.
-    current_block_home: Cell<Option<usize>>,
+    pub(crate) current_block_home: Cell<Option<usize>>,
     /// The `EntityId` of the entity whose message handler is currently executing
     /// on this evaluator. `None` outside any entity handler. Used for sync
     /// self-send detection. Stored here (not in a thread-local) because may
@@ -167,12 +173,12 @@ impl Evaluator {
 
     // ── Method receiver stack ─────────────────────────────────────────────────
 
-    fn push_self(&self, binding: SelfBinding) {
+    pub(crate) fn push_self(&self, binding: SelfBinding) {
         self.method_stack.borrow_mut().push(binding);
         self.method_depth.set(self.method_depth.get() + 1);
     }
 
-    fn pop_self(&self) {
+    pub(crate) fn pop_self(&self) {
         self.method_stack.borrow_mut().pop();
         self.method_depth.set(self.method_depth.get() - 1);
     }
@@ -182,6 +188,7 @@ impl Evaluator {
         match self.method_stack.borrow().last() {
             Some(SelfBinding::Instance { defining_class, .. }) => Some(defining_class.clone()),
             Some(SelfBinding::ClassSide { defining_class, .. }) => Some(defining_class.clone()),
+            Some(SelfBinding::Primitive { defining_class, .. }) => Some(defining_class.clone()),
             None => None,
         }
     }
@@ -249,6 +256,20 @@ impl Evaluator {
                 // 3. outer env (globals)
                 env.lookup_outer_frames(name)
             }
+            Some(SelfBinding::Primitive { defining_class, .. }) => {
+                // 1. local frame (params, method locals, self)
+                if let Some(v) = env.lookup_top_frame(name) {
+                    return Some(v);
+                }
+                // 2. class variables of the primitive's class (no instance variables)
+                if let Some(owner) = defining_class.lookup_class_var_owner(name)
+                    && let Some(v) = owner.class_var_storage.read().get(name).cloned()
+                {
+                    return Some(v);
+                }
+                // 3. outer env (globals)
+                env.lookup_outer_frames(name)
+            }
             None => env.get(name),
         }
     }
@@ -259,7 +280,12 @@ impl Evaluator {
     /// Requires: `value` is the fully-evaluated right-hand side.
     /// Ensures: exactly one `Value::clone` is performed regardless of path.
     #[inline]
-    fn assign_var(&self, name: &Arc<str>, value: Value, env: &mut Env) -> Result<Value, EvalError> {
+    pub(crate) fn assign_var(
+        &self,
+        name: &Arc<str>,
+        value: Value,
+        env: &mut Env,
+    ) -> Result<Value, EvalError> {
         if self.method_depth.get() > 0 {
             let top = self.method_stack.borrow().last().cloned();
             match top {
@@ -294,6 +320,14 @@ impl Evaluator {
                 Some(SelfBinding::ClassSide { handle, .. }) => {
                     // No ivar check for class-side.
                     if let Some(owner) = handle.0.class.lookup_class_var_owner(name.as_ref()) {
+                        let ret = value.clone();
+                        owner.class_var_storage.write().insert(name.clone(), value);
+                        return Ok(ret);
+                    }
+                }
+                Some(SelfBinding::Primitive { defining_class, .. }) => {
+                    // No ivar check for primitives.
+                    if let Some(owner) = defining_class.lookup_class_var_owner(name.as_ref()) {
                         let ret = value.clone();
                         owner.class_var_storage.write().insert(name.clone(), value);
                         return Ok(ret);
@@ -490,7 +524,11 @@ impl Evaluator {
     /// Evaluate a `Literal` into a runtime `Value`. For `Literal::Array` this
     /// requires the evaluator and environment to construct the `Array` object;
     /// all other variants are pure data and do not need either.
-    fn eval_literal_as_value(&self, lit: &Literal, env: &mut Env) -> Result<Value, EvalError> {
+    pub(crate) fn eval_literal_as_value(
+        &self,
+        lit: &Literal,
+        env: &mut Env,
+    ) -> Result<Value, EvalError> {
         match lit {
             Literal::Array(elems) => self.eval_array_literal(elems, env),
             _ => Ok(eval_literal(lit)),
@@ -548,7 +586,7 @@ impl Evaluator {
 
     /// Handle `super send`: look up the selector starting from the superclass of
     /// the defining class and invoke on the current receiver.
-    fn send_super(&self, message: &Message, env: &mut Env) -> Result<Value, EvalError> {
+    pub(crate) fn send_super(&self, message: &Message, env: &mut Env) -> Result<Value, EvalError> {
         let defining_class = self
             .current_defining_class()
             .ok_or_else(|| EvalError::TypeError("super used outside method context".into()))?;
@@ -589,6 +627,15 @@ impl Evaluator {
                     }
                 }
             }
+            Some(SelfBinding::Primitive { self_value, .. }) => match superclass.lookup(&selector) {
+                Some((method, def_class)) => {
+                    self.invoke_primitive_method(self_value, def_class, method, args, env)
+                }
+                None => Err(EvalError::MessageNotUnderstood {
+                    receiver_kind: "nil",
+                    selector,
+                }),
+            },
             None => Err(EvalError::TypeError(
                 "super used outside method context".into(),
             )),
@@ -596,7 +643,7 @@ impl Evaluator {
     }
 
     /// Evaluate `Expr::NamespaceRef`: resolve a `Ns::ClassName` path.
-    fn eval_namespace_ref(
+    pub(crate) fn eval_namespace_ref(
         &self,
         namespace_path: &[Arc<str>],
         name: &Arc<str>,
@@ -830,6 +877,53 @@ impl Evaluator {
         }
     }
 
+    /// Invoke a user-defined method where `self` is a primitive value (e.g. `nil`).
+    ///
+    /// Requires: `args.len() == method.pattern.params().len()`.
+    /// Ensures: `self_value` is bound as `self` in the method frame; a method
+    ///   with no explicit `^` returns `self_value` (Smalltalk implicit self return).
+    pub fn invoke_primitive_method(
+        &self,
+        self_value: Value,
+        defining_class: Arc<Class>,
+        method: Arc<Method>,
+        args: Vec<Value>,
+        env: &mut Env,
+    ) -> Result<Value, EvalError> {
+        let params = method.pattern.params();
+        if args.len() != params.len() {
+            return Err(EvalError::ArityMismatch {
+                expected: params.len(),
+                got: args.len(),
+            });
+        }
+        let mut method_env = env.clone();
+        method_env.push_frame();
+        method_env.define(self_sym(), self_value.clone());
+        for (param, val) in params.iter().zip(args.iter()) {
+            method_env.define(param.clone(), val.clone());
+        }
+        for local in &method.locals {
+            method_env.define(local.clone(), Value::Nil);
+        }
+        self.push_self(SelfBinding::Primitive {
+            defining_class,
+            self_value: self_value.clone(),
+        });
+        let my_depth = self.method_depth.get();
+        let prev_home = self.current_block_home.get();
+        self.current_block_home.set(None);
+        let result = self.eval_program(&method.body, &mut method_env);
+        self.current_block_home.set(prev_home);
+        self.pop_self();
+        method_env.pop_frame();
+        match result {
+            Ok(_) => Ok(self_value),
+            Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Create an evaluator from an existing `ClassRegistry`, loading `kernel.smol`.
     ///
     /// Ensures: same post-conditions as `new()` but shares the given registry
@@ -864,12 +958,12 @@ impl Evaluator {
 
 /// Returns a pre-allocated `Arc<str>` for the identifier `"self"`.
 /// Allocated once per process via `OnceLock`; subsequent calls are a refcount bump.
-fn self_sym() -> Arc<str> {
+pub(crate) fn self_sym() -> Arc<str> {
     static SELF: OnceLock<Arc<str>> = OnceLock::new();
     SELF.get_or_init(|| Arc::from("self")).clone()
 }
 
-fn eval_literal(lit: &Literal) -> Value {
+pub(crate) fn eval_literal(lit: &Literal) -> Value {
     match lit {
         Literal::Int(n) => Value::Int(*n),
         Literal::Float(f) => Value::Float(*f),
@@ -964,7 +1058,7 @@ fn check_prim_sends_in_message(msg: &Message) -> Result<(), EvalError> {
 /// Requires: `stmts` is the body of a method being installed.
 /// Ensures: returns `Err(EvalError::TypeError)` if any such send is found;
 ///   otherwise `Ok(())`.
-fn check_prim_sends_in_body(stmts: &[Stmt]) -> Result<(), EvalError> {
+pub(crate) fn check_prim_sends_in_body(stmts: &[Stmt]) -> Result<(), EvalError> {
     for stmt in stmts {
         match stmt {
             Stmt::Expr(e) | Stmt::Return(e) => check_prim_sends_in_expr(e)?,

@@ -1639,7 +1639,7 @@ fn hash_largeint_returns_int() {
 
 #[test]
 fn hash_block_returns_int() {
-    assert!(matches!(eval("[1 + 1] hash"), Value::Int(_)));
+    assert_eq!(eval("[1 + 1] hash isNil"), Value::Bool(false));
 }
 
 #[test]

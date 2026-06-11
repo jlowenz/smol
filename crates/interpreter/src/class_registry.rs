@@ -89,7 +89,7 @@ impl ClassRegistry {
         // `Value` is the built-in passive base class (is_value: true), a subclass of Object.
         let value_class = Arc::new(Class {
             name: Arc::from("Value"),
-            superclass: Some(object_class),
+            superclass: Some(object_class.clone()),
             own_instance_vars: vec![],
             own_class_vars: vec![],
             class_var_storage: RwLock::new(HashMap::new()),
@@ -112,11 +112,37 @@ impl ClassRegistry {
             .ok();
         kernel.register(InstanceHandle(value_state));
 
+        // `Nil` is the class of `nil` (analogous to Smalltalk's `UndefinedObject`).
+        // Subclass of Object; user-defined methods on `Nil` are dispatched for `Value::Nil`
+        // receivers via `invoke_primitive_method`.
+        let nil_class = Arc::new(Class {
+            name: Arc::from("Nil"),
+            superclass: Some(object_class.clone()),
+            own_instance_vars: vec![],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(HashMap::new()),
+            indexed_slot_kind: None,
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
+            class_object: std::sync::OnceLock::new(),
+        });
+        let nil_state = Arc::new(InstanceState {
+            class: nil_class.clone(),
+            kind: InstanceKind::ClassEntity(Box::new(new_entity_data(
+                &nil_class,
+                store.clone_handle(),
+            ))),
+        });
+        nil_class.class_object.set(Arc::downgrade(&nil_state)).ok();
+        kernel.register(InstanceHandle(nil_state));
+
         let mut roots = HashMap::new();
         roots.insert(Arc::from("Kernel"), kernel.clone());
 
-        // Object and Value have no own_instance_vars; register_class_predicates is a no-op
-        // for them. No call needed here — user-defined subclasses register via handle_subclass.
+        // Object, Value, and Nil have no own_instance_vars; register_class_predicates is a
+        // no-op for them. No call needed here — user-defined subclasses register via
+        // handle_subclass.
         Self {
             kernel,
             roots: RwLock::new(roots),
@@ -179,6 +205,19 @@ impl ClassRegistry {
             class_object: std::sync::OnceLock::new(),
         });
 
+        let nil_class = Arc::new(Class {
+            name: Arc::from("Nil"),
+            superclass: Some(object_class.clone()),
+            own_instance_vars: vec![],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(HashMap::new()),
+            indexed_slot_kind: None,
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
+            class_object: std::sync::OnceLock::new(),
+        });
+
         let mut roots = HashMap::new();
         roots.insert(Arc::from("Kernel"), kernel.clone());
 
@@ -220,7 +259,7 @@ impl ClassRegistry {
         let value_handle = spawn_class_entity(
             value_class.clone(),
             arc.clone(),
-            bootstrap_env,
+            bootstrap_env.clone(),
             store.clone_handle(),
         );
         let value_id = match &value_handle.0.kind {
@@ -235,6 +274,25 @@ impl ClassRegistry {
             .set(Arc::downgrade(&value_handle.0))
             .ok();
         kernel.register(value_handle);
+
+        let nil_handle = spawn_class_entity(
+            nil_class.clone(),
+            arc.clone(),
+            bootstrap_env,
+            store.clone_handle(),
+        );
+        let nil_id = match &nil_handle.0.kind {
+            InstanceKind::ClassEntity(d) => d.id,
+            _ => unreachable!(),
+        };
+        arc.class_entities
+            .write()
+            .insert(nil_id, nil_handle.0.clone());
+        nil_class
+            .class_object
+            .set(Arc::downgrade(&nil_handle.0))
+            .ok();
+        kernel.register(nil_handle);
 
         arc.register_class_predicates(&object_class);
         arc.register_class_predicates(&value_class);
