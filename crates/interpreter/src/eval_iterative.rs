@@ -1,6 +1,10 @@
 // C30 will promote IEvaluator to the default evaluator; until then all items
 // here are only reachable via test_helpers and are flagged as dead by clippy.
 #![allow(dead_code)]
+
+/// One reduction = one completed message dispatch. Matches BEAM's "one reduction
+/// per function call" granularity. At ~1M msg/s this yields every ~1 ms.
+const YIELD_INTERVAL: u32 = 1024;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -345,6 +349,7 @@ fn handle_step_error(
 fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, EvalError> {
     let mut stack: Vec<Cont> = vec![initial_cont];
     let mut acc: Value = Value::Nil;
+    let mut reductions: u32 = 0;
 
     loop {
         let cont = match stack.pop() {
@@ -580,6 +585,11 @@ fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, EvalError> {
                     });
                     stack.push(Cont::EvalExpr { expr: next, env });
                 } else {
+                    reductions += 1;
+                    if reductions >= YIELD_INTERVAL {
+                        reductions = 0;
+                        may::coroutine::yield_now();
+                    }
                     if let Err(e) = dispatch_to_stack(
                         ev, receiver, selector, done, &mut env, &mut stack, &mut acc,
                     ) {

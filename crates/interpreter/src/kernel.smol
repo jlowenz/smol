@@ -658,6 +658,15 @@ HandlerContext >> on: anArray run: body [
 HandlerContext >> pairs            [ ^pairs ]
 HandlerContext >> run: body        [ ^self _primHCRun: body ]
 
+"Loop — block and number iteration delegating to Rust primitives for O(1) Rust
+stack depth and cooperative yield every YIELD_INTERVAL iterations."
+Block >> whileTrue: aBlock  [ ^self _primWhileTrue: aBlock ]
+Block >> whileFalse: aBlock [ ^self _primWhileFalse: aBlock ]
+Block >> whileTrue          [ ^self _primWhileTrue ]
+Block >> whileFalse         [ ^self _primWhileFalse ]
+
+Int >> timesRepeat: aBlock [ ^self _primTimesRepeat: aBlock ]
+
 "World — environment-level queries over the live entity registry."
 Object subclass: #World
     instanceVariableNames: ''

@@ -137,10 +137,61 @@ impl ClassRegistry {
         nil_class.class_object.set(Arc::downgrade(&nil_state)).ok();
         kernel.register(InstanceHandle(nil_state));
 
+        // `Block` is the class of block closures. Subclass of Object; user-defined
+        // methods dispatch for `Value::Block` receivers via `invoke_primitive_method`.
+        let block_class = Arc::new(Class {
+            name: Arc::from("Block"),
+            superclass: Some(object_class.clone()),
+            own_instance_vars: vec![],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(HashMap::new()),
+            indexed_slot_kind: None,
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
+            class_object: std::sync::OnceLock::new(),
+        });
+        let block_state = Arc::new(InstanceState {
+            class: block_class.clone(),
+            kind: InstanceKind::ClassEntity(Box::new(new_entity_data(
+                &block_class,
+                store.clone_handle(),
+            ))),
+        });
+        block_class
+            .class_object
+            .set(Arc::downgrade(&block_state))
+            .ok();
+        kernel.register(InstanceHandle(block_state));
+
+        // `Int` is the class of small integers (`Value::Int`). Subclass of Object;
+        // user-defined methods dispatch via `invoke_primitive_method`.
+        let int_class = Arc::new(Class {
+            name: Arc::from("Int"),
+            superclass: Some(object_class.clone()),
+            own_instance_vars: vec![],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(HashMap::new()),
+            indexed_slot_kind: None,
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
+            class_object: std::sync::OnceLock::new(),
+        });
+        let int_state = Arc::new(InstanceState {
+            class: int_class.clone(),
+            kind: InstanceKind::ClassEntity(Box::new(new_entity_data(
+                &int_class,
+                store.clone_handle(),
+            ))),
+        });
+        int_class.class_object.set(Arc::downgrade(&int_state)).ok();
+        kernel.register(InstanceHandle(int_state));
+
         let mut roots = HashMap::new();
         roots.insert(Arc::from("Kernel"), kernel.clone());
 
-        // Object, Value, and Nil have no own_instance_vars; register_class_predicates is a
+        // Primitive classes have no own_instance_vars; register_class_predicates is a
         // no-op for them. No call needed here — user-defined subclasses register via
         // handle_subclass.
         Self {
@@ -218,6 +269,32 @@ impl ClassRegistry {
             class_object: std::sync::OnceLock::new(),
         });
 
+        let block_class = Arc::new(Class {
+            name: Arc::from("Block"),
+            superclass: Some(object_class.clone()),
+            own_instance_vars: vec![],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(HashMap::new()),
+            indexed_slot_kind: None,
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
+            class_object: std::sync::OnceLock::new(),
+        });
+
+        let int_class = Arc::new(Class {
+            name: Arc::from("Int"),
+            superclass: Some(object_class.clone()),
+            own_instance_vars: vec![],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(HashMap::new()),
+            indexed_slot_kind: None,
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
+            class_object: std::sync::OnceLock::new(),
+        });
+
         let mut roots = HashMap::new();
         roots.insert(Arc::from("Kernel"), kernel.clone());
 
@@ -278,7 +355,7 @@ impl ClassRegistry {
         let nil_handle = spawn_class_entity(
             nil_class.clone(),
             arc.clone(),
-            bootstrap_env,
+            bootstrap_env.clone(),
             store.clone_handle(),
         );
         let nil_id = match &nil_handle.0.kind {
@@ -293,6 +370,44 @@ impl ClassRegistry {
             .set(Arc::downgrade(&nil_handle.0))
             .ok();
         kernel.register(nil_handle);
+
+        let block_handle = spawn_class_entity(
+            block_class.clone(),
+            arc.clone(),
+            bootstrap_env.clone(),
+            store.clone_handle(),
+        );
+        let block_id = match &block_handle.0.kind {
+            InstanceKind::ClassEntity(d) => d.id,
+            _ => unreachable!(),
+        };
+        arc.class_entities
+            .write()
+            .insert(block_id, block_handle.0.clone());
+        block_class
+            .class_object
+            .set(Arc::downgrade(&block_handle.0))
+            .ok();
+        kernel.register(block_handle);
+
+        let int_handle = spawn_class_entity(
+            int_class.clone(),
+            arc.clone(),
+            bootstrap_env,
+            store.clone_handle(),
+        );
+        let int_id = match &int_handle.0.kind {
+            InstanceKind::ClassEntity(d) => d.id,
+            _ => unreachable!(),
+        };
+        arc.class_entities
+            .write()
+            .insert(int_id, int_handle.0.clone());
+        int_class
+            .class_object
+            .set(Arc::downgrade(&int_handle.0))
+            .ok();
+        kernel.register(int_handle);
 
         arc.register_class_predicates(&object_class);
         arc.register_class_predicates(&value_class);

@@ -383,6 +383,65 @@ fn block_on_do_passes_through_on_success() {
     assert_eq!(eval("[42] on: Object do: [:e | 0]"), Value::Int(42));
 }
 
+// ── Loop primitives (whileTrue:/whileFalse:/timesRepeat: via kernel.smol) ───
+// Blocks cannot assign to outer locals, so state is tracked via OC message sends.
+
+#[test]
+fn while_true_counts_to_100() {
+    let src = "| oc | oc := OrderedCollection new.
+               [oc size < 100] whileTrue: [oc add: 1].
+               oc size";
+    assert_eq!(eval(src), Value::Int(100));
+}
+
+#[test]
+fn while_false_counts_to_5() {
+    let src = "| oc | oc := OrderedCollection new.
+               [oc size >= 5] whileFalse: [oc add: 1].
+               oc size";
+    assert_eq!(eval(src), Value::Int(5));
+}
+
+#[test]
+fn while_true_body_never_runs_when_condition_starts_false() {
+    let src = "| oc | oc := OrderedCollection new.
+               [false] whileTrue: [oc add: 1].
+               oc size";
+    assert_eq!(eval(src), Value::Int(0));
+}
+
+#[test]
+fn while_true_propagates_signal_from_body() {
+    assert_signal_contains(
+        &eval_err("[true] whileTrue: [Error signal: 'stop']"),
+        "stop",
+    );
+}
+
+#[test]
+fn times_repeat_five_times() {
+    let src = "| oc | oc := OrderedCollection new.
+               5 timesRepeat: [oc add: 1].
+               oc size";
+    assert_eq!(eval(src), Value::Int(5));
+}
+
+#[test]
+fn times_repeat_zero_never_runs() {
+    let src = "| oc | oc := OrderedCollection new.
+               0 timesRepeat: [oc add: 99].
+               oc size";
+    assert_eq!(eval(src), Value::Int(0));
+}
+
+#[test]
+fn times_repeat_negative_never_runs() {
+    let src = "| oc | oc := OrderedCollection new.
+               -1 timesRepeat: [oc add: 99].
+               oc size";
+    assert_eq!(eval(src), Value::Int(0));
+}
+
 // ── Object primitives ─────────────────────────────────────────────────────
 
 #[test]

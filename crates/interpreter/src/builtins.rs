@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Cooperative yield interval: one yield every N completed message dispatches.
+/// Matches the step-loop constant in eval_iterative so loop primitives and the
+/// iterative evaluator yield at the same granularity.
+const YIELD_INTERVAL: u32 = 1024;
+
 use num_bigint::BigInt;
 use num_traits::Zero;
 use parking_lot::RwLock;
@@ -512,6 +517,12 @@ fn dispatch_int(
     mut args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
+    // User-defined methods on Int take priority over builtins.
+    if let Some(int_handle) = ev.registry.kernel().lookup_class("Int")
+        && let Some((method, def_class)) = int_handle.0.class.lookup(sel)
+    {
+        return ev.invoke_primitive_method(Value::Int(n), def_class, method, args, env);
+    }
     match sel.as_ref() {
         "+" => {
             expect_arity(sel, 1, args.len())?;
@@ -689,11 +700,14 @@ fn dispatch_int(
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Float(n as f64))
         }
-        "timesRepeat:" => {
+        "_primTimesRepeat:" => {
             expect_arity(sel, 1, args.len())?;
             let blk = as_block(args.remove(0), sel)?;
-            for _ in 0..n.max(0) {
+            for i in 0..n.max(0) {
                 ev.eval_block(&blk, vec![], env)?;
+                if i > 0 && (i as u32).is_multiple_of(YIELD_INTERVAL) {
+                    may::coroutine::yield_now();
+                }
             }
             Ok(Value::Nil)
         }
@@ -1215,6 +1229,12 @@ fn dispatch_block(
     mut args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
+    // User-defined methods on Block take priority over builtins.
+    if let Some(block_handle) = ev.registry.kernel().lookup_class("Block")
+        && let Some((method, def_class)) = block_handle.0.class.lookup(sel)
+    {
+        return ev.invoke_primitive_method(Value::Block(blk), def_class, method, args, env);
+    }
     match sel.as_ref() {
         "value" => {
             expect_arity(sel, 0, args.len())?;
@@ -1232,9 +1252,10 @@ fn dispatch_block(
             expect_arity(sel, 3, args.len())?;
             ev.eval_block(&blk, args, env)
         }
-        "whileTrue:" => {
+        "_primWhileTrue:" => {
             expect_arity(sel, 1, args.len())?;
             let body = as_block(args.remove(0), sel)?;
+            let mut iters: u32 = 0;
             loop {
                 match ev.eval_block(&blk, vec![], env)? {
                     Value::Bool(true) => {
@@ -1247,12 +1268,17 @@ fn dispatch_block(
                         )));
                     }
                 }
+                iters += 1;
+                if iters.is_multiple_of(YIELD_INTERVAL) {
+                    may::coroutine::yield_now();
+                }
             }
             Ok(Value::Nil)
         }
-        "whileFalse:" => {
+        "_primWhileFalse:" => {
             expect_arity(sel, 1, args.len())?;
             let body = as_block(args.remove(0), sel)?;
+            let mut iters: u32 = 0;
             loop {
                 match ev.eval_block(&blk, vec![], env)? {
                     Value::Bool(false) => {
@@ -1265,11 +1291,16 @@ fn dispatch_block(
                         )));
                     }
                 }
+                iters += 1;
+                if iters.is_multiple_of(YIELD_INTERVAL) {
+                    may::coroutine::yield_now();
+                }
             }
             Ok(Value::Nil)
         }
-        "whileTrue" => {
+        "_primWhileTrue" => {
             expect_arity(sel, 0, args.len())?;
+            let mut iters: u32 = 0;
             loop {
                 match ev.eval_block(&blk, vec![], env)? {
                     Value::Bool(true) => {}
@@ -1280,11 +1311,16 @@ fn dispatch_block(
                         )));
                     }
                 }
+                iters += 1;
+                if iters.is_multiple_of(YIELD_INTERVAL) {
+                    may::coroutine::yield_now();
+                }
             }
             Ok(Value::Nil)
         }
-        "whileFalse" => {
+        "_primWhileFalse" => {
             expect_arity(sel, 0, args.len())?;
+            let mut iters: u32 = 0;
             loop {
                 match ev.eval_block(&blk, vec![], env)? {
                     Value::Bool(false) => {}
@@ -1294,6 +1330,10 @@ fn dispatch_block(
                             "{sel}: block must return Bool"
                         )));
                     }
+                }
+                iters += 1;
+                if iters.is_multiple_of(YIELD_INTERVAL) {
+                    may::coroutine::yield_now();
                 }
             }
             Ok(Value::Nil)
