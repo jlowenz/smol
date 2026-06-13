@@ -302,7 +302,25 @@ pub(crate) fn lookup_user_method(
                 def_class,
             })
         }
-        _ => None, // Int, Float, Bool, Str, Symbol, Block, LargeInt, Future, Namespace
+        Value::Block(blk) => {
+            let blk_cls = ev.registry.kernel().lookup_class("Block")?;
+            let (method, def_class) = blk_cls.0.class.lookup(selector)?;
+            Some(UserMethodFound::Primitive {
+                self_value: Value::Block(blk.clone()),
+                method,
+                def_class,
+            })
+        }
+        Value::Int(n) => {
+            let int_cls = ev.registry.kernel().lookup_class("Int")?;
+            let (method, def_class) = int_cls.0.class.lookup(selector)?;
+            Some(UserMethodFound::Primitive {
+                self_value: Value::Int(*n),
+                method,
+                def_class,
+            })
+        }
+        _ => None, // Float, Bool, Str, Symbol, LargeInt, Future, Namespace
     }
 }
 
@@ -313,7 +331,11 @@ fn mnu(recv_kind: &'static str, selector: &Arc<str>) -> EvalError {
     }
 }
 
-fn expect_arity(_selector: &Arc<str>, expected: usize, got: usize) -> Result<(), EvalError> {
+pub(crate) fn expect_arity(
+    _selector: &Arc<str>,
+    expected: usize,
+    got: usize,
+) -> Result<(), EvalError> {
     if got != expected {
         Err(EvalError::ArityMismatch { expected, got })
     } else {
@@ -343,7 +365,7 @@ fn as_int(v: Value, selector: &Arc<str>) -> Result<i64, EvalError> {
     }
 }
 
-fn as_block(v: Value, selector: &Arc<str>) -> Result<Arc<Block>, EvalError> {
+pub(crate) fn as_block(v: Value, selector: &Arc<str>) -> Result<Arc<Block>, EvalError> {
     match force_value(v)? {
         Value::Block(b) => Ok(b),
         _ => Err(EvalError::TypeError(format!(
@@ -517,12 +539,8 @@ fn dispatch_int(
     mut args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
-    // User-defined methods on Int take priority over builtins.
-    if let Some(int_handle) = ev.registry.kernel().lookup_class("Int")
-        && let Some((method, def_class)) = int_handle.0.class.lookup(sel)
-    {
-        return ev.invoke_primitive_method(Value::Int(n), def_class, method, args, env);
-    }
+    // Note: user-defined Int methods are now routed via lookup_user_method in the
+    // iterative evaluator. The old (recursive) evaluator reaches builtins directly.
     match sel.as_ref() {
         "+" => {
             expect_arity(sel, 1, args.len())?;
@@ -700,7 +718,11 @@ fn dispatch_int(
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Float(n as f64))
         }
-        "_primTimesRepeat:" => {
+        // `timesRepeat:` is the public selector; `_primTimesRepeat:` is the legacy
+        // primitive name kept for backward compatibility. Both run the Rust loop
+        // in the old (recursive) evaluator; the iterative evaluator routes through
+        // the Smol recursive kernel.smol method via lookup_user_method instead.
+        "timesRepeat:" | "_primTimesRepeat:" => {
             expect_arity(sel, 1, args.len())?;
             let blk = as_block(args.remove(0), sel)?;
             for i in 0..n.max(0) {
@@ -1229,12 +1251,8 @@ fn dispatch_block(
     mut args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
-    // User-defined methods on Block take priority over builtins.
-    if let Some(block_handle) = ev.registry.kernel().lookup_class("Block")
-        && let Some((method, def_class)) = block_handle.0.class.lookup(sel)
-    {
-        return ev.invoke_primitive_method(Value::Block(blk), def_class, method, args, env);
-    }
+    // Note: user-defined Block methods are now routed via lookup_user_method in the
+    // iterative evaluator. The old (recursive) evaluator reaches builtins directly.
     match sel.as_ref() {
         "value" => {
             expect_arity(sel, 0, args.len())?;
@@ -1252,7 +1270,12 @@ fn dispatch_block(
             expect_arity(sel, 3, args.len())?;
             ev.eval_block(&blk, args, env)
         }
-        "_primWhileTrue:" => {
+        // Public selectors are aliased with their legacy _prim* names.
+        // The old (recursive) evaluator reaches these arms directly.
+        // The iterative evaluator routes through the Smol recursive kernel.smol
+        // methods via lookup_user_method + TCO, so these arms are not reached
+        // from that path for whileTrue: and whileFalse:.
+        "whileTrue:" | "_primWhileTrue:" => {
             expect_arity(sel, 1, args.len())?;
             let body = as_block(args.remove(0), sel)?;
             let mut iters: u32 = 0;
@@ -1275,7 +1298,7 @@ fn dispatch_block(
             }
             Ok(Value::Nil)
         }
-        "_primWhileFalse:" => {
+        "whileFalse:" | "_primWhileFalse:" => {
             expect_arity(sel, 1, args.len())?;
             let body = as_block(args.remove(0), sel)?;
             let mut iters: u32 = 0;
@@ -1298,7 +1321,7 @@ fn dispatch_block(
             }
             Ok(Value::Nil)
         }
-        "_primWhileTrue" => {
+        "whileTrue" | "_primWhileTrue" => {
             expect_arity(sel, 0, args.len())?;
             let mut iters: u32 = 0;
             loop {
@@ -1318,7 +1341,7 @@ fn dispatch_block(
             }
             Ok(Value::Nil)
         }
-        "_primWhileFalse" => {
+        "whileFalse" | "_primWhileFalse" => {
             expect_arity(sel, 0, args.len())?;
             let mut iters: u32 = 0;
             loop {

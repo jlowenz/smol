@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::ast::{Expr, Message, MethodDef, Stmt};
-use crate::builtins::{UserMethodFound, lookup_user_method};
+use crate::builtins::{UserMethodFound, as_block, lookup_user_method};
 use crate::class::{Class, Method};
 use crate::entity::InstanceHandle;
 use crate::env::Env;
@@ -346,7 +346,7 @@ fn handle_step_error(
 ///   `ev.method_stack`.
 /// Ensures: returns the value accumulated when the continuation stack
 ///   is empty, or propagates the first terminal error.
-fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, EvalError> {
+pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, EvalError> {
     let mut stack: Vec<Cont> = vec![initial_cont];
     let mut acc: Value = Value::Nil;
     let mut reductions: u32 = 0;
@@ -733,10 +733,181 @@ fn dispatch_stmt(
     Ok(())
 }
 
-/// Dispatch a message send, either by pushing a `CallFrame` for user-defined methods
-/// or by calling `builtins::dispatch` for everything else.
+/// Push a block evaluation frame onto the iterative stack.
+///
+/// Requires: `args.len() == block.params.len()`.
+/// Ensures: equivalent to `Evaluator::eval_block` but reuses the caller's continuation
+///   stack; no nested `step_loop` call is made. Suitable for `value`, `value:`,
+///   `ifTrue:`, `ifFalse:` and other block-evaluation sites where a `Future` block
+///   result is acceptable (caller will force if needed). NOT suitable for
+///   `syncValue`, `on:do:`, or `ensure:`, which require inter-statement future forcing.
+pub(crate) fn push_block_frame(
+    ev: &Evaluator,
+    block: &Arc<crate::value::Block>,
+    args: Vec<Value>,
+    stack: &mut Vec<Cont>,
+) -> Result<(), EvalError> {
+    use crate::ast::Stmt;
+    if args.len() != block.params.len() {
+        return Err(EvalError::ArityMismatch {
+            expected: block.params.len(),
+            got: args.len(),
+        });
+    }
+    let mut block_env = block.env.clone();
+    block_env.push_frame();
+    for name in &block.locals {
+        block_env.define(name.clone(), Value::Nil);
+    }
+    for (name, val) in block.params.iter().zip(args) {
+        block_env.define(name.clone(), val);
+    }
+    for stmt in &block.body {
+        if let Stmt::LocalDecl(names) = stmt {
+            for name in names {
+                block_env.define(name.clone(), Value::Nil);
+            }
+        }
+    }
+    let saved_home = ev.current_block_home.get();
+    ev.current_block_home.set(Some(block.home_depth));
+    stack.push(Cont::CallFrame {
+        self_binding: None,
+        depth: 0,
+        pending: block.body.iter().cloned().collect(),
+        env: block_env,
+        implicit_return: Value::Nil,
+        is_method: false,
+        pops_env: true,
+        saved_block_home: saved_home,
+        frame_block_home: Some(block.home_depth),
+        defining_class: None,
+    });
+    Ok(())
+}
+
+/// Drain tail-call frame patterns from the stack before pushing a new callee.
+///
+/// Requires: none (safe to call on any stack state; no-op if no pattern matches).
+/// Ensures:
+///   (1) All empty block frames (`is_method=false`, `pending` empty) at the top are
+///       drained (env popped, `current_block_home` restored).
+///   (2) If the top is then `ReturnUnwind(D)` and, scanning past any further empty
+///       block frames, the next is an empty method frame at depth D, the entire
+///       sequence (ReturnUnwind + intervening block frames + method frame) is drained.
+///   (3) Steps (1)–(2) repeat until no further pattern applies.
+///   Safe: empty block frames return `acc` unchanged; `ReturnUnwind(D)` would have
+///   overridden the method's implicit self-return with the same value the new callee
+///   will produce.
+fn drain_tail_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
+    loop {
+        // Phase 1: drain leading empty block frames.
+        loop {
+            let should_drain = matches!(
+                stack.last(),
+                Some(Cont::CallFrame { is_method: false, pending, .. }) if pending.is_empty()
+            );
+            if !should_drain {
+                break;
+            }
+            if let Some(Cont::CallFrame {
+                saved_block_home,
+                pops_env,
+                mut env,
+                ..
+            }) = stack.pop()
+            {
+                ev.current_block_home.set(saved_block_home);
+                if pops_env {
+                    env.pop_frame();
+                }
+            }
+        }
+
+        // Phase 2: check for ReturnUnwind(D) followed (past empty block frames)
+        // by an empty method frame at depth D.
+        let target = match stack.last() {
+            Some(Cont::ReturnUnwind { target_depth }) => *target_depth,
+            _ => break,
+        };
+
+        // Scan downward past empty block frames to find the matching method frame.
+        let mut scan_idx = stack.len().checked_sub(2);
+        let mut intermediate = 0usize;
+        let found_method = loop {
+            match scan_idx {
+                None => break false,
+                Some(idx) => match stack.get(idx) {
+                    Some(Cont::CallFrame {
+                        is_method: false,
+                        pending,
+                        ..
+                    }) if pending.is_empty() => {
+                        intermediate += 1;
+                        scan_idx = idx.checked_sub(1);
+                    }
+                    Some(Cont::CallFrame {
+                        is_method: true,
+                        depth,
+                        pending,
+                        ..
+                    }) if *depth == target && pending.is_empty() => {
+                        break true;
+                    }
+                    _ => break false,
+                },
+            }
+        };
+
+        if !found_method {
+            break;
+        }
+
+        // Drain: ReturnUnwind, then intermediate empty block frames, then the method frame.
+        stack.pop(); // ReturnUnwind
+        for _ in 0..intermediate {
+            if let Some(Cont::CallFrame {
+                saved_block_home,
+                pops_env,
+                mut env,
+                ..
+            }) = stack.pop()
+            {
+                ev.current_block_home.set(saved_block_home);
+                if pops_env {
+                    env.pop_frame();
+                }
+            }
+        }
+        if let Some(Cont::CallFrame {
+            saved_block_home,
+            pops_env,
+            mut env,
+            is_method: true,
+            ..
+        }) = stack.pop()
+        {
+            ev.pop_self();
+            ev.current_block_home.set(saved_block_home);
+            if pops_env {
+                env.pop_frame();
+            }
+        }
+        // Repeat: there may be another drainable layer above.
+    }
+}
+
+/// Dispatch a message send to the iterative stack.
 ///
 /// Requires: `args` are fully evaluated in left-to-right order.
+/// Ensures:
+///   (1) User-defined methods for Block/Int/Nil/ValueObject/Entity-self-send found
+///       via `lookup_user_method` → TCO drain + `push_method_call_frame`.
+///   (2) `Block >> value` family → `push_block_frame` (no nested step_loop).
+///   (3) `Bool >> ifTrue:` family → `push_block_frame` for selected branch,
+///       or `acc = Value::Nil` for the unchosen branch.
+///   (4) All other selectors → `builtins::dispatch` (preserves syncValue/on:do:/
+///       ensure: sync semantics).
 fn dispatch_to_stack(
     ev: &Evaluator,
     receiver: Value,
@@ -746,11 +917,83 @@ fn dispatch_to_stack(
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
+    // (1) User-defined method lookup (covers Block, Int, Nil, ValueObject, entity self-send).
     if let Some(found) = lookup_user_method(ev, &receiver, &selector) {
+        drain_tail_frames(ev, stack);
         push_method_call_frame(ev, found, args, env, stack)?;
-    } else {
-        *acc = crate::builtins::dispatch(ev, receiver, selector, args, env)?;
+        return Ok(());
     }
+
+    // (2) Inline Block value/value:/value:value:/value:value:value: dispatch.
+    if let Value::Block(ref blk) = receiver {
+        let arity: Option<usize> = match selector.as_ref() {
+            "value" => Some(0),
+            "value:" => Some(1),
+            "value:value:" => Some(2),
+            "value:value:value:" => Some(3),
+            _ => None,
+        };
+        if let Some(expected) = arity {
+            if args.len() != expected {
+                return Err(EvalError::ArityMismatch {
+                    expected,
+                    got: args.len(),
+                });
+            }
+            push_block_frame(ev, blk, args, stack)?;
+            return Ok(());
+        }
+    }
+
+    // (3) Inline Bool ifTrue:/ifFalse:/ifTrue:ifFalse:/ifFalse:ifTrue: dispatch.
+    if let Value::Bool(b) = receiver {
+        match selector.as_ref() {
+            "ifTrue:" => {
+                let blk = as_block(args.into_iter().next().unwrap_or(Value::Nil), &selector)?;
+                if b {
+                    push_block_frame(ev, &blk, vec![], stack)?;
+                } else {
+                    *acc = Value::Nil;
+                }
+                return Ok(());
+            }
+            "ifFalse:" => {
+                let blk = as_block(args.into_iter().next().unwrap_or(Value::Nil), &selector)?;
+                if !b {
+                    push_block_frame(ev, &blk, vec![], stack)?;
+                } else {
+                    *acc = Value::Nil;
+                }
+                return Ok(());
+            }
+            "ifTrue:ifFalse:" => {
+                let mut iter = args.into_iter();
+                let t_blk = as_block(iter.next().unwrap_or(Value::Nil), &selector)?;
+                let f_blk = as_block(iter.next().unwrap_or(Value::Nil), &selector)?;
+                if b {
+                    push_block_frame(ev, &t_blk, vec![], stack)?;
+                } else {
+                    push_block_frame(ev, &f_blk, vec![], stack)?;
+                }
+                return Ok(());
+            }
+            "ifFalse:ifTrue:" => {
+                let mut iter = args.into_iter();
+                let f_blk = as_block(iter.next().unwrap_or(Value::Nil), &selector)?;
+                let t_blk = as_block(iter.next().unwrap_or(Value::Nil), &selector)?;
+                if b {
+                    push_block_frame(ev, &t_blk, vec![], stack)?;
+                } else {
+                    push_block_frame(ev, &f_blk, vec![], stack)?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    // (4) All other selectors fall through to builtins (preserves syncValue/on:do:/ensure:).
+    *acc = crate::builtins::dispatch(ev, receiver, selector, args, env)?;
     Ok(())
 }
 
@@ -759,7 +1002,7 @@ fn dispatch_to_stack(
 /// Requires: `args.len() == method.pattern.params().len()`.
 /// Ensures: a `CallFrame` is pushed onto `stack` with the method env set up;
 ///   `ev.method_stack` is updated (push_self called).
-fn push_method_call_frame(
+pub(crate) fn push_method_call_frame(
     ev: &Evaluator,
     found: UserMethodFound,
     args: Vec<Value>,
@@ -963,7 +1206,10 @@ mod tests {
             let ev = IEvaluator::new(Arc::new(Evaluator::new()));
             let mut env = Env::new();
             ev.inner.registry.populate_env(&mut env);
-            let result = ev.eval_program(&prog.stmts, &mut env);
+            let result = ev.eval_program(&prog.stmts, &mut env).and_then(|v| {
+                // Resolve top-level Futures so tests can assert against concrete values.
+                crate::builtins::force_value(v)
+            });
             ev.inner.shutdown();
             tx.send(result).unwrap();
         });
@@ -1111,5 +1357,106 @@ mod tests {
         ";
         let v = iter_eval(src).unwrap();
         assert_eq!(v, Value::Int(42));
+    }
+
+    // ── C29.6: TCO loop tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn while_true_1000_iterations() {
+        // Exercises the Smol recursive whileTrue: + TCO. Would stack-overflow
+        // without drain_tail_frames eliminating the accumulated frames.
+        let src = "
+            | c |
+            c := OrderedCollection new.
+            [ c size < 1000 ] whileTrue: [ c add: 1 ].
+            c size
+        ";
+        let v = iter_eval(src).unwrap();
+        assert_eq!(v, Value::Int(1000));
+    }
+
+    #[test]
+    fn while_false_1000_iterations() {
+        let src = "
+            | c |
+            c := OrderedCollection new.
+            [ c size >= 1000 ] whileFalse: [ c add: 1 ].
+            c size
+        ";
+        let v = iter_eval(src).unwrap();
+        assert_eq!(v, Value::Int(1000));
+    }
+
+    #[test]
+    fn times_repeat_1000() {
+        let src = "
+            | c |
+            c := OrderedCollection new.
+            1000 timesRepeat: [ c add: 1 ].
+            c size
+        ";
+        let v = iter_eval(src).unwrap();
+        assert_eq!(v, Value::Int(1000));
+    }
+
+    #[test]
+    fn user_recursive_count_down() {
+        // Exercises ReturnUnwind TCO: countFrom: tail-calls itself via ^.
+        // Would stack-overflow at depth 1000 without TCO.
+        let src = "
+            Value subclass: #Counter instanceVariableNames: ''.
+            Counter >> countFrom: n [
+                n = 0 ifTrue: [ ^0 ].
+                ^self countFrom: n - 1
+            ].
+            Counter new countFrom: 1000
+        ";
+        let v = iter_eval(src).unwrap();
+        assert_eq!(v, Value::Int(0));
+    }
+
+    #[test]
+    fn nonlocal_return_through_inline_iftrue() {
+        // Verifies ^-return unwinds correctly through an inlined ifTrue: block frame.
+        let src = "
+            Value subclass: #Foo instanceVariableNames: ''.
+            Foo >> test: cond [
+                cond ifTrue: [ ^42 ].
+                ^0
+            ].
+            Foo new test: true
+        ";
+        let v = iter_eval(src).unwrap();
+        assert_eq!(v, Value::Int(42));
+    }
+
+    #[test]
+    fn nonlocal_return_through_inline_iffalse() {
+        let src = "
+            Value subclass: #Foo instanceVariableNames: ''.
+            Foo >> test: cond [
+                cond ifFalse: [ ^42 ].
+                ^0
+            ].
+            Foo new test: false
+        ";
+        let v = iter_eval(src).unwrap();
+        assert_eq!(v, Value::Int(42));
+    }
+
+    #[test]
+    fn inline_iftrue_iffalse_both_branches() {
+        // ifTrue:ifFalse: dispatches to the correct branch inline.
+        let src = "
+            Value subclass: #Foo instanceVariableNames: ''.
+            Foo >> pick: b [
+                ^b ifTrue: [ 1 ] ifFalse: [ 2 ]
+            ].
+            | f |
+            f := Foo new.
+            (f pick: true) + (f pick: false)
+        ";
+        let v = iter_eval(src).unwrap();
+        assert_eq!(v, Value::Int(3));
     }
 }

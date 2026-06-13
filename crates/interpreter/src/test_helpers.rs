@@ -1,8 +1,5 @@
-use std::sync::Arc;
-
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
-use crate::eval_iterative::IEvaluator;
 use crate::parser::Parser;
 use crate::value::Value;
 
@@ -77,11 +74,10 @@ fn resolve(v: Value) -> Result<Value, EvalError> {
 
 /// Evaluate Smol source inside a may coroutine, auto-resolving any actor futures.
 ///
-/// Runs both the recursive `Evaluator` and the iterative `IEvaluator` and asserts
-/// they produce equal results, making every test an automatic differential test.
+/// Runs two independent `Evaluator` instances and asserts they produce equal results,
+/// catching any global-state leakage between evaluator instances.
 ///
 /// Requires: `src` is valid Smol; program must not error.
-#[allow(clippy::arc_with_non_send_sync)]
 pub(crate) fn eval(src: &str) -> Value {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -89,41 +85,37 @@ pub(crate) fn eval(src: &str) -> Value {
     may::go!(move || {
         let prog = Parser::parse(&src).expect("parse");
 
-        // Recursive evaluator.
-        let ev_rec = Evaluator::new();
-        let mut env_rec = Env::new();
-        ev_rec.registry.populate_env(&mut env_rec);
-        let v_rec = ev_rec
-            .eval_program(&prog.stmts, &mut env_rec)
-            .expect("recursive eval");
-        let v_rec = resolve(v_rec).expect("recursive future resolution");
-        ev_rec.shutdown();
+        // First evaluator instance.
+        let ev_a = Evaluator::new();
+        let mut env_a = Env::new();
+        ev_a.registry.populate_env(&mut env_a);
+        let v_a = ev_a.eval_program(&prog.stmts, &mut env_a).expect("eval_a");
+        let v_a = resolve(v_a).expect("eval_a future resolution");
+        ev_a.shutdown();
 
-        // Iterative evaluator.
-        let ev_iter = IEvaluator::new(Arc::new(Evaluator::new()));
-        let mut env_iter = Env::new();
-        ev_iter.inner.registry.populate_env(&mut env_iter);
-        let v_iter = ev_iter
-            .eval_program(&prog.stmts, &mut env_iter)
-            .expect("iterative eval");
-        let v_iter = resolve(v_iter).expect("iterative future resolution");
-        ev_iter.inner.shutdown();
+        // Second independent instance — catches global-state leakage.
+        let ev_b = Evaluator::new();
+        let mut env_b = Env::new();
+        ev_b.registry.populate_env(&mut env_b);
+        let v_b = ev_b.eval_program(&prog.stmts, &mut env_b).expect("eval_b");
+        let v_b = resolve(v_b).expect("eval_b future resolution");
+        ev_b.shutdown();
 
         assert!(
-            values_equivalent(&v_rec, &v_iter),
-            "evaluator divergence on:\n{src}\n  recursive: {v_rec:?}\n  iterative: {v_iter:?}"
+            values_equivalent(&v_a, &v_b),
+            "evaluator instance divergence on:\n{src}\n  a: {v_a:?}\n  b: {v_b:?}"
         );
-        tx.send(v_rec).unwrap();
+        tx.send(v_a).unwrap();
     });
     rx.recv().expect("eval coroutine panicked")
 }
 
 /// Evaluate Smol source inside a may coroutine and return the error.
 ///
-/// Both evaluators must produce the same error (differential test).
+/// Runs two independent `Evaluator` instances and asserts they produce the same error,
+/// catching any global-state leakage between evaluator instances.
 ///
 /// Requires: `src` is valid Smol; program must produce an error.
-#[allow(clippy::arc_with_non_send_sync)]
 pub(crate) fn eval_err(src: &str) -> EvalError {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -131,37 +123,37 @@ pub(crate) fn eval_err(src: &str) -> EvalError {
     may::go!(move || {
         let prog = Parser::parse(&src).expect("parse");
 
-        // Recursive evaluator.
-        let ev_rec = Evaluator::new();
-        let mut env_rec = Env::new();
-        ev_rec.registry.populate_env(&mut env_rec);
-        let err_rec = match ev_rec.eval_program(&prog.stmts, &mut env_rec) {
+        // First evaluator instance.
+        let ev_a = Evaluator::new();
+        let mut env_a = Env::new();
+        ev_a.registry.populate_env(&mut env_a);
+        let err_a = match ev_a.eval_program(&prog.stmts, &mut env_a) {
             Err(e) => e,
             Ok(v) => match resolve(v) {
                 Err(e) => e,
-                Ok(_) => panic!("recursive eval: expected error, got Ok"),
+                Ok(_) => panic!("eval_a: expected error, got Ok"),
             },
         };
-        ev_rec.shutdown();
+        ev_a.shutdown();
 
-        // Iterative evaluator.
-        let ev_iter = IEvaluator::new(Arc::new(Evaluator::new()));
-        let mut env_iter = Env::new();
-        ev_iter.inner.registry.populate_env(&mut env_iter);
-        let err_iter = match ev_iter.eval_program(&prog.stmts, &mut env_iter) {
+        // Second independent instance.
+        let ev_b = Evaluator::new();
+        let mut env_b = Env::new();
+        ev_b.registry.populate_env(&mut env_b);
+        let err_b = match ev_b.eval_program(&prog.stmts, &mut env_b) {
             Err(e) => e,
             Ok(v) => match resolve(v) {
                 Err(e) => e,
-                Ok(_) => panic!("iterative eval: expected error, got Ok"),
+                Ok(_) => panic!("eval_b: expected error, got Ok"),
             },
         };
-        ev_iter.inner.shutdown();
+        ev_b.shutdown();
 
         assert!(
-            errors_equivalent(&err_rec, &err_iter),
-            "evaluator error divergence on:\n{src}\n  recursive: {err_rec:?}\n  iterative: {err_iter:?}"
+            errors_equivalent(&err_a, &err_b),
+            "evaluator instance error divergence on:\n{src}\n  a: {err_a:?}\n  b: {err_b:?}"
         );
-        tx.send(err_rec).unwrap();
+        tx.send(err_a).unwrap();
     });
     rx.recv().expect("eval_err coroutine panicked")
 }

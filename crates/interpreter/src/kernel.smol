@@ -658,14 +658,42 @@ HandlerContext >> on: anArray run: body [
 HandlerContext >> pairs            [ ^pairs ]
 HandlerContext >> run: body        [ ^self _primHCRun: body ]
 
-"Loop — block and number iteration delegating to Rust primitives for O(1) Rust
-stack depth and cooperative yield every YIELD_INTERVAL iterations."
-Block >> whileTrue: aBlock  [ ^self _primWhileTrue: aBlock ]
-Block >> whileFalse: aBlock [ ^self _primWhileFalse: aBlock ]
-Block >> whileTrue          [ ^self _primWhileTrue ]
-Block >> whileFalse         [ ^self _primWhileFalse ]
+"Loop — pure Smol recursive implementations enabled by inline block dispatch and
+TCO in the iterative evaluator. The _prim* builtins in builtins.rs remain as
+direct fallbacks for the old (recursive) evaluator, which reaches them via the
+aliased 'whileTrue:'/'_primWhileTrue:' match arms without going through these
+Smol methods."
 
-Int >> timesRepeat: aBlock [ ^self _primTimesRepeat: aBlock ]
+Block >> whileTrue: aBlock [
+    self value ifFalse: [ ^nil ].
+    aBlock value.
+    ^self whileTrue: aBlock
+]
+
+Block >> whileFalse: aBlock [
+    self value ifTrue: [ ^nil ].
+    aBlock value.
+    ^self whileFalse: aBlock
+]
+
+Block >> whileTrue [
+    self value ifFalse: [ ^nil ].
+    ^self whileTrue
+]
+
+Block >> whileFalse [
+    self value ifTrue: [ ^nil ].
+    ^self whileFalse
+]
+
+"timesRepeat: recurses on (self - 1) instead of mutating a counter variable,
+avoiding NonLocalBlockAssignment. The iterative evaluator handles this O(1) via
+TCO; the old evaluator uses the _primTimesRepeat: alias in dispatch_int directly."
+Int >> timesRepeat: aBlock [
+    self > 0 ifFalse: [ ^nil ].
+    aBlock value.
+    ^(self - 1) timesRepeat: aBlock
+]
 
 "World — environment-level queries over the live entity registry."
 Object subclass: #World

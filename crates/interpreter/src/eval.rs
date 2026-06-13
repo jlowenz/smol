@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 use crate::entity::{EntityId, InstanceHandle, InstanceKind, InstanceState};
+use crate::eval_iterative::{Cont, push_method_call_frame, step_loop};
 use triple_store::store::{OwnedStoreTransaction, Store};
 
 use thiserror::Error;
@@ -349,7 +350,41 @@ impl Evaluator {
     /// Ensures: returns the value of the last statement, or `Value::Nil` if
     ///   `stmts` is empty. `EvalError::Return` propagates to the caller; a
     ///   method-frame caller should catch and unwrap it.
+    /// Iterative entry point: runs `stmts` via the step-loop evaluator.
+    ///
+    /// Requires: `env` has at least one live frame.
+    /// Ensures: semantically identical to `eval_program_recursive`; Smol method calls
+    ///   use heap-allocated `CallFrame`s rather than Rust stack frames.
     pub fn eval_program(&self, stmts: &[Stmt], env: &mut Env) -> Result<Value, EvalError> {
+        for stmt in stmts {
+            if let Stmt::LocalDecl(names) = stmt {
+                for name in names {
+                    env.define(name.clone(), Value::Nil);
+                }
+            }
+        }
+        let frame = Cont::CallFrame {
+            self_binding: None,
+            depth: 0,
+            pending: stmts.iter().cloned().collect(),
+            env: env.clone(),
+            implicit_return: Value::Nil,
+            is_method: false,
+            pops_env: false,
+            saved_block_home: self.current_block_home.get(),
+            frame_block_home: None,
+            defining_class: None,
+        };
+        step_loop(self, frame)
+    }
+
+    /// Reference recursive implementation retained for differential testing.
+    /// Production code uses `eval_program`.
+    pub(crate) fn eval_program_recursive(
+        &self,
+        stmts: &[Stmt],
+        env: &mut Env,
+    ) -> Result<Value, EvalError> {
         // Pre-bind all LocalDecl names to nil before evaluating any statement.
         for stmt in stmts {
             if let Stmt::LocalDecl(names) = stmt {
@@ -688,13 +723,60 @@ impl Evaluator {
         crate::builtins::dispatch(self, recv, selector, args, env)
     }
 
-    /// Evaluate a `Block` value by sending it `value` / `value:` etc.
+    /// Iterative `Block` evaluation: runs via the step-loop evaluator.
     ///
-    /// Sets `current_block_home` to the block's `home_depth` so that any `^`
-    /// inside the block targets the correct enclosing method frame. Does NOT
-    /// catch `EvalError::Return` — it propagates to `invoke_method` / `invoke_class_method`
-    /// of the frame whose depth matches the Return's target.
+    /// Requires: `args.len() == block.params.len()`.
+    /// Ensures: semantically identical to `eval_block_recursive`; method calls within
+    ///   the body use heap-allocated `CallFrame`s rather than Rust stack frames.
+    ///   Does NOT catch `EvalError::Return` — it propagates to the matching frame.
     pub fn eval_block(
+        &self,
+        block: &Block,
+        args: Vec<Value>,
+        _outer_env: &mut Env,
+    ) -> Result<Value, EvalError> {
+        if args.len() != block.params.len() {
+            return Err(EvalError::ArityMismatch {
+                expected: block.params.len(),
+                got: args.len(),
+            });
+        }
+        let mut block_env = block.env.clone();
+        block_env.push_frame();
+        for name in &block.locals {
+            block_env.define(name.clone(), Value::Nil);
+        }
+        for (name, val) in block.params.iter().zip(args) {
+            block_env.define(name.clone(), val);
+        }
+        for stmt in &block.body {
+            if let Stmt::LocalDecl(names) = stmt {
+                for name in names {
+                    block_env.define(name.clone(), Value::Nil);
+                }
+            }
+        }
+        let saved_home = self.current_block_home.get();
+        let frame = Cont::CallFrame {
+            self_binding: None,
+            depth: 0,
+            pending: block.body.iter().cloned().collect(),
+            env: block_env,
+            implicit_return: Value::Nil,
+            is_method: false,
+            pops_env: true,
+            saved_block_home: saved_home,
+            frame_block_home: Some(block.home_depth),
+            defining_class: None,
+        };
+        self.current_block_home.set(Some(block.home_depth));
+        // current_block_home is restored by the CallFrame when it pops.
+        step_loop(self, frame)
+    }
+
+    /// Reference recursive implementation retained for differential testing.
+    /// Production code uses `eval_block`.
+    pub(crate) fn eval_block_recursive(
         &self,
         block: &Block,
         args: Vec<Value>,
@@ -717,7 +799,7 @@ impl Evaluator {
         for (name, val) in block.params.iter().zip(args) {
             block_env.define(name.clone(), val);
         }
-        let result = self.eval_program(&block.body, &mut block_env);
+        let result = self.eval_program_recursive(&block.body, &mut block_env);
         block_env.pop_frame();
         self.current_block_home.set(prev_home);
         result
@@ -774,15 +856,35 @@ impl Evaluator {
         Ok(last)
     }
 
-    /// Invoke a user-defined method on a receiver object.
+    /// Iterative method invocation: runs via the step-loop evaluator.
     ///
     /// Requires: `args.len() == method.pattern.params().len()`.
-    /// Ensures: method locals and `self` are bound in a fresh frame; the frame
-    ///   is cleaned up on return; a method with no explicit `^` returns
-    ///   `Value::Instance(handle)` (Smalltalk implicit self return); `EvalError::Return`
-    ///   whose depth matches this frame is caught and unwrapped; Returns
-    ///   targeting an outer frame propagate.
+    /// Ensures: semantically identical to `invoke_method_recursive`; Smol calls
+    ///   within the body use heap-allocated `CallFrame`s rather than Rust stack frames.
     pub fn invoke_method(
+        &self,
+        handle: InstanceHandle,
+        defining_class: Arc<Class>,
+        method: Arc<Method>,
+        args: Vec<Value>,
+        env: &mut Env,
+    ) -> Result<Value, EvalError> {
+        let found = crate::builtins::UserMethodFound::Instance {
+            handle,
+            method,
+            def_class: defining_class,
+        };
+        let mut stack = Vec::new();
+        push_method_call_frame(self, found, args, env, &mut stack)?;
+        let initial = stack
+            .pop()
+            .expect("push_method_call_frame must push exactly one frame");
+        step_loop(self, initial)
+    }
+
+    /// Reference recursive implementation retained for differential testing.
+    /// Production code uses `invoke_method`.
+    pub(crate) fn invoke_method_recursive(
         &self,
         handle: InstanceHandle,
         defining_class: Arc<Class>,
@@ -812,11 +914,9 @@ impl Evaluator {
             defining_class,
         });
         let my_depth = self.method_depth.get();
-        // A method body is not a block: reset current_block_home so that ^-returns
-        // inside this body target this frame (not the block home of a caller).
         let prev_home = self.current_block_home.get();
         self.current_block_home.set(None);
-        let result = self.eval_program(&method.body, &mut method_env);
+        let result = self.eval_program_recursive(&method.body, &mut method_env);
         self.current_block_home.set(prev_home);
         self.pop_self();
         method_env.pop_frame();
@@ -827,14 +927,69 @@ impl Evaluator {
         }
     }
 
-    /// Invoke a user-defined class-side method.
+    /// Iterative class-side method invocation: runs via the step-loop evaluator.
     ///
     /// Requires: `args.len() == method.pattern.params().len()`.
-    /// Ensures: `self` is bound to `Value::Instance(handle)` in the method frame;
-    ///   a method with no explicit `^` returns `Value::Instance(handle)` (Smalltalk
-    ///   implicit self return); `EvalError::Return` whose depth matches this
-    ///   frame is caught and unwrapped.
+    /// Ensures: semantically identical to `invoke_class_method_recursive`; Smol calls
+    ///   within the body use heap-allocated `CallFrame`s rather than Rust stack frames.
     pub fn invoke_class_method(
+        &self,
+        handle: crate::entity::InstanceHandle,
+        defining_class: Arc<Class>,
+        method: Arc<Method>,
+        args: Vec<Value>,
+        env: &mut Env,
+    ) -> Result<Value, EvalError> {
+        let params = method.pattern.params();
+        if args.len() != params.len() {
+            return Err(EvalError::ArityMismatch {
+                expected: params.len(),
+                got: args.len(),
+            });
+        }
+        let self_val = Value::Instance(handle.clone());
+        let mut method_env = env.clone();
+        method_env.push_frame();
+        method_env.define(self_sym(), self_val.clone());
+        for (param, val) in params.iter().zip(args.iter()) {
+            method_env.define(param.clone(), val.clone());
+        }
+        for local in &method.locals {
+            method_env.define(local.clone(), Value::Nil);
+        }
+        for stmt in &method.body {
+            if let Stmt::LocalDecl(names) = stmt {
+                for name in names {
+                    method_env.define(name.clone(), Value::Nil);
+                }
+            }
+        }
+        let binding = SelfBinding::ClassSide {
+            handle,
+            defining_class: defining_class.clone(),
+        };
+        self.push_self(binding.clone());
+        let depth = self.method_depth.get();
+        let saved_block_home = self.current_block_home.get();
+        self.current_block_home.set(None);
+        let frame = Cont::CallFrame {
+            self_binding: Some(binding),
+            depth,
+            pending: method.body.iter().cloned().collect(),
+            env: method_env,
+            implicit_return: self_val,
+            is_method: true,
+            pops_env: true,
+            saved_block_home,
+            frame_block_home: None,
+            defining_class: Some(defining_class),
+        };
+        step_loop(self, frame)
+    }
+
+    /// Reference recursive implementation retained for differential testing.
+    /// Production code uses `invoke_class_method`.
+    pub(crate) fn invoke_class_method_recursive(
         &self,
         handle: crate::entity::InstanceHandle,
         defining_class: Arc<Class>,
@@ -866,7 +1021,7 @@ impl Evaluator {
         let my_depth = self.method_depth.get();
         let prev_home = self.current_block_home.get();
         self.current_block_home.set(None);
-        let result = self.eval_program(&method.body, &mut method_env);
+        let result = self.eval_program_recursive(&method.body, &mut method_env);
         self.current_block_home.set(prev_home);
         self.pop_self();
         method_env.pop_frame();

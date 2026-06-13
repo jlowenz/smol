@@ -784,12 +784,16 @@ fn string_at_out_of_bounds() {
 }
 
 // ── Block whileTrue:/whileFalse: non-Bool errors ──────────────────────────
+// After C29.6, the loop primitives are implemented as pure Smol recursive methods.
+// A non-Bool condition causes `self value ifFalse:` (or ifTrue:) to be sent to the
+// non-Bool result, which produces MessageNotUnderstood rather than TypeError.
+// This is the correct Smalltalk semantics: `1 ifFalse: [...]` is MNU.
 
 #[test]
 fn block_while_true_colon_non_bool_condition_errors() {
     assert!(matches!(
         eval_err("[1] whileTrue: []"),
-        crate::eval::EvalError::TypeError(_)
+        crate::eval::EvalError::MessageNotUnderstood { .. }
     ));
 }
 
@@ -797,7 +801,7 @@ fn block_while_true_colon_non_bool_condition_errors() {
 fn block_while_false_colon_non_bool_condition_errors() {
     assert!(matches!(
         eval_err("[1] whileFalse: []"),
-        crate::eval::EvalError::TypeError(_)
+        crate::eval::EvalError::MessageNotUnderstood { .. }
     ));
 }
 
@@ -805,7 +809,7 @@ fn block_while_false_colon_non_bool_condition_errors() {
 fn block_while_true_no_arg_non_bool_errors() {
     assert!(matches!(
         eval_err("[1] whileTrue"),
-        crate::eval::EvalError::TypeError(_)
+        crate::eval::EvalError::MessageNotUnderstood { .. }
     ));
 }
 
@@ -813,7 +817,7 @@ fn block_while_true_no_arg_non_bool_errors() {
 fn block_while_false_no_arg_non_bool_errors() {
     assert!(matches!(
         eval_err("[1] whileFalse"),
-        crate::eval::EvalError::TypeError(_)
+        crate::eval::EvalError::MessageNotUnderstood { .. }
     ));
 }
 
@@ -933,14 +937,19 @@ fn as_int_type_error() {
 
 #[test]
 fn as_block_type_error() {
-    // as_block is called when a Block is expected but another type is given.
+    // After C29.6, loop primitives are Smol recursive methods. The body argument
+    // is not type-checked eagerly; errors surface as MNU when `aBlock value` is sent
+    // to a non-Block. The condition must evaluate to false so that `aBlock value` is
+    // actually reached; otherwise the method exits before calling the body.
     assert!(matches!(
         eval_err("[true] whileTrue: 'notABlock'"),
-        crate::eval::EvalError::TypeError(_)
+        crate::eval::EvalError::MessageNotUnderstood { .. }
     ));
+    // Use [false] so the condition is false on the first check, meaning aBlock value
+    // (Int 42) is reached and produces MNU.
     assert!(matches!(
-        eval_err("[true] whileFalse: 42"),
-        crate::eval::EvalError::TypeError(_)
+        eval_err("[false] whileFalse: 42"),
+        crate::eval::EvalError::MessageNotUnderstood { .. }
     ));
 }
 
