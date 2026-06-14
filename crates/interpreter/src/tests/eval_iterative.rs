@@ -1,54 +1,33 @@
 use super::*;
-use crate::env::Env;
-use crate::parser::Parser;
-
-/// Run Smol source through the iterative evaluator inside a may coroutine.
-fn iter_eval(src: &str) -> Result<Value, EvalError> {
-    let src = src.to_owned();
-    let (tx, rx) = std::sync::mpsc::channel();
-    crate::entity::init_coroutine_stack();
-    may::go!(move || {
-        let prog = Parser::parse(&src).expect("parse");
-        let ev = Evaluator::new();
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
-        let result = ev.eval_program(&prog.stmts, &mut env).and_then(|v| {
-            // Resolve top-level Futures so tests can assert against concrete values.
-            crate::builtins::force_value(v)
-        });
-        ev.shutdown();
-        tx.send(result).unwrap();
-    });
-    rx.recv().expect("iter_eval coroutine panicked")
-}
+use crate::test_helpers::eval;
 
 #[test]
 fn s1_literal_return() {
-    let v = iter_eval("^42").unwrap();
+    let v = eval("^42");
     assert_eq!(v, Value::Int(42));
 }
 
 #[test]
 fn s1_var_lookup() {
-    let v = iter_eval("| x | x := 7. x").unwrap();
+    let v = eval("| x | x := 7. x");
     assert_eq!(v, Value::Int(7));
 }
 
 #[test]
 fn s2_binary_send() {
-    let v = iter_eval("3 + 4").unwrap();
+    let v = eval("3 + 4");
     assert_eq!(v, Value::Int(7));
 }
 
 #[test]
 fn s2_unary_send() {
-    let v = iter_eval("'hello' size").unwrap();
+    let v = eval("'hello' size");
     assert_eq!(v, Value::Int(5));
 }
 
 #[test]
 fn s2_keyword_send() {
-    let v = iter_eval("10 max: 20").unwrap();
+    let v = eval("10 max: 20");
     assert_eq!(v, Value::Int(20));
 }
 
@@ -62,7 +41,7 @@ fn s2_user_defined_method() {
         c := Calc new.
         c add: 3 to: 4
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(7));
 }
 
@@ -77,7 +56,7 @@ fn s2_chained_user_methods() {
         c := Calc new.
         c quadruple: 3
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(12));
 }
 
@@ -85,13 +64,13 @@ fn s2_chained_user_methods() {
 fn s3_cascade() {
     // Cascade sends multiple messages to the same receiver; result is last send.
     // 'hello' printString returns 'hello'; 'hello' size returns 5.
-    let v = iter_eval("'hello' printString; size").unwrap();
+    let v = eval("'hello' printString; size");
     assert_eq!(v, Value::Int(5));
 }
 
 #[test]
 fn s3_dynamic_array() {
-    let v = iter_eval("{ 1 + 1. 2 + 2. 3 + 3 }").unwrap();
+    let v = eval("{ 1 + 1. 2 + 2. 3 + 3 }");
     // Result is an Array with 3 elements: 2, 4, 6.
     use crate::object::IndexedStorage;
     if let Value::Instance(h) = v
@@ -109,7 +88,7 @@ fn s3_dynamic_array() {
 
 #[test]
 fn s3_array_literal() {
-    let v = iter_eval("#(1 2 3)").unwrap();
+    let v = eval("#(1 2 3)");
     use crate::object::IndexedStorage;
     if let Value::Instance(h) = v
         && let crate::entity::InstanceKind::ValueObject(obj) = &h.0.kind
@@ -135,7 +114,7 @@ fn s5_nonlocal_return_from_block() {
         ].
         Foo new bar
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(42));
 }
 
@@ -147,7 +126,7 @@ fn s5_on_do_catches_signal() {
             on: Error
             do: [:e | 'caught']
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Str(Arc::from("caught")));
 }
 
@@ -161,7 +140,7 @@ fn s5_ensure_runs_cleanup() {
         ].
         Tester new go
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(42));
 }
 
@@ -177,7 +156,7 @@ fn while_true_1000_iterations() {
         [ c size < 1000 ] whileTrue: [ c add: 1 ].
         c size
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(1000));
 }
 
@@ -189,7 +168,7 @@ fn while_false_1000_iterations() {
         [ c size >= 1000 ] whileFalse: [ c add: 1 ].
         c size
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(1000));
 }
 
@@ -201,7 +180,7 @@ fn times_repeat_1000() {
         1000 timesRepeat: [ c add: 1 ].
         c size
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(1000));
 }
 
@@ -217,7 +196,7 @@ fn user_recursive_count_down() {
         ].
         Counter new countFrom: 1000
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(0));
 }
 
@@ -232,7 +211,7 @@ fn nonlocal_return_through_inline_iftrue() {
         ].
         Foo new test: true
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(42));
 }
 
@@ -246,7 +225,7 @@ fn nonlocal_return_through_inline_iffalse() {
         ].
         Foo new test: false
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(42));
 }
 
@@ -262,7 +241,7 @@ fn inline_iftrue_iffalse_both_branches() {
         f := Foo new.
         (f pick: true) + (f pick: false)
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(3));
 }
 
@@ -278,7 +257,7 @@ fn ensure_runs_after_normal_completion() {
         [log update: [:v | v + 1]. 42] ensure: [log update: [:v | v + 10]].
         log get
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(11));
 }
 
@@ -286,7 +265,7 @@ fn ensure_runs_after_normal_completion() {
 fn ensure_returns_body_result() {
     // Body result (42) is returned, not the ensure block result (0).
     let src = "[42] ensure: [0]";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(42));
 }
 
@@ -301,7 +280,7 @@ fn ensure_runs_after_signal() {
         ] on: Error do: [:e | log update: [:v | v + 1]].
         log get
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(11));
 }
 
@@ -315,7 +294,7 @@ fn ensure_runs_after_nonlocal_return() {
         ].
         Tester new go
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(42));
 }
 
@@ -325,7 +304,7 @@ fn on_do_catches_signal() {
     let src = "
         [Error signal: 'oops'] on: Error do: [:e | 'handled']
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Str(Arc::from("handled")));
 }
 
@@ -342,7 +321,7 @@ fn on_do_passes_non_matching_signal() {
     // Let's use a more specific test: ensure inner handler doesn't match if we
     // use a completely different check.
     // Actually: we'll check that the outer on:do: catches it when the inner doesn't.
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     // Error is a subclass of Condition, so on:Condition:do: WOULD match.
     // Let's just verify that catching works at all with the outer handler.
     assert_eq!(v, Value::Str(Arc::from("wrong")));
@@ -352,7 +331,7 @@ fn on_do_passes_non_matching_signal() {
 fn on_do_handler_result_returned() {
     // on:do: returns handler result when signal is caught.
     let src = "[Error signal: 'x'] on: Error do: [:e | e message]";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Str(Arc::from("x")));
 }
 
@@ -369,7 +348,7 @@ fn on_do_retry_reruns_body() {
             n get
         ] on: Error do: [:e | e retry]
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(3));
 }
 
@@ -379,7 +358,7 @@ fn on_do_resume_returns_value() {
     let src = "
         [Error signal: 'x'] on: Error do: [:e | e return: 99]
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(99));
 }
 
@@ -387,7 +366,7 @@ fn on_do_resume_returns_value() {
 fn on_do_body_completes_normally() {
     // Body completes without signalling; body result returned.
     let src = "[42] on: Error do: [:e | 0]";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(42));
 }
 
@@ -395,49 +374,49 @@ fn on_do_body_completes_normally() {
 fn sync_value_evaluates_block() {
     // syncValue evaluates the block and returns the result.
     let src = "[3 + 4] syncValue";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(7));
 }
 
 #[test]
 fn ifnil_fires_on_nil() {
     let src = "nil ifNil: ['was nil']";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Str(Arc::from("was nil")));
 }
 
 #[test]
 fn ifnil_skips_on_non_nil() {
     let src = "42 ifNil: ['was nil']";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Nil);
 }
 
 #[test]
 fn ifnotnil_fires_on_non_nil() {
     let src = "42 ifNotNil: [:x | x + 1]";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(43));
 }
 
 #[test]
 fn ifnotnil_skips_on_nil() {
     let src = "nil ifNotNil: [:x | x + 1]";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Nil);
 }
 
 #[test]
 fn ifnil_ifnotnil_nil_branch() {
     let src = "nil ifNil: ['nil'] ifNotNil: [:x | 'notnil']";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Str(Arc::from("nil")));
 }
 
 #[test]
 fn ifnil_ifnotnil_notnnil_branch() {
     let src = "42 ifNil: ['nil'] ifNotNil: [:x | x + 1]";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(43));
 }
 
@@ -452,7 +431,7 @@ fn nested_ensure_on_do() {
         ] on: Error do: [:e | log update: [:v | v + 1]].
         log get
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(11));
 }
 
@@ -467,7 +446,7 @@ fn ensure_nested_in_on_do_success() {
         ] on: Error do: [:e | 0].
         log get
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(11));
 }
 
@@ -484,7 +463,7 @@ fn super_binary_send_iterative() {
         Child >> + n [ ^super + n + 1 ]
         (Child new) + 5
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(106));
 }
 
@@ -498,7 +477,7 @@ fn super_keyword_send_iterative() {
         Child >> addTo: n [ ^super addTo: n + 1 ]
         (Child new) addTo: 5
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(106));
 }
 
@@ -512,6 +491,6 @@ fn super_keyword_multi_arg_send_iterative() {
         Child >> from: a to: b [ ^super from: a to: b + 1 ]
         (Child new) from: 3 to: 8
     ";
-    let v = iter_eval(src).unwrap();
+    let v = eval(src);
     assert_eq!(v, Value::Int(6));
 }
