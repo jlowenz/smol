@@ -3,21 +3,20 @@ use crate::env::Env;
 use crate::parser::Parser;
 
 /// Run Smol source through the iterative evaluator inside a may coroutine.
-#[allow(clippy::arc_with_non_send_sync)]
 fn iter_eval(src: &str) -> Result<Value, EvalError> {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
     crate::entity::init_coroutine_stack();
     may::go!(move || {
         let prog = Parser::parse(&src).expect("parse");
-        let ev = IEvaluator::new(Arc::new(Evaluator::new()));
+        let ev = Evaluator::new();
         let mut env = Env::new();
-        ev.inner.registry.populate_env(&mut env);
+        ev.registry.populate_env(&mut env);
         let result = ev.eval_program(&prog.stmts, &mut env).and_then(|v| {
             // Resolve top-level Futures so tests can assert against concrete values.
             crate::builtins::force_value(v)
         });
-        ev.inner.shutdown();
+        ev.shutdown();
         tx.send(result).unwrap();
     });
     rx.recv().expect("iter_eval coroutine panicked")

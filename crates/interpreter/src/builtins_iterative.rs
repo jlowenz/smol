@@ -81,7 +81,8 @@ pub fn dispatch(
             .ok_or_else(|| {
                 EvalError::TypeError("'->': Association not yet defined in kernel".into())
             })?;
-        return ev.dispatch(
+        return crate::builtins::dispatch(
+            ev,
             Value::Instance(assoc_class),
             Arc::from("key:value:"),
             vec![recv, value],

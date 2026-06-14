@@ -379,61 +379,6 @@ impl Evaluator {
         step_loop(self, frame)
     }
 
-    pub fn eval_expr(&self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
-        match expr {
-            Expr::Super => Err(EvalError::TypeError(
-                "super may only appear as a message receiver".into(),
-            )),
-            Expr::Lit(lit) => Ok(eval_literal(lit)),
-            Expr::Var(name) => self
-                .lookup_var(name.as_ref(), env)
-                .ok_or_else(|| EvalError::UndefinedVariable(name.clone())),
-            Expr::Send { receiver, message } => {
-                // Detect `super send` before evaluating the receiver normally.
-                if matches!(receiver.as_ref(), Expr::Super) {
-                    return self.send_super(message, env);
-                }
-                let recv = self.eval_expr(receiver, env)?;
-                self.send(recv, message, env)
-            }
-            Expr::Block {
-                params,
-                locals,
-                body,
-            } => {
-                // Blocks inherit the home depth of their creation context: the same method
-                // that an enclosing block targets, or the current method depth if no block
-                // context is active. This ensures nested blocks all point to the right frame.
-                let home_depth = self
-                    .current_block_home
-                    .get()
-                    .unwrap_or_else(|| self.method_depth.get());
-                Ok(Value::Block(Arc::new(Block {
-                    params: params.clone(),
-                    locals: locals.clone(),
-                    body: body.clone(),
-                    env: env.clone(),
-                    home_depth,
-                    home_entity: self.current_entity_id.get(),
-                })))
-            }
-            Expr::Cascade { receiver, messages } => {
-                let recv = self.eval_expr(receiver, env)?;
-                let mut result = Value::Nil;
-                for msg in messages {
-                    result = self.send(recv.clone(), msg, env)?;
-                }
-                Ok(result)
-            }
-            Expr::NamespaceRef {
-                namespace_path,
-                name,
-            } => self.eval_namespace_ref(namespace_path, name, env),
-            Expr::ArrayLiteral(elements) => self.eval_array_literal(elements, env),
-            Expr::DynamicArray(elements) => self.eval_dynamic_array(elements, env),
-        }
-    }
-
     fn eval_array_literal(&self, elements: &[Literal], env: &mut Env) -> Result<Value, EvalError> {
         use crate::entity::{InstanceHandle, InstanceKind, InstanceState};
         let array_handle = self
@@ -458,30 +403,6 @@ impl Evaluator {
         }))))
     }
 
-    fn eval_dynamic_array(&self, elements: &[Expr], env: &mut Env) -> Result<Value, EvalError> {
-        use crate::entity::{InstanceHandle, InstanceKind, InstanceState};
-        let array_handle = self
-            .registry
-            .kernel()
-            .lookup_class("Array")
-            .ok_or_else(|| EvalError::UndefinedVariable(Arc::from("Array")))?;
-        let array_class = array_handle.0.class.clone();
-        let obj = Arc::new(Object::new_with_indexed(
-            array_class.clone(),
-            elements.len(),
-        ));
-        for (i, elem_expr) in elements.iter().enumerate() {
-            let v = self.eval_expr(elem_expr, env)?;
-            if let Some(IndexedStorage::Pointer(slots)) = obj.indexed.as_ref() {
-                slots.lock()[i] = v;
-            }
-        }
-        Ok(Value::Instance(InstanceHandle(Arc::new(InstanceState {
-            class: array_class,
-            kind: InstanceKind::ValueObject(obj),
-        }))))
-    }
-
     /// Evaluate a `Literal` into a runtime `Value`. For `Literal::Array` this
     /// requires the evaluator and environment to construct the `Array` object;
     /// all other variants are pure data and do not need either.
@@ -493,113 +414,6 @@ impl Evaluator {
         match lit {
             Literal::Array(elems) => self.eval_array_literal(elems, env),
             _ => Ok(eval_literal(lit)),
-        }
-    }
-
-    fn send(&self, recv: Value, message: &Message, env: &mut Env) -> Result<Value, EvalError> {
-        match message {
-            Message::Unary(sel) => self.dispatch(recv, sel.clone(), vec![], env),
-            Message::Binary { op, arg } => {
-                let arg_val = self.eval_expr(arg, env)?;
-                self.dispatch(recv, op.clone(), vec![arg_val], env)
-            }
-            Message::Keyword { parts } => {
-                let selector: Arc<str> = parts
-                    .iter()
-                    .map(|(k, _)| k.as_ref())
-                    .collect::<String>()
-                    .into();
-                let mut args = Vec::with_capacity(parts.len());
-                for (_, expr) in parts {
-                    args.push(self.eval_expr(expr, env)?);
-                }
-                self.dispatch(recv, selector, args, env)
-            }
-        }
-    }
-
-    /// Evaluate message args for a super send without evaluating the receiver.
-    fn eval_message_args(
-        &self,
-        message: &Message,
-        env: &mut Env,
-    ) -> Result<(Arc<str>, Vec<Value>), EvalError> {
-        match message {
-            Message::Unary(sel) => Ok((sel.clone(), vec![])),
-            Message::Binary { op, arg } => {
-                let v = self.eval_expr(arg, env)?;
-                Ok((op.clone(), vec![v]))
-            }
-            Message::Keyword { parts } => {
-                let selector: Arc<str> = parts
-                    .iter()
-                    .map(|(k, _)| k.as_ref())
-                    .collect::<String>()
-                    .into();
-                let mut args = Vec::with_capacity(parts.len());
-                for (_, expr) in parts {
-                    args.push(self.eval_expr(expr, env)?);
-                }
-                Ok((selector, args))
-            }
-        }
-    }
-
-    /// Handle `super send`: look up the selector starting from the superclass of
-    /// the defining class and invoke on the current receiver.
-    pub(crate) fn send_super(&self, message: &Message, env: &mut Env) -> Result<Value, EvalError> {
-        let defining_class = self
-            .current_defining_class()
-            .ok_or_else(|| EvalError::TypeError("super used outside method context".into()))?;
-        let superclass = defining_class
-            .superclass
-            .as_ref()
-            .ok_or_else(|| {
-                EvalError::TypeError(format!(
-                    "super sent in {} which has no superclass",
-                    defining_class.name
-                ))
-            })?
-            .clone();
-        let (selector, args) = self.eval_message_args(message, env)?;
-
-        // Clone the top binding to avoid holding the RefCell borrow during invoke.
-        let top = self.method_stack.borrow().last().cloned();
-        match top {
-            Some(SelfBinding::Instance { handle, .. }) => match superclass.lookup(&selector) {
-                Some((method, def_class)) => {
-                    self.invoke_method(handle, def_class, method, args, env)
-                }
-                None => Err(EvalError::MessageNotUnderstood {
-                    receiver_kind: "Object",
-                    selector,
-                }),
-            },
-            Some(SelfBinding::ClassSide { handle, .. }) => {
-                match superclass.lookup_class_method(&selector) {
-                    Some((method, def_class)) => {
-                        self.invoke_class_method(handle, def_class, method, args, env)
-                    }
-                    // No user-defined super method; fall through to built-in class
-                    // dispatch so `super new` / `super new:` reach the Rust primitives
-                    // without re-entering the receiver's own `new` override.
-                    None => {
-                        crate::builtins::dispatch_class_builtin(self, handle, selector, args, env)
-                    }
-                }
-            }
-            Some(SelfBinding::Primitive { self_value, .. }) => match superclass.lookup(&selector) {
-                Some((method, def_class)) => {
-                    self.invoke_primitive_method(self_value, def_class, method, args, env)
-                }
-                None => Err(EvalError::MessageNotUnderstood {
-                    receiver_kind: "nil",
-                    selector,
-                }),
-            },
-            None => Err(EvalError::TypeError(
-                "super used outside method context".into(),
-            )),
         }
     }
 
@@ -636,17 +450,6 @@ impl Evaluator {
             .ok_or_else(|| {
                 EvalError::TypeError(format!("class {name} not found in namespace {}", ns.name))
             })
-    }
-
-    /// Dispatches a message to a value. `selector` is the full selector string.
-    pub fn dispatch(
-        &self,
-        recv: Value,
-        selector: Arc<str>,
-        args: Vec<Value>,
-        env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        crate::builtins::dispatch(self, recv, selector, args, env)
     }
 
     /// Iterative `Block` evaluation: runs via the step-loop evaluator.

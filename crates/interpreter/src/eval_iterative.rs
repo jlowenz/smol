@@ -1,7 +1,3 @@
-// C30 will promote IEvaluator to the default evaluator; until then all items
-// here are only reachable via test_helpers and are flagged as dead by clippy.
-#![allow(dead_code)]
-
 /// One reduction = one completed message dispatch. Matches BEAM's "one reduction
 /// per function call" granularity. At ~1M msg/s this yields every ~1 ms.
 const YIELD_INTERVAL: u32 = 1024;
@@ -17,159 +13,6 @@ use crate::eval::{
     EvalError, Evaluator, SelfBinding, check_prim_sends_in_body, eval_literal, self_sym,
 };
 use crate::value::Value;
-
-pub struct IEvaluator {
-    pub inner: Arc<Evaluator>,
-}
-
-impl IEvaluator {
-    pub fn new(ev: Arc<Evaluator>) -> Self {
-        Self { inner: ev }
-    }
-
-    /// Iterative replacement for `Evaluator::eval_program`.
-    ///
-    /// Requires: `env` has at least one live frame; all `LocalDecl` names in
-    ///   `stmts` are pre-declared before any expression is evaluated.
-    /// Ensures: semantically identical to `Evaluator::eval_program`; Smol method
-    ///   calls within the body use heap-allocated `CallFrame`s rather than Rust
-    ///   stack frames.
-    pub fn eval_program(&self, stmts: &[Stmt], env: &mut Env) -> Result<Value, EvalError> {
-        for stmt in stmts {
-            if let Stmt::LocalDecl(names) = stmt {
-                for name in names {
-                    env.define(name.clone(), Value::Nil);
-                }
-            }
-        }
-        let frame = Cont::CallFrame {
-            self_binding: None,
-            depth: 0,
-            pending: stmts.iter().cloned().collect(),
-            env: env.clone(),
-            implicit_return: Value::Nil,
-            is_method: false,
-            pops_env: false,
-            saved_block_home: self.inner.current_block_home.get(),
-            frame_block_home: None,
-            defining_class: None,
-            sync: false,
-        };
-        step_loop(&self.inner, frame)
-    }
-
-    /// Iterative replacement for `Evaluator::eval_block`.
-    ///
-    /// Requires: `args.len() == block.params.len()`.
-    /// Ensures: semantically identical to `Evaluator::eval_block`; method calls
-    ///   within the body use heap-allocated `CallFrame`s.
-    pub fn eval_block(
-        &self,
-        block: &crate::value::Block,
-        args: Vec<Value>,
-        _outer_env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        if args.len() != block.params.len() {
-            return Err(EvalError::ArityMismatch {
-                expected: block.params.len(),
-                got: args.len(),
-            });
-        }
-        let mut block_env = block.env.clone();
-        block_env.push_frame();
-        for name in &block.locals {
-            block_env.define(name.clone(), Value::Nil);
-        }
-        for (name, val) in block.params.iter().zip(args) {
-            block_env.define(name.clone(), val);
-        }
-        // Pre-bind LocalDecl names.
-        for stmt in &block.body {
-            if let Stmt::LocalDecl(names) = stmt {
-                for name in names {
-                    block_env.define(name.clone(), Value::Nil);
-                }
-            }
-        }
-        let saved_home = self.inner.current_block_home.get();
-        let frame = Cont::CallFrame {
-            self_binding: None,
-            depth: 0,
-            pending: block.body.iter().cloned().collect(),
-            env: block_env,
-            implicit_return: Value::Nil,
-            is_method: false,
-            pops_env: true,
-            saved_block_home: saved_home,
-            frame_block_home: Some(block.home_depth),
-            defining_class: None,
-            sync: false,
-        };
-        self.inner.current_block_home.set(Some(block.home_depth));
-        // current_block_home is restored by the CallFrame when it pops.
-        step_loop(&self.inner, frame)
-    }
-
-    /// Iterative replacement for `Evaluator::eval_block_sync`.
-    ///
-    /// Requires: `args.len() == block.params.len()`.
-    /// Ensures: each statement result is force-resolved before the next runs.
-    pub fn eval_block_sync(
-        &self,
-        block: &crate::value::Block,
-        args: Vec<Value>,
-        outer_env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        // For C29, delegate to eval_block (sync force-value is applied by builtins
-        // calling eval_block_sync; the sync wrapper is in the builtin, not here).
-        self.eval_block(block, args, outer_env)
-    }
-
-    /// Iterative replacement for `Evaluator::invoke_method`.
-    ///
-    /// Requires: `args.len() == method.pattern.params().len()`.
-    /// Ensures: semantically identical to `Evaluator::invoke_method`; method calls
-    ///   within the body use heap-allocated `CallFrame`s.
-    pub fn invoke_method(
-        &self,
-        handle: InstanceHandle,
-        defining_class: Arc<Class>,
-        method: Arc<Method>,
-        args: Vec<Value>,
-        env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        let found = crate::builtins::UserMethodFound::Instance {
-            handle,
-            method,
-            def_class: defining_class,
-        };
-        let mut stack = Vec::new();
-        push_method_call_frame(&self.inner, found, args, env, &mut stack)?;
-        let initial = stack
-            .pop()
-            .expect("push_method_call_frame must push a frame");
-        step_loop(&self.inner, initial)
-    }
-
-    /// Iterative replacement for `Evaluator::invoke_class_method`.
-    ///
-    /// Requires: `args.len() == method.pattern.params().len()`.
-    /// Ensures: semantically identical to `Evaluator::invoke_class_method`.
-    pub fn invoke_class_method(
-        &self,
-        handle: InstanceHandle,
-        defining_class: Arc<Class>,
-        method: Arc<Method>,
-        args: Vec<Value>,
-        env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        // Class-side dispatch: use the recursive path for C29.
-        // C30 will promote IEvaluator to be the default, at which point this
-        // becomes the iterative path too.
-        self.inner
-            .invoke_class_method(handle, defining_class, method, args, env)
-    }
-}
 
 /// Heap-allocated continuation for the iterative evaluator.
 ///
@@ -188,6 +31,17 @@ pub(crate) enum Cont {
     /// (with the last `acc` appended) is the full argument list.
     CollectArgs {
         receiver: Value,
+        selector: Arc<str>,
+        done: Vec<Value>,
+        pending: VecDeque<Expr>,
+        env: Env,
+    },
+
+    /// Accumulate arguments for a super send left-to-right, then dispatch to superclass.
+    ///
+    /// Like `CollectArgs` but has no receiver value — the receiver is always `self`,
+    /// looked up from `ev.method_stack` at dispatch time.
+    SuperCollectArgs {
         selector: Arc<str>,
         done: Vec<Value>,
         pending: VecDeque<Expr>,
@@ -588,10 +442,46 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 }
                 Expr::Send { receiver, message } => {
                     if matches!(receiver.as_ref(), Expr::Super) {
-                        // Super sends: use recursive path (S6 will iterativise).
-                        match ev.send_super(&message, &mut env) {
-                            Ok(v) => acc = v,
-                            Err(e) => handle_step_error(e, ev, &mut stack, &mut acc)?,
+                        match message {
+                            Message::Unary(sel) => {
+                                if let Err(e) = dispatch_super_to_stack(
+                                    ev,
+                                    sel,
+                                    vec![],
+                                    &mut env,
+                                    &mut stack,
+                                    &mut acc,
+                                ) {
+                                    handle_step_error(e, ev, &mut stack, &mut acc)?;
+                                }
+                            }
+                            Message::Binary { op, arg } => {
+                                stack.push(Cont::SuperCollectArgs {
+                                    selector: op,
+                                    done: vec![],
+                                    pending: VecDeque::new(),
+                                    env: env.clone(),
+                                });
+                                stack.push(Cont::EvalExpr { expr: *arg, env });
+                            }
+                            Message::Keyword { parts } => {
+                                let selector: Arc<str> = parts
+                                    .iter()
+                                    .map(|(k, _)| k.as_ref())
+                                    .collect::<String>()
+                                    .into();
+                                let mut exprs: VecDeque<Expr> =
+                                    parts.into_iter().map(|(_, e)| e).collect();
+                                let first =
+                                    exprs.pop_front().expect("keyword message has no parts");
+                                stack.push(Cont::SuperCollectArgs {
+                                    selector,
+                                    done: vec![],
+                                    pending: exprs,
+                                    env: env.clone(),
+                                });
+                                stack.push(Cont::EvalExpr { expr: first, env });
+                            }
                         }
                     } else {
                         // Push AfterReceiver first (below in stack), then receiver eval.
@@ -851,6 +741,36 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                     if let Err(e) = dispatch_to_stack(
                         ev, receiver, selector, done, &mut env, &mut stack, &mut acc,
                     ) {
+                        handle_step_error(e, ev, &mut stack, &mut acc)?;
+                    }
+                }
+            }
+
+            // ── SuperCollectArgs ──────────────────────────────────────────
+            Cont::SuperCollectArgs {
+                selector,
+                mut done,
+                mut pending,
+                mut env,
+            } => {
+                done.push(acc.clone());
+                if let Some(next) = pending.pop_front() {
+                    stack.push(Cont::SuperCollectArgs {
+                        selector,
+                        done,
+                        pending,
+                        env: env.clone(),
+                    });
+                    stack.push(Cont::EvalExpr { expr: next, env });
+                } else {
+                    reductions += 1;
+                    if reductions >= YIELD_INTERVAL {
+                        reductions = 0;
+                        may::coroutine::yield_now();
+                    }
+                    if let Err(e) =
+                        dispatch_super_to_stack(ev, selector, done, &mut env, &mut stack, &mut acc)
+                    {
                         handle_step_error(e, ev, &mut stack, &mut acc)?;
                     }
                 }
@@ -1169,6 +1089,163 @@ fn drain_tail_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
 ///   (6) `Bool >> ifTrue:` family → `push_block_frame(false)` for selected branch.
 ///   (7) Universal nil-guard family (`ifNil:` / `ifNotNil:` / combined) → inline.
 ///   (8) All other selectors → `builtins::dispatch`.
+/// Push a `CallFrame` for a class-side method invocation.
+///
+/// Requires: `args.len() == method.pattern.params().len()`.
+/// Ensures: a `CallFrame` with `SelfBinding::ClassSide` is pushed onto `stack`.
+fn push_class_method_frame(
+    ev: &Evaluator,
+    handle: InstanceHandle,
+    def_class: Arc<Class>,
+    method: Arc<Method>,
+    args: Vec<Value>,
+    env: &Env,
+    stack: &mut Vec<Cont>,
+) -> Result<(), EvalError> {
+    let params = method.pattern.params();
+    if args.len() != params.len() {
+        return Err(EvalError::ArityMismatch {
+            expected: params.len(),
+            got: args.len(),
+        });
+    }
+    let self_val = Value::Instance(handle.clone());
+    let mut method_env = env.clone();
+    method_env.push_frame();
+    method_env.define(self_sym(), self_val.clone());
+    for (param, val) in params.iter().zip(args.iter()) {
+        method_env.define(param.clone(), val.clone());
+    }
+    for local in &method.locals {
+        method_env.define(local.clone(), Value::Nil);
+    }
+    for stmt in &method.body {
+        if let Stmt::LocalDecl(names) = stmt {
+            for name in names {
+                method_env.define(name.clone(), Value::Nil);
+            }
+        }
+    }
+    let binding = SelfBinding::ClassSide {
+        handle,
+        defining_class: def_class.clone(),
+    };
+    ev.push_self(binding.clone());
+    let depth = ev.method_depth.get();
+    let saved_block_home = ev.current_block_home.get();
+    ev.current_block_home.set(None);
+    stack.push(Cont::CallFrame {
+        self_binding: Some(binding),
+        depth,
+        pending: method.body.iter().cloned().collect(),
+        env: method_env,
+        implicit_return: self_val,
+        is_method: true,
+        pops_env: true,
+        saved_block_home,
+        frame_block_home: None,
+        defining_class: Some(def_class),
+        sync: false,
+    });
+    Ok(())
+}
+
+/// Dispatch a super send iteratively: look up `selector` starting from the
+/// superclass of the current defining class and push the method frame.
+///
+/// Requires: called from within a method context (`ev.method_stack` non-empty).
+/// Ensures: for a found user method, pushes a `CallFrame` and returns `Ok(())`.
+///   For a class-side miss, falls through to `dispatch_class_builtin` and sets `*acc`.
+///   For an instance/primitive miss, returns `MessageNotUnderstood`.
+fn dispatch_super_to_stack(
+    ev: &Evaluator,
+    selector: Arc<str>,
+    args: Vec<Value>,
+    env: &mut Env,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+) -> Result<(), EvalError> {
+    let defining_class = ev
+        .current_defining_class()
+        .ok_or_else(|| EvalError::TypeError("super used outside method context".into()))?;
+    let superclass = defining_class
+        .superclass
+        .as_ref()
+        .ok_or_else(|| {
+            EvalError::TypeError(format!(
+                "super sent in {} which has no superclass",
+                defining_class.name
+            ))
+        })?
+        .clone();
+
+    let top = ev.method_stack.borrow().last().cloned();
+    match top {
+        Some(SelfBinding::Instance { handle, .. }) => match superclass.lookup(&selector) {
+            Some((method, def_class)) => {
+                drain_tail_frames(ev, stack);
+                push_method_call_frame(
+                    ev,
+                    UserMethodFound::Instance {
+                        handle,
+                        method,
+                        def_class,
+                    },
+                    args,
+                    env,
+                    stack,
+                )?;
+            }
+            None => {
+                return Err(EvalError::MessageNotUnderstood {
+                    receiver_kind: "Object",
+                    selector,
+                });
+            }
+        },
+        Some(SelfBinding::ClassSide { handle, .. }) => {
+            match superclass.lookup_class_method(&selector) {
+                Some((method, def_class)) => {
+                    drain_tail_frames(ev, stack);
+                    push_class_method_frame(ev, handle, def_class, method, args, env, stack)?;
+                }
+                None => {
+                    *acc =
+                        crate::builtins::dispatch_class_builtin(ev, handle, selector, args, env)?;
+                }
+            }
+        }
+        Some(SelfBinding::Primitive { self_value, .. }) => match superclass.lookup(&selector) {
+            Some((method, def_class)) => {
+                drain_tail_frames(ev, stack);
+                push_method_call_frame(
+                    ev,
+                    UserMethodFound::Primitive {
+                        self_value,
+                        method,
+                        def_class,
+                    },
+                    args,
+                    env,
+                    stack,
+                )?;
+            }
+            None => {
+                return Err(EvalError::MessageNotUnderstood {
+                    receiver_kind: "nil",
+                    selector,
+                });
+            }
+        },
+        None => {
+            return Err(EvalError::TypeError(
+                "super used outside method context".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn dispatch_to_stack(
     ev: &Evaluator,
     receiver: Value,
