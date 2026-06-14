@@ -92,8 +92,8 @@ impl Object {
     /// Permanently prevent ivar writes on this object.
     ///
     /// Requires: called exactly once, after `_primNewValue:` initialization block returns.
-    /// Ensures: `frozen.load(Ordering::Acquire)` is `true`; subsequent `assign_var`
-    ///   calls on the owning `ValueObject` raise `EvalError::TypeError`.
+    /// Ensures: `is_frozen()` returns `true`; subsequent `assign_var` calls on the
+    ///   owning `ValueObject` raise `EvalError::TypeError`.
     pub fn freeze(&self) {
         self.frozen.store(true, Ordering::Release);
     }

@@ -1,6 +1,3 @@
-/// One reduction = one completed message dispatch. Matches BEAM's "one reduction
-/// per function call" granularity. At ~1M msg/s this yields every ~1 ms.
-const YIELD_INTERVAL: u32 = 1024;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -13,6 +10,10 @@ use crate::eval::{
     EvalError, Evaluator, SelfBinding, check_prim_sends_in_body, eval_literal, self_sym,
 };
 use crate::value::Value;
+
+/// One reduction = one completed message dispatch. Matches BEAM's "one reduction
+/// per function call" granularity. At ~1M msg/s this yields every ~1 ms.
+const YIELD_INTERVAL: u32 = 1024;
 
 /// Heap-allocated continuation for the iterative evaluator.
 ///

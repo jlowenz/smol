@@ -340,18 +340,9 @@ pub fn spawn_entity_bare(
 /// Enqueue a message to an entity and return a future for the reply.
 ///
 /// Requires: `data.status` is `Running`; called from outside the entity's own coroutine.
-/// Ensures: the envelope is appended to the mailbox; the returned
-///   `FutureHandle` resolves when the entity completes the handler.
-pub fn send_to_entity(data: &EntityData, selector: Arc<str>, args: Vec<Value>) -> FutureHandle {
-    send_to_entity_with_chain(data, selector, args, vec![])
-}
-
-/// Enqueue a message carrying an inherited HC handler chain.
-///
-/// Requires: `data.status` is `Running`; called from outside the entity's own coroutine.
 /// Ensures: the envelope is appended to the mailbox with `chain` attached;
 ///   the returned `FutureHandle` resolves when the entity completes the handler.
-pub fn send_to_entity_with_chain(
+pub fn send_to_entity(
     data: &EntityData,
     selector: Arc<str>,
     args: Vec<Value>,

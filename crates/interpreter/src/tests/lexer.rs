@@ -37,6 +37,19 @@ fn float_with_exponent() {
 }
 
 #[test]
+fn float_with_signed_exponent() {
+    assert_eq!(tok("1.5e+2"), vec![Token::Float(150.0), Token::Eof]);
+    assert_eq!(tok("2.0e-1"), vec![Token::Float(0.2), Token::Eof]);
+}
+
+#[test]
+fn float_exponent_missing_digits_errors() {
+    // `1.5e` followed by a non-digit — LexError::InvalidNumber.
+    let err = Lexer::tokenize("1.5e!").unwrap_err();
+    assert!(matches!(err, LexError::InvalidNumber(_)));
+}
+
+#[test]
 fn negative_integer_literal() {
     assert_eq!(tok("-42"), vec![Token::Int(-42), Token::Eof]);
 }

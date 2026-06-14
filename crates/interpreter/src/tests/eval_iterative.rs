@@ -470,3 +470,48 @@ fn ensure_nested_in_on_do_success() {
     let v = iter_eval(src).unwrap();
     assert_eq!(v, Value::Int(11));
 }
+
+// ── C29.8 S6: Iterative super binary/keyword sends ───────────────────────────
+// These target dispatch_super_to_stack + Cont::SuperCollectArgs directly.
+
+#[test]
+fn super_binary_send_iterative() {
+    // super + n delegates to superclass method; exercises SuperCollectArgs binary arm.
+    let src = "
+        Object subclass: #Base.
+        Base >> + n [ ^n + 100 ]
+        Base subclass: #Child.
+        Child >> + n [ ^super + n + 1 ]
+        (Child new) + 5
+    ";
+    let v = iter_eval(src).unwrap();
+    assert_eq!(v, Value::Int(106));
+}
+
+#[test]
+fn super_keyword_send_iterative() {
+    // super keyword: arg; exercises SuperCollectArgs single-keyword arm.
+    let src = "
+        Object subclass: #Base.
+        Base >> addTo: n [ ^n + 100 ]
+        Base subclass: #Child.
+        Child >> addTo: n [ ^super addTo: n + 1 ]
+        (Child new) addTo: 5
+    ";
+    let v = iter_eval(src).unwrap();
+    assert_eq!(v, Value::Int(106));
+}
+
+#[test]
+fn super_keyword_multi_arg_send_iterative() {
+    // super multi-keyword; exercises SuperCollectArgs multi-arg pending-queue drain.
+    let src = "
+        Object subclass: #Base.
+        Base >> from: a to: b [ ^b - a ]
+        Base subclass: #Child.
+        Child >> from: a to: b [ ^super from: a to: b + 1 ]
+        (Child new) from: 3 to: 8
+    ";
+    let v = iter_eval(src).unwrap();
+    assert_eq!(v, Value::Int(6));
+}

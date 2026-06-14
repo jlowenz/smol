@@ -12,8 +12,8 @@ use parking_lot::RwLock;
 
 use crate::class::{Class, IndexedSlotKind};
 use crate::entity::{
-    EntityId, InstanceHandle, InstanceKind, InstanceState, send_to_entity_with_chain,
-    spawn_class_entity, spawn_entity_bare,
+    EntityId, InstanceHandle, InstanceKind, InstanceState, send_to_entity, spawn_class_entity,
+    spawn_entity_bare,
 };
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
@@ -1376,7 +1376,7 @@ fn dispatch_entity(
         }
     };
     let future = match &handle.0.kind {
-        InstanceKind::Entity(d) => send_to_entity_with_chain(d, selector, args, chain_snapshot),
+        InstanceKind::Entity(d) => send_to_entity(d, selector, args, chain_snapshot),
         _ => unreachable!(),
     };
     Ok(Value::Future(future))
@@ -2098,9 +2098,7 @@ fn dispatch_class(
         }
     };
     let future = match &handle.0.kind {
-        InstanceKind::ClassEntity(d) => {
-            send_to_entity_with_chain(d, selector, args, chain_snapshot)
-        }
+        InstanceKind::ClassEntity(d) => send_to_entity(d, selector, args, chain_snapshot),
         _ => unreachable!(),
     };
     Ok(Value::Future(future))

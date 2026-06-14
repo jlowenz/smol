@@ -1,6 +1,5 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 use crate::entity::{EntityId, InstanceHandle, InstanceKind, InstanceState};
@@ -296,8 +295,7 @@ impl Evaluator {
                     // guard across a re-entrant lock on the same object.
                     let has_ivar = obj.slots.lock().contains_key(name.as_ref());
                     if has_ivar {
-                        if matches!(&handle.0.kind, InstanceKind::ValueObject(_))
-                            && obj.frozen.load(Ordering::Acquire)
+                        if matches!(&handle.0.kind, InstanceKind::ValueObject(_)) && obj.is_frozen()
                         {
                             return Err(EvalError::TypeError(format!(
                                 "cannot assign to ivar '{}': Value object is frozen",
@@ -501,58 +499,6 @@ impl Evaluator {
         };
         self.current_block_home.set(Some(block.home_depth));
         // current_block_home is restored by the CallFrame when it pops.
-        step_loop(self, frame)
-    }
-
-    /// Evaluate a `Block` with sync semantics: after each statement any
-    /// `Value::Future` result is awaited before proceeding to the next.
-    /// Implemented iteratively via `step_loop` with `sync: true`.
-    ///
-    /// Requires: `args.len() == block.params.len()`.
-    /// Ensures: every statement result is fully resolved before the next
-    ///   statement runs; the final result is fully resolved.
-    pub fn eval_block_sync(
-        &self,
-        block: &Block,
-        args: Vec<Value>,
-        _outer_env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        if args.len() != block.params.len() {
-            return Err(EvalError::ArityMismatch {
-                expected: block.params.len(),
-                got: args.len(),
-            });
-        }
-        let mut block_env = block.env.clone();
-        block_env.push_frame();
-        for name in &block.locals {
-            block_env.define(name.clone(), Value::Nil);
-        }
-        for (name, val) in block.params.iter().zip(args) {
-            block_env.define(name.clone(), val);
-        }
-        for stmt in &block.body {
-            if let Stmt::LocalDecl(names) = stmt {
-                for name in names {
-                    block_env.define(name.clone(), Value::Nil);
-                }
-            }
-        }
-        let saved_home = self.current_block_home.get();
-        let frame = Cont::CallFrame {
-            self_binding: None,
-            depth: 0,
-            pending: block.body.iter().cloned().collect(),
-            env: block_env,
-            implicit_return: Value::Nil,
-            is_method: false,
-            pops_env: true,
-            saved_block_home: saved_home,
-            frame_block_home: Some(block.home_depth),
-            defining_class: None,
-            sync: true,
-        };
-        self.current_block_home.set(Some(block.home_depth));
         step_loop(self, frame)
     }
 

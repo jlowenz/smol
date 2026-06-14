@@ -1568,6 +1568,61 @@ Child new trySuper.
     assert!(matches!(err, EvalError::MessageNotUnderstood { .. }));
 }
 
+// ── Super binary and keyword sends ───────────────────────────────────────────
+// These exercise Cont::SuperCollectArgs / dispatch_super_to_stack (C29.8 S6).
+
+#[test]
+fn super_binary_send() {
+    // super + n in a method delegates to the superclass's + method.
+    let src = r#"
+Object subclass: #Base.
+Base >> + n [ ^n + 100 ]
+Base subclass: #Child.
+Child >> + n [ ^super + n + 1 ]
+(Child new) + 5
+"#;
+    // super + 5 = 5 + 100 = 105; then 105 + 1 = 106.
+    assert_eq!(eval(src), Value::Int(106));
+}
+
+#[test]
+fn super_keyword_send() {
+    // super keyword: arg delegates to the superclass's keyword method.
+    let src = r#"
+Object subclass: #Base.
+Base >> addTo: n [ ^n + 100 ]
+Base subclass: #Child.
+Child >> addTo: n [ ^super addTo: n + 1 ]
+(Child new) addTo: 5
+"#;
+    // Child addTo: 5 → super addTo: 6 → 6 + 100 = 106.
+    assert_eq!(eval(src), Value::Int(106));
+}
+
+#[test]
+fn super_keyword_multi_arg_send() {
+    // super with a multi-keyword message exercises multi-arg SuperCollectArgs accumulation.
+    let src = r#"
+Object subclass: #Base.
+Base >> from: a to: b [ ^b - a ]
+Base subclass: #Child.
+Child >> from: a to: b [ ^super from: a to: b + 1 ]
+(Child new) from: 3 to: 8
+"#;
+    // Child from: 3 to: 8 → super from: 3 to: 9 → 9 - 3 = 6.
+    assert_eq!(eval(src), Value::Int(6));
+}
+
+// ── Namespace deep-path error ─────────────────────────────────────────────────
+
+#[test]
+fn namespace_ref_sub_namespace_not_found() {
+    // Three-segment path A::B::C — Kernel has no sub-namespace Sub.
+    // Exercises the segment-loop error branch in eval_namespace_ref.
+    let err = eval_err("Kernel::Sub::Object");
+    assert!(matches!(err, EvalError::TypeError(_)));
+}
+
 // ── S7: historyOf: / historyOf:from:to: ──────────────────────────────────────
 
 #[test]
