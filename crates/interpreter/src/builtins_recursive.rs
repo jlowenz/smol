@@ -2456,4 +2456,3 @@ fn handle_subclass(
     }
     Ok(Value::Instance(class_handle))
 }
-

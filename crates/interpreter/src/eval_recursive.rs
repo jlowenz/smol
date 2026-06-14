@@ -37,6 +37,7 @@ impl RecursiveEvaluator {
     }
 
     /// Create a recursive evaluator without loading `kernel_recursive.smol`.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new_without_kernel() -> Self {
         Self {
             inner: Arc::new(Evaluator::new_without_kernel()),
@@ -45,6 +46,7 @@ impl RecursiveEvaluator {
 
     /// Create a recursive evaluator sharing an existing registry (for entity
     /// spawns that should share the same class set).
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn with_registry(registry: Arc<ClassRegistry>) -> Self {
         Self {
             inner: Arc::new(Evaluator::with_registry(registry)),
