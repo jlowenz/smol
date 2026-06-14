@@ -57,6 +57,29 @@ pub fn dispatch(
         let v = force_value(recv)?;
         return Ok(Value::Int(hash_value(&v)));
     }
+    // `_primClass` — maps any value to its kernel class entity handle.
+    if selector.as_ref() == "_primClass" {
+        expect_arity(&selector, 0, args.len())?;
+        let recv = force_value(recv)?;
+        return value_to_class_handle(ev, &recv)
+            .map(Value::Instance)
+            .ok_or_else(|| mnu("Object", &selector));
+    }
+    // `_primIsKindOf:` — true iff receiver's class is aClass or a subclass of it.
+    if selector.as_ref() == "_primIsKindOf:" {
+        expect_arity(&selector, 1, args.len())?;
+        let recv = force_value(recv)?;
+        let arg = force_value(args.into_iter().next().unwrap())?;
+        let recv_class = match value_to_class_handle(ev, &recv) {
+            Some(h) => h.0.class.clone(),
+            None => return Ok(Value::Bool(false)),
+        };
+        let arg_class = match arg {
+            Value::Instance(h) => h.0.class.clone(),
+            _ => return Ok(Value::Bool(false)),
+        };
+        return Ok(Value::Bool(is_kind_of(&recv_class, &arg_class)));
+    }
     // `hash` is universal for non-object types (primitive values don't route through
     // Object method lookup). For Value::Instance with Entity/ValueObject kind, the
     // type-specific dispatch runs instead to find any user-defined `hash` override.
@@ -170,7 +193,7 @@ pub fn dispatch(
     match recv {
         Value::Int(n) => dispatch_int(ev, n, &selector, args, env),
         Value::Float(f) => dispatch_float(ev, f, &selector, args, env),
-        Value::Bool(b) => dispatch_bool(ev, b, &selector, args, env),
+        Value::Bool(_) => dispatch_primitive_fallback(ev, "Bool", &selector, args),
         Value::Nil => dispatch_nil(ev, &selector, args, env),
         Value::Str(s) => dispatch_str(ev, s, &selector, args, env),
         Value::Symbol(s) => dispatch_symbol(ev, s, &selector, args, env),
@@ -275,7 +298,19 @@ pub(crate) fn lookup_user_method(
                 def_class,
             })
         }
-        _ => None, // Float, Bool, Str, Symbol, LargeInt, Future, Namespace
+        Value::Bool(b) => {
+            let cls = ev
+                .registry
+                .kernel()
+                .lookup_class(if *b { "True" } else { "False" })?;
+            let (method, def_class) = cls.0.class.lookup(selector)?;
+            Some(UserMethodFound::Primitive {
+                self_value: Value::Bool(*b),
+                method,
+                def_class,
+            })
+        }
+        _ => None, // Float, Str, Symbol, LargeInt, Future, Namespace
     }
 }
 
@@ -920,127 +955,6 @@ fn dispatch_float(
     }
 }
 
-// ── Bool ─────────────────────────────────────────────────────────────────────
-
-fn dispatch_bool(
-    ev: &Evaluator,
-    b: bool,
-    sel: &Arc<str>,
-    mut args: Vec<Value>,
-    env: &mut Env,
-) -> Result<Value, EvalError> {
-    match sel.as_ref() {
-        "ifTrue:" => {
-            expect_arity(sel, 1, args.len())?;
-            let blk = as_block(args.remove(0), sel)?;
-            if b {
-                ev.eval_block(&blk, vec![], env)
-            } else {
-                Ok(Value::Nil)
-            }
-        }
-        "ifFalse:" => {
-            expect_arity(sel, 1, args.len())?;
-            let blk = as_block(args.remove(0), sel)?;
-            if !b {
-                ev.eval_block(&blk, vec![], env)
-            } else {
-                Ok(Value::Nil)
-            }
-        }
-        "ifTrue:ifFalse:" => {
-            expect_arity(sel, 2, args.len())?;
-            let true_blk = as_block(args.remove(0), sel)?;
-            let false_blk = as_block(args.remove(0), sel)?;
-            if b {
-                ev.eval_block(&true_blk, vec![], env)
-            } else {
-                ev.eval_block(&false_blk, vec![], env)
-            }
-        }
-        "ifFalse:ifTrue:" => {
-            expect_arity(sel, 2, args.len())?;
-            let false_blk = as_block(args.remove(0), sel)?;
-            let true_blk = as_block(args.remove(0), sel)?;
-            if b {
-                ev.eval_block(&true_blk, vec![], env)
-            } else {
-                ev.eval_block(&false_blk, vec![], env)
-            }
-        }
-        "&" => {
-            expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
-                Value::Bool(b2) => Ok(Value::Bool(b && b2)),
-                _ => Err(EvalError::TypeError(format!(
-                    "{sel}: argument must be Bool"
-                ))),
-            }
-        }
-        "|" => {
-            expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
-                Value::Bool(b2) => Ok(Value::Bool(b || b2)),
-                _ => Err(EvalError::TypeError(format!(
-                    "{sel}: argument must be Bool"
-                ))),
-            }
-        }
-        "and:" => {
-            expect_arity(sel, 1, args.len())?;
-            if !b {
-                return Ok(Value::Bool(false));
-            }
-            let blk = as_block(args.remove(0), sel)?;
-            let f = ev.eval_block(&blk, vec![], env)?;
-            match f {
-                Value::Bool(b2) => Ok(Value::Bool(b2)),
-                Value::Future(_) => force_value(f),
-                _ => Err(EvalError::TypeError(format!(
-                    "{sel}: block must return Bool"
-                ))),
-            }
-        }
-        "or:" => {
-            expect_arity(sel, 1, args.len())?;
-            if b {
-                return Ok(Value::Bool(true));
-            }
-            let blk = as_block(args.remove(0), sel)?;
-            let f = ev.eval_block(&blk, vec![], env)?;
-            match f {
-                Value::Bool(b2) => Ok(Value::Bool(b2)),
-                Value::Future(_) => force_value(f),
-                _ => Err(EvalError::TypeError(format!(
-                    "{sel}: block must return Bool"
-                ))),
-            }
-        }
-        "not" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Bool(!b))
-        }
-        "=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Bool(b) == force_value(args.remove(0))?))
-        }
-        "~=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Bool(b) != force_value(args.remove(0))?))
-        }
-        "printString" => {
-            expect_arity(sel, 0, args.len())?;
-            if b {
-                println!("true")
-            } else {
-                println!("false")
-            }
-            Ok(Value::Str(Arc::from(if b { "true" } else { "false" })))
-        }
-        _ => dispatch_primitive_fallback(ev, "Bool", sel, args),
-    }
-}
-
 // ── Nil ───────────────────────────────────────────────────────────────────────
 
 fn dispatch_nil(
@@ -1433,17 +1347,6 @@ pub(crate) fn dispatch_object_primitive(
             let s: Arc<str> = Arc::from(format!("a {}", obj.class.name).as_str());
             println!("{:?}", s);
             Ok(Value::Str(s))
-        }
-        "class" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Instance(class_handle_of(&obj)?))
-        }
-        "isKindOf:" => {
-            expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
-                Value::Instance(h) => Ok(Value::Bool(is_kind_of(&obj.class, &h.0.class))),
-                _ => Ok(Value::Bool(false)),
-            }
         }
         "respondsTo:" => {
             expect_arity(sel, 1, args.len())?;
@@ -1911,6 +1814,38 @@ fn is_kind_of(class: &Arc<Class>, target: &Arc<Class>) -> bool {
     }
 }
 
+/// Maps a value to its kernel class entity handle for `_primClass` / `_primIsKindOf:`.
+///
+/// Requires: `v` is not a `Value::Future` (caller must force first).
+/// Ensures: returns `Some(handle)` where handle is the class entity for `v`'s type,
+///   or `None` if no kernel class is available (ClassEntity receiver, Namespace).
+fn value_to_class_handle(ev: &Evaluator, v: &Value) -> Option<InstanceHandle> {
+    let class_name = match v {
+        Value::Bool(b) => {
+            if *b {
+                "True"
+            } else {
+                "False"
+            }
+        }
+        Value::Int(_) | Value::LargeInt(_) => "Int",
+        Value::Float(_) => "Float",
+        Value::Str(_) => "String",
+        Value::Symbol(_) => "Symbol",
+        Value::Block(_) => "Block",
+        Value::Nil => "Nil",
+        Value::Instance(h) => {
+            return match &h.0.kind {
+                InstanceKind::ValueObject(obj) => class_handle_of(obj).ok(),
+                InstanceKind::Entity(d) => class_handle_of(&d.data).ok(),
+                InstanceKind::ClassEntity(_) => None,
+            };
+        }
+        _ => return None,
+    };
+    ev.registry.kernel().lookup_class(class_name)
+}
+
 /// Assert `(entity, __instance_of__, class_entity)` in a fresh one-shot transaction.
 ///
 /// Requires: `inst` is an Entity kind handle.
@@ -2075,10 +2010,13 @@ fn dispatch_class(
     // Value-class methods (classes whose instances are passive ValueObjects) are also
     // dispatched synchronously: they carry no actor-mailbox semantics, so
     // cross-entity dispatch would be wrong.
+    // `=` and `~=` on class objects are pure structural identity checks — they
+    // must be synchronous so callers don't receive a Future where a Bool is expected.
     let current = ev.current_entity_id.get();
     if current == Some(entity_id)
         || selector.starts_with("subclass:")
         || handle.0.class.inherits_is_value()
+        || matches!(selector.as_ref(), "=" | "~=")
     {
         let class = handle.0.class.clone();
         if let Some((method, def_class)) = class.lookup_class_method(&selector) {

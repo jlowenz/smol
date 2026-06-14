@@ -268,6 +268,9 @@ impl Evaluator {
                     return Some(v);
                 }
                 // 3. outer env (globals)
+                // Ivar access for blocks with a home instance is handled by
+                // push_block_frame which pushes SelfBinding::Instance{home_self}
+                // before the block frame, so lookup_var sees Instance at top, not Primitive.
                 env.lookup_outer_frames(name)
             }
             None => env.get(name),
@@ -325,7 +328,10 @@ impl Evaluator {
                     }
                 }
                 Some(SelfBinding::Primitive { defining_class, .. }) => {
-                    // No ivar check for primitives.
+                    // Primitive receivers have no ivars. Ivar writes from blocks
+                    // with a home instance are handled by push_block_frame pushing
+                    // SelfBinding::Instance{home_self}, so assign_var sees Instance
+                    // at top, not Primitive.
                     if let Some(owner) = defining_class.lookup_class_var_owner(name.as_ref()) {
                         let ret = value.clone();
                         owner.class_var_storage.write().insert(name.clone(), value);
@@ -371,6 +377,7 @@ impl Evaluator {
             pops_env: false,
             saved_block_home: self.current_block_home.get(),
             frame_block_home: None,
+            block_home_self: None,
             defining_class: None,
             sync: false,
         };
@@ -483,6 +490,14 @@ impl Evaluator {
                 }
             }
         }
+        // If the block captured a home instance, push its SelfBinding now so
+        // lookup_var finds ivars. The frame cleanup in step_loop pops it.
+        if let Some(ref handle) = block.home_self {
+            self.push_self(SelfBinding::Instance {
+                handle: handle.clone(),
+                defining_class: handle.0.class.clone(),
+            });
+        }
         let saved_home = self.current_block_home.get();
         let frame = Cont::CallFrame {
             self_binding: None,
@@ -494,6 +509,7 @@ impl Evaluator {
             pops_env: true,
             saved_block_home: saved_home,
             frame_block_home: Some(block.home_depth),
+            block_home_self: block.home_self.clone(),
             defining_class: None,
             sync: false,
         };
@@ -583,17 +599,19 @@ impl Evaluator {
             pops_env: true,
             saved_block_home,
             frame_block_home: None,
+            block_home_self: None,
             defining_class: Some(defining_class),
             sync: false,
         };
         step_loop(self, frame)
     }
 
-    /// Invoke a user-defined method where `self` is a primitive value (e.g. `nil`).
+    /// Invoke a user-defined method where `self` is a primitive value (e.g. `nil`, `true`).
     ///
     /// Requires: `args.len() == method.pattern.params().len()`.
-    /// Ensures: `self_value` is bound as `self` in the method frame; a method
-    ///   with no explicit `^` returns `self_value` (Smalltalk implicit self return).
+    /// Ensures: `self_value` is bound as `self` in a proper method frame; `^`-returns
+    ///   are caught by that frame; a method with no explicit `^` returns `self_value`
+    ///   (Smalltalk implicit self return).
     pub fn invoke_primitive_method(
         &self,
         self_value: Value,
@@ -618,22 +636,36 @@ impl Evaluator {
         for local in &method.locals {
             method_env.define(local.clone(), Value::Nil);
         }
-        self.push_self(SelfBinding::Primitive {
-            defining_class,
-            self_value: self_value.clone(),
-        });
-        let my_depth = self.method_depth.get();
-        let prev_home = self.current_block_home.get();
-        self.current_block_home.set(None);
-        let result = self.eval_program(&method.body, &mut method_env);
-        self.current_block_home.set(prev_home);
-        self.pop_self();
-        method_env.pop_frame();
-        match result {
-            Ok(_) => Ok(self_value),
-            Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
-            Err(e) => Err(e),
+        for stmt in &method.body {
+            if let Stmt::LocalDecl(names) = stmt {
+                for name in names {
+                    method_env.define(name.clone(), Value::Nil);
+                }
+            }
         }
+        let binding = SelfBinding::Primitive {
+            defining_class: defining_class.clone(),
+            self_value: self_value.clone(),
+        };
+        self.push_self(binding.clone());
+        let depth = self.method_depth.get();
+        let saved_block_home = self.current_block_home.get();
+        self.current_block_home.set(None);
+        let frame = Cont::CallFrame {
+            self_binding: Some(binding),
+            depth,
+            pending: method.body.iter().cloned().collect(),
+            env: method_env,
+            implicit_return: self_value,
+            is_method: true,
+            pops_env: true,
+            saved_block_home,
+            frame_block_home: None,
+            block_home_self: None,
+            defining_class: Some(defining_class),
+            sync: false,
+        };
+        step_loop(self, frame)
     }
 
     /// Create an evaluator from an existing `ClassRegistry`, loading `kernel.smol`.

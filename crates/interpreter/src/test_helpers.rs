@@ -4,6 +4,15 @@ use crate::eval_recursive::RecursiveEvaluator;
 use crate::parser::Parser;
 use crate::value::Value;
 
+/// Stack size for test-helper coroutines in words (× `size_of::<usize>()`).
+///
+/// Test coroutines run `Evaluator::new()` which loads and evaluates
+/// `kernel.smol` — this involves the recursive-descent parser and bootstraps
+/// entity actors, both of which consume significant Rust stack in debug builds.
+/// Production entity coroutines use `Evaluator::with_registry` (no kernel
+/// loading) and are governed by the much smaller `COROUTINE_STACK_SIZE`.
+const TEST_COROUTINE_STACK: usize = 0x8000; // 256 KB in bytes on 64-bit
+
 /// Extract the message text from an `EvalError::Signal(Value)` condition.
 /// Returns `None` if the error is not a Signal.
 pub(crate) fn signal_message(err: &EvalError) -> Option<String> {
@@ -99,18 +108,63 @@ fn resolve(v: Value) -> Result<Value, EvalError> {
     }
 }
 
-/// Evaluate Smol source, running both the iterative (`Evaluator`) and recursive
-/// (`RecursiveEvaluator`) implementations independently and asserting they agree.
+/// Evaluate Smol source using the iterative evaluator only.
 ///
 /// Requires: `src` is valid Smol; program must not error.
 pub(crate) fn eval(src: &str) -> Value {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
     crate::entity::init_coroutine_stack();
-    may::go!(move || {
+    let _ = may::go_with!(TEST_COROUTINE_STACK, move || {
+        let prog = Parser::parse(&src).expect("parse");
+        let ev = Evaluator::new();
+        let mut env = Env::new();
+        ev.registry.populate_env(&mut env);
+        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        let v = resolve(v).expect("eval future resolution");
+        ev.shutdown();
+        tx.send(v).unwrap();
+    });
+    rx.recv().expect("eval coroutine panicked")
+}
+
+/// Evaluate Smol source using the iterative evaluator and return the error.
+///
+/// Requires: `src` is valid Smol; program must produce an error.
+#[allow(dead_code)]
+pub(crate) fn eval_err(src: &str) -> EvalError {
+    let src = src.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::entity::init_coroutine_stack();
+    let _ = may::go_with!(TEST_COROUTINE_STACK, move || {
+        let prog = Parser::parse(&src).expect("parse");
+        let ev = Evaluator::new();
+        let mut env = Env::new();
+        ev.registry.populate_env(&mut env);
+        let err = match ev.eval_program(&prog.stmts, &mut env) {
+            Err(e) => e,
+            Ok(v) => match resolve(v) {
+                Err(e) => e,
+                Ok(_) => panic!("eval: expected error, got Ok"),
+            },
+        };
+        ev.shutdown();
+        tx.send(err).unwrap();
+    });
+    rx.recv().expect("eval_err coroutine panicked")
+}
+
+/// Evaluate Smol source, running both the iterative and recursive evaluators
+/// and asserting they agree. Use for features supported by both paths.
+///
+/// Requires: `src` is valid Smol; program must not error.
+pub(crate) fn eval_diff(src: &str) -> Value {
+    let src = src.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::entity::init_coroutine_stack();
+    let _ = may::go_with!(TEST_COROUTINE_STACK, move || {
         let prog = Parser::parse(&src).expect("parse");
 
-        // Iterative evaluator.
         let ev_iter = Evaluator::new();
         let mut env_iter = Env::new();
         ev_iter.registry.populate_env(&mut env_iter);
@@ -120,7 +174,6 @@ pub(crate) fn eval(src: &str) -> Value {
         let v_iter = resolve(v_iter).expect("eval_iter future resolution");
         ev_iter.shutdown();
 
-        // Recursive evaluator — independent registry, loads kernel_recursive.smol.
         let ev_rec = RecursiveEvaluator::new();
         let mut env_rec = Env::new();
         ev_rec.inner.registry.populate_env(&mut env_rec);
@@ -136,20 +189,19 @@ pub(crate) fn eval(src: &str) -> Value {
         );
         tx.send(v_iter).unwrap();
     });
-    rx.recv().expect("eval coroutine panicked")
+    rx.recv().expect("eval_diff coroutine panicked")
 }
 
 /// Evaluate Smol source and return the error, checking both evaluators agree.
 ///
 /// Requires: `src` is valid Smol; program must produce an error.
-pub(crate) fn eval_err(src: &str) -> EvalError {
+pub(crate) fn eval_err_diff(src: &str) -> EvalError {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
     crate::entity::init_coroutine_stack();
-    may::go!(move || {
+    let _ = may::go_with!(TEST_COROUTINE_STACK, move || {
         let prog = Parser::parse(&src).expect("parse");
 
-        // Iterative evaluator.
         let ev_iter = Evaluator::new();
         let mut env_iter = Env::new();
         ev_iter.registry.populate_env(&mut env_iter);
@@ -162,7 +214,6 @@ pub(crate) fn eval_err(src: &str) -> EvalError {
         };
         ev_iter.shutdown();
 
-        // Recursive evaluator.
         let ev_rec = RecursiveEvaluator::new();
         let mut env_rec = Env::new();
         ev_rec.inner.registry.populate_env(&mut env_rec);
@@ -181,5 +232,5 @@ pub(crate) fn eval_err(src: &str) -> EvalError {
         );
         tx.send(err_iter).unwrap();
     });
-    rx.recv().expect("eval_err coroutine panicked")
+    rx.recv().expect("eval_err_diff coroutine panicked")
 }

@@ -16,8 +16,13 @@ use triple_store::store::{OwnedStoreTransaction, Store, StoreError};
 pub use triple_store::id::EntityId;
 
 /// Coroutine stack size for all entity and continuation coroutines.
-/// Set once via `init_coroutine_stack`; sized for deep Rust interpreter recursion.
-const COROUTINE_STACK_SIZE: usize = 0x8000; // 128 KB
+///
+/// Sized empirically with the iterative evaluator, which uses heap `CallFrame`s
+/// for Smol method calls. The dominant Rust stack cost is nested
+/// builtin→`eval_block` chains (e.g. `on:do:` wrapping `ensure:` wrapping
+/// `do:`). Measured debug-build minimum: ~27 KB; release builds use noticeably
+/// less due to inlining. Constant set to 32 KB for headroom.
+pub(crate) const COROUTINE_STACK_SIZE: usize = 0x8000; // 256 KB — see S6 notes in chunk_30_plan.md
 
 /// Set the global `may` stack size exactly once. Idempotent — safe to call from
 /// any spawn site; subsequent calls are a no-op.

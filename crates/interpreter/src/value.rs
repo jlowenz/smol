@@ -54,6 +54,13 @@ pub struct Block {
     /// created outside any entity context. Used to detect cross-entity block
     /// invocations for write-guard enforcement.
     pub home_entity: Option<EntityId>,
+    /// The instance `self` at the point the block was captured, if any.
+    ///
+    /// Ensures ivar/classvar access in blocks is correct even after TCO removes
+    /// the enclosing method frame from the `method_stack`. `push_block_frame`
+    /// pushes a `SelfBinding::Instance` for this handle so `lookup_var` finds
+    /// ivars without walking the stack.
+    pub home_self: Option<InstanceHandle>,
 }
 
 impl PartialEq for Value {

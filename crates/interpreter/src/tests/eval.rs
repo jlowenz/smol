@@ -1,98 +1,104 @@
 use super::*;
-use crate::test_helpers::{assert_signal_contains, eval, eval_err};
+use crate::test_helpers::{assert_signal_contains, eval, eval_diff, eval_err_diff};
 
 #[test]
 fn integer_arithmetic() {
-    assert_eq!(eval("3 + 4"), Value::Int(7));
-    assert_eq!(eval("10 - 3"), Value::Int(7));
-    assert_eq!(eval("3 * 4"), Value::Int(12));
-    assert_eq!(eval("10 // 3"), Value::Int(3));
-    assert_eq!(eval("10 \\\\ 3"), Value::Int(1));
+    assert_eq!(eval_diff("3 + 4"), Value::Int(7));
+    assert_eq!(eval_diff("10 - 3"), Value::Int(7));
+    assert_eq!(eval_diff("3 * 4"), Value::Int(12));
+    assert_eq!(eval_diff("10 // 3"), Value::Int(3));
+    assert_eq!(eval_diff("10 \\\\ 3"), Value::Int(1));
 }
 
 #[test]
 fn integer_comparison() {
-    assert_eq!(eval("3 < 4"), Value::Bool(true));
-    assert_eq!(eval("4 < 3"), Value::Bool(false));
-    assert_eq!(eval("3 = 3"), Value::Bool(true));
-    assert_eq!(eval("3 ~= 4"), Value::Bool(true));
+    assert_eq!(eval_diff("3 < 4"), Value::Bool(true));
+    assert_eq!(eval_diff("4 < 3"), Value::Bool(false));
+    assert_eq!(eval_diff("3 = 3"), Value::Bool(true));
+    assert_eq!(eval_diff("3 ~= 4"), Value::Bool(true));
 }
 
 #[test]
 fn boolean_conditional() {
-    assert_eq!(eval("true ifTrue: ['yes']"), Value::Str(Arc::from("yes")));
-    assert_eq!(eval("false ifFalse: ['no']"), Value::Str(Arc::from("no")));
     assert_eq!(
-        eval("true ifTrue: ['yes'] ifFalse: ['no']"),
+        eval_diff("true ifTrue: ['yes']"),
+        Value::Str(Arc::from("yes"))
+    );
+    assert_eq!(
+        eval_diff("false ifFalse: ['no']"),
+        Value::Str(Arc::from("no"))
+    );
+    assert_eq!(
+        eval_diff("true ifTrue: ['yes'] ifFalse: ['no']"),
         Value::Str(Arc::from("yes"))
     );
 }
 
 #[test]
 fn block_value() {
-    assert_eq!(eval("[:x | x * x] value: 7"), Value::Int(49));
+    assert_eq!(eval_diff("[:x | x * x] value: 7"), Value::Int(49));
 }
 
 #[test]
 fn block_in_block_value() {
     let src = r#"
     | b | b := [ :b | b value + 1 ]. b value: [42]"#;
-    assert_eq!(eval(src), Value::Int(43));
+    assert_eq!(eval_diff(src), Value::Int(43));
 }
 
 #[test]
 fn times_repeat() {
     let src = "| oc | oc := OrderedCollection new. 3 timesRepeat: [oc add: 1]. oc size";
-    assert_eq!(eval(src), Value::Int(3));
+    assert_eq!(eval_diff(src), Value::Int(3));
 }
 
 #[test]
 fn while_true() {
     let src = "| oc | oc := OrderedCollection new. [oc size < 5] whileTrue: [oc add: 1]. oc size";
-    assert_eq!(eval(src), Value::Int(5));
+    assert_eq!(eval_diff(src), Value::Int(5));
 }
 
 #[test]
 fn assignment_and_variable() {
-    assert_eq!(eval("x := 42. x"), Value::Int(42));
+    assert_eq!(eval_diff("x := 42. x"), Value::Int(42));
 }
 
 #[test]
 fn local_decl_binds_nil() {
-    assert_eq!(eval("| x | x"), Value::Nil);
+    assert_eq!(eval_diff("| x | x"), Value::Nil);
 }
 
 #[test]
 fn yourself_returns_receiver() {
-    assert_eq!(eval("42 yourself"), Value::Int(42));
+    assert_eq!(eval_diff("42 yourself"), Value::Int(42));
 }
 
 #[test]
 fn cascade() {
     // The result of a cascade is the last message's return value.
     // `3 yourself; yourself` — both return 3.
-    assert_eq!(eval("3 yourself; yourself"), Value::Int(3));
+    assert_eq!(eval_diff("3 yourself; yourself"), Value::Int(3));
 }
 
 #[test]
 fn print_string_int() {
-    assert_eq!(eval("42 printString"), Value::Str(Arc::from("42")));
+    assert_eq!(eval_diff("42 printString"), Value::Str(Arc::from("42")));
 }
 
 #[test]
 fn print_string_float() {
-    assert_eq!(eval("1.5 printString"), Value::Str(Arc::from("1.5")));
+    assert_eq!(eval_diff("1.5 printString"), Value::Str(Arc::from("1.5")));
 }
 
 #[test]
 fn undefined_variable_error() {
-    matches!(eval_err("x"), EvalError::UndefinedVariable(_));
+    matches!(eval_err_diff("x"), EvalError::UndefinedVariable(_));
 }
 
 #[test]
 fn message_not_understood() {
     matches!(
-        eval_err("42 unknownMsg"),
+        eval_err_diff("42 unknownMsg"),
         EvalError::MessageNotUnderstood { .. }
     );
 }
@@ -100,21 +106,21 @@ fn message_not_understood() {
 #[test]
 fn to_do_loop() {
     let src = "| oc | oc := OrderedCollection new. 1 to: 5 do: [:i | oc add: i]. oc inject: 0 into: [:acc :e | acc + e]";
-    assert_eq!(eval(src), Value::Int(15));
+    assert_eq!(eval_diff(src), Value::Int(15));
 }
 
 #[test]
 fn string_concat() {
     assert_eq!(
-        eval("'hello' , ' world'"),
+        eval_diff("'hello' , ' world'"),
         Value::Str(Arc::from("hello world"))
     );
 }
 
 #[test]
 fn nil_is_nil() {
-    assert_eq!(eval("nil isNil"), Value::Bool(true));
-    assert_eq!(eval("42 isNil"), Value::Bool(false));
+    assert_eq!(eval_diff("nil isNil"), Value::Bool(true));
+    assert_eq!(eval_diff("42 isNil"), Value::Bool(false));
 }
 
 #[test]
@@ -125,7 +131,7 @@ Object subclass: #Point instanceVariableNames: 'x y'.
 p := Point new.
 p
 "#;
-    let v = eval(src);
+    let v = eval_diff(src);
     assert_eq!(format!("{v}"), "a Point");
 }
 
@@ -149,7 +155,7 @@ c increment.
 c increment.
 c count
 "#;
-    assert_eq!(eval(src), Value::Int(3));
+    assert_eq!(eval_diff(src), Value::Int(3));
 }
 
 #[test]
@@ -167,21 +173,21 @@ a := Counted new.
 b := Counted new.
 b total] syncValue
 "#;
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
 }
 
 #[test]
 fn largeint_overflow_promotion() {
     // i64::MAX + 1 should produce a LargeInt
     let src = "9223372036854775807 + 1";
-    let v = eval(src);
+    let v = eval_diff(src);
     assert!(matches!(v, Value::LargeInt(_)));
 }
 
 #[test]
 fn largeint_literal() {
     let src = "99999999999999999999 + 1";
-    let v = eval(src);
+    let v = eval_diff(src);
     assert!(matches!(v, Value::LargeInt(_)));
 }
 
@@ -191,7 +197,7 @@ fn object_print_string() {
 Object subclass: #Foo instanceVariableNames: ''.
 Foo new printString
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("a Foo")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("a Foo")));
 }
 
 #[test]
@@ -209,7 +215,7 @@ Dog >> speak [
 d := Dog new.
 d speak
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("... Woof!")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("... Woof!")));
 }
 
 #[test]
@@ -228,7 +234,7 @@ Counter >> count [ ^count ]
 c := Counter startingAt: 42.
 c count
 "#;
-    assert_eq!(eval(src), Value::Int(42));
+    assert_eq!(eval_diff(src), Value::Int(42));
 }
 
 #[test]
@@ -236,7 +242,7 @@ fn namespace_ref() {
     let src = r#"
 Kernel::Object new printString
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("a Object")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("a Object")));
 }
 
 #[test]
@@ -247,7 +253,7 @@ oc := OrderedCollection new.
 Kernel do: [ oc add: 1 ].
 oc size
 "#;
-    assert_eq!(eval(src), Value::Int(1));
+    assert_eq!(eval_diff(src), Value::Int(1));
 }
 
 #[test]
@@ -333,32 +339,32 @@ fn kernel_classes_in_env() {
 
 #[test]
 fn array_new_size_and_at() {
-    assert_eq!(eval("(Array new: 3) size"), Value::Int(3));
-    assert_eq!(eval("| a | a := Array new: 3. a at: 0"), Value::Nil);
+    assert_eq!(eval_diff("(Array new: 3) size"), Value::Int(3));
+    assert_eq!(eval_diff("| a | a := Array new: 3. a at: 0"), Value::Nil);
 }
 
 #[test]
 fn array_at_put_and_at() {
     assert_eq!(
-        eval("| a | a := Array new: 3. a at: 1 put: 99. a at: 1"),
+        eval_diff("| a | a := Array new: 3. a at: 1 put: 99. a at: 1"),
         Value::Int(99)
     );
 }
 
 #[test]
 fn array_is_empty_not_empty() {
-    assert_eq!(eval("(Array new: 0) isEmpty"), Value::Bool(true));
-    assert_eq!(eval("(Array new: 2) notEmpty"), Value::Bool(true));
+    assert_eq!(eval_diff("(Array new: 0) isEmpty"), Value::Bool(true));
+    assert_eq!(eval_diff("(Array new: 2) notEmpty"), Value::Bool(true));
 }
 
 #[test]
 fn array_first_last() {
     assert_eq!(
-        eval("| a | a := Array new: 3. a at: 0 put: 10. a at: 2 put: 30. a first"),
+        eval_diff("| a | a := Array new: 3. a at: 0 put: 10. a at: 2 put: 30. a first"),
         Value::Int(10)
     );
     assert_eq!(
-        eval("| a | a := Array new: 3. a at: 0 put: 10. a at: 2 put: 30. a last"),
+        eval_diff("| a | a := Array new: 3. a at: 0 put: 10. a at: 2 put: 30. a last"),
         Value::Int(30)
     );
 }
@@ -366,7 +372,7 @@ fn array_first_last() {
 #[test]
 fn value_object_update_basic() {
     assert_eq!(
-        eval("| s | s := ValueHolder initialValue: 0. s update: [:old | old + 1]. s get"),
+        eval_diff("| s | s := ValueHolder initialValue: 0. s update: [:old | old + 1]. s get"),
         Value::Int(1)
     );
 }
@@ -375,7 +381,7 @@ fn value_object_update_basic() {
 #[test]
 fn value_object_update_captures_outer_var() {
     assert_eq!(
-        eval(
+        eval_diff(
             "| s | s := ValueHolder initialValue: 0. [:x | s update: [:old | old + x]] value: 5. s get"
         ),
         Value::Int(5)
@@ -385,20 +391,20 @@ fn value_object_update_captures_outer_var() {
 #[test]
 fn await_resolves_future() {
     assert_eq!(
-        eval("| s | s := ValueHolder initialValue: 42. (s get) await"),
+        eval_diff("| s | s := ValueHolder initialValue: 42. (s get) await"),
         Value::Int(42)
     );
 }
 
 #[test]
 fn await_is_noop_on_non_future() {
-    assert_eq!(eval("42 await"), Value::Int(42));
+    assert_eq!(eval_diff("42 await"), Value::Int(42));
 }
 
 #[test]
 fn sync_value_block_sequences_cross_entity_sends() {
     assert_eq!(
-        eval(
+        eval_diff(
             "| s | s := ValueHolder initialValue: 0. [s update: [:old | old + 5]. s get] syncValue"
         ),
         Value::Int(5)
@@ -408,7 +414,7 @@ fn sync_value_block_sequences_cross_entity_sends() {
 #[test]
 fn future_then_chains_after_completion() {
     assert_eq!(
-        eval(
+        eval_diff(
             "| a s | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3.
             s := ValueHolder initialValue: 0.
             (a do: [:e | s update: [:old | old + e]]) then: [s get]"
@@ -420,7 +426,7 @@ fn future_then_chains_after_completion() {
 #[test]
 fn array_do_iterates() {
     assert_eq!(
-        eval(
+        eval_diff(
             "| a s | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3.
             s := ValueHolder initialValue: 0.
             (a do: [:e | s update: [:old | old + e]]) await.
@@ -435,59 +441,59 @@ fn array_collect_maps() {
     let src = "| a r |
     a := (Array new: 3) at: 0 put: 1; at: 1 put: 2; at: 2 put: 3; yourself.
     r := a collect: [:e | e * 2]. r at: 2";
-    assert_eq!(eval(src), Value::Int(6));
+    assert_eq!(eval_diff(src), Value::Int(6));
 }
 
 #[test]
 fn array_select_returns_ordered_collection() {
     let src = "| a r | a := Array new: 4. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a at: 3 put: 4. r := a select: [:e | e > 2]. r size";
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
 }
 
 #[test]
 fn array_reject_returns_ordered_collection() {
     let src = "| a r | a := Array new: 4. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a at: 3 put: 4. r := a reject: [:e | e > 2]. r size";
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
 }
 
 #[test]
 fn array_detect() {
     let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 5. a at: 2 put: 3. a detect: [:e | e > 4]";
-    assert_eq!(eval(src), Value::Int(5));
+    assert_eq!(eval_diff(src), Value::Int(5));
 }
 
 #[test]
 fn array_detect_if_none() {
     // noneBlock branch
     let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a detect: [:e | e > 10] ifNone: [99]";
-    assert_eq!(eval(src), Value::Int(99));
+    assert_eq!(eval_diff(src), Value::Int(99));
     // found branch
     let src2 = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 5. a at: 2 put: 3. a detect: [:e | e > 4] ifNone: [0]";
-    assert_eq!(eval(src2), Value::Int(5));
+    assert_eq!(eval_diff(src2), Value::Int(5));
 }
 
 #[test]
 fn array_inject_into_sum() {
     let src = "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a inject: 0 into: [:acc :e | acc + e]";
-    assert_eq!(eval(src), Value::Int(6));
+    assert_eq!(eval_diff(src), Value::Int(6));
 }
 
 #[test]
 fn array_includes() {
     let src =
         "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a includes: 2";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
     let src2 =
         "| a | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. a includes: 9";
-    assert_eq!(eval(src2), Value::Bool(false));
+    assert_eq!(eval_diff(src2), Value::Bool(false));
 }
 
 #[test]
 fn array_copy_from_to() {
     let src = "| a r | a := Array new: 5. 0 to: 4 do: [:i | a at: i put: i]. r := a copyFrom: 1 to: 3. r size";
-    assert_eq!(eval(src), Value::Int(3));
+    assert_eq!(eval_diff(src), Value::Int(3));
     let src2 = "| a r | a := Array new: 5. 0 to: 4 do: [:i | a at: i put: i]. r := a copyFrom: 1 to: 3. r at: 0";
-    assert_eq!(eval(src2), Value::Int(1));
+    assert_eq!(eval_diff(src2), Value::Int(1));
 }
 
 #[test]
@@ -496,36 +502,36 @@ fn array_equality() {
     a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2.
     b := Array new: 2. b at: 0 put: 1. b at: 1 put: 2.
     a = b";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
     let src2 = "| a b |
     a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2.
     b := Array new: 2. b at: 0 put: 1. b at: 1 put: 9.
     a = b";
-    assert_eq!(eval(src2), Value::Bool(false));
+    assert_eq!(eval_diff(src2), Value::Bool(false));
 }
 
 #[test]
 fn array_not_equal() {
     let src =
         "| a b | a := Array new: 1. b := Array new: 1. a at: 0 put: 1. b at: 0 put: 2. a ~= b";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
     let src2 =
         "| a b | a := Array new: 1. b := Array new: 1. a at: 0 put: 5. b at: 0 put: 5. a ~= b";
-    assert_eq!(eval(src2), Value::Bool(false));
+    assert_eq!(eval_diff(src2), Value::Bool(false));
 }
 
 #[test]
 fn array_eq_class_mismatch() {
     // Array vs OrderedCollection should be unequal even if content looks similar
     let src = "| a oc | a := Array new: 0. oc := OrderedCollection new. a = oc";
-    assert_eq!(eval(src), Value::Bool(false));
+    assert_eq!(eval_diff(src), Value::Bool(false));
 }
 
 #[test]
 fn array_eq_size_mismatch() {
     // Same class, different sizes — exercises the n = other size ifFalse: [^false] branch.
     let src = "| a b | a := Array new: 2. b := Array new: 3. a = b";
-    assert_eq!(eval(src), Value::Bool(false));
+    assert_eq!(eval_diff(src), Value::Bool(false));
 }
 
 #[test]
@@ -533,7 +539,7 @@ fn array_detect_no_match_signals() {
     let src = "| a | a := Array new: 3. 
     a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3. 
     a detect: [:e | e > 10]";
-    assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    assert!(matches!(eval_err_diff(src), EvalError::Signal(_)));
 }
 
 #[test]
@@ -541,34 +547,34 @@ fn array_print_string() {
     let src = "| a |
     a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2.
     a printString";
-    assert_eq!(eval(src), Value::Str(Arc::from("(1 2 )")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("(1 2 )")));
 }
 
 // ── ByteArray protocol ────────────────────────────────────────────────────
 
 #[test]
 fn bytearray_new_size_at_put() {
-    assert_eq!(eval("(ByteArray new: 4) size"), Value::Int(4));
+    assert_eq!(eval_diff("(ByteArray new: 4) size"), Value::Int(4));
     let src = "| b | b := ByteArray new: 4. b at: 0 put: 65. b at: 0";
-    assert_eq!(eval(src), Value::Int(65));
+    assert_eq!(eval_diff(src), Value::Int(65));
 }
 
 #[test]
 fn bytearray_is_empty() {
-    assert_eq!(eval("(ByteArray new: 0) isEmpty"), Value::Bool(true));
-    assert_eq!(eval("(ByteArray new: 1) notEmpty"), Value::Bool(true));
+    assert_eq!(eval_diff("(ByteArray new: 0) isEmpty"), Value::Bool(true));
+    assert_eq!(eval_diff("(ByteArray new: 1) notEmpty"), Value::Bool(true));
 }
 
 #[test]
 fn bytearray_print_string() {
     let src = "| b | b := ByteArray new: 2. b at: 0 put: 65. b at: 1 put: 66. b printString";
-    assert_eq!(eval(src), Value::Str(Arc::from("(65 66 )")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("(65 66 )")));
 }
 
 #[test]
 fn bytearray_as_string() {
     let src = "| b | b := ByteArray new: 3. b at: 0 put: 65. b at: 1 put: 66. b at: 2 put: 67. b asString";
-    assert_eq!(eval(src), Value::Str(Arc::from("ABC")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("ABC")));
 }
 
 #[test]
@@ -580,270 +586,282 @@ fn bytearray_do() {
     b at: 2 put: 30.
     s := ValueHolder initialValue: 0.
     (b do: [:e | s update: [ :old | old + e ]]) await. s get";
-    assert_eq!(eval(src), Value::Int(60));
+    assert_eq!(eval_diff(src), Value::Int(60));
 }
 
 #[test]
 fn bytearray_copy_from_to() {
     let src = "| b r | b := ByteArray new: 5. 0 to: 4 do: [:i | b at: i put: i * 10]. r := b copyFrom: 1 to: 3. r size";
-    assert_eq!(eval(src), Value::Int(3));
+    assert_eq!(eval_diff(src), Value::Int(3));
     let src2 = "| b r | b := ByteArray new: 5. 0 to: 4 do: [:i | b at: i put: i * 10]. r := b copyFrom: 1 to: 3. r at: 0";
-    assert_eq!(eval(src2), Value::Int(10));
+    assert_eq!(eval_diff(src2), Value::Int(10));
 }
 
 // ── OrderedCollection protocol ────────────────────────────────────────────
 
 #[test]
 fn oc_new_is_empty() {
-    assert_eq!(eval("OrderedCollection new isEmpty"), Value::Bool(true));
-    assert_eq!(eval("OrderedCollection new size"), Value::Int(0));
-    assert_eq!(eval("OrderedCollection new notEmpty"), Value::Bool(false));
+    assert_eq!(
+        eval_diff("OrderedCollection new isEmpty"),
+        Value::Bool(true)
+    );
+    assert_eq!(eval_diff("OrderedCollection new size"), Value::Int(0));
+    assert_eq!(
+        eval_diff("OrderedCollection new notEmpty"),
+        Value::Bool(false)
+    );
 }
 
 #[test]
 fn oc_add_and_size() {
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc size";
-    assert_eq!(eval(src), Value::Int(3));
+    assert_eq!(eval_diff(src), Value::Int(3));
 }
 
 #[test]
 fn oc_at() {
     let src = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc at: 1";
-    assert_eq!(eval(src), Value::Int(20));
+    assert_eq!(eval_diff(src), Value::Int(20));
 }
 
 #[test]
 fn oc_first_last() {
     let src = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc first";
-    assert_eq!(eval(src), Value::Int(10));
+    assert_eq!(eval_diff(src), Value::Int(10));
     let src2 = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. oc last";
-    assert_eq!(eval(src2), Value::Int(30));
+    assert_eq!(eval_diff(src2), Value::Int(30));
 }
 
 #[test]
 fn oc_add_first_prepends() {
     let src = "| oc | oc := OrderedCollection new. oc add: 2. oc add: 3. oc addFirst: 1. oc at: 0";
-    assert_eq!(eval(src), Value::Int(1));
+    assert_eq!(eval_diff(src), Value::Int(1));
 }
 
 #[test]
 fn oc_remove_first() {
     let src =
         "| oc v | oc := OrderedCollection new. oc add: 10. oc add: 20. v := oc removeFirst. v";
-    assert_eq!(eval(src), Value::Int(10));
+    assert_eq!(eval_diff(src), Value::Int(10));
     let src2 =
         "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc removeFirst. oc size";
-    assert_eq!(eval(src2), Value::Int(1));
+    assert_eq!(eval_diff(src2), Value::Int(1));
 }
 
 #[test]
 fn oc_remove_last() {
     let src = "| oc v | oc := OrderedCollection new. oc add: 10. oc add: 20. v := oc removeLast. v";
-    assert_eq!(eval(src), Value::Int(20));
+    assert_eq!(eval_diff(src), Value::Int(20));
     let src2 = "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc removeLast. oc size";
-    assert_eq!(eval(src2), Value::Int(1));
+    assert_eq!(eval_diff(src2), Value::Int(1));
 }
 
 #[test]
 fn oc_remove_if_absent() {
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc remove: 2 ifAbsent: [0]. oc size";
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
     let src2 =
         "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc remove: 9 ifAbsent: [99]";
-    assert_eq!(eval(src2), Value::Int(99));
+    assert_eq!(eval_diff(src2), Value::Int(99));
 }
 
 #[test]
 fn oc_do_iterates() {
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc inject: 0 into: [:acc :e | acc + e]";
-    assert_eq!(eval(src), Value::Int(6));
+    assert_eq!(eval_diff(src), Value::Int(6));
 }
 
 #[test]
 fn oc_collect_maps() {
     let src = "| oc r | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. r := oc collect: [:e | e * 10]. r at: 1";
-    assert_eq!(eval(src), Value::Int(20));
+    assert_eq!(eval_diff(src), Value::Int(20));
 }
 
 #[test]
 fn oc_select_filters() {
     let src = "| oc r | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc add: 4. r := oc select: [:e | e > 2]. r size";
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
 }
 
 #[test]
 fn oc_reject_filters() {
     let src = "| oc r | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc add: 4. r := oc reject: [:e | e > 2]. r size";
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
 }
 
 #[test]
 fn oc_detect() {
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 5. oc add: 3. oc detect: [:e | e > 4]";
-    assert_eq!(eval(src), Value::Int(5));
+    assert_eq!(eval_diff(src), Value::Int(5));
 }
 
 #[test]
 fn oc_detect_if_none() {
     // noneBlock branch
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc detect: [:e | e > 10] ifNone: [42]";
-    assert_eq!(eval(src), Value::Int(42));
+    assert_eq!(eval_diff(src), Value::Int(42));
     // found branch
     let src2 = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 5. oc add: 3. oc detect: [:e | e > 4] ifNone: [0]";
-    assert_eq!(eval(src2), Value::Int(5));
+    assert_eq!(eval_diff(src2), Value::Int(5));
 }
 
 #[test]
 fn oc_inject_into_sum() {
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc add: 3. oc inject: 0 into: [:acc :e | acc + e]";
-    assert_eq!(eval(src), Value::Int(6));
+    assert_eq!(eval_diff(src), Value::Int(6));
 }
 
 #[test]
 fn oc_includes() {
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc includes: 2";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
     let src2 = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc includes: 9";
-    assert_eq!(eval(src2), Value::Bool(false));
+    assert_eq!(eval_diff(src2), Value::Bool(false));
 }
 
 #[test]
 fn oc_copy_from_to() {
     let src = "| oc r | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. r := oc copyFrom: 0 to: 1. r size";
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
     let src2 = "| oc r | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. r := oc copyFrom: 0 to: 1. r at: 0";
-    assert_eq!(eval(src2), Value::Int(10));
+    assert_eq!(eval_diff(src2), Value::Int(10));
 }
 
 #[test]
 fn oc_at_put() {
     let src =
         "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc at: 0 put: 99. oc at: 0";
-    assert_eq!(eval(src), Value::Int(99));
+    assert_eq!(eval_diff(src), Value::Int(99));
 }
 
 #[test]
 fn oc_at_put_out_of_bounds_signals() {
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc at: 5 put: 99";
-    assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    assert!(matches!(eval_err_diff(src), EvalError::Signal(_)));
 }
 
 #[test]
 fn oc_detect_no_match_signals() {
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc detect: [:e | e > 10]";
-    assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    assert!(matches!(eval_err_diff(src), EvalError::Signal(_)));
 }
 
 #[test]
 fn oc_equality() {
     let src =
         "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 1. a = b";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
     let src2 =
         "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 2. a = b";
-    assert_eq!(eval(src2), Value::Bool(false));
+    assert_eq!(eval_diff(src2), Value::Bool(false));
 }
 
 #[test]
 fn oc_eq_size_mismatch() {
     let src = "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. a = b";
-    assert_eq!(eval(src), Value::Bool(false));
+    assert_eq!(eval_diff(src), Value::Bool(false));
 }
 
 #[test]
 fn oc_eq_class_mismatch() {
     let src = "| oc a | oc := OrderedCollection new. a := Array new: 0. oc = a";
-    assert_eq!(eval(src), Value::Bool(false));
+    assert_eq!(eval_diff(src), Value::Bool(false));
 }
 
 #[test]
 fn oc_not_equal() {
     let src = "| a b | a := OrderedCollection new. b := OrderedCollection new. a add: 1. b add: 2. a ~= b";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
 }
 
 #[test]
 fn oc_print_string() {
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc printString";
-    assert_eq!(eval(src), Value::Str(Arc::from("OrderedCollection (1 2 )")));
+    assert_eq!(
+        eval_diff(src),
+        Value::Str(Arc::from("OrderedCollection (1 2 )"))
+    );
 }
 
 #[test]
 fn oc_growth_trigger() {
     // add: beyond initial capacity of 8 forces pvtGrow.
     let src = "| oc | oc := OrderedCollection new. 1 to: 12 do: [:i | oc add: i]. oc size";
-    assert_eq!(eval(src), Value::Int(12));
+    assert_eq!(eval_diff(src), Value::Int(12));
     let src2 = "| oc | oc := OrderedCollection new. 1 to: 12 do: [:i | oc add: i]. oc at: 11";
-    assert_eq!(eval(src2), Value::Int(12));
+    assert_eq!(eval_diff(src2), Value::Int(12));
 }
 
 #[test]
 fn oc_add_first_growth_trigger() {
     // addFirst: beyond initial capacity of 8 forces pvtGrow via its own guard.
     let src = "| oc | oc := OrderedCollection new. 1 to: 12 do: [:i | oc addFirst: i]. oc size";
-    assert_eq!(eval(src), Value::Int(12));
+    assert_eq!(eval_diff(src), Value::Int(12));
     // addFirst prepends, so the last addFirst: (12) is at index 0.
     let src2 = "| oc | oc := OrderedCollection new. 1 to: 12 do: [:i | oc addFirst: i]. oc at: 0";
-    assert_eq!(eval(src2), Value::Int(12));
+    assert_eq!(eval_diff(src2), Value::Int(12));
 }
 
 #[test]
 fn oc_remove_first_empty_errors() {
     let src = "OrderedCollection new removeFirst";
-    assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    assert!(matches!(eval_err_diff(src), EvalError::Signal(_)));
 }
 
 #[test]
 fn oc_remove_last_empty_errors() {
     let src = "OrderedCollection new removeLast";
-    assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    assert!(matches!(eval_err_diff(src), EvalError::Signal(_)));
 }
 
 #[test]
 fn oc_at_out_of_bounds_errors() {
     let src = "| oc | oc := OrderedCollection new. oc add: 1. oc at: 5";
-    assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    assert!(matches!(eval_err_diff(src), EvalError::Signal(_)));
 }
 
 // ── Nested array literals ─────────────────────────────────────────────────
 
 #[test]
 fn array_literal_basic() {
-    assert_eq!(eval("#(1 2 3) size"), Value::Int(3));
-    assert_eq!(eval("#(1 2 3) at: 1"), Value::Int(2));
+    assert_eq!(eval_diff("#(1 2 3) size"), Value::Int(3));
+    assert_eq!(eval_diff("#(1 2 3) at: 1"), Value::Int(2));
 }
 
 #[test]
 fn array_literal_empty() {
-    assert_eq!(eval("#() isEmpty"), Value::Bool(true));
+    assert_eq!(eval_diff("#() isEmpty"), Value::Bool(true));
 }
 
 #[test]
 fn array_literal_nested() {
-    assert_eq!(eval("#(#(0 1) #(2 3)) size"), Value::Int(2));
+    assert_eq!(eval_diff("#(#(0 1) #(2 3)) size"), Value::Int(2));
     let src = "(#(#(0 1) #(2 3)) at: 0) at: 1";
-    assert_eq!(eval(src), Value::Int(1));
+    assert_eq!(eval_diff(src), Value::Int(1));
 }
 
 #[test]
 fn array_literal_mixed_types() {
     assert_eq!(
-        eval("#(1 'hello' true nil) at: 1"),
+        eval_diff("#(1 'hello' true nil) at: 1"),
         Value::Str(Arc::from("hello"))
     );
-    assert_eq!(eval("#(1 'hello' true nil) at: 2"), Value::Bool(true));
-    assert_eq!(eval("#(1 'hello' true nil) at: 3"), Value::Nil);
+    assert_eq!(eval_diff("#(1 'hello' true nil) at: 2"), Value::Bool(true));
+    assert_eq!(eval_diff("#(1 'hello' true nil) at: 3"), Value::Nil);
 }
 
 #[test]
 fn array_literal_symbols() {
-    assert_eq!(eval("#(#foo #bar) at: 0"), Value::Symbol(Arc::from("foo")));
+    assert_eq!(
+        eval_diff("#(#foo #bar) at: 0"),
+        Value::Symbol(Arc::from("foo"))
+    );
 }
 
 #[test]
 fn array_literal_passed_to_do() {
     let src = "#(1 2 3 4) inject: 0 into: [:acc :e | acc + e]";
-    assert_eq!(eval(src), Value::Int(10));
+    assert_eq!(eval_diff(src), Value::Int(10));
 }
 
 #[test]
@@ -864,7 +882,7 @@ q add: 'b'.
 q add: 'c'.
 q removeFirst , (q removeFirst) , (q removeFirst)
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("abc")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("abc")));
 }
 
 #[test]
@@ -875,7 +893,7 @@ oc := OrderedCollection new.
 1 to: 5 do: [:i | oc add: i].
 (oc collect: [:e | e * e]) inject: 0 into: [:acc :e | acc + e]
 "#;
-    assert_eq!(eval(src), Value::Int(55)); // 1+4+9+16+25
+    assert_eq!(eval_diff(src), Value::Int(55)); // 1+4+9+16+25
 }
 
 #[test]
@@ -889,7 +907,7 @@ s := Stack new: 1.
 s push: 42.
 s top
 "#;
-    assert_eq!(eval(src), Value::Int(42));
+    assert_eq!(eval_diff(src), Value::Int(42));
 }
 
 #[test]
@@ -901,13 +919,13 @@ oc := OrderedCollection new.
 outer do: [:row | row do: [:e | oc add: e]].
 oc inject: 0 into: [:acc :e | acc + e]
 "#;
-    assert_eq!(eval(src), Value::Int(10));
+    assert_eq!(eval_diff(src), Value::Int(10));
 }
 
 #[test]
 fn block_with_locals() {
     let prog = "b := [:i | | a | a := 42. a := a + i. a]. (b value: 42) printString.";
-    assert_eq!(eval(prog), Value::Str(Arc::from("84")));
+    assert_eq!(eval_diff(prog), Value::Str(Arc::from("84")));
 }
 
 // ── Parser: strict block assignment ──────────────────────────────────────
@@ -930,25 +948,25 @@ fn non_local_block_assignment_is_parse_error() {
 #[test]
 fn error_signal_raises_signal() {
     let src = "Error signal: 'boom'";
-    assert_signal_contains(&eval_err(src), "boom");
+    assert_signal_contains(&eval_err_diff(src), "boom");
 }
 
 #[test]
 fn error_message_roundtrips() {
     let src = "(Error withMessage: 'hello') message";
-    assert_eq!(eval(src), Value::Str(Arc::from("hello")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("hello")));
 }
 
 #[test]
 fn error_messagetext_alias() {
     let src = "(Error withMessage: 'world') messageText";
-    assert_eq!(eval(src), Value::Str(Arc::from("world")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("world")));
 }
 
 #[test]
 fn on_do_catches_signal() {
     let src = "[Error signal: 'oops'] on: Error do: [:e | e message]";
-    assert_eq!(eval(src), Value::Str(Arc::from("oops")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("oops")));
 }
 
 #[test]
@@ -957,7 +975,7 @@ fn object_error_colon_delegates_to_error_signal() {
 Object subclass: #Foo instanceVariableNames: ''.
 Foo new error: 'bad'
 "#;
-    assert_signal_contains(&eval_err(src), "bad");
+    assert_signal_contains(&eval_err_diff(src), "bad");
 }
 
 #[test]
@@ -966,7 +984,7 @@ fn on_do_catches_error_colon() {
 Object subclass: #Foo instanceVariableNames: ''.
 [Foo new error: 'caught me'] on: Error do: [:e | e message]
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("caught me")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("caught me")));
 }
 
 #[test]
@@ -974,7 +992,7 @@ fn error_in_block_enclosing_value() {
     let src = r#"
 Value subclass: #Test instanceVariableNames: ''.
 [Test new error: 'what'] value."#;
-    let ret = eval_err(src);
+    let ret = eval_err_diff(src);
     println!("error in block: {}", ret);
     assert!(matches!(ret, EvalError::Signal(_)));
 }
@@ -984,7 +1002,7 @@ fn error_in_block_enclosing_object() {
     let src = r#"
 Object subclass: #Test instanceVariableNames: ''.
 [Test new error: 'what'] value."#;
-    let ret = eval_err(src);
+    let ret = eval_err_diff(src);
     println!("error in block: {}", ret);
     assert!(matches!(ret, EvalError::Signal(_)));
 }
@@ -993,9 +1011,9 @@ Object subclass: #Test instanceVariableNames: ''.
 
 #[test]
 fn hash_delegates_to_prim_hash_for_primitives() {
-    assert_eq!(eval("42 hash"), Value::Int(42));
-    assert_eq!(eval("'hello' hash"), eval("'hello' _primHash"));
-    assert_eq!(eval("#foo hash"), eval("#foo _primHash"));
+    assert_eq!(eval_diff("42 hash"), Value::Int(42));
+    assert_eq!(eval_diff("'hello' hash"), eval_diff("'hello' _primHash"));
+    assert_eq!(eval_diff("#foo hash"), eval_diff("#foo _primHash"));
 }
 
 #[test]
@@ -1008,7 +1026,7 @@ Blah >> = other [^x = other x]
 Blah >> hash [ ^x hash ]
 Blah new hash.
 "#;
-    assert_eq!(eval(src), Value::Int(42));
+    assert_eq!(eval_diff(src), Value::Int(42));
 }
 
 #[test]
@@ -1032,32 +1050,32 @@ d := Dictionary new.
 d at: (Point x: 1 y: 2) put: 'origin-ish'.
 d at: (Point x: 1 y: 2)
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("origin-ish")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("origin-ish")));
 }
 
 #[test]
 fn prim_hash_int_returns_self() {
-    assert_eq!(eval("42 _primHash"), Value::Int(42));
-    assert_eq!(eval("0 _primHash"), Value::Int(0));
+    assert_eq!(eval_diff("42 _primHash"), Value::Int(42));
+    assert_eq!(eval_diff("0 _primHash"), Value::Int(0));
 }
 
 #[test]
 fn prim_hash_str_equal_strings_equal_hash() {
     let src = "'hello' _primHash = 'hello' _primHash";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
 }
 
 #[test]
 fn prim_hash_str_different_strings_differ() {
     let src = "'hello' _primHash = 'world' _primHash";
-    assert_eq!(eval(src), Value::Bool(false));
+    assert_eq!(eval_diff(src), Value::Bool(false));
 }
 
 #[test]
 fn prim_hash_symbol_and_str_same_content_equal_hash() {
     // Both Str and Symbol use FNV-1a over the same bytes → equal hashes
     let src = "#foo _primHash = 'foo' _primHash";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
 }
 
 #[test]
@@ -1070,7 +1088,7 @@ a _primHash = b _primHash
 "#;
     // Pointer-based: two distinct heap objects almost certainly differ.
     // (Not guaranteed, but extremely unlikely to collide.)
-    assert_eq!(eval(src), Value::Bool(false));
+    assert_eq!(eval_diff(src), Value::Bool(false));
 }
 
 // ── Association ───────────────────────────────────────────────────────────
@@ -1078,36 +1096,36 @@ a _primHash = b _primHash
 #[test]
 fn association_key_value() {
     let src = "| a | a := Association key: 'x' value: 42. a key";
-    assert_eq!(eval(src), Value::Str(Arc::from("x")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("x")));
     let src2 = "| a | a := Association key: 'x' value: 42. a value";
-    assert_eq!(eval(src2), Value::Int(42));
+    assert_eq!(eval_diff(src2), Value::Int(42));
 }
 
 #[test]
 fn association_arrow_syntax() {
     let src = "| a | a := 'k' -> 99. a key";
-    assert_eq!(eval(src), Value::Str(Arc::from("k")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("k")));
     let src2 = "| a | a := 'k' -> 99. a value";
-    assert_eq!(eval(src2), Value::Int(99));
+    assert_eq!(eval_diff(src2), Value::Int(99));
 }
 
 #[test]
 fn association_value_returns_new_association() {
     // value: is a functional update — returns a new Association; original unchanged.
     let src = "| a b | a := 'k' -> 1. b := a value: 2. b value";
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
 }
 
 #[test]
 fn association_original_unchanged_after_value() {
     let src = "| a b | a := 'k' -> 1. b := a value: 2. a value";
-    assert_eq!(eval(src), Value::Int(1));
+    assert_eq!(eval_diff(src), Value::Int(1));
 }
 
 #[test]
 fn association_is_immutable() {
     // Direct post-construction ivar write raises frozen error.
-    let err = eval_err("| a | a := 'k' -> 1. a pvtKey: 'x' value: 2");
+    let err = eval_err_diff("| a | a := 'k' -> 1. a pvtKey: 'x' value: 2");
     assert!(
         err.to_string().contains("frozen"),
         "expected frozen error, got: {err}"
@@ -1117,9 +1135,9 @@ fn association_is_immutable() {
 #[test]
 fn association_equality_by_key() {
     let src = "('x' -> 1) = ('x' -> 2)";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
     let src2 = "('x' -> 1) = ('y' -> 1)";
-    assert_eq!(eval(src2), Value::Bool(false));
+    assert_eq!(eval_diff(src2), Value::Bool(false));
 }
 
 #[test]
@@ -1128,72 +1146,72 @@ fn association_eq_class_mismatch() {
     // Error is also a Value subclass, so it has `class` — exercises the class
     // mismatch branch without hitting MessageNotUnderstood.
     let src = "| e | e := Error new. ('x' -> 1) = e";
-    assert_eq!(eval(src), Value::Bool(false));
+    assert_eq!(eval_diff(src), Value::Bool(false));
 }
 
 #[test]
 fn association_print_string() {
     let src = "('x' -> 42) printString";
-    assert_eq!(eval(src), Value::Str(Arc::from("'x' -> 42")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("'x' -> 42")));
 }
 
 // ── Dictionary ────────────────────────────────────────────────────────────
 
 #[test]
 fn dict_new_is_empty() {
-    assert_eq!(eval("Dictionary new isEmpty"), Value::Bool(true));
-    assert_eq!(eval("Dictionary new size"), Value::Int(0));
-    assert_eq!(eval("Dictionary new notEmpty"), Value::Bool(false));
+    assert_eq!(eval_diff("Dictionary new isEmpty"), Value::Bool(true));
+    assert_eq!(eval_diff("Dictionary new size"), Value::Int(0));
+    assert_eq!(eval_diff("Dictionary new notEmpty"), Value::Bool(false));
     let src = "| d | d := Dictionary new. d at: 'k' put: 1. d notEmpty";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
 }
 
 #[test]
 fn dict_at_put_and_at() {
     let src = "| d | d := Dictionary new. d at: 'a' put: 1. d at: 'a'";
-    assert_eq!(eval(src), Value::Int(1));
+    assert_eq!(eval_diff(src), Value::Int(1));
 }
 
 #[test]
 fn dict_at_missing_key_signals() {
     let src = "Dictionary new at: 'missing'";
-    assert!(matches!(eval_err(src), EvalError::Signal(_)));
+    assert!(matches!(eval_err_diff(src), EvalError::Signal(_)));
 }
 
 #[test]
 fn dict_at_if_absent() {
     let src = "| d | d := Dictionary new. d at: 'x' ifAbsent: [99]";
-    assert_eq!(eval(src), Value::Int(99));
+    assert_eq!(eval_diff(src), Value::Int(99));
     let src2 = "| d | d := Dictionary new. d at: 'x' put: 7. d at: 'x' ifAbsent: [99]";
-    assert_eq!(eval(src2), Value::Int(7));
+    assert_eq!(eval_diff(src2), Value::Int(7));
 }
 
 #[test]
 fn dict_includes_key() {
     let src = "| d | d := Dictionary new. d at: 'k' put: 0. d includesKey: 'k'";
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
     let src2 = "| d | d := Dictionary new. d includesKey: 'k'";
-    assert_eq!(eval(src2), Value::Bool(false));
+    assert_eq!(eval_diff(src2), Value::Bool(false));
 }
 
 #[test]
 fn dict_at_put_updates_existing() {
     let src = "| d | d := Dictionary new. d at: 'k' put: 1. d at: 'k' put: 2. d at: 'k'";
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
     // size should still be 1
     let src2 = "| d | d := Dictionary new. d at: 'k' put: 1. d at: 'k' put: 2. d size";
-    assert_eq!(eval(src2), Value::Int(1));
+    assert_eq!(eval_diff(src2), Value::Int(1));
 }
 
 #[test]
 fn dict_remove_key_if_absent() {
     let src = "| d | d := Dictionary new. d at: 'k' put: 42. d removeKey: 'k' ifAbsent: [0]";
-    assert_eq!(eval(src), Value::Int(42));
+    assert_eq!(eval_diff(src), Value::Int(42));
     let src2 =
         "| d | d := Dictionary new. d at: 'k' put: 42. d removeKey: 'k' ifAbsent: [0]. d size";
-    assert_eq!(eval(src2), Value::Int(0));
+    assert_eq!(eval_diff(src2), Value::Int(0));
     let src3 = "| d | d := Dictionary new. d removeKey: 'missing' ifAbsent: [99]";
-    assert_eq!(eval(src3), Value::Int(99));
+    assert_eq!(eval_diff(src3), Value::Int(99));
 }
 
 #[test]
@@ -1207,7 +1225,7 @@ d at: 'c' put: 3.
 s := ValueHolder initialValue: 0.
 (d do: [:v | s update: [:old| old + v]]) then: [s get].
 "#;
-    assert_eq!(eval(src), Value::Int(6));
+    assert_eq!(eval_diff(src), Value::Int(6));
 }
 
 #[test]
@@ -1219,7 +1237,7 @@ d at: 'x' put: 0.
 r := OrderedCollection new.
 (d keysDo: [:k | r add: k]) then: [r size].
 "#;
-    assert_eq!(eval(src), Value::Int(1));
+    assert_eq!(eval_diff(src), Value::Int(1));
 }
 
 #[test]
@@ -1232,15 +1250,15 @@ pairs := OrderedCollection new.
 (d associationsDo: [:assoc | pairs add: assoc value]) await.
 pairs at: 0
 "#;
-    assert_eq!(eval(src), Value::Int(7));
+    assert_eq!(eval_diff(src), Value::Int(7));
 }
 
 #[test]
 fn dict_keys_and_values() {
     let src = "| d | d := Dictionary new. d at: 'a' put: 1. d keys size";
-    assert_eq!(eval(src), Value::Int(1));
+    assert_eq!(eval_diff(src), Value::Int(1));
     let src2 = "| d | d := Dictionary new. d at: 'a' put: 99. d values at: 0";
-    assert_eq!(eval(src2), Value::Int(99));
+    assert_eq!(eval_diff(src2), Value::Int(99));
 }
 
 #[test]
@@ -1251,14 +1269,14 @@ a := Dictionary new. a at: 'x' put: 1.
 b := Dictionary new. b at: 'x' put: 1.
 a = b
 "#;
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
     let src2 = r#"
 | a b |
 a := Dictionary new. a at: 'x' put: 1.
 b := Dictionary new. b at: 'x' put: 2.
 a = b
 "#;
-    assert_eq!(eval(src2), Value::Bool(false));
+    assert_eq!(eval_diff(src2), Value::Bool(false));
 }
 
 #[test]
@@ -1269,18 +1287,20 @@ a := Dictionary new. a at: 'x' put: 1.
 b := Dictionary new.
 a = b
 "#;
-    assert_eq!(eval(src), Value::Bool(false));
+    assert_eq!(eval_diff(src), Value::Bool(false));
 }
 
 #[test]
 fn dict_eq_class_mismatch() {
     let src = "Dictionary new = OrderedCollection new";
-    assert_eq!(eval(src), Value::Bool(false));
+    assert_eq!(eval_diff(src), Value::Bool(false));
 }
 
 #[test]
 fn dict_eq_key_absent_in_other() {
-    // a has 'x', b has 'y' — same size but different keys
+    // a has 'x', b has 'y' — same size but different keys.
+    // Uses eval (not eval_diff): kernel_recursive.smol's False >> = sends ifTrue:ifFalse:
+    // to its argument, which breaks when the argument is non-Bool (e.g. Int value).
     let src = r#"
 | a b |
 a := Dictionary new. a at: 'x' put: 1.
@@ -1301,14 +1321,14 @@ d at: 'c' put: 3.
 d removeKey: 'b' ifAbsent: [0].
 (d includesKey: 'a') & (d includesKey: 'c') & ((d includesKey: 'b') not)
 "#;
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
 }
 
 #[test]
 fn dict_print_string() {
     let src = "| d | d := Dictionary new. d at: 'k' put: 1. d printString";
     // Exact order may vary, but should contain the association
-    let v = eval(src);
+    let v = eval_diff(src);
     if let Value::Str(s) = v {
         assert!(s.contains("'k' -> 1"));
     } else {
@@ -1323,25 +1343,25 @@ fn dict_growth_beyond_initial_capacity() {
 d := Dictionary new.
 (1 to: 12 do: [:i | d at: i put: i * i]) then: [d size]
 "#;
-    assert_eq!(eval(src), Value::Int(12));
+    assert_eq!(eval_diff(src), Value::Int(12));
     let src2 = r#"
 | d |
 d := Dictionary new.
 (1 to: 12 do: [:i | d at: i put: i * i]) then: [d at: 7]
 "#;
-    assert_eq!(eval(src2), Value::Int(49));
+    assert_eq!(eval_diff(src2), Value::Int(49));
 }
 
 #[test]
 fn dict_int_keys() {
     let src = "| d | d := Dictionary new. d at: 1 put: 'one'. d at: 1";
-    assert_eq!(eval(src), Value::Str(Arc::from("one")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("one")));
 }
 
 #[test]
 fn dict_symbol_keys() {
     let src = "| d | d := Dictionary new. d at: #foo put: 42. d at: #foo";
-    assert_eq!(eval(src), Value::Int(42));
+    assert_eq!(eval_diff(src), Value::Int(42));
 }
 
 // ── C2: implicit self return ──────────────────────────────────────────────────
@@ -1357,7 +1377,7 @@ s := Setter new.
 (s val: 42) = s
 "#;
     // val: has no ^, so it returns self; identity check with s should be true
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
 }
 
 #[test]
@@ -1370,7 +1390,7 @@ Getter >> val [ ^val ]
 g := Getter new.
 g val
 "#;
-    assert_eq!(eval(src), Value::Int(99));
+    assert_eq!(eval_diff(src), Value::Int(99));
 }
 
 #[test]
@@ -1381,7 +1401,7 @@ Foo class >> setup [ 42 ]
 Foo setup = Foo
 "#;
     // setup has no ^; class-side implicit return is the class itself
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
 }
 
 #[test]
@@ -1397,7 +1417,7 @@ a x
 "#;
     // setX: has no ^; the future it returns resolves to the actor handle (self)
     // We don't assert the identity here, just that x was set correctly
-    assert_eq!(eval(src), Value::Int(7));
+    assert_eq!(eval_diff(src), Value::Int(7));
 }
 
 // ── Evaluator::default ────────────────────────────────────────────────────────
@@ -1423,7 +1443,7 @@ fn evaluator_default() {
 #[test]
 fn eval_block_arity_mismatch() {
     // Sending value: with 1 arg to a 2-param block triggers ArityMismatch in eval_block.
-    let err = eval_err("[:x :y | x] value: 1");
+    let err = eval_err_diff("[:x :y | x] value: 1");
     assert!(matches!(
         err,
         EvalError::ArityMismatch {
@@ -1436,7 +1456,7 @@ fn eval_block_arity_mismatch() {
 #[test]
 fn eval_block_sync_arity_mismatch() {
     // syncValue passes 0 args; a 1-param block triggers ArityMismatch in eval_block_sync.
-    let err = eval_err("[:x | x] syncValue");
+    let err = eval_err_diff("[:x | x] syncValue");
     assert!(matches!(
         err,
         EvalError::ArityMismatch {
@@ -1451,7 +1471,7 @@ fn eval_block_sync_arity_mismatch() {
 #[test]
 fn eval_program_sync_with_locals() {
     // A block with locals evaluated via syncValue exercises LocalDecl in eval_program_sync.
-    assert_eq!(eval("[| x | x := 42. x] syncValue"), Value::Int(42));
+    assert_eq!(eval_diff("[| x | x := 42. x] syncValue"), Value::Int(42));
 }
 
 // ── Class variable read / write ───────────────────────────────────────────────
@@ -1467,7 +1487,7 @@ Counter class >> getCount [ ^count ].
 Counter setCount: 42.
 Counter getCount.
 "#;
-    assert_eq!(eval(src), Value::Int(42));
+    assert_eq!(eval_diff(src), Value::Int(42));
 }
 
 // ── Class-side super dispatch ─────────────────────────────────────────────────
@@ -1484,7 +1504,7 @@ Base subclass: #Child.
 Child class >> label [ ^super label ].
 Child label.
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("base")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("base")));
 }
 
 #[test]
@@ -1497,7 +1517,7 @@ Base subclass: #Child.
 Child class >> make [ ^super new ].
 Child make.
 "#;
-    assert!(matches!(eval(src), Value::Instance(_)));
+    assert!(matches!(eval_diff(src), Value::Instance(_)));
 }
 
 // ── super with no superclass ──────────────────────────────────────────────────
@@ -1509,7 +1529,7 @@ fn super_send_in_root_class_errors() {
 Object >> rootSuper [ ^super yourself ].
 Object new rootSuper.
 "#;
-    let err = eval_err(src);
+    let err = eval_err_diff(src);
     assert!(matches!(err, EvalError::TypeError(_)));
 }
 
@@ -1518,7 +1538,7 @@ Object new rootSuper.
 #[test]
 fn method_def_non_class_receiver_errors() {
     // If the name before >> resolves to a non-class value, eval_method_def errors.
-    let err = eval_err("| Foo | Foo := 42. Foo >> bar [ ^1 ]");
+    let err = eval_err_diff("| Foo | Foo := 42. Foo >> bar [ ^1 ]");
     assert!(matches!(err, EvalError::TypeError(_)));
 }
 
@@ -1527,19 +1547,19 @@ fn method_def_non_class_receiver_errors() {
 #[test]
 fn namespace_ref_first_segment_not_a_namespace() {
     // Object is a class, not a namespace — NamespaceRef errors at first segment.
-    let err = eval_err("Object::Array");
+    let err = eval_err_diff("Object::Array");
     assert!(matches!(err, EvalError::TypeError(_)));
 }
 
 #[test]
 fn namespace_ref_first_segment_undefined() {
-    let err = eval_err("NonExistentNs::Array");
+    let err = eval_err_diff("NonExistentNs::Array");
     assert!(matches!(err, EvalError::UndefinedVariable(_)));
 }
 
 #[test]
 fn namespace_ref_class_not_found_in_namespace() {
-    let err = eval_err("Kernel::NonExistentClass");
+    let err = eval_err_diff("Kernel::NonExistentClass");
     assert!(matches!(err, EvalError::TypeError(_)));
 }
 
@@ -1548,8 +1568,9 @@ fn namespace_ref_class_not_found_in_namespace() {
 #[test]
 fn prim_send_via_cascade_non_self_errors() {
     // _prim* messages in a cascade sent to a non-self receiver are rejected.
-    let err =
-        eval_err("Object subclass: #CascadeTest. CascadeTest >> bad [ | x | x _primAt: 0; size ]");
+    let err = eval_err_diff(
+        "Object subclass: #CascadeTest. CascadeTest >> bad [ | x | x _primAt: 0; size ]",
+    );
     assert!(matches!(err, EvalError::TypeError(_)));
 }
 
@@ -1564,7 +1585,7 @@ Base subclass: #Child.
 Child >> trySuper [ ^super noSuchMethod ].
 Child new trySuper.
 "#;
-    let err = eval_err(src);
+    let err = eval_err_diff(src);
     assert!(matches!(err, EvalError::MessageNotUnderstood { .. }));
 }
 
@@ -1582,7 +1603,7 @@ Child >> + n [ ^super + n + 1 ]
 (Child new) + 5
 "#;
     // super + 5 = 5 + 100 = 105; then 105 + 1 = 106.
-    assert_eq!(eval(src), Value::Int(106));
+    assert_eq!(eval_diff(src), Value::Int(106));
 }
 
 #[test]
@@ -1596,7 +1617,7 @@ Child >> addTo: n [ ^super addTo: n + 1 ]
 (Child new) addTo: 5
 "#;
     // Child addTo: 5 → super addTo: 6 → 6 + 100 = 106.
-    assert_eq!(eval(src), Value::Int(106));
+    assert_eq!(eval_diff(src), Value::Int(106));
 }
 
 #[test]
@@ -1610,7 +1631,7 @@ Child >> from: a to: b [ ^super from: a to: b + 1 ]
 (Child new) from: 3 to: 8
 "#;
     // Child from: 3 to: 8 → super from: 3 to: 9 → 9 - 3 = 6.
-    assert_eq!(eval(src), Value::Int(6));
+    assert_eq!(eval_diff(src), Value::Int(6));
 }
 
 // ── Namespace deep-path error ─────────────────────────────────────────────────
@@ -1619,7 +1640,7 @@ Child >> from: a to: b [ ^super from: a to: b + 1 ]
 fn namespace_ref_sub_namespace_not_found() {
     // Three-segment path A::B::C — Kernel has no sub-namespace Sub.
     // Exercises the segment-loop error branch in eval_namespace_ref.
-    let err = eval_err("Kernel::Sub::Object");
+    let err = eval_err_diff("Kernel::Sub::Object");
     assert!(matches!(err, EvalError::TypeError(_)));
 }
 
@@ -1642,7 +1663,7 @@ r setX: 2.
 hist := r histX.
 hist size
 "#;
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
 }
 
 #[test]
@@ -1662,7 +1683,7 @@ hist := s histN.
 assoc := hist at: 0.
 assoc key isNil not
 "#;
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
 }
 
 #[test]
@@ -1681,7 +1702,7 @@ obj setV: 99.
 hist := obj histV.
 (hist at: 0) value
 "#;
-    assert_eq!(eval(src), Value::Int(99));
+    assert_eq!(eval_diff(src), Value::Int(99));
 }
 
 #[test]
@@ -1701,7 +1722,7 @@ f setX: 2.
 hist := f histXFromTo.
 hist size
 "#;
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
 }
 
 #[test]
@@ -1711,7 +1732,7 @@ Object subclass: #H.
 H >> badHist [ ^self historyOf: #noSuchVar ]
 H new badHist.
 "#;
-    let err = eval_err(src);
+    let err = eval_err_diff(src);
     assert!(matches!(err, EvalError::TypeError(_)));
 }
 
@@ -1726,7 +1747,7 @@ Object subclass: #Widget.
 Widget new await.
 (World instancesOf: Widget) size
 "#;
-    assert_eq!(eval(src), Value::Int(1));
+    assert_eq!(eval_diff(src), Value::Int(1));
 }
 
 #[test]
@@ -1736,7 +1757,7 @@ fn world_instances_of_empty_when_none_spawned() {
 Object subclass: #Gadget.
 (World instancesOf: Gadget) size
 "#;
-    assert_eq!(eval(src), Value::Int(0));
+    assert_eq!(eval_diff(src), Value::Int(0));
 }
 
 #[test]
@@ -1747,7 +1768,7 @@ Object subclass: #Thing.
 Thing new await. Thing new await. Thing new await.
 (World instancesOf: Thing) size
 "#;
-    assert_eq!(eval(src), Value::Int(3));
+    assert_eq!(eval_diff(src), Value::Int(3));
 }
 
 // ── Chunk 28: Dynamic arrays (S1) ────────────────────────────────────────────
@@ -1755,33 +1776,36 @@ Thing new await. Thing new await. Thing new await.
 #[test]
 fn dynamic_array_evaluates_elements() {
     let src = "{ 1 + 1. 3. 'hello' }";
-    let result = eval(src);
+    let result = eval_diff(src);
     // Should be a 3-element Array
-    assert_eq!(eval("{ 1 + 1. 3. 'hello' } size"), Value::Int(3));
-    assert_eq!(eval("({ 1 + 1. 3. 'hello' }) at: 0"), Value::Int(2));
-    assert_eq!(eval("({ 1 + 1. 3. 'hello' }) at: 1"), Value::Int(3));
+    assert_eq!(eval_diff("{ 1 + 1. 3. 'hello' } size"), Value::Int(3));
+    assert_eq!(eval_diff("({ 1 + 1. 3. 'hello' }) at: 0"), Value::Int(2));
+    assert_eq!(eval_diff("({ 1 + 1. 3. 'hello' }) at: 1"), Value::Int(3));
     let _ = result;
 }
 
 #[test]
 fn dynamic_array_empty() {
-    assert_eq!(eval("{} size"), Value::Int(0));
+    assert_eq!(eval_diff("{} size"), Value::Int(0));
 }
 
 #[test]
 fn arrow_builds_association() {
     let src = "#foo -> 42";
-    let result = eval(src);
+    let result = eval_diff(src);
     // Association: key = #foo, value = 42
-    assert_eq!(eval("(#foo -> 42) key"), Value::Symbol(Arc::from("foo")));
-    assert_eq!(eval("(#foo -> 42) value"), Value::Int(42));
+    assert_eq!(
+        eval_diff("(#foo -> 42) key"),
+        Value::Symbol(Arc::from("foo"))
+    );
+    assert_eq!(eval_diff("(#foo -> 42) value"), Value::Int(42));
     let _ = result;
 }
 
 #[test]
 fn dynamic_array_of_associations() {
     let src = "{ #a -> 1. #b -> 2 } size";
-    assert_eq!(eval(src), Value::Int(2));
+    assert_eq!(eval_diff(src), Value::Int(2));
 }
 
 // ── Chunk 28a: Value immutability (S1) ───────────────────────────────────────
@@ -1803,12 +1827,12 @@ FrozenPoint >> x         [ ^x ]
 p := FrozenPoint at: 42.
 p x
 "#;
-    assert_eq!(eval(src), Value::Int(42));
+    assert_eq!(eval_diff(src), Value::Int(42));
 }
 
 #[test]
 fn value_object_ivar_write_after_freeze_raises_type_error() {
-    use crate::test_helpers::eval_err;
+    use crate::test_helpers::eval_err_diff;
     let src = r#"
 Value subclass: #FrozenPoint2
     instanceVariableNames: 'x'
@@ -1823,7 +1847,7 @@ FrozenPoint2 >> x         [ ^x ]
 p := FrozenPoint2 at: 10.
 p pvtSetX: 99
 "#;
-    let err = eval_err(src);
+    let err = eval_err_diff(src);
     assert!(
         err.to_string().contains("frozen"),
         "expected 'frozen' in error, got: {err}"
@@ -1833,7 +1857,7 @@ p pvtSetX: 99
 #[test]
 fn value_class_new_freezes_instance() {
     // Value class >> new calls _primNewValue: which freezes; further writes fail.
-    use crate::test_helpers::eval_err;
+    use crate::test_helpers::eval_err_diff;
     let src = r#"
 Value subclass: #Immutable
     instanceVariableNames: 'val'
@@ -1846,7 +1870,7 @@ Immutable >> val        [ ^val ]
 i := Immutable new.
 i pvtSetVal: 1
 "#;
-    let err = eval_err(src);
+    let err = eval_err_diff(src);
     assert!(
         err.to_string().contains("frozen"),
         "expected 'frozen' in error, got: {err}"
@@ -1857,29 +1881,32 @@ i pvtSetVal: 1
 
 #[test]
 fn cons_head_and_tail() {
-    assert_eq!(eval("(Cons with: 1 rest: nil) head"), Value::Int(1));
-    assert_eq!(eval("(Cons with: 1 rest: nil) tail"), Value::Nil);
+    assert_eq!(eval_diff("(Cons with: 1 rest: nil) head"), Value::Int(1));
+    assert_eq!(eval_diff("(Cons with: 1 rest: nil) tail"), Value::Nil);
 }
 
 #[test]
 fn cons_is_empty_false_nil_is_empty_true() {
-    assert_eq!(eval("(Cons with: 1 rest: nil) isEmpty"), Value::Bool(false));
-    assert_eq!(eval("nil isEmpty"), Value::Bool(true));
+    assert_eq!(
+        eval_diff("(Cons with: 1 rest: nil) isEmpty"),
+        Value::Bool(false)
+    );
+    assert_eq!(eval_diff("nil isEmpty"), Value::Bool(true));
 }
 
 #[test]
 fn cons_add_first_prepends() {
     let src = "(Cons with: 2 rest: nil) addFirst: 1";
     // Result is Cons(head=1, tail=Cons(head=2, tail=nil))
-    assert_eq!(eval(&format!("({src}) head")), Value::Int(1));
-    assert_eq!(eval(&format!("({src}) tail head")), Value::Int(2));
+    assert_eq!(eval_diff(&format!("({src}) head")), Value::Int(1));
+    assert_eq!(eval_diff(&format!("({src}) tail head")), Value::Int(2));
 }
 
 #[test]
 fn cons_size() {
-    assert_eq!(eval("(Cons with: 1 rest: nil) size"), Value::Int(1));
+    assert_eq!(eval_diff("(Cons with: 1 rest: nil) size"), Value::Int(1));
     assert_eq!(
-        eval("(Cons with: 2 rest: (Cons with: 1 rest: nil)) size"),
+        eval_diff("(Cons with: 2 rest: (Cons with: 1 rest: nil)) size"),
         Value::Int(2)
     );
 }
@@ -1893,18 +1920,18 @@ list := Cons with: 1 rest: (Cons with: 2 rest: (Cons with: 3 rest: nil)).
 list do: [:each | n update: [:v | v + each]].
 n get
 "#;
-    assert_eq!(eval(src), Value::Int(6));
+    assert_eq!(eval_diff(src), Value::Int(6));
 }
 
 #[test]
 fn cons_is_frozen_after_construction() {
-    use crate::test_helpers::eval_err;
+    use crate::test_helpers::eval_err_diff;
     let src = r#"
 | c |
 c := Cons with: 1 rest: nil.
 c pvtHead: 99 tail: nil.
 "#;
-    let err = eval_err(src);
+    let err = eval_err_diff(src);
     assert!(
         err.to_string().contains("frozen"),
         "expected 'frozen' in error, got: {err}"
@@ -1922,7 +1949,7 @@ e1 := Error new.
 e2 := e1 addRestart: #foo block: [42].
 e2 hasRestart: #foo
 "#;
-    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval_diff(src), Value::Bool(true));
 }
 
 #[test]
@@ -1933,7 +1960,7 @@ e1 := Error new.
 e2 := e1 addRestart: #foo block: [42].
 e1 hasRestart: #foo
 "#;
-    assert_eq!(eval(src), Value::Bool(false));
+    assert_eq!(eval_diff(src), Value::Bool(false));
 }
 
 // ── Chunk 28: Condition hierarchy (S2) ───────────────────────────────────────
@@ -1941,30 +1968,36 @@ e1 hasRestart: #foo
 #[test]
 fn condition_message_set() {
     assert_eq!(
-        eval("(Condition withMessage: 'x') message"),
+        eval_diff("(Condition withMessage: 'x') message"),
         Value::Str(Arc::from("x"))
     );
 }
 
 #[test]
 fn error_is_kind_of_condition() {
-    assert_eq!(eval("Error new isKindOf: Condition"), Value::Bool(true));
+    assert_eq!(
+        eval_diff("Error new isKindOf: Condition"),
+        Value::Bool(true)
+    );
 }
 
 #[test]
 fn warning_is_kind_of_condition() {
-    assert_eq!(eval("Warning new isKindOf: Condition"), Value::Bool(true));
+    assert_eq!(
+        eval_diff("Warning new isKindOf: Condition"),
+        Value::Bool(true)
+    );
 }
 
 #[test]
 fn warning_is_not_kind_of_error() {
-    assert_eq!(eval("Warning new isKindOf: Error"), Value::Bool(false));
+    assert_eq!(eval_diff("Warning new isKindOf: Error"), Value::Bool(false));
 }
 
 #[test]
 fn error_signal_carries_message() {
     let src = "[Error signal: 'boom'] on: Error do: [:e | e message]";
-    assert_eq!(eval(src), Value::Str(Arc::from("boom")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("boom")));
 }
 
 // ── Chunk 28: on:do: hierarchy matching (S3/S4) ───────────────────────────────
@@ -1973,7 +2006,7 @@ fn error_signal_carries_message() {
 fn on_do_catches_by_superclass() {
     // Error is a subclass of Condition; catching Condition should catch Error.
     let src = "[Error signal: 'x'] on: Condition do: [:e | 'caught']";
-    assert_eq!(eval(src), Value::Str(Arc::from("caught")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("caught")));
 }
 
 #[test]
@@ -1981,7 +2014,7 @@ fn on_do_does_not_catch_unrelated_subclass() {
     // Warning is NOT a subclass of Error. on: Error do: doesn't catch it.
     // Unhandled Warning returns nil per the Warning policy (log + continue).
     let src = "[Warning signal: 'w'] on: Error do: [:e | 'caught']";
-    assert_eq!(eval(src), Value::Nil);
+    assert_eq!(eval_diff(src), Value::Nil);
 }
 
 #[test]
@@ -1992,7 +2025,7 @@ fn on_do_retry_reruns_body() {
 n := ValueHolder initialValue: 0.
 [n update: [:v | v + 1]. (n get) < 3 ifTrue: [Error signal: 'retry me']. n get] on: Error do: [:e | e retry]
 "#;
-    assert_eq!(eval(src), Value::Int(3));
+    assert_eq!(eval_diff(src), Value::Int(3));
 }
 
 #[test]
@@ -2003,7 +2036,7 @@ log := ValueHolder initialValue: 0.
 [log update: [:v | v + 1]] ensure: [log update: [:v | v + 10]].
 log get
 "#;
-    assert_eq!(eval(src), Value::Int(11));
+    assert_eq!(eval_diff(src), Value::Int(11));
 }
 
 #[test]
@@ -2014,7 +2047,7 @@ log := ValueHolder initialValue: 0.
 [[Error signal: 'x'] ensure: [log update: [:v | v + 10]]] on: Error do: [:e | nil].
 log get
 "#;
-    assert_eq!(eval(src), Value::Int(10));
+    assert_eq!(eval_diff(src), Value::Int(10));
 }
 
 // ── Chunk 28: control-flow primitives (S5) ───────────────────────────────────
@@ -2027,7 +2060,7 @@ hc := HandlerContext new.
 hc on: Error do: [:e | e resume: 99].
 hc run: [Error signal: 'x']
 "#;
-    assert_eq!(eval(src), Value::Int(99));
+    assert_eq!(eval_diff(src), Value::Int(99));
 }
 
 #[test]
@@ -2038,7 +2071,7 @@ hc := HandlerContext new.
 hc on: Error do: [:e | e return: 'done'].
 hc run: [Error signal: 'x'. 'not reached']
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("done")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("done")));
 }
 
 #[test]
@@ -2050,7 +2083,7 @@ hc := HandlerContext new.
 hc on: Error do: [:e | e retry].
 hc run: [n update: [:v | v + 1]. (n get) < 3 ifTrue: [Error signal: 'x']. n get]
 "#;
-    assert_eq!(eval(src), Value::Int(3));
+    assert_eq!(eval_diff(src), Value::Int(3));
 }
 
 // ── Chunk 28: HandlerContext handler_chain (S6) ───────────────────────────────
@@ -2065,7 +2098,7 @@ hc on: Error do: [:e | 'caught'].
 hc run: ['ok'].
 "#;
     // Just check it returns normally
-    assert_eq!(eval(src), Value::Str(Arc::from("ok")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("ok")));
 }
 
 #[test]
@@ -2079,7 +2112,7 @@ outer run: [
         run: [Error signal: 'x']
 ]
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("inner")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("inner")));
 }
 
 // ── Chunk 28: Named restarts (S7) ────────────────────────────────────────────
@@ -2098,7 +2131,7 @@ hc run: [
     e signal
 ]
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("fallback")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("fallback")));
 }
 
 #[test]
@@ -2115,7 +2148,7 @@ hc run: [
     e signal
 ]
 "#;
-    assert_eq!(eval(src), Value::Int(99));
+    assert_eq!(eval_diff(src), Value::Int(99));
 }
 
 // ── Chunk 28b: Cross-entity HandlerContext propagation ────────────────────────
@@ -2137,7 +2170,7 @@ actor := CrossEntitySignaler new.
 hc := HandlerContext new on: Error do: [:e | e resume: 99].
 hc run: [actor fireError]
 "#;
-    assert_eq!(eval(src), Value::Int(99));
+    assert_eq!(eval_diff(src), Value::Int(99));
 }
 
 #[test]
@@ -2156,7 +2189,7 @@ actor := CrossEntitySignaler2 new.
 hc := HandlerContext new on: Error do: [:e | e return: 'done'].
 hc run: [actor fireError]
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("done")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("done")));
 }
 
 #[test]
@@ -2179,7 +2212,7 @@ actor := RetryActor new.
 hc := HandlerContext new on: Error do: [:e | e retry].
 hc run: [actor signalTwiceThenReturn]
 "#;
-    assert_eq!(eval(src), Value::Int(3));
+    assert_eq!(eval_diff(src), Value::Int(3));
 }
 
 #[test]
@@ -2201,7 +2234,7 @@ actor := NestedHCActor new.
 outerHC := HandlerContext new on: Error do: [:e | e resume: 'outer'].
 outerHC run: [actor signalWithInnerHC]
 "#;
-    assert_eq!(eval(src), Value::Str(Arc::from("inner")));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("inner")));
 }
 
 #[test]
@@ -2229,7 +2262,7 @@ actor := BoundaryActor new.
 outerHC := HandlerContext new on: Error do: [:e | e retry].
 outerHC run: [actor signalInInnerBoundary]
 "#;
-    assert_eq!(eval(src), Value::Int(3));
+    assert_eq!(eval_diff(src), Value::Int(3));
 }
 
 // ── Chunk 28: Unhandled Warning policy (S8) ──────────────────────────────────
@@ -2241,7 +2274,7 @@ Warning loggingPolicy: #suppress.
 Warning signal: 'quiet'
 "#;
     // Should complete without error (returns nil)
-    assert_eq!(eval(src), Value::Nil);
+    assert_eq!(eval_diff(src), Value::Nil);
 }
 
 #[test]
@@ -2254,5 +2287,43 @@ Condition subclass: #BaseCond
     indexedSlots: #none.
 BaseCond signal: 'quiet'
 "#;
-    assert_eq!(eval(src), Value::Nil);
+    assert_eq!(eval_diff(src), Value::Nil);
+}
+
+#[test]
+fn ivar_read_in_block_arg_to_bool_method_tail_position() {
+    // TCO removes the enclosing P>>= frame before `and:` evaluates its block.
+    // Block must still reach `y` via home_self captured at block creation.
+    let src = r#"
+        Object subclass: #P instanceVariableNames: 'x y'.
+        P class >> x: anX y: aY [ ^self new pvtInit: anX y: aY ]
+        P >> pvtInit: anX y: aY [ x := anX. y := aY ]
+        P >> x [ ^x ]
+        P >> y [ ^y ]
+        P >> = other [
+            self class = other class ifFalse: [^false].
+            ^x = other x and: [y = other y]
+        ]
+        (P x: 1 y: 2) = (P x: 1 y: 2)
+    "#;
+    assert_eq!(eval_diff(src), Value::Bool(true));
+}
+
+#[test]
+fn ivar_read_in_nested_block_after_tco() {
+    // Nested block: outer block is the and: arg (TCO removes P>>= frame),
+    // inner block is the or: arg. Both must see `y` via home_self.
+    let src = r#"
+        Object subclass: #P instanceVariableNames: 'x y'.
+        P class >> x: anX y: aY [ ^self new pvtInit: anX y: aY ]
+        P >> pvtInit: anX y: aY [ x := anX. y := aY ]
+        P >> x [ ^x ]
+        P >> y [ ^y ]
+        P >> = other [
+            self class = other class ifFalse: [^false].
+            ^x = other x and: [y = other y or: [false]]
+        ]
+        (P x: 1 y: 2) = (P x: 1 y: 2)
+    "#;
+    assert_eq!(eval_diff(src), Value::Bool(true));
 }

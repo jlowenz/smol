@@ -111,6 +111,11 @@ pub(crate) enum Cont {
         /// `Value::Future` results are resolved before the next statement runs.
         /// Used by `syncValue`, `on:do:` body, and `ensure:` body.
         sync: bool,
+        /// For block frames only: the `InstanceHandle` that was pushed onto
+        /// `method_stack` as a synthetic `SelfBinding::Instance` when this
+        /// frame was created. `Some(h)` means pop the binding on cleanup;
+        /// `None` means this is a method frame or a block with no home instance.
+        block_home_self: Option<InstanceHandle>,
     },
 
     /// Force `acc` via `force_value` before the next continuation fires.
@@ -203,10 +208,13 @@ fn unwind_stack_to_depth(
                 mut env,
                 is_method,
                 pops_env,
+                block_home_self,
                 ..
             } => {
                 if is_method {
                     debug_assert!(self_binding.is_some());
+                    ev.pop_self();
+                } else if block_home_self.is_some() {
                     ev.pop_self();
                 }
                 ev.current_block_home.set(saved_block_home);
@@ -242,11 +250,14 @@ fn cleanup_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
             mut env,
             is_method,
             pops_env,
+            block_home_self,
             ..
         } = frame
         {
             if is_method {
                 debug_assert!(self_binding.is_some());
+                ev.pop_self();
+            } else if block_home_self.is_some() {
                 ev.pop_self();
             }
             ev.current_block_home.set(saved_block_home);
@@ -302,10 +313,13 @@ fn handle_step_error(
                         mut env,
                         is_method,
                         pops_env,
+                        block_home_self,
                         ..
                     } => {
                         if is_method {
                             debug_assert!(self_binding.is_some());
+                            ev.pop_self();
+                        } else if block_home_self.is_some() {
                             ev.pop_self();
                         }
                         ev.current_block_home.set(saved_block_home);
@@ -421,6 +435,13 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                         .current_block_home
                         .get()
                         .unwrap_or_else(|| ev.method_depth.get());
+                    let home_self = {
+                        let ms = ev.method_stack.borrow();
+                        ms.iter().rev().find_map(|b| match b {
+                            SelfBinding::Instance { handle, .. } => Some(handle.clone()),
+                            _ => None,
+                        })
+                    };
                     acc = Value::Block(Arc::new(crate::value::Block {
                         params,
                         locals,
@@ -428,6 +449,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                         env: env.clone(),
                         home_depth,
                         home_entity: ev.current_entity_id.get(),
+                        home_self,
                     }));
                 }
                 Expr::NamespaceRef {
@@ -566,6 +588,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 frame_block_home,
                 defining_class,
                 sync,
+                block_home_self,
             } => {
                 if pending.is_empty() {
                     // Frame exhausted — pop method stack and restore home.
@@ -574,6 +597,8 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                             self_binding.is_some(),
                             "method CallFrame must have a self_binding"
                         );
+                        ev.pop_self();
+                    } else if block_home_self.is_some() {
                         ev.pop_self();
                     }
                     ev.current_block_home.set(saved_block_home);
@@ -601,6 +626,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                         frame_block_home,
                         defining_class,
                         sync,
+                        block_home_self,
                     });
                     // For sync frames, force the statement result before the frame resumes.
                     if sync {
@@ -948,6 +974,14 @@ pub(crate) fn push_block_frame(
             }
         }
     }
+    // If the block captured a home instance, push it onto method_stack so
+    // lookup_var finds ivars even after TCO has removed the enclosing method frame.
+    if let Some(ref handle) = block.home_self {
+        ev.push_self(SelfBinding::Instance {
+            handle: handle.clone(),
+            defining_class: handle.0.class.clone(),
+        });
+    }
     let saved_home = ev.current_block_home.get();
     ev.current_block_home.set(Some(block.home_depth));
     stack.push(Cont::CallFrame {
@@ -960,6 +994,7 @@ pub(crate) fn push_block_frame(
         pops_env: true,
         saved_block_home: saved_home,
         frame_block_home: Some(block.home_depth),
+        block_home_self: block.home_self.clone(),
         defining_class: None,
         sync,
     });
@@ -993,10 +1028,14 @@ fn drain_tail_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
             if let Some(Cont::CallFrame {
                 saved_block_home,
                 pops_env,
+                block_home_self,
                 mut env,
                 ..
             }) = stack.pop()
             {
+                if block_home_self.is_some() {
+                    ev.pop_self();
+                }
                 ev.current_block_home.set(saved_block_home);
                 if pops_env {
                     env.pop_frame();
@@ -1049,10 +1088,14 @@ fn drain_tail_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
             if let Some(Cont::CallFrame {
                 saved_block_home,
                 pops_env,
+                block_home_self,
                 mut env,
                 ..
             }) = stack.pop()
             {
+                if block_home_self.is_some() {
+                    ev.pop_self();
+                }
                 ev.current_block_home.set(saved_block_home);
                 if pops_env {
                     env.pop_frame();
@@ -1145,6 +1188,7 @@ fn push_class_method_frame(
         pops_env: true,
         saved_block_home,
         frame_block_home: None,
+        block_home_self: None,
         defining_class: Some(def_class),
         sync: false,
     });
@@ -1256,7 +1300,12 @@ fn dispatch_to_stack(
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
-    // (1) User-defined method lookup (covers Block, Int, Nil, ValueObject, entity self-send).
+    // Force a Future receiver before dispatch. We must know the actual type to
+    // look up a method. Blocking here is a cooperative yield in the may scheduler
+    // — other coroutines (entities) run while this one waits for resolution.
+    let receiver = force_value(receiver)?;
+
+    // (1) User-defined method lookup (covers Bool, Block, Int, Nil, ValueObject, entity self-send).
     if let Some(found) = lookup_user_method(ev, &receiver, &selector) {
         drain_tail_frames(ev, stack);
         push_method_call_frame(ev, found, args, env, stack)?;
@@ -1338,54 +1387,7 @@ fn dispatch_to_stack(
         }
     }
 
-    // (6) Inline Bool ifTrue:/ifFalse:/ifTrue:ifFalse:/ifFalse:ifTrue: dispatch.
-    if let Value::Bool(b) = receiver {
-        match selector.as_ref() {
-            "ifTrue:" => {
-                let blk = as_block(args.into_iter().next().unwrap_or(Value::Nil), &selector)?;
-                if b {
-                    push_block_frame(ev, &blk, vec![], false, stack)?;
-                } else {
-                    *acc = Value::Nil;
-                }
-                return Ok(());
-            }
-            "ifFalse:" => {
-                let blk = as_block(args.into_iter().next().unwrap_or(Value::Nil), &selector)?;
-                if !b {
-                    push_block_frame(ev, &blk, vec![], false, stack)?;
-                } else {
-                    *acc = Value::Nil;
-                }
-                return Ok(());
-            }
-            "ifTrue:ifFalse:" => {
-                let mut iter = args.into_iter();
-                let t_blk = as_block(iter.next().unwrap_or(Value::Nil), &selector)?;
-                let f_blk = as_block(iter.next().unwrap_or(Value::Nil), &selector)?;
-                if b {
-                    push_block_frame(ev, &t_blk, vec![], false, stack)?;
-                } else {
-                    push_block_frame(ev, &f_blk, vec![], false, stack)?;
-                }
-                return Ok(());
-            }
-            "ifFalse:ifTrue:" => {
-                let mut iter = args.into_iter();
-                let f_blk = as_block(iter.next().unwrap_or(Value::Nil), &selector)?;
-                let t_blk = as_block(iter.next().unwrap_or(Value::Nil), &selector)?;
-                if b {
-                    push_block_frame(ev, &t_blk, vec![], false, stack)?;
-                } else {
-                    push_block_frame(ev, &f_blk, vec![], false, stack)?;
-                }
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
-
-    // (7) Universal nil-guard family — checked after user methods so user overrides win.
+    // (6) Universal nil-guard family — checked after user methods so user overrides win.
     match selector.as_ref() {
         "ifNil:" => {
             if args.len() != 1 {
@@ -1458,7 +1460,7 @@ fn dispatch_to_stack(
         _ => {}
     }
 
-    // (8) All other selectors fall through to builtins.
+    // (7) All other selectors fall through to builtins.
     *acc = crate::builtins::dispatch(ev, receiver, selector, args, env)?;
     Ok(())
 }
@@ -1524,6 +1526,7 @@ pub(crate) fn push_method_call_frame(
                 pops_env: true,
                 saved_block_home,
                 frame_block_home: None,
+                block_home_self: None,
                 defining_class: Some(def_class),
                 sync: false,
             });
@@ -1574,6 +1577,7 @@ pub(crate) fn push_method_call_frame(
                 pops_env: true,
                 saved_block_home,
                 frame_block_home: None,
+                block_home_self: None,
                 defining_class: Some(def_class),
                 sync: false,
             });

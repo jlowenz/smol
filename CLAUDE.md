@@ -31,7 +31,7 @@ Rust source only, so `just cov` numbers say nothing about Smol kernel code cover
 
 ### Interpreter and `may` coroutines
 
-The current coroutine stack size is set to 128KB, which is a lot (comparatively, BEAM processes start with ~2KB). We should be aware of the Rust interpreter stack depth and try to minimize the stack overhead here, though future VM work may help ameliorate this issue. 
+The coroutine stack size (`COROUTINE_STACK_SIZE` in `entity.rs`) is 32 KB (0x8000). The iterative evaluator uses heap `CallFrame`s for Smol method calls, so the dominant Rust stack cost is nested builtin→`eval_block` chains. Measured debug-build minimum for the test suite: ~27 KB; the 32 KB constant provides headroom. The previous doc comment claiming 128 KB was incorrect — the code value was always 32 KB.
 
 ### Futures
 

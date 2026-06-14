@@ -326,6 +326,9 @@ Object >> initialize []
 "Default isEmpty returns false; collection subclasses override."
 Object >> isEmpty [ ^false ]
 
+Object >> class [ ^self _primClass ]
+Object >> isKindOf: aClass [ ^self _primIsKindOf: aClass ]
+
 Object class >> new [
     ^[self _primNew initialize] syncValue
 ]
@@ -657,6 +660,50 @@ HandlerContext >> on: anArray run: body [
 ]
 HandlerContext >> pairs            [ ^pairs ]
 HandlerContext >> run: body        [ ^self _primHCRun: body ]
+
+"Boolean hierarchy — mirrors kernel.smol; required by entity coroutines."
+Value subclass: #Boolean
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Boolean subclass: #True
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Boolean subclass: #False
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+True  >> ifTrue: aBlock             [ ^aBlock value ]
+True  >> ifFalse: aBlock            [ ^nil ]
+True  >> ifTrue: t ifFalse: f       [ ^t value ]
+True  >> ifFalse: f ifTrue: t       [ ^t value ]
+True  >> and: aBlock                [ ^aBlock value ]
+True  >> or: aBlock                 [ ^true ]
+True  >> not                        [ ^false ]
+True  >> xor: aBool                 [ ^aBool not ]
+True  >> printString                [ ^'true' ]
+True  >> = other                    [ ^other ifTrue: [true] ifFalse: [false] ]
+True  >> & other                    [ ^other ]
+True  >> | other                    [ ^true ]
+
+False >> ifTrue: aBlock             [ ^nil ]
+False >> ifFalse: aBlock            [ ^aBlock value ]
+False >> ifTrue: t ifFalse: f       [ ^f value ]
+False >> ifFalse: f ifTrue: t       [ ^f value ]
+False >> and: aBlock                [ ^false ]
+False >> or: aBlock                 [ ^aBlock value ]
+False >> not                        [ ^true ]
+False >> xor: aBool                 [ ^aBool not ]
+False >> printString                [ ^'false' ]
+False >> = other                    [ ^other ifTrue: [false] ifFalse: [true] ]
+False >> & other                    [ ^false ]
+False >> | other                    [ ^other ]
+
+Boolean >> ~= other                 [ ^(self = other) not ]
 
 "World — environment-level queries over the live entity registry."
 Object subclass: #World

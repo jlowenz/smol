@@ -540,6 +540,7 @@ mod tests {
             env: crate::env::Env::new(),
             home_depth: 0,
             home_entity: None,
+            home_self: None,
         }));
         assert!(matches!(value_to_bridge(&blk), BridgeResult::Skip));
     }

@@ -237,6 +237,17 @@ impl Parser {
                 };
                 MethodPattern::Binary { op, param }
             }
+            Token::Pipe => {
+                self.advance();
+                let param = match self.expect("parameter name", |t| matches!(t, Token::Ident(_)))? {
+                    Token::Ident(n) => n,
+                    _ => unreachable!(),
+                };
+                MethodPattern::Binary {
+                    op: Arc::from("|"),
+                    param,
+                }
+            }
             Token::Keyword(_) => {
                 let mut parts = Vec::new();
                 while let Token::Keyword(kw) = self.peek().clone() {

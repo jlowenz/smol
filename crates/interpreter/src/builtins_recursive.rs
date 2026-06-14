@@ -58,6 +58,29 @@ pub fn dispatch(
         let v = force_value(recv)?;
         return Ok(Value::Int(hash_value(&v)));
     }
+    // `_primClass` — maps any value to its kernel class entity handle.
+    if selector.as_ref() == "_primClass" {
+        expect_arity(&selector, 0, args.len())?;
+        let recv = force_value(recv)?;
+        return value_to_class_handle_rec(ev, &recv)
+            .map(Value::Instance)
+            .ok_or_else(|| mnu("Object", &selector));
+    }
+    // `_primIsKindOf:` — true iff receiver's class is aClass or a subclass of it.
+    if selector.as_ref() == "_primIsKindOf:" {
+        expect_arity(&selector, 1, args.len())?;
+        let recv = force_value(recv)?;
+        let arg = force_value(args.into_iter().next().unwrap())?;
+        let recv_class = match value_to_class_handle_rec(ev, &recv) {
+            Some(h) => h.0.class.clone(),
+            None => return Ok(Value::Bool(false)),
+        };
+        let arg_class = match arg {
+            Value::Instance(h) => h.0.class.clone(),
+            _ => return Ok(Value::Bool(false)),
+        };
+        return Ok(Value::Bool(is_kind_of(&recv_class, &arg_class)));
+    }
     // `hash` is universal for non-object types (primitive values don't route through
     // Object method lookup). For Value::Instance with Entity/ValueObject kind, the
     // type-specific dispatch runs instead to find any user-defined `hash` override.
@@ -932,20 +955,18 @@ fn dispatch_bool(
         }
         "&" => {
             expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
-                Value::Bool(b2) => Ok(Value::Bool(b && b2)),
-                _ => Err(EvalError::TypeError(format!(
-                    "{sel}: argument must be Bool"
-                ))),
+            if b {
+                force_value(args.remove(0))
+            } else {
+                Ok(Value::Bool(false))
             }
         }
         "|" => {
             expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
-                Value::Bool(b2) => Ok(Value::Bool(b || b2)),
-                _ => Err(EvalError::TypeError(format!(
-                    "{sel}: argument must be Bool"
-                ))),
+            if b {
+                Ok(Value::Bool(true))
+            } else {
+                force_value(args.remove(0))
             }
         }
         "and:" => {
@@ -954,14 +975,7 @@ fn dispatch_bool(
                 return Ok(Value::Bool(false));
             }
             let blk = as_block(args.remove(0), sel)?;
-            let f = ev.eval_block(&blk, vec![], env)?;
-            match f {
-                Value::Bool(b2) => Ok(Value::Bool(b2)),
-                Value::Future(_) => force_value(f),
-                _ => Err(EvalError::TypeError(format!(
-                    "{sel}: block must return Bool"
-                ))),
-            }
+            ev.eval_block(&blk, vec![], env)
         }
         "or:" => {
             expect_arity(sel, 1, args.len())?;
@@ -969,14 +983,7 @@ fn dispatch_bool(
                 return Ok(Value::Bool(true));
             }
             let blk = as_block(args.remove(0), sel)?;
-            let f = ev.eval_block(&blk, vec![], env)?;
-            match f {
-                Value::Bool(b2) => Ok(Value::Bool(b2)),
-                Value::Future(_) => force_value(f),
-                _ => Err(EvalError::TypeError(format!(
-                    "{sel}: block must return Bool"
-                ))),
-            }
+            ev.eval_block(&blk, vec![], env)
         }
         "not" => {
             expect_arity(sel, 0, args.len())?;
@@ -1390,6 +1397,33 @@ fn dispatch_entity(
         _ => unreachable!(),
     };
     Ok(Value::Future(future))
+}
+
+fn value_to_class_handle_rec(ev: &RecursiveEvaluator, v: &Value) -> Option<InstanceHandle> {
+    let class_name = match v {
+        Value::Bool(b) => {
+            if *b {
+                "True"
+            } else {
+                "False"
+            }
+        }
+        Value::Int(_) | Value::LargeInt(_) => "Int",
+        Value::Float(_) => "Float",
+        Value::Str(_) => "String",
+        Value::Symbol(_) => "Symbol",
+        Value::Block(_) => "Block",
+        Value::Nil => "Nil",
+        Value::Instance(h) => {
+            return match &h.0.kind {
+                InstanceKind::ValueObject(obj) => class_handle_of(obj).ok(),
+                InstanceKind::Entity(d) => class_handle_of(&d.data).ok(),
+                InstanceKind::ClassEntity(_) => None,
+            };
+        }
+        _ => return None,
+    };
+    ev.inner.registry.kernel().lookup_class(class_name)
 }
 
 /// Returns the canonical `InstanceHandle` for the class of `obj`.

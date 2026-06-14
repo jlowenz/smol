@@ -1,4 +1,4 @@
-use crate::test_helpers::eval;
+use crate::test_helpers::{eval, eval_diff};
 
 use super::*;
 
@@ -39,7 +39,7 @@ Five >> anotherFive [ ^Five new ].
 f := Five new.
 f anotherFive anotherFive value.
 "#;
-    assert_eq!(eval(prog), Value::Int(5));
+    assert_eq!(eval_diff(prog), Value::Int(5));
 }
 
 #[test]
@@ -207,4 +207,54 @@ fn instance_handle_class_entity_debug() {
     let s = format!("{handle:?}");
     assert!(s.contains("ClassEntity"), "got: {s}");
     assert!(s.contains("MyClass"), "got: {s}");
+}
+
+/// Stress test: 100 entities × 1 000 messages each at the current stack size.
+#[test]
+fn entity_stress_100x1000() {
+    let src = r#"
+        | results |
+        results := OrderedCollection new.
+        1 to: 100 do: [:i |
+            | vh |
+            vh := ValueHolder initialValue: 0.
+            1 to: 1000 do: [:j | vh update: [:v | v + 1]].
+            results add: vh get
+        ].
+        results inject: 0 into: [:acc :e | acc + e]
+    "#;
+    assert_eq!(eval(src), Value::Int(100_000));
+}
+
+/// Stack probe using the PRODUCTION coroutine path: load kernel on the test
+/// thread (which has a full OS stack), then evaluate inside a coroutine using
+/// only `Evaluator::with_registry` — mirroring how `run_entity_loop` works.
+/// This isolates the true coroutine stack cost from kernel-loading overhead.
+#[test]
+fn entity_stack_depth_probe() {
+    let src = r#"
+        | col acc |
+        col := OrderedCollection new.
+        1 to: 20 do: [:i | col add: i].
+        acc := ValueHolder initialValue: 0.
+        [ col do: [:each |
+            [ acc update: [:v | v + each] ] ensure: [ nil ]
+        ] ] on: Error do: [:e | nil].
+        acc get await
+    "#;
+    // Load kernel on the test thread (not inside the coroutine).
+    crate::entity::init_coroutine_stack();
+    let base_ev = crate::eval::Evaluator::new();
+    let registry = base_ev.registry.clone();
+    let prog = crate::parser::Parser::parse(src).expect("parse");
+
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    may::go!(move || {
+        let ev = crate::eval::Evaluator::with_registry(registry);
+        let mut env = crate::env::Env::new();
+        ev.registry.populate_env(&mut env);
+        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        tx.send(v).unwrap();
+    });
+    assert_eq!(rx.recv().unwrap(), Value::Int(210));
 }

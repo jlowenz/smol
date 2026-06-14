@@ -401,6 +401,15 @@ impl RecursiveEvaluator {
                     env: env.clone(),
                     home_depth,
                     home_entity: self.inner.current_entity_id.get(),
+                    home_self: {
+                        let ms = self.inner.method_stack.borrow();
+                        ms.iter().rev().find_map(|b| match b {
+                            crate::eval::SelfBinding::Instance { handle, .. } => {
+                                Some(handle.clone())
+                            }
+                            _ => None,
+                        })
+                    },
                 })))
             }
             Expr::Cascade { receiver, messages } => {
