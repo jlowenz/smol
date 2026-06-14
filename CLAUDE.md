@@ -66,6 +66,24 @@ Claude Code to do the audit explicitly; it has done this successfully as of chun
 Neither item blocks ongoing chunk work; both should be scheduled before the
 kernel grows significantly beyond its current size.
 
+### Two-path evaluator architecture (C29.8)
+
+The interpreter has two independent evaluation paths:
+
+| Path | Module | Kernel | Entry point |
+|------|--------|--------|-------------|
+| Iterative | `eval.rs` + `eval_iterative.rs` | `kernel.smol` (Smol-recursive loops + TCO) | `Evaluator::eval_program` / `IEvaluator::eval_program` |
+| Recursive | `eval_recursive.rs` | `kernel_recursive.smol` (`_primWhileTrue:` etc.) | `RecursiveEvaluator::eval_program` |
+
+Dispatch:
+- Iterative: `builtins_iterative.rs` (`dispatch(ev: &Evaluator, ...)`) — block-eval ops handled by `dispatch_to_stack` + `push_block_frame`.
+- Recursive: `builtins_recursive.rs` (`dispatch(ev: &RecursiveEvaluator, ...)`) — includes `ensure:`, `on:do:`, `syncValue`, `ifNil:` family.
+- `builtins.rs` is a re-export shim for `builtins_iterative` (backward compat).
+
+`test_helpers::eval(src)` runs both paths independently and asserts they agree on results.
+
+To retire the recursive evaluator: `git rm eval_recursive.rs builtins_recursive.rs kernel_recursive.smol` + remove from `lib.rs` + simplify `test_helpers.rs` to run one evaluator.
+
 ## Preferences and Rules
 
 I will add to this list as the project proceeds, but may also ask you to add things here as well. If something seems like it should be a preference or rule, please suggest putting it here. 
