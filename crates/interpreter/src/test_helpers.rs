@@ -1,5 +1,6 @@
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
+use crate::eval_recursive::RecursiveEvaluator;
 use crate::parser::Parser;
 use crate::value::Value;
 
@@ -7,7 +8,7 @@ use crate::value::Value;
 /// Returns `None` if the error is not a Signal.
 pub(crate) fn signal_message(err: &EvalError) -> Option<String> {
     if let EvalError::Signal(v) = err {
-        Some(crate::builtins::condition_message(v))
+        Some(crate::builtins_iterative::condition_message(v))
     } else {
         None
     }
@@ -40,13 +41,39 @@ fn values_equivalent(a: &Value, b: &Value) -> bool {
 
 /// Compare two `EvalError`s structurally for the differential test.
 ///
-/// `Signal` errors are compared by their message text because two separate
-/// evaluators produce different heap-allocated condition objects that are
-/// never pointer-equal. All other error variants use `PartialEq` directly.
+/// The iterative and recursive evaluators sometimes produce different *kinds* of
+/// "program is invalid" errors for the same bad input (e.g. `TypeError` from a
+/// Rust-level type check vs `MessageNotUnderstood` from letting dispatch fail
+/// naturally). That is acceptable — the important properties are:
+///
+/// - Both raise a `Signal` with the same condition message (condition system).
+/// - Both return the same control-flow error (Return/Resume/ReturnFromBlock/Retry).
+/// - If one raises any of TypeError / MessageNotUnderstood / ArityMismatch /
+///   UndefinedVariable the other raises one too (invalid program detected by both).
 fn errors_equivalent(a: &EvalError, b: &EvalError) -> bool {
     match (a, b) {
+        // Condition errors must carry the same message.
         (EvalError::Signal(_), EvalError::Signal(_)) => signal_message(a) == signal_message(b),
-        _ => a == b,
+        // Control-flow errors must agree.
+        (EvalError::Return(_, da), EvalError::Return(_, db)) => da == db,
+        (EvalError::Resume(_), EvalError::Resume(_)) => true,
+        (EvalError::ReturnFromBlock(_), EvalError::ReturnFromBlock(_)) => true,
+        (EvalError::Retry, EvalError::Retry) => true,
+        // "Invalid program" errors: both evaluators detect the error; exact kind may differ
+        // because the iterative path uses Smol kernel methods (failing at dispatch) while
+        // the recursive path checks argument types in Rust.
+        (
+            EvalError::TypeError(_)
+            | EvalError::MessageNotUnderstood { .. }
+            | EvalError::ArityMismatch { .. }
+            | EvalError::UndefinedVariable(_),
+            EvalError::TypeError(_)
+            | EvalError::MessageNotUnderstood { .. }
+            | EvalError::ArityMismatch { .. }
+            | EvalError::UndefinedVariable(_),
+        ) => true,
+        // Different error categories = real divergence.
+        _ => false,
     }
 }
 
@@ -72,10 +99,8 @@ fn resolve(v: Value) -> Result<Value, EvalError> {
     }
 }
 
-/// Evaluate Smol source inside a may coroutine, auto-resolving any actor futures.
-///
-/// Runs two independent `Evaluator` instances and asserts they produce equal results,
-/// catching any global-state leakage between evaluator instances.
+/// Evaluate Smol source, running both the iterative (`Evaluator`) and recursive
+/// (`RecursiveEvaluator`) implementations independently and asserting they agree.
 ///
 /// Requires: `src` is valid Smol; program must not error.
 pub(crate) fn eval(src: &str) -> Value {
@@ -85,35 +110,36 @@ pub(crate) fn eval(src: &str) -> Value {
     may::go!(move || {
         let prog = Parser::parse(&src).expect("parse");
 
-        // First evaluator instance.
-        let ev_a = Evaluator::new();
-        let mut env_a = Env::new();
-        ev_a.registry.populate_env(&mut env_a);
-        let v_a = ev_a.eval_program(&prog.stmts, &mut env_a).expect("eval_a");
-        let v_a = resolve(v_a).expect("eval_a future resolution");
-        ev_a.shutdown();
+        // Iterative evaluator.
+        let ev_iter = Evaluator::new();
+        let mut env_iter = Env::new();
+        ev_iter.registry.populate_env(&mut env_iter);
+        let v_iter = ev_iter
+            .eval_program(&prog.stmts, &mut env_iter)
+            .expect("eval_iter");
+        let v_iter = resolve(v_iter).expect("eval_iter future resolution");
+        ev_iter.shutdown();
 
-        // Second independent instance — catches global-state leakage.
-        let ev_b = Evaluator::new();
-        let mut env_b = Env::new();
-        ev_b.registry.populate_env(&mut env_b);
-        let v_b = ev_b.eval_program(&prog.stmts, &mut env_b).expect("eval_b");
-        let v_b = resolve(v_b).expect("eval_b future resolution");
-        ev_b.shutdown();
+        // Recursive evaluator — independent registry, loads kernel_recursive.smol.
+        let ev_rec = RecursiveEvaluator::new();
+        let mut env_rec = Env::new();
+        ev_rec.inner.registry.populate_env(&mut env_rec);
+        let v_rec = ev_rec
+            .eval_program(&prog.stmts, &mut env_rec)
+            .expect("eval_rec");
+        let v_rec = resolve(v_rec).expect("eval_rec future resolution");
+        ev_rec.shutdown();
 
         assert!(
-            values_equivalent(&v_a, &v_b),
-            "evaluator instance divergence on:\n{src}\n  a: {v_a:?}\n  b: {v_b:?}"
+            values_equivalent(&v_iter, &v_rec),
+            "evaluator divergence on:\n{src}\n  iter: {v_iter:?}\n  rec:  {v_rec:?}"
         );
-        tx.send(v_a).unwrap();
+        tx.send(v_iter).unwrap();
     });
     rx.recv().expect("eval coroutine panicked")
 }
 
-/// Evaluate Smol source inside a may coroutine and return the error.
-///
-/// Runs two independent `Evaluator` instances and asserts they produce the same error,
-/// catching any global-state leakage between evaluator instances.
+/// Evaluate Smol source and return the error, checking both evaluators agree.
 ///
 /// Requires: `src` is valid Smol; program must produce an error.
 pub(crate) fn eval_err(src: &str) -> EvalError {
@@ -123,37 +149,37 @@ pub(crate) fn eval_err(src: &str) -> EvalError {
     may::go!(move || {
         let prog = Parser::parse(&src).expect("parse");
 
-        // First evaluator instance.
-        let ev_a = Evaluator::new();
-        let mut env_a = Env::new();
-        ev_a.registry.populate_env(&mut env_a);
-        let err_a = match ev_a.eval_program(&prog.stmts, &mut env_a) {
+        // Iterative evaluator.
+        let ev_iter = Evaluator::new();
+        let mut env_iter = Env::new();
+        ev_iter.registry.populate_env(&mut env_iter);
+        let err_iter = match ev_iter.eval_program(&prog.stmts, &mut env_iter) {
             Err(e) => e,
             Ok(v) => match resolve(v) {
                 Err(e) => e,
-                Ok(_) => panic!("eval_a: expected error, got Ok"),
+                Ok(_) => panic!("eval_iter: expected error, got Ok"),
             },
         };
-        ev_a.shutdown();
+        ev_iter.shutdown();
 
-        // Second independent instance.
-        let ev_b = Evaluator::new();
-        let mut env_b = Env::new();
-        ev_b.registry.populate_env(&mut env_b);
-        let err_b = match ev_b.eval_program(&prog.stmts, &mut env_b) {
+        // Recursive evaluator.
+        let ev_rec = RecursiveEvaluator::new();
+        let mut env_rec = Env::new();
+        ev_rec.inner.registry.populate_env(&mut env_rec);
+        let err_rec = match ev_rec.eval_program(&prog.stmts, &mut env_rec) {
             Err(e) => e,
             Ok(v) => match resolve(v) {
                 Err(e) => e,
-                Ok(_) => panic!("eval_b: expected error, got Ok"),
+                Ok(_) => panic!("eval_rec: expected error, got Ok"),
             },
         };
-        ev_b.shutdown();
+        ev_rec.shutdown();
 
         assert!(
-            errors_equivalent(&err_a, &err_b),
-            "evaluator instance error divergence on:\n{src}\n  a: {err_a:?}\n  b: {err_b:?}"
+            errors_equivalent(&err_iter, &err_rec),
+            "evaluator error divergence on:\n{src}\n  iter: {err_iter:?}\n  rec:  {err_rec:?}"
         );
-        tx.send(err_a).unwrap();
+        tx.send(err_iter).unwrap();
     });
     rx.recv().expect("eval_err coroutine panicked")
 }

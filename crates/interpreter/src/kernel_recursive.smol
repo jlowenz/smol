@@ -1,0 +1,669 @@
+"ValueHolder - an actor that holds a single mutable value reference"
+Object subclass: #ValueHolder instanceVariableNames: 'val'.
+ValueHolder class >> initialValue: aVal [
+    ^ValueHolder new set: aVal; yourself
+]
+ValueHolder >> set: aVal [ val := aVal ]
+ValueHolder >> get [ ^val ]
+"Takes aBlock that accepts the old value and returns an updated value"
+ValueHolder >> update: aBlock [
+    self set: (aBlock value: self get)
+]
+
+"Array — fixed-size indexed collection of pointer slots."
+Object subclass: #Array
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #pointer.
+
+Array >> at: i       [ ^self _primAt: i ]
+Array >> at: i put: v [ self _primAt: i put: v. ^v ]
+Array >> size        [ ^self _primSize ]
+Array >> isEmpty     [ ^self _primSize = 0 ]
+Array >> notEmpty    [ ^self _primSize > 0 ]
+Array >> first       [ ^self _primAt: 0 ]
+Array >> last        [ ^self _primAt: self _primSize - 1 ]
+
+Array >> do: aBlock [
+    0 to: (self _primSize - 1) do: [ :i |
+        aBlock value: (self _primAt: i)
+    ]
+]
+
+Array >> collect: aBlock [
+    | result |
+    result := Array new: self _primSize.
+    0 to: (self _primSize - 1) do: [ :i |
+        result at: i put: (aBlock value: (self _primAt: i))
+    ]
+    ^result
+]
+
+Array >> select: aBlock [
+    | result |
+    result := OrderedCollection new.
+    self do: [:each | (aBlock value: each) ifTrue: [result add: each]].
+    ^result
+]
+
+Array >> reject: aBlock [
+    | result |
+    result := OrderedCollection new.
+    self do: [:each | (aBlock value: each) ifFalse: [result add: each]].
+    ^result
+]
+
+Array >> detect: aBlock [
+    self do: [:each | (aBlock value: each) ifTrue: [^each]].
+    self error: 'detect: no element satisfies the condition'
+]
+
+Array >> detect: aBlock ifNone: noneBlock [
+    self do: [:each | (aBlock value: each) ifTrue: [^each]].
+    ^noneBlock value
+]
+
+Array >> inject: init into: aBlock [
+    | holder |
+    holder := ValueHolder initialValue: init.
+    ^[self do: [:each |
+        holder update: [:acc | aBlock value: acc value: each]
+    ]] then: [holder get]
+]
+
+Array >> includes: v [
+    self do: [:each | each = v ifTrue: [^true]].
+    ^false
+]
+
+Array >> copyFrom: start to: stop [
+    | result |
+    result := Array new: stop - start + 1.
+    0 to: stop - start do: [:i |
+        result at: i put: (self _primAt: start + i)
+    ].
+    ^result
+]
+
+Array >> = other [
+    | n |
+    self class = other class ifFalse: [^false].
+    n := self _primSize.
+    n = other size ifFalse: [^false].
+    0 to: n - 1 do: [ :i |
+        (self _primAt: i) = (other at: i) ifFalse: [^false].
+    ].
+    ^true
+]
+
+Array >> ~= other [ ^(self = other) not ]
+
+Array >> printString [
+    | holder |
+    holder := ValueHolder initialValue: '('.
+    ^[self do: [:each |
+        holder update: [:s | s , each printString , ' ']
+    ]] then: [holder get , ')']
+]
+
+"ByteArray — fixed-size indexed collection of byte (0..255) slots."
+Object subclass: #ByteArray
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #byte.
+
+ByteArray >> at: i       [ ^self _primAt: i ]
+ByteArray >> at: i put: v [ self _primAt: i put: v. ^v ]
+ByteArray >> size        [ ^self _primSize ]
+ByteArray >> isEmpty     [ ^self _primSize = 0 ]
+ByteArray >> notEmpty    [ ^self _primSize > 0 ]
+
+ByteArray >> do: aBlock [
+    0 to: self _primSize - 1 do: [:i |
+        aBlock value: (self _primAt: i)
+    ]
+]
+
+ByteArray >> copyFrom: start to: stop [
+    | result |
+    result := ByteArray new: stop - start + 1.
+    0 to: stop - start do: [:i |
+        result at: i put: (self _primAt: start + i)
+    ].
+    ^result
+]
+
+ByteArray >> asString [ ^self _primAsString ]
+
+ByteArray >> printString [
+    | holder |
+    holder := ValueHolder initialValue: '('.
+    ^[self do: [:each |
+        holder update: [:s | s , each printString , ' ']
+    ]] then: [holder get , ')']
+]
+
+"OrderedCollection — growable sequence backed by an Array."
+Object subclass: #OrderedCollection
+    instanceVariableNames: 'storage size'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+OrderedCollection >> initialize [
+    storage := Array new: 8.
+    size := 0
+]
+
+OrderedCollection >> size        [ ^size ]
+OrderedCollection >> isEmpty     [ ^size = 0 ]
+OrderedCollection >> notEmpty    [ ^size > 0 ]
+OrderedCollection >> first       [ ^self at: 0 ]
+OrderedCollection >> last        [ ^self at: size - 1 ]
+
+OrderedCollection >> at: i [
+    (i < 0 or: [i >= size]) ifTrue: [self error: 'at: index out of bounds'].
+    ^storage at: i
+]
+
+OrderedCollection >> at: i put: v [
+    (i < 0 or: [i >= size]) ifTrue: [self error: 'at:put: index out of bounds'].
+    storage at: i put: v.
+    ^v
+]
+
+OrderedCollection >> add: v [
+    size >= storage size ifTrue: [self pvtGrow].
+    storage at: size put: v.
+    size := size + 1.
+    ^v
+]
+
+OrderedCollection >> addLast: v [ ^self add: v ]
+
+OrderedCollection >> addFirst: v [
+    size >= storage size ifTrue: [self pvtGrow].
+    size to: 1 by: -1 do: [:i |
+        storage at: i put: (storage at: i - 1)
+    ].
+    storage at: 0 put: v.
+    size := size + 1.
+    ^v
+]
+
+OrderedCollection >> removeFirst [
+    | v |
+    size = 0 ifTrue: [self error: 'removeFirst: collection is empty'].
+    v := storage at: 0.
+    1 to: size - 1 do: [:i |
+        storage at: i - 1 put: (storage at: i)
+    ].
+    size := size - 1.
+    ^v
+]
+
+OrderedCollection >> removeLast [
+    | v |
+    size = 0 ifTrue: [self error: 'removeLast: collection is empty'].
+    v := storage at: size - 1.
+    size := size - 1.
+    ^v
+]
+
+OrderedCollection >> pvtRemoveAt: idx [
+    idx + 1 to: size - 1 do: [:j |
+        storage at: j - 1 put: (storage at: j)
+    ].
+    size := size - 1
+]
+
+OrderedCollection >> remove: v ifAbsent: aBlock [
+    0 to: size - 1 do: [:i |
+        (storage at: i) = v ifTrue: [
+            (self pvtRemoveAt: i) then: [^v]
+        ]
+    ].
+    ^aBlock value
+]
+
+OrderedCollection >> do: aBlock [
+    0 to: size - 1 do: [:i |
+        aBlock value: (storage at: i)
+    ]
+]
+
+OrderedCollection >> collect: aBlock [
+    | result |
+    result := OrderedCollection new.
+    0 to: size - 1 do: [:i |
+        result add: (aBlock value: (storage at: i))
+    ].
+    ^result
+]
+
+OrderedCollection >> select: aBlock [
+    | result |
+    result := OrderedCollection new.
+    self do: [:each | (aBlock value: each) ifTrue: [result add: each]].
+    ^result
+]
+
+OrderedCollection >> reject: aBlock [
+    | result |
+    result := OrderedCollection new.
+    self do: [:each | (aBlock value: each) ifFalse: [result add: each]].
+    ^result
+]
+
+OrderedCollection >> detect: aBlock [
+    self do: [:each | (aBlock value: each) ifTrue: [^each]].
+    self error: 'detect: no element satisfies the condition'
+]
+
+OrderedCollection >> detect: aBlock ifNone: noneBlock [
+    self do: [:each | (aBlock value: each) ifTrue: [^each]].
+    ^noneBlock value
+]
+
+OrderedCollection >> inject: init into: aBlock [
+    | holder |
+    holder := ValueHolder initialValue: init.
+    ^[self do: [:each |
+        holder update: [:acc | aBlock value: acc value: each]
+    ]] then: [holder get]
+]
+
+OrderedCollection >> includes: v [
+    self do: [:each | each = v ifTrue: [^true]].
+    ^false
+]
+
+OrderedCollection >> copyFrom: start to: stop [
+    | result |
+    result := OrderedCollection new.
+    start to: stop do: [:i |
+        result add: (self at: i)
+    ].
+    ^result
+]
+
+OrderedCollection >> = other [
+    self class = other class ifFalse: [^false].
+    size = other size ifFalse: [^false].
+    0 to: size - 1 do: [:i |
+        (self at: i) = (other at: i) ifFalse: [^false]
+    ].
+    ^true
+]
+
+OrderedCollection >> ~= other [ ^(self = other) not ]
+
+OrderedCollection >> printString [
+    | holder |
+    holder := ValueHolder initialValue: 'OrderedCollection ('.
+    ^[self do: [:each |
+        holder update: [:s | s , each printString , ' ']
+    ]] then: [holder get , ')']
+]
+
+OrderedCollection >> pvtGrow [
+    | newStorage |
+    newStorage := Array new: storage size * 2.
+    0 to: size - 1 do: [:i |
+        newStorage at: i put: (storage at: i)
+    ].
+    storage := newStorage
+]
+
+
+"Default hash delegates to _primHash (identity-based pointer hash).
+ Subclasses that override = for value equality must also override hash
+ to maintain the invariant: a = b → a hash = b hash."
+Object >> hash [ ^self _primHash ]
+
+"Default initialize is a no-op."
+Object >> initialize []
+
+"Default isEmpty returns false; collection subclasses override."
+Object >> isEmpty [ ^false ]
+
+Object class >> new [
+    ^[self _primNew initialize] syncValue
+]
+
+Object class >> new: n [
+    ^[(self _primNew: n) initialize] syncValue
+]
+
+"Value class >> new freezes the instance after initialize."
+Value class >> new [
+    ^self _primNewValue: [:inst | inst initialize]
+]
+
+Value class >> new: n [
+    ^self _primNewValueIndexed: n init: [:inst | inst initialize]
+]
+
+"Association — immutable key / mutable value pair."
+Value subclass: #Association
+    instanceVariableNames: 'key value'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Association class >> key: k value: v [
+    ^self _primNewValue: [:a | a pvtKey: k value: v]
+]
+
+Association >> pvtKey: k value: v [ key := k. value := v ]
+Association >> key      [ ^key ]
+Association >> value    [ ^value ]
+Association >> value: v [ ^self class key: key value: v ]
+Association >> = other [
+    self class = other class ifFalse: [^false].
+    ^key = other key
+]
+Association >> printString [
+    ^key printString , ' -> ' , value printString
+]
+
+"Shorthand for building Associations via binary message -> ."
+Object >> -> aVal [ ^Association key: self value: aVal ]
+
+"Cons — immutable singly-linked list node.
+ nil is the empty list; isNil / isEmpty are the emptiness checks."
+Value subclass: #Cons
+    instanceVariableNames: 'head tail'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Cons class >> with: anObject rest: aList [
+    ^self _primNewValue: [:c |
+        c pvtHead: anObject tail: aList.
+    ]
+]
+
+Cons class >> singleton: anObject [
+    ^self _primNewValue: [:c |
+        c pvtHead: anObject tail: nil.
+    ]
+]
+
+Cons >> pvtHead: h tail: t [ head := h. tail := t. ]
+Cons >> head           [ ^head ]
+Cons >> tail           [ ^tail ]
+Cons >> isEmpty        [ ^false ]
+
+Cons >> addFirst: x [ ^Cons with: x rest: self ]
+
+Cons >> do: aBlock [
+    aBlock value: head.
+    tail isNil ifFalse: [tail do: aBlock]
+]
+
+Cons >> size [
+    ^1 + (tail isNil ifTrue: [0] ifFalse: [tail size])
+]
+
+Nil >> isEmpty [ ^true ]
+Nil >> inject: aValue into: aBlock [ ^aValue ]
+
+Cons >> inject: aValue into: aBlock [
+    ^tail inject: (aBlock value: aValue value: head) into: aBlock
+]
+
+"Dictionary — open-addressing hash map over a flat Array of Association slots.
+ Initial capacity 8; rehashes at 75% load by doubling."
+Object subclass: #Dictionary
+    instanceVariableNames: 'table size'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Dictionary >> initialize [
+    table := Array new: 8.
+    size := 0
+]
+
+"Returns the slot index for key — nil slot means absent, matching slot means present."
+Dictionary >> pvtSlotFor: key [
+    | cap h i |
+    cap := table size.
+    h := key hash \\ cap.
+    i := h < 0 ifTrue: [h + cap] ifFalse: [h].
+    i to: (i + table size - 1) do: [ :i | 
+        |slot j|
+        j := i \\ cap. 
+        slot := table at: j.
+        (slot isNil or: [slot key = key]) ifTrue: [^j]
+    ]
+]
+
+Dictionary >> at: key put: value [
+    | i slot |
+    (size * 4) >= (table size * 3) ifTrue: [self pvtRehash].
+    i := self pvtSlotFor: key.
+    slot := table at: i.
+    size := slot isNil
+        ifTrue: [
+            table at: i put: (Association key: key value: value).
+            size + 1]
+        ifFalse: [
+            table at: i put: (Association key: key value: value).
+            size].
+    ^value
+]
+
+Dictionary >> at: key [
+    ^self at: key ifAbsent: [Error signal: 'key not found']
+]
+
+Dictionary >> at: key ifAbsent: aBlock [
+    | i slot |
+    i := self pvtSlotFor: key.
+    slot := table at: i.
+    slot isNil ifTrue: [^aBlock value].
+    ^slot value
+]
+
+Dictionary >> includesKey: key [
+    | slot |
+    slot := table at: (self pvtSlotFor: key).
+    ^slot notNil
+]
+
+"Removes key; returns value if present, block result if absent.
+ Uses full-table rebuild to preserve open-addressing invariants."
+Dictionary >> removeKey: key ifAbsent: aBlock [
+    | i slot removedValue oldTable oldSize |
+    i := self pvtSlotFor: key.
+    slot := table at: i.
+    slot isNil ifTrue: [^aBlock value].
+    removedValue := slot value.
+    oldTable := table.
+    oldSize := oldTable size.
+    table := Array new: oldSize.
+    size := 0.
+    0 to: oldSize - 1 do: [:i |
+        (oldTable at: i) ifNotNil: [:s |
+            (s key ~= key) ifTrue: [self at: s key put: s value]
+        ]
+    ].
+    ^removedValue
+]
+
+Dictionary >> size     [ ^size ]
+Dictionary >> isEmpty  [ ^size = 0 ]
+Dictionary >> notEmpty [ ^size > 0 ]
+
+Dictionary >> do: aBlock [
+    | cap |
+    cap := table size.
+    0 to: cap - 1 do: [:i |
+        (table at: i) ifNotNil: [:slot | aBlock value: slot value]
+    ]
+]
+
+Dictionary >> keysDo: aBlock [
+    | cap |
+    cap := table size.
+    0 to: cap - 1 do: [:i |
+        (table at: i) ifNotNil: [:slot | aBlock value: slot key]
+    ]
+]
+
+Dictionary >> associationsDo: aBlock [
+    | cap |
+    cap := table size.
+    0 to: cap - 1 do: [:i |
+        (table at: i) ifNotNil: [:slot | aBlock value: slot]
+    ]
+]
+
+Dictionary >> keys [
+    | result |
+    result := OrderedCollection new.
+    self keysDo: [:k | result add: k].
+    ^result
+]
+
+Dictionary >> values [
+    | result |
+    result := OrderedCollection new.
+    self do: [:v | result add: v].
+    ^result
+]
+
+Dictionary >> = other [
+    self class = other class ifFalse: [^false].
+    size = other size ifFalse: [^false].
+    self associationsDo: [:assoc |
+        (other at: assoc key ifAbsent: [^false]) = assoc value
+            ifFalse: [^false]
+    ].
+    ^true
+]
+
+Dictionary >> printString [
+    | holder |
+    holder := ValueHolder initialValue: 'Dictionary ('.
+    ^[self associationsDo: [:assoc |
+        holder update: [:s | s , assoc printString , ' ']
+    ]] then: [holder get , ')']
+]
+
+Dictionary >> pvtRehash [
+    | old |
+    old := table.
+    table := Array new: old size * 2.
+    size := 0.
+    0 to: old size - 1 do: [:i |
+        (old at: i) ifNotNil: [:slot | self at: slot key put: slot value]
+    ]
+]
+
+"Condition hierarchy — CL-inspired non-local condition/restart system."
+
+Value subclass: #Condition
+    instanceVariableNames: 'message restarts'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Condition class >> withMessage: aString [
+    ^self _primNewValue: [:c |
+        c pvtSetMessage: aString
+    ]
+]
+
+"Factory for functional updates: preserves polymorphism across Condition subclasses."
+Condition class >> pvtMessage: msg restarts: r [
+    ^self _primNewValue: [:c |
+        c pvtSetMessage: msg.
+        c pvtSetRestarts: r
+    ]
+]
+
+Condition class >> signal: aString [ ^(self withMessage: aString) signal ]
+
+"restarts is a Cons-of-Association (or nil). Frozen after construction."
+Condition >> initialize         [ message := '' ]
+Condition >> pvtSetMessage: s   [ message := s ]
+Condition >> pvtSetRestarts: r  [ restarts := r ]
+Condition >> message            [ ^message ]
+Condition >> messageText        [ ^message ]
+
+"Returns a new Condition with this restart prepended; self is unchanged (frozen)."
+Condition >> addRestart: name block: aBlock [
+    ^self class pvtMessage: message restarts: (Cons with: (name -> aBlock) rest: restarts)
+]
+
+Condition >> pvtFindRestart: name in: node [
+    node isNil ifTrue: [^nil].
+    node head key = name ifTrue: [^node head value].
+    ^self pvtFindRestart: name in: node tail
+]
+
+Condition >> hasRestart: name [ ^(self pvtFindRestart: name in: restarts) notNil ]
+Condition >> availableRestarts [ ^#() ]
+
+Condition >> invokeRestart: name [
+    | blk |
+    blk := self pvtFindRestart: name in: restarts.
+    blk isNil ifTrue: [self error: 'no restart named: ', name].
+    ^self resume: blk value
+]
+
+Condition >> invokeRestart: name with: arg [
+    | blk |
+    blk := self pvtFindRestart: name in: restarts.
+    blk isNil ifTrue: [self error: 'no restart named: ', name].
+    ^self resume: (blk value: arg)
+]
+
+Condition >> signal    [ ^self _primSignalCondition: self ]
+Condition >> resume: v [ ^self _primResume: v ]
+Condition >> return: v [ ^self _primReturn: v ]
+Condition >> retry     [ ^self _primRetry ]
+
+Condition subclass: #Warning
+    instanceVariableNames: ''
+    classVariableNames: 'LoggingPolicy'
+    indexedSlots: #none.
+
+Warning class >> initialize         [ LoggingPolicy := #stderr ]
+Warning class >> loggingPolicy: sym [ LoggingPolicy := sym ]
+Warning class >> loggingPolicy      [ ^LoggingPolicy ]
+
+Condition subclass: #Error
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+"HandlerContext — non-unwinding handler registration (CL handler-bind analog).
+pairs is a Cons-of-Association linked list (or nil):
+  Cons(head: cls -> blk, tail: rest)
+Newest pair is at the head. Using pure-Value Cons nodes avoids cross-entity reads
+in _primHCRun:, which executes as a self-send in the entity's own coroutine."
+Object subclass: #HandlerContext
+    instanceVariableNames: 'pairs'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+HandlerContext >> initialize       [ pairs := nil ]
+HandlerContext >> on: cls do: blk  [
+    pairs := Cons with: (cls -> blk) rest: pairs.
+    ^self
+]
+HandlerContext >> on: anArray run: body [
+    anArray do: [:assoc | self on: assoc key do: assoc value].
+    ^self run: body
+]
+HandlerContext >> pairs            [ ^pairs ]
+HandlerContext >> run: body        [ ^self _primHCRun: body ]
+
+"World — environment-level queries over the live entity registry."
+Object subclass: #World
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+World class >> instancesOf: aClass [
+    ^self _primInstancesOf: aClass
+]

@@ -95,7 +95,7 @@ pub struct Evaluator {
     ///
     /// Note: this is a per-evaluator (single-threaded) cell. Future multi-fiber
     /// execution will need to move this to a per-frame or per-fiber slot.
-    active_namespace: RefCell<Arc<Namespace>>,
+    pub(crate) active_namespace: RefCell<Arc<Namespace>>,
     /// The method-stack depth that the innermost active `eval_block` invocation
     /// should target with a `^`-return. `None` when not inside any `eval_block`
     /// (i.e., evaluating a method body directly). Saved and restored by each
@@ -185,7 +185,7 @@ impl Evaluator {
     }
 
     /// Returns the `defining_class` of the top method frame (for `super` dispatch).
-    fn current_defining_class(&self) -> Option<Arc<Class>> {
+    pub(crate) fn current_defining_class(&self) -> Option<Arc<Class>> {
         match self.method_stack.borrow().last() {
             Some(SelfBinding::Instance { defining_class, .. }) => Some(defining_class.clone()),
             Some(SelfBinding::ClassSide { defining_class, .. }) => Some(defining_class.clone()),
@@ -374,83 +374,9 @@ impl Evaluator {
             saved_block_home: self.current_block_home.get(),
             frame_block_home: None,
             defining_class: None,
+            sync: false,
         };
         step_loop(self, frame)
-    }
-
-    /// Reference recursive implementation retained for differential testing.
-    /// Production code uses `eval_program`.
-    pub(crate) fn eval_program_recursive(
-        &self,
-        stmts: &[Stmt],
-        env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        // Pre-bind all LocalDecl names to nil before evaluating any statement.
-        for stmt in stmts {
-            if let Stmt::LocalDecl(names) = stmt {
-                for name in names {
-                    env.define(name.clone(), Value::Nil);
-                }
-            }
-        }
-        let mut last = Value::Nil;
-        for stmt in stmts {
-            last = self.eval_stmt(stmt, env)?;
-        }
-        Ok(last)
-    }
-
-    fn eval_stmt(&self, stmt: &Stmt, env: &mut Env) -> Result<Value, EvalError> {
-        match stmt {
-            Stmt::LocalDecl(_) => Ok(Value::Nil), // already pre-bound in eval_program
-            Stmt::Expr(e) => self.eval_expr(e, env),
-            Stmt::Assign { name, value } => {
-                let v = self.eval_expr(value, env)?;
-                self.assign_var(name, v, env)
-            }
-            Stmt::Return(e) => {
-                let v = self.eval_expr(e, env)?;
-                // Target the home method for this return. Inside eval_block the home
-                // is the depth of the method that defined the block; at the method body
-                // level current_block_home is None so we use the current method depth.
-                let depth = self
-                    .current_block_home
-                    .get()
-                    .unwrap_or_else(|| self.method_depth.get());
-                Err(EvalError::Return(v, depth))
-            }
-            Stmt::MethodDef(def) => {
-                use crate::entity::InstanceKind;
-                // Look up the class from env first (covers non-Kernel namespace classes).
-                let class = match self.lookup_var(&def.class_name, env) {
-                    Some(Value::Instance(h))
-                        if matches!(h.0.kind, InstanceKind::ClassEntity(_)) =>
-                    {
-                        h.0.class.clone()
-                    }
-                    Some(_) => {
-                        return Err(EvalError::TypeError(format!(
-                            "{} is not a class",
-                            def.class_name
-                        )));
-                    }
-                    None => return Err(EvalError::UndefinedVariable(def.class_name.clone())),
-                };
-                check_prim_sends_in_body(&def.body)?;
-                let method = Arc::new(Method {
-                    pattern: def.pattern.clone(),
-                    locals: def.locals.clone(),
-                    body: def.body.clone(),
-                });
-                let selector = def.pattern.selector();
-                if def.is_class_side {
-                    class.class_methods.write().insert(selector, method);
-                } else {
-                    class.methods.write().insert(selector, method);
-                }
-                Ok(Value::Nil)
-            }
-        }
     }
 
     pub fn eval_expr(&self, expr: &Expr, env: &mut Env) -> Result<Value, EvalError> {
@@ -768,45 +694,16 @@ impl Evaluator {
             saved_block_home: saved_home,
             frame_block_home: Some(block.home_depth),
             defining_class: None,
+            sync: false,
         };
         self.current_block_home.set(Some(block.home_depth));
         // current_block_home is restored by the CallFrame when it pops.
         step_loop(self, frame)
     }
 
-    /// Reference recursive implementation retained for differential testing.
-    /// Production code uses `eval_block`.
-    pub(crate) fn eval_block_recursive(
-        &self,
-        block: &Block,
-        args: Vec<Value>,
-        _outer_env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        if args.len() != block.params.len() {
-            return Err(EvalError::ArityMismatch {
-                expected: block.params.len(),
-                got: args.len(),
-            });
-        }
-        let prev_home = self.current_block_home.get();
-        self.current_block_home.set(Some(block.home_depth));
-
-        let mut block_env = block.env.clone();
-        block_env.push_frame();
-        for name in &block.locals {
-            block_env.define(name.clone(), Value::Nil);
-        }
-        for (name, val) in block.params.iter().zip(args) {
-            block_env.define(name.clone(), val);
-        }
-        let result = self.eval_program_recursive(&block.body, &mut block_env);
-        block_env.pop_frame();
-        self.current_block_home.set(prev_home);
-        result
-    }
-
     /// Evaluate a `Block` with sync semantics: after each statement any
     /// `Value::Future` result is awaited before proceeding to the next.
+    /// Implemented iteratively via `step_loop` with `sync: true`.
     ///
     /// Requires: `args.len() == block.params.len()`.
     /// Ensures: every statement result is fully resolved before the next
@@ -823,9 +720,6 @@ impl Evaluator {
                 got: args.len(),
             });
         }
-        let prev_home = self.current_block_home.get();
-        self.current_block_home.set(Some(block.home_depth));
-
         let mut block_env = block.env.clone();
         block_env.push_frame();
         for name in &block.locals {
@@ -834,26 +728,29 @@ impl Evaluator {
         for (name, val) in block.params.iter().zip(args) {
             block_env.define(name.clone(), val);
         }
-        let result = self.eval_program_sync(&block.body, &mut block_env);
-        block_env.pop_frame();
-        self.current_block_home.set(prev_home);
-        result
-    }
-
-    fn eval_program_sync(&self, stmts: &[Stmt], env: &mut Env) -> Result<Value, EvalError> {
-        for stmt in stmts {
+        for stmt in &block.body {
             if let Stmt::LocalDecl(names) = stmt {
                 for name in names {
-                    env.define(name.clone(), Value::Nil);
+                    block_env.define(name.clone(), Value::Nil);
                 }
             }
         }
-        let mut last = Value::Nil;
-        for stmt in stmts {
-            let v = self.eval_stmt(stmt, env)?;
-            last = crate::builtins::force_value(v)?;
-        }
-        Ok(last)
+        let saved_home = self.current_block_home.get();
+        let frame = Cont::CallFrame {
+            self_binding: None,
+            depth: 0,
+            pending: block.body.iter().cloned().collect(),
+            env: block_env,
+            implicit_return: Value::Nil,
+            is_method: false,
+            pops_env: true,
+            saved_block_home: saved_home,
+            frame_block_home: Some(block.home_depth),
+            defining_class: None,
+            sync: true,
+        };
+        self.current_block_home.set(Some(block.home_depth));
+        step_loop(self, frame)
     }
 
     /// Iterative method invocation: runs via the step-loop evaluator.
@@ -880,51 +777,6 @@ impl Evaluator {
             .pop()
             .expect("push_method_call_frame must push exactly one frame");
         step_loop(self, initial)
-    }
-
-    /// Reference recursive implementation retained for differential testing.
-    /// Production code uses `invoke_method`.
-    pub(crate) fn invoke_method_recursive(
-        &self,
-        handle: InstanceHandle,
-        defining_class: Arc<Class>,
-        method: Arc<Method>,
-        args: Vec<Value>,
-        env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        let params = method.pattern.params();
-        if args.len() != params.len() {
-            return Err(EvalError::ArityMismatch {
-                expected: params.len(),
-                got: args.len(),
-            });
-        }
-        let self_value = Value::Instance(handle.clone());
-        let mut method_env = env.clone();
-        method_env.push_frame();
-        method_env.define(self_sym(), self_value.clone());
-        for (param, val) in params.iter().zip(args.iter()) {
-            method_env.define(param.clone(), val.clone());
-        }
-        for local in &method.locals {
-            method_env.define(local.clone(), Value::Nil);
-        }
-        self.push_self(SelfBinding::Instance {
-            handle: handle.clone(),
-            defining_class,
-        });
-        let my_depth = self.method_depth.get();
-        let prev_home = self.current_block_home.get();
-        self.current_block_home.set(None);
-        let result = self.eval_program_recursive(&method.body, &mut method_env);
-        self.current_block_home.set(prev_home);
-        self.pop_self();
-        method_env.pop_frame();
-        match result {
-            Ok(_) => Ok(self_value),
-            Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
-            Err(e) => Err(e),
-        }
     }
 
     /// Iterative class-side method invocation: runs via the step-loop evaluator.
@@ -983,53 +835,9 @@ impl Evaluator {
             saved_block_home,
             frame_block_home: None,
             defining_class: Some(defining_class),
+            sync: false,
         };
         step_loop(self, frame)
-    }
-
-    /// Reference recursive implementation retained for differential testing.
-    /// Production code uses `invoke_class_method`.
-    pub(crate) fn invoke_class_method_recursive(
-        &self,
-        handle: crate::entity::InstanceHandle,
-        defining_class: Arc<Class>,
-        method: Arc<Method>,
-        args: Vec<Value>,
-        env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        let params = method.pattern.params();
-        if args.len() != params.len() {
-            return Err(EvalError::ArityMismatch {
-                expected: params.len(),
-                got: args.len(),
-            });
-        }
-        let self_val = Value::Instance(handle.clone());
-        let mut method_env = env.clone();
-        method_env.push_frame();
-        method_env.define(self_sym(), self_val.clone());
-        for (param, val) in params.iter().zip(args.iter()) {
-            method_env.define(param.clone(), val.clone());
-        }
-        for local in &method.locals {
-            method_env.define(local.clone(), Value::Nil);
-        }
-        self.push_self(SelfBinding::ClassSide {
-            handle,
-            defining_class,
-        });
-        let my_depth = self.method_depth.get();
-        let prev_home = self.current_block_home.get();
-        self.current_block_home.set(None);
-        let result = self.eval_program_recursive(&method.body, &mut method_env);
-        self.current_block_home.set(prev_home);
-        self.pop_self();
-        method_env.pop_frame();
-        match result {
-            Ok(_) => Ok(self_val),
-            Err(EvalError::Return(v, d)) if d == my_depth => Ok(v),
-            Err(e) => Err(e),
-        }
     }
 
     /// Invoke a user-defined method where `self` is a primitive value (e.g. `nil`).
