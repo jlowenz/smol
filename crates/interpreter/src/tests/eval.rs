@@ -1155,6 +1155,43 @@ fn association_print_string() {
     assert_eq!(eval_diff(src), Value::Str(Arc::from("'x' -> 42")));
 }
 
+#[test]
+fn arrow_on_all_primitive_receiver_types() {
+    // Float and LargeInt receivers reach the -> arm in dispatch() directly
+    // (lookup_user_method returns None for those types); Int, Bool, and Nil
+    // go through the kernel.smol Object >> -> method via lookup_user_method.
+    // All must produce an Association with the correct key and value.
+
+    // Float receiver — goes through dispatch() -> arm
+    assert_eq!(eval_diff("(1.5 -> #ok) key"), Value::Float(1.5));
+    assert_eq!(
+        eval_diff("(1.5 -> #ok) value"),
+        Value::Symbol(Arc::from("ok"))
+    );
+
+    // LargeInt receiver — goes through dispatch() -> arm
+    assert_eq!(
+        eval_diff("(99999999999999999999 -> 7) key"),
+        eval_diff("99999999999999999999")
+    );
+    assert_eq!(
+        eval_diff("(99999999999999999999 -> 7) value"),
+        Value::Int(7)
+    );
+
+    // Int receiver — goes through Object >> -> in kernel.smol
+    assert_eq!(eval_diff("(42 -> 'v') key"), Value::Int(42));
+    assert_eq!(eval_diff("(42 -> 'v') value"), Value::Str(Arc::from("v")));
+
+    // Bool receiver
+    assert_eq!(eval_diff("(true -> 0) key"), Value::Bool(true));
+    assert_eq!(eval_diff("(false -> 1) key"), Value::Bool(false));
+
+    // Nil receiver
+    assert_eq!(eval_diff("(nil -> 'x') key"), Value::Nil);
+    assert_eq!(eval_diff("(nil -> 'x') value"), Value::Str(Arc::from("x")));
+}
+
 // ── Dictionary ────────────────────────────────────────────────────────────
 
 #[test]

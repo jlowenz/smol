@@ -494,3 +494,35 @@ fn super_keyword_multi_arg_send_iterative() {
     let v = eval(src);
     assert_eq!(v, Value::Int(6));
 }
+
+#[test]
+fn class_method_with_local_decl() {
+    // Class-side method body containing | temp | exercises LocalDecl pre-binding
+    // in invoke_class_method (eval.rs). Value subclass -> synchronous dispatch.
+    let src = "
+        Value subclass: #Box instanceVariableNames: ''.
+        Box class >> doubled: n [
+            | x |
+            x := n * 2.
+            ^x
+        ]
+        Box doubled: 21
+    ";
+    let v = eval(src);
+    assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn super_in_class_side_method_dispatches_to_parent() {
+    // super inside a class-side method dispatches to the parent class's class method.
+    // Exercises the ClassSide arm of dispatch_super in eval_iterative.rs.
+    let src = "
+        Value subclass: #Base2 instanceVariableNames: ''.
+        Base2 class >> greeting [ ^'base' ]
+        Base2 subclass: #Child2 instanceVariableNames: ''.
+        Child2 class >> greeting [ ^'child+' , super greeting ]
+        Child2 greeting
+    ";
+    let v = eval(src);
+    assert_eq!(v, Value::Str(Arc::from("child+base")));
+}

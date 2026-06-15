@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_helpers::{assert_signal_contains, eval, eval_diff, eval_err_diff};
+use crate::test_helpers::{assert_signal_contains, eval, eval_diff, eval_err, eval_err_diff};
 
 // ── Float ────────────────────────────────────────────────────────────────
 
@@ -1512,6 +1512,120 @@ holder := ValueHolder initialValue: 0.
 [3 timesRepeat: [holder update: [:n | n + 1]]] then: [holder get]
 "#;
     assert_eq!(eval_diff(src), Value::Int(3));
+}
+
+// ── then: on Future receiver ──────────────────────────────────────────────────
+
+#[test]
+fn then_on_future_receiver_chains_after_resolution() {
+    // Cross-entity send returns a Future; then: on that Future chains the block
+    // after the send completes. This exercises the Value::Future then: arm in
+    // dispatch() — made reachable by passing then: through dispatch_to_stack
+    // before force_value so the raw Future is seen.
+    let src = r#"
+| vh |
+vh := ValueHolder initialValue: 0.
+(vh set: 42) then: [vh get]
+"#;
+    assert_eq!(eval(src), Value::Int(42));
+}
+
+// ── as_block type error ───────────────────────────────────────────────────────
+
+#[test]
+fn as_block_type_error_non_block_arg() {
+    // Passing a non-Block where a Block is required hits the as_block Err path.
+    // then: dispatches through dispatch() directly (before force_value), so the
+    // _ arm calls as_block on the argument.
+    assert!(matches!(
+        eval_err("42 then: 99"),
+        crate::eval::EvalError::TypeError(_)
+    ));
+}
+
+// ── Nil user-defined method (UserMethodFound::Primitive frame path) ──────────
+
+#[test]
+fn nil_user_method_via_cons_inject_into() {
+    // Cons inject:into: bottoms out at nil. The iterative evaluator routes Nil
+    // user-defined methods through lookup_user_method -> push_method_call_frame
+    // with UserMethodFound::Primitive, exercising the Primitive variant of
+    // push_method_call_frame.
+    let src = r#"
+Value subclass: #Cons instanceVariableNames: 'head tail'.
+Cons class >> head: h tail: t [
+    ^self _primNewValue: [:c | c pvtHead: h tail: t]
+]
+Cons >> pvtHead: h tail: t [ head := h. tail := t ]
+Cons >> inject: seed into: aBlock [
+    ^tail inject: (aBlock value: seed value: head) into: aBlock
+]
+Nil >> inject: seed into: aBlock [ ^seed ]
+
+| list |
+list := Cons head: 3 tail: (Cons head: 2 tail: (Cons head: 1 tail: nil)).
+list inject: 0 into: [:acc :e | acc + e]
+"#;
+    assert_eq!(eval(src), Value::Int(6));
+}
+
+// ── nil isEmpty ───────────────────────────────────────────────────────────────
+
+#[test]
+fn nil_is_empty() {
+    assert_eq!(eval_diff("nil isEmpty"), Value::Bool(true));
+}
+
+// ── Int arithmetic with LargeInt args ────────────────────────────────────────
+
+#[test]
+fn int_div_largeint_arg() {
+    // 100 / (large int) exercises the LargeInt branch of dispatch_int "/".
+    assert_eq!(
+        eval_diff("100 / (99999999999999999999 + 1 - 99999999999999999999)"),
+        Value::Int(100)
+    );
+}
+
+#[test]
+fn int_floor_div_largeint_arg() {
+    assert_eq!(
+        eval_diff("100 // (99999999999999999999 + 1 - 99999999999999999999)"),
+        Value::Int(100)
+    );
+}
+
+#[test]
+fn int_mod_largeint_arg() {
+    assert_eq!(
+        eval_diff("7 \\\\ (99999999999999999999 + 1 - 99999999999999999999)"),
+        Value::Int(0)
+    );
+}
+
+// ── Int <= and >= ─────────────────────────────────────────────────────────────
+
+#[test]
+fn int_le_and_ge() {
+    assert_eq!(eval_diff("3 <= 3"), Value::Bool(true));
+    assert_eq!(eval_diff("4 <= 3"), Value::Bool(false));
+    assert_eq!(eval_diff("3 >= 3"), Value::Bool(true));
+    assert_eq!(eval_diff("2 >= 3"), Value::Bool(false));
+}
+
+// ── Int / LargeInt asString ───────────────────────────────────────────────────
+
+#[test]
+fn int_as_string() {
+    assert_eq!(eval_diff("42 asString"), Value::Str(Arc::from("42")));
+}
+
+#[test]
+fn largeint_as_string() {
+    assert_eq!(
+        eval_diff("99999999999999999999 asString"),
+        Value::Str(Arc::from("99999999999999999999"))
+    );
 }
 
 // ── Universal error: on primitive types ──────────────────────────────────────

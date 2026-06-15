@@ -4,8 +4,6 @@ use std::sync::Arc;
 /// Cooperative yield interval: one yield every N completed message dispatches.
 /// Matches the step-loop constant in eval_iterative so loop primitives and the
 /// iterative evaluator yield at the same granularity.
-const YIELD_INTERVAL: u32 = 1024;
-
 use num_bigint::BigInt;
 use num_traits::Zero;
 use parking_lot::RwLock;
@@ -204,11 +202,10 @@ pub fn dispatch(
             InstanceKind::Entity(_) => dispatch_entity(ev, handle, selector, args, env),
             InstanceKind::ClassEntity(_) => dispatch_class(ev, handle, selector, args, env),
         },
-        Value::Future(future) => {
-            // Transparent future: wait for it to resolve, then re-dispatch to the result.
-            let resolved = future.wait()?;
-            dispatch(ev, resolved, selector, args, env)
-        }
+        Value::Future(_) => unreachable!(
+            "dispatch() called with unresolved Future; dispatch_to_stack forces futures before \
+             calling dispatch(), and then: intercepts Futures before force_value"
+        ),
         Value::Namespace(ns) => dispatch_namespace(ev, ns, selector, args, env),
     }
 }
@@ -463,7 +460,8 @@ pub(crate) fn hash_value(v: &Value) -> i64 {
             h as i64
         }
         Value::Instance(h) => fmix64(Arc::as_ptr(&h.0) as usize as u64) as i64,
-        Value::Future(f) => fmix64(Arc::as_ptr(&f.0) as usize as u64) as i64,
+        // Futures are resolved by force_value before hash_value is called.
+        Value::Future(_) => unreachable!("hash_value called on unresolved Future"),
         Value::Block(b) => fmix64(Arc::as_ptr(b) as usize as u64) as i64,
         Value::Namespace(ns) => fnv1a_hash(&ns.name),
     }
@@ -708,21 +706,6 @@ fn dispatch_int(
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Float(n as f64))
         }
-        // `timesRepeat:` is the public selector; `_primTimesRepeat:` is the legacy
-        // primitive name kept for backward compatibility. Both run the Rust loop
-        // in the old (recursive) evaluator; the iterative evaluator routes through
-        // the Smol recursive kernel.smol method via lookup_user_method instead.
-        "timesRepeat:" | "_primTimesRepeat:" => {
-            expect_arity(sel, 1, args.len())?;
-            let blk = as_block(args.remove(0), sel)?;
-            for i in 0..n.max(0) {
-                ev.eval_block(&blk, vec![], env)?;
-                if i > 0 && (i as u32).is_multiple_of(YIELD_INTERVAL) {
-                    may::coroutine::yield_now();
-                }
-            }
-            Ok(Value::Nil)
-        }
         "to:do:" => {
             expect_arity(sel, 2, args.len())?;
             let stop = as_int(args.remove(0), sel)?;
@@ -961,14 +944,10 @@ fn dispatch_nil(
     ev: &Evaluator,
     sel: &Arc<str>,
     mut args: Vec<Value>,
-    env: &mut Env,
+    _env: &mut Env,
 ) -> Result<Value, EvalError> {
-    // User-defined methods on the Nil class take priority over builtins.
-    if let Some(nil_handle) = ev.registry.kernel().lookup_class("Nil")
-        && let Some((method, def_class)) = nil_handle.0.class.lookup(sel)
-    {
-        return ev.invoke_primitive_method(Value::Nil, def_class, method, args, env);
-    }
+    // User-defined Nil methods (e.g. isEmpty, inject:into:) are intercepted by
+    // lookup_user_method in dispatch_to_stack before dispatch() is called.
     match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;
@@ -987,10 +966,6 @@ fn dispatch_nil(
         "printString" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from("nil")))
-        }
-        "isEmpty" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Bool(true))
         }
         _ => dispatch_primitive_fallback(ev, "Nil", sel, args),
     }
@@ -1117,121 +1092,14 @@ fn dispatch_block(
     ev: &Evaluator,
     blk: Arc<Block>,
     sel: &Arc<str>,
-    mut args: Vec<Value>,
-    env: &mut Env,
+    args: Vec<Value>,
+    _env: &mut Env,
 ) -> Result<Value, EvalError> {
-    // Note: user-defined Block methods are now routed via lookup_user_method in the
-    // iterative evaluator. The old (recursive) evaluator reaches builtins directly.
-    match sel.as_ref() {
-        "value" => {
-            expect_arity(sel, 0, args.len())?;
-            ev.eval_block(&blk, vec![], env)
-        }
-        "value:" => {
-            expect_arity(sel, 1, args.len())?;
-            ev.eval_block(&blk, args, env)
-        }
-        "value:value:" => {
-            expect_arity(sel, 2, args.len())?;
-            ev.eval_block(&blk, args, env)
-        }
-        "value:value:value:" => {
-            expect_arity(sel, 3, args.len())?;
-            ev.eval_block(&blk, args, env)
-        }
-        // Public selectors are aliased with their legacy _prim* names.
-        // The old (recursive) evaluator reaches these arms directly.
-        // The iterative evaluator routes through the Smol recursive kernel.smol
-        // methods via lookup_user_method + TCO, so these arms are not reached
-        // from that path for whileTrue: and whileFalse:.
-        "whileTrue:" | "_primWhileTrue:" => {
-            expect_arity(sel, 1, args.len())?;
-            let body = as_block(args.remove(0), sel)?;
-            let mut iters: u32 = 0;
-            loop {
-                match ev.eval_block(&blk, vec![], env)? {
-                    Value::Bool(true) => {
-                        ev.eval_block(&body, vec![], env)?;
-                    }
-                    Value::Bool(false) => break,
-                    _ => {
-                        return Err(EvalError::TypeError(format!(
-                            "{sel}: condition block must return Bool"
-                        )));
-                    }
-                }
-                iters += 1;
-                if iters.is_multiple_of(YIELD_INTERVAL) {
-                    may::coroutine::yield_now();
-                }
-            }
-            Ok(Value::Nil)
-        }
-        "whileFalse:" | "_primWhileFalse:" => {
-            expect_arity(sel, 1, args.len())?;
-            let body = as_block(args.remove(0), sel)?;
-            let mut iters: u32 = 0;
-            loop {
-                match ev.eval_block(&blk, vec![], env)? {
-                    Value::Bool(false) => {
-                        ev.eval_block(&body, vec![], env)?;
-                    }
-                    Value::Bool(true) => break,
-                    _ => {
-                        return Err(EvalError::TypeError(format!(
-                            "{sel}: condition block must return Bool"
-                        )));
-                    }
-                }
-                iters += 1;
-                if iters.is_multiple_of(YIELD_INTERVAL) {
-                    may::coroutine::yield_now();
-                }
-            }
-            Ok(Value::Nil)
-        }
-        "whileTrue" | "_primWhileTrue" => {
-            expect_arity(sel, 0, args.len())?;
-            let mut iters: u32 = 0;
-            loop {
-                match ev.eval_block(&blk, vec![], env)? {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) => break,
-                    _ => {
-                        return Err(EvalError::TypeError(format!(
-                            "{sel}: block must return Bool"
-                        )));
-                    }
-                }
-                iters += 1;
-                if iters.is_multiple_of(YIELD_INTERVAL) {
-                    may::coroutine::yield_now();
-                }
-            }
-            Ok(Value::Nil)
-        }
-        "whileFalse" | "_primWhileFalse" => {
-            expect_arity(sel, 0, args.len())?;
-            let mut iters: u32 = 0;
-            loop {
-                match ev.eval_block(&blk, vec![], env)? {
-                    Value::Bool(false) => {}
-                    Value::Bool(true) => break,
-                    _ => {
-                        return Err(EvalError::TypeError(format!(
-                            "{sel}: block must return Bool"
-                        )));
-                    }
-                }
-                iters += 1;
-                if iters.is_multiple_of(YIELD_INTERVAL) {
-                    may::coroutine::yield_now();
-                }
-            }
-            Ok(Value::Nil)
-        }
-        _ => dispatch_primitive_fallback(ev, "Block", sel, args),
-    }
+    // The iterative evaluator intercepts value/value:/whileTrue:/whileFalse:/etc. in
+    // dispatch_to_stack (via push_block_frame or lookup_user_method + TCO) before
+    // dispatch() is called, so only unknown selectors reach here.
+    drop(blk);
+    dispatch_primitive_fallback(ev, "Block", sel, args)
 }
 
 // ── Object (user-defined instances) ──────────────────────────────────────────
@@ -1243,10 +1111,8 @@ fn dispatch_object_value(
     args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
-    let class = handle.0.class.clone();
-    if let Some((method, def_class)) = class.lookup(&selector) {
-        return ev.invoke_method(handle.clone(), def_class, method, args, env);
-    }
+    // User-defined methods are intercepted by lookup_user_method in dispatch_to_stack
+    // before dispatch() is called, so class.lookup() here would always return None.
     dispatch_object_primitive(ev, handle, &selector, args, env)
 }
 
@@ -1269,12 +1135,11 @@ fn dispatch_entity(
     };
 
     // Self-send: dispatch synchronously on the current thread to avoid deadlock.
+    // User-defined methods for self-sends are intercepted by lookup_user_method
+    // in dispatch_to_stack before dispatch() is called, so class.lookup() would
+    // always return None here; only builtins remain.
     let current = ev.current_entity_id.get();
     if current == Some(entity_id) {
-        let class = handle.0.class.clone();
-        if let Some((method, def_class)) = class.lookup(&selector) {
-            return ev.invoke_method(handle.clone(), def_class, method, args, env);
-        }
         return dispatch_object_primitive(ev, handle, &selector, args, env);
     }
 

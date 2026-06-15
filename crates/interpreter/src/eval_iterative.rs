@@ -1300,6 +1300,13 @@ fn dispatch_to_stack(
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
+    // `then:` must see the raw receiver (including Futures) so that
+    // `Future then: [blk]` chains asynchronously without eager resolution.
+    if selector.as_ref() == "then:" {
+        *acc = crate::builtins::dispatch(ev, receiver, selector, args, env)?;
+        return Ok(());
+    }
+
     // Force a Future receiver before dispatch. We must know the actual type to
     // look up a method. Blocking here is a cooperative yield in the may scheduler
     // — other coroutines (entities) run while this one waits for resolution.
