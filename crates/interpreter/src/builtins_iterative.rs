@@ -216,7 +216,6 @@ pub fn dispatch(
 ///
 /// When `Some`, the step loop should push a `CallFrame` instead of calling
 /// `builtins::dispatch`. When `None`, the dispatch falls through to builtins.
-#[allow(dead_code)]
 pub(crate) enum UserMethodFound {
     /// Instance or entity self-send: invoke `method` with `handle` as receiver.
     Instance {
@@ -238,7 +237,6 @@ pub(crate) enum UserMethodFound {
 /// Ensures: returns `Some` only for synchronous user-method calls — ValueObject
 ///   instance methods, entity self-sends, and nil methods. Cross-entity sends and
 ///   class-entity dispatch return `None` (handled by `builtins::dispatch`).
-#[allow(dead_code)]
 pub(crate) fn lookup_user_method(
     ev: &Evaluator,
     recv: &Value,

@@ -87,7 +87,6 @@ fn errors_equivalent(a: &EvalError, b: &EvalError) -> bool {
 }
 
 /// Assert that an `EvalError` is a Signal whose message contains `substring`.
-#[allow(dead_code)]
 pub(crate) fn assert_signal_contains(err: &EvalError, substring: &str) {
     let msg = signal_message(err).unwrap_or_else(|| panic!("expected Signal, got {err:?}"));
     assert!(
@@ -131,7 +130,6 @@ pub(crate) fn eval(src: &str) -> Value {
 /// Evaluate Smol source using the iterative evaluator and return the error.
 ///
 /// Requires: `src` is valid Smol; program must produce an error.
-#[allow(dead_code)]
 pub(crate) fn eval_err(src: &str) -> EvalError {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();

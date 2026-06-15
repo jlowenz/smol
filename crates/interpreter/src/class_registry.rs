@@ -114,7 +114,7 @@ impl ClassRegistry {
 
         // `Nil` is the class of `nil` (analogous to Smalltalk's `UndefinedObject`).
         // Subclass of Object; user-defined methods on `Nil` are dispatched for `Value::Nil`
-        // receivers via `invoke_primitive_method`.
+        // receivers via `push_method_call_frame(UserMethodFound::Primitive)`.
         let nil_class = Arc::new(Class {
             name: Arc::from("Nil"),
             superclass: Some(object_class.clone()),
@@ -138,7 +138,7 @@ impl ClassRegistry {
         kernel.register(InstanceHandle(nil_state));
 
         // `Block` is the class of block closures. Subclass of Object; user-defined
-        // methods dispatch for `Value::Block` receivers via `invoke_primitive_method`.
+        // methods dispatch for `Value::Block` receivers via `push_method_call_frame(UserMethodFound::Primitive)`.
         let block_class = Arc::new(Class {
             name: Arc::from("Block"),
             superclass: Some(object_class.clone()),
@@ -165,7 +165,7 @@ impl ClassRegistry {
         kernel.register(InstanceHandle(block_state));
 
         // `Int` is the class of small integers (`Value::Int`). Subclass of Object;
-        // user-defined methods dispatch via `invoke_primitive_method`.
+        // user-defined methods dispatch via `push_method_call_frame(UserMethodFound::Primitive)`.
         let int_class = Arc::new(Class {
             name: Arc::from("Int"),
             superclass: Some(object_class.clone()),

@@ -2364,3 +2364,48 @@ fn ivar_read_in_nested_block_after_tco() {
     "#;
     assert_eq!(eval_diff(src), Value::Bool(true));
 }
+
+// ── SelfBinding::Primitive coverage ──────────────────────────────────────────
+
+#[test]
+fn primitive_method_reads_outer_env_var() {
+    // lookup_var Primitive arm: outer-frame path (eval.rs line 276).
+    // A user-defined method on Nil accesses a variable from the call-site env.
+    let src = "| x | x := 99. Nil >> readX [ ^ x ]. nil readX";
+    assert_eq!(eval_diff(src), Value::Int(99));
+}
+
+#[test]
+fn assign_inside_primitive_method_body() {
+    // assign_var Primitive arm (eval.rs line 330): assignment to a local
+    // variable inside a user-defined method on a primitive-value class (Nil).
+    // The method frame has SelfBinding::Primitive active during the assignment.
+    let src = "Nil >> setAndGet [ | y | y := 42. ^ y ]. nil setAndGet";
+    assert_eq!(eval_diff(src), Value::Int(42));
+}
+
+#[test]
+fn super_in_nil_method_dispatches_to_object() {
+    // current_defining_class Primitive arm (eval.rs line 191) +
+    // dispatch_super_to_stack Primitive arm (eval_iterative.rs line 1263).
+    let src = r#"
+        Object >> baseMsg [ ^ 42 ]
+        Nil >> testSuper [ ^ super baseMsg ]
+        nil testSuper
+    "#;
+    assert_eq!(eval_diff(src), Value::Int(42));
+}
+
+#[test]
+fn super_outside_method_context_errors() {
+    // current_defining_class None arm (eval.rs line 192):
+    // super send at the top level with no active method frame.
+    let err = eval_err_diff("super foo");
+    assert!(
+        matches!(
+            err,
+            EvalError::TypeError(_) | EvalError::MessageNotUnderstood { .. }
+        ),
+        "expected TypeError or MNU, got {err:?}"
+    );
+}

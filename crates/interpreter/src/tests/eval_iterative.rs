@@ -526,3 +526,70 @@ fn super_in_class_side_method_dispatches_to_parent() {
     let v = eval(src);
     assert_eq!(v, Value::Str(Arc::from("child+base")));
 }
+
+// ── Additional coverage gaps ──────────────────────────────────────────────────
+
+#[test]
+fn cascade_binary_message() {
+    // CascadeStep binary arm (eval_iterative.rs lines 835-843).
+    // Cascade sends the second message to the original receiver (3), not the result (7).
+    let v = eval("3 + 4; + 5");
+    assert_eq!(v, Value::Int(8));
+}
+
+#[test]
+fn on_do_non_matching_inner_handler_propagates() {
+    // OnDoCatch: signal class doesn't match handler class (eval_iterative.rs lines 356-357).
+    // Inner on:do: catches OrderedCollection but signal is Error → propagates to outer.
+    let src = "
+        | result |
+        result := ValueHolder initialValue: 'none'.
+        [
+            [Error signal: 'test'] on: OrderedCollection do: [:e | result set: 'wrong']
+        ] on: Error do: [:e | result set: 'propagated'].
+        result get
+    ";
+    let v = eval(src);
+    assert_eq!(v, Value::Str(Arc::from("propagated")));
+}
+
+#[test]
+fn on_do_handler_re_signals_propagates_to_outer() {
+    // HandleOnDoResult other-error arm (eval_iterative.rs lines 383-385):
+    // an error raised inside an on:do: handler is not Retry/Resume/ReturnFromBlock,
+    // so it keeps scanning and is caught by the outer on:do:.
+    let src = "
+        | result |
+        result := ValueHolder initialValue: 'none'.
+        [
+            [Error signal: 'inner'] on: Error do: [:e | Error signal: 'from handler']
+        ] on: Error do: [:e | result set: e message].
+        result get
+    ";
+    let v = eval(src);
+    assert_eq!(v, Value::Str(Arc::from("from handler")));
+}
+
+#[test]
+fn on_do_resume_with_value() {
+    // HandleOnDoResult Resume arm (eval_iterative.rs lines 375-377):
+    // handler calls resume: which delivers a value back through on:do:.
+    let src = "
+        [Error signal: 'x'] on: Error do: [:e | e resume: 99]
+    ";
+    let v = eval(src);
+    assert_eq!(v, Value::Int(99));
+}
+
+#[test]
+fn super_standalone_errors() {
+    // Expr::Super standalone (eval_iterative.rs lines 462-464):
+    // super as a standalone expression (not a send receiver) is a TypeError.
+    use crate::eval::EvalError;
+    use crate::test_helpers::eval_err;
+    let err = eval_err("| x | x := super");
+    assert!(
+        matches!(err, EvalError::TypeError(_)),
+        "expected TypeError, got {err:?}"
+    );
+}

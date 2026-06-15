@@ -606,68 +606,6 @@ impl Evaluator {
         step_loop(self, frame)
     }
 
-    /// Invoke a user-defined method where `self` is a primitive value (e.g. `nil`, `true`).
-    ///
-    /// Requires: `args.len() == method.pattern.params().len()`.
-    /// Ensures: `self_value` is bound as `self` in a proper method frame; `^`-returns
-    ///   are caught by that frame; a method with no explicit `^` returns `self_value`
-    ///   (Smalltalk implicit self return).
-    pub fn invoke_primitive_method(
-        &self,
-        self_value: Value,
-        defining_class: Arc<Class>,
-        method: Arc<Method>,
-        args: Vec<Value>,
-        env: &mut Env,
-    ) -> Result<Value, EvalError> {
-        let params = method.pattern.params();
-        if args.len() != params.len() {
-            return Err(EvalError::ArityMismatch {
-                expected: params.len(),
-                got: args.len(),
-            });
-        }
-        let mut method_env = env.clone();
-        method_env.push_frame();
-        method_env.define(self_sym(), self_value.clone());
-        for (param, val) in params.iter().zip(args.iter()) {
-            method_env.define(param.clone(), val.clone());
-        }
-        for local in &method.locals {
-            method_env.define(local.clone(), Value::Nil);
-        }
-        for stmt in &method.body {
-            if let Stmt::LocalDecl(names) = stmt {
-                for name in names {
-                    method_env.define(name.clone(), Value::Nil);
-                }
-            }
-        }
-        let binding = SelfBinding::Primitive {
-            defining_class: defining_class.clone(),
-            self_value: self_value.clone(),
-        };
-        self.push_self(binding.clone());
-        let depth = self.method_depth.get();
-        let saved_block_home = self.current_block_home.get();
-        self.current_block_home.set(None);
-        let frame = Cont::CallFrame {
-            self_binding: Some(binding),
-            depth,
-            pending: method.body.iter().cloned().collect(),
-            env: method_env,
-            implicit_return: self_value,
-            is_method: true,
-            pops_env: true,
-            saved_block_home,
-            frame_block_home: None,
-            block_home_self: None,
-            defining_class: Some(defining_class),
-            sync: false,
-        };
-        step_loop(self, frame)
-    }
-
     /// Create an evaluator from an existing `ClassRegistry`, loading `kernel.smol`.
     ///
     /// Ensures: same post-conditions as `new()` but shares the given registry
