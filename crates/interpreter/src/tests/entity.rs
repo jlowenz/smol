@@ -209,6 +209,297 @@ fn instance_handle_class_entity_debug() {
     assert!(s.contains("MyClass"), "got: {s}");
 }
 
+/// `handle_commit_error` — direct unit test of the extracted fault helper.
+///
+/// Verifies that a `StoreError` passed to `handle_commit_error`:
+///   - sets `EntityStatus::Faulted` on the entity
+///   - resolves the current envelope's reply with `EvalError::Signal`
+///   - drains and resolves every message in the mailbox with the same error
+#[test]
+fn handle_commit_error_faults_entity_drains_mailbox() {
+    use crate::class::Class;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use triple_store::store::StoreError;
+
+    let cls = Arc::new(Class {
+        name: Arc::from("Stub"),
+        superclass: None,
+        own_instance_vars: vec![],
+        own_class_vars: vec![],
+        class_var_storage: RwLock::new(HashMap::new()),
+        indexed_slot_kind: None,
+        methods: RwLock::new(HashMap::new()),
+        class_methods: RwLock::new(HashMap::new()),
+        is_value: false,
+        class_object: std::sync::OnceLock::new(),
+    });
+
+    let data = EntityData {
+        id: EntityId(1),
+        data: Arc::new(crate::object::Object::new(cls.clone())),
+        mailbox: Mutex::new(VecDeque::new()),
+        mailbox_ready: Condvar::new(),
+        status: Mutex::new(EntityStatus::Running),
+        shutdown: std::sync::atomic::AtomicBool::new(false),
+        store: triple_store::store::Store::in_memory(),
+    };
+
+    // Queue a second message so the mailbox-drain path is exercised.
+    let queued_reply = FutureHandle::new();
+    data.mailbox.lock().unwrap().push_back(Envelope {
+        selector: Arc::from("queued"),
+        args: vec![],
+        reply: queued_reply.clone(),
+        inherited_chain: vec![],
+    });
+
+    let ev = crate::eval::Evaluator::new_without_kernel();
+    let envelope = Envelope {
+        selector: Arc::from("test"),
+        args: vec![],
+        reply: FutureHandle::new(),
+        inherited_chain: vec![],
+    };
+
+    handle_commit_error(
+        StoreError::Internal("injected failure"),
+        &data,
+        &ev,
+        &envelope,
+    );
+
+    assert!(
+        matches!(*data.status.lock().unwrap(), EntityStatus::Faulted(_)),
+        "entity must be Faulted after commit error"
+    );
+    assert!(
+        envelope.reply.is_resolved(),
+        "current envelope reply must be resolved"
+    );
+    assert!(
+        queued_reply.is_resolved(),
+        "queued mailbox reply must be drained and resolved"
+    );
+    assert!(
+        data.mailbox.lock().unwrap().is_empty(),
+        "mailbox must be empty after drain"
+    );
+}
+
+/// entity.rs:537 — `handle_commit_error` called from the `Err(EvalError::Return)` arm.
+///
+/// An entity spawned with `AlwaysFailingStore` receives a block whose
+/// `home_depth = 2` (doesn't match the receiver's `run:` frame at depth 1).
+/// The `^` inside the block fires a non-local return that exhausts the entity's
+/// unwind stack → `EvalError::Return` escapes `dispatch_envelope`.  The active
+/// transaction (from `ran := true`) then fails to commit → `handle_commit_error`
+/// is invoked from the NLR arm, covering the previously-unreachable lines.
+#[test]
+fn nlr_with_failing_commit_faults_entity() {
+    use crate::ast::{Expr, Literal, Stmt};
+    use crate::entity::spawn_entity_bare;
+    use crate::env::Env;
+    use crate::value::Block;
+    use triple_store::store::Store;
+    use triple_store::test_support::AlwaysFailingStore;
+
+    crate::entity::init_coroutine_stack();
+
+    // Define a class with `run: aBlock [ ran := true. ^aBlock value ]`
+    // via a full kernel evaluator so predicates and class infrastructure
+    // are registered in the in-memory store normally.
+    let base_ev = crate::eval::Evaluator::new();
+    let mut env = Env::new();
+    base_ev.registry.populate_env(&mut env);
+    let prog = crate::parser::Parser::parse(
+        "Object subclass: #NLRFaultActor instanceVariableNames: 'ran'.",
+    )
+    .expect("parse");
+    base_ev
+        .eval_program(&prog.stmts, &mut env)
+        .expect("eval class");
+    let prog2 =
+        crate::parser::Parser::parse("NLRFaultActor >> run: aBlock [ ran := true. ^aBlock value ]")
+            .expect("parse method");
+    base_ev
+        .eval_program(&prog2.stmts, &mut env)
+        .expect("eval method");
+
+    // Look up the class.
+    let class_handle = base_ev
+        .registry
+        .kernel()
+        .lookup_class("NLRFaultActor")
+        .expect("NLRFaultActor must be defined");
+    let class = class_handle.0.class.clone();
+
+    // Spawn an instance entity backed by AlwaysFailingStore so its
+    // transaction commit always returns Err(StoreError::Internal).
+    let inst = spawn_entity_bare(
+        class,
+        base_ev.registry.clone(),
+        env.clone(),
+        None,
+        Store::new(Arc::new(AlwaysFailingStore)),
+    );
+
+    // Construct a block with home_depth=2.  The receiver's `run:` frame is
+    // always at depth 1, so the NLR target (2) exhausts the unwind stack.
+    let nlr_block = Arc::new(Block {
+        params: vec![],
+        locals: vec![],
+        body: vec![Stmt::Return(Expr::Lit(Literal::Int(77)))],
+        env: Env::new(),
+        home_depth: 2,
+        home_entity: None,
+        home_self: None,
+    });
+
+    // Push the envelope directly onto the entity's mailbox.
+    let reply = FutureHandle::new();
+    if let InstanceKind::Entity(d) = &inst.0.kind {
+        d.mailbox.lock().unwrap().push_back(Envelope {
+            selector: Arc::from("run:"),
+            args: vec![Value::Block(nlr_block)],
+            reply: reply.clone(),
+            inherited_chain: vec![],
+        });
+        d.mailbox_ready.notify_all();
+    }
+
+    // Wait for the reply — must be an error because the commit failed.
+    let result = reply.wait();
+    assert!(
+        result.is_err(),
+        "reply must be Err after commit failure: {result:?}"
+    );
+
+    // Entity must have faulted.
+    if let InstanceKind::Entity(d) = &inst.0.kind {
+        assert!(
+            matches!(*d.status.lock().unwrap(), EntityStatus::Faulted(_)),
+            "entity must be Faulted"
+        );
+    }
+
+    base_ev.shutdown();
+}
+
+/// entity.rs:571 — mailbox-drain loop body in the unhandled-signal / instance-entity
+/// termination path.
+///
+/// Three messages are sent to the entity before `r1 await` yields the main
+/// coroutine: `crash`, then two `noop`s whose futures are discarded.
+/// `may`'s cooperative scheduler does not preempt on `Condvar::notify_all`,
+/// so the actor runs to completion — crashing on `crash` and draining both
+/// `noop` envelopes — before the main coroutine resumes.  The Signal from
+/// `crash` is catchable by `on:do:` at the Smol level.
+#[test]
+fn signal_crash_drains_queued_mailbox() {
+    let src = r#"
+Object subclass: #DrainSignalActor
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+DrainSignalActor >> crash [ Error signal: 'boom' ]
+DrainSignalActor >> noop [ ^nil ]
+
+| actor r1 |
+actor := DrainSignalActor new.
+r1 := actor crash.
+actor noop.
+actor noop.
+[r1 await] on: Error do: [:e | nil].
+"#;
+    assert_eq!(eval(src), Value::Nil);
+}
+
+/// entity.rs:590 — mailbox-drain loop body in the `Err(e)` (non-Signal) entity
+/// termination path.
+///
+/// A `TypeError` from `1 + false` is not wrapped in a `Signal`; it propagates
+/// directly to `run_entity_loop` as `Err(EvalError::TypeError(...))`, hitting
+/// the `Err(e)` arm at line 578.  Two queued `noop` messages ensure the drain
+/// loop body at line 590 is reached.
+#[test]
+fn type_error_crash_drains_queued_mailbox() {
+    use crate::entity::spawn_entity_bare;
+    use crate::env::Env;
+    use triple_store::store::Store;
+
+    crate::entity::init_coroutine_stack();
+
+    let ev = crate::eval::Evaluator::new();
+    let mut env = Env::new();
+    ev.registry.populate_env(&mut env);
+
+    let prog = crate::parser::Parser::parse(
+        "Object subclass: #DrainTypeErrorActor instanceVariableNames: ''.
+         DrainTypeErrorActor >> badOp [ ^1 + false ]
+         DrainTypeErrorActor >> noop [ ^nil ]",
+    )
+    .expect("parse");
+    ev.eval_program(&prog.stmts, &mut env).expect("eval");
+
+    let class = ev
+        .registry
+        .kernel()
+        .lookup_class("DrainTypeErrorActor")
+        .expect("class")
+        .0
+        .class
+        .clone();
+
+    let inst = spawn_entity_bare(
+        class,
+        ev.registry.clone(),
+        env.clone(),
+        None,
+        Store::in_memory(),
+    );
+
+    let reply_bad = FutureHandle::new();
+    let reply_a = FutureHandle::new();
+    let reply_b = FutureHandle::new();
+
+    if let InstanceKind::Entity(d) = &inst.0.kind {
+        let mut mb = d.mailbox.lock().unwrap();
+        mb.push_back(Envelope {
+            selector: Arc::from("badOp"),
+            args: vec![],
+            reply: reply_bad.clone(),
+            inherited_chain: vec![],
+        });
+        mb.push_back(Envelope {
+            selector: Arc::from("noop"),
+            args: vec![],
+            reply: reply_a.clone(),
+            inherited_chain: vec![],
+        });
+        mb.push_back(Envelope {
+            selector: Arc::from("noop"),
+            args: vec![],
+            reply: reply_b.clone(),
+            inherited_chain: vec![],
+        });
+        drop(mb);
+        d.mailbox_ready.notify_all();
+    }
+
+    assert!(reply_bad.wait().is_err(), "badOp reply must be Err");
+    assert!(
+        reply_a.wait().is_err(),
+        "queued reply_a must be drained with Err"
+    );
+    assert!(
+        reply_b.wait().is_err(),
+        "queued reply_b must be drained with Err"
+    );
+
+    ev.shutdown();
+}
+
 /// Stress test: 100 entities × 1 000 messages each at the current stack size.
 #[test]
 fn entity_stress_100x1000() {

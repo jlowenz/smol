@@ -37,6 +37,7 @@ pub mod queryable;
 pub mod storage;
 pub mod store;
 pub mod term;
+pub mod test_support;
 pub mod time;
 pub mod transaction;
 pub mod triple_store;

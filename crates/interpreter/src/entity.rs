@@ -375,6 +375,36 @@ pub fn send_to_entity(
 ///
 /// Ensures: returns `Ok(())` on success or on `FactNotFound`; returns `Err`
 ///   for all other `StoreError` variants so the caller can fault the entity.
+/// Fault the entity, drain its mailbox, and resolve the current envelope's
+/// reply with an error derived from `e`.
+///
+/// Requires: `data.status` is not already `Faulted` (called only on the first
+///   commit failure for this dispatch).
+/// Ensures: `data.status` is `EntityStatus::Faulted`; `envelope.reply` is
+///   resolved with `EvalError::Signal`; every message currently in
+///   `data.mailbox` is drained and resolved with the same error.
+pub(crate) fn handle_commit_error(
+    e: StoreError,
+    data: &EntityData,
+    ev: &crate::eval::Evaluator,
+    envelope: &Envelope,
+) {
+    use crate::builtins::make_error_value;
+    use crate::eval::EvalError;
+    let msg = e.to_string();
+    *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
+    let fault_val = make_error_value(&ev.registry, &msg);
+    envelope
+        .reply
+        .resolve_err(EvalError::Signal(fault_val.clone()));
+    let mut mb = data.mailbox.lock().unwrap();
+    for pending in mb.drain(..) {
+        pending
+            .reply
+            .resolve_err(EvalError::Signal(fault_val.clone()));
+    }
+}
+
 fn commit_or_warn(tx: OwnedStoreTransaction) -> Result<(), StoreError> {
     match tx.commit() {
         Ok(_) => Ok(()),
@@ -494,18 +524,7 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
                 if let Some(tx) = ev.current_tx.borrow_mut().take()
                     && let Err(e) = commit_or_warn(tx)
                 {
-                    let msg = e.to_string();
-                    *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
-                    let fault_val = make_error_value(&ev.registry, &msg);
-                    envelope
-                        .reply
-                        .resolve_err(EvalError::Signal(fault_val.clone()));
-                    let mut mb = data.mailbox.lock().unwrap();
-                    for pending in mb.drain(..) {
-                        pending
-                            .reply
-                            .resolve_err(EvalError::Signal(fault_val.clone()));
-                    }
+                    handle_commit_error(e, data, &ev, &envelope);
                     break;
                 }
                 envelope.reply.resolve_ok(v);
@@ -515,18 +534,7 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
                 if let Some(tx) = ev.current_tx.borrow_mut().take()
                     && let Err(e) = commit_or_warn(tx)
                 {
-                    let msg = e.to_string();
-                    *data.status.lock().unwrap() = EntityStatus::Faulted(msg.clone());
-                    let fault_val = make_error_value(&ev.registry, &msg);
-                    envelope
-                        .reply
-                        .resolve_err(EvalError::Signal(fault_val.clone()));
-                    let mut mb = data.mailbox.lock().unwrap();
-                    for pending in mb.drain(..) {
-                        pending
-                            .reply
-                            .resolve_err(EvalError::Signal(fault_val.clone()));
-                    }
+                    handle_commit_error(e, data, &ev, &envelope);
                     break;
                 }
                 envelope.reply.resolve_ok(v);
