@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::Arc;
 
 use num_bigint::BigInt;
@@ -34,6 +35,10 @@ pub enum Value {
     Future(FutureHandle),
     /// A namespace object. Namespace names in the environment are bound to this variant.
     Namespace(Arc<Namespace>),
+    /// An opaque handle to a native/OS resource (e.g. a scheduled timer).
+    /// Stored as an ivar of value objects that wrap OS primitives. Concrete type
+    /// is downcast by the primitive that created the handle.
+    Handle(Arc<dyn Any + Send + Sync>),
 }
 
 /// A block (closure). Captures its defining environment via shared frames.
@@ -79,6 +84,7 @@ impl PartialEq for Value {
             (Value::Instance(a), Value::Instance(b)) => Arc::ptr_eq(&a.0, &b.0),
             (Value::Future(a), Value::Future(b)) => Arc::ptr_eq(&a.0, &b.0),
             (Value::Namespace(a), Value::Namespace(b)) => Arc::ptr_eq(a, b),
+            (Value::Handle(a), Value::Handle(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -100,6 +106,7 @@ impl std::hash::Hash for Value {
             Value::Instance(h) => Arc::as_ptr(&h.0).hash(state),
             Value::Future(f) => Arc::as_ptr(&f.0).hash(state),
             Value::Namespace(ns) => Arc::as_ptr(ns).hash(state),
+            Value::Handle(h) => (Arc::as_ptr(h) as *const () as usize).hash(state),
         }
     }
 }
@@ -123,6 +130,7 @@ impl std::fmt::Display for Value {
             },
             Value::Future(_) => write!(f, "a Future"),
             Value::Namespace(ns) => write!(f, "Namespace({})", ns.name),
+            Value::Handle(_) => write!(f, "a Handle"),
         }
     }
 }
@@ -146,6 +154,7 @@ impl Value {
             },
             Value::Future(_) => "Future",
             Value::Namespace(_) => "Namespace",
+            Value::Handle(_) => "Handle",
         }
     }
 }

@@ -14,6 +14,7 @@ use crate::class_registry::ClassRegistry;
 use crate::env::Env;
 use crate::namespace::Namespace;
 use crate::object::{IndexedStorage, Object};
+use crate::os_interface::{DefaultOsInterface, OsInterface};
 use crate::parser::Parser;
 use crate::value::{Block, Value};
 
@@ -72,11 +73,48 @@ pub enum SelfBinding {
     },
 }
 
+/// Snapshot of an evaluator's inherited dynamic context for async continuations.
+///
+/// All fields are `Send + 'static` so this can be moved into `may::go!` closures.
+/// Produced by `Evaluator::fork_context`; consumed by `ContinuationContext::into_evaluator`.
+pub struct ContinuationContext {
+    pub(crate) registry: Arc<ClassRegistry>,
+    pub(crate) handler_chain: Vec<(Arc<Class>, Arc<Block>)>,
+    pub(crate) active_namespace: Arc<Namespace>,
+}
+
+impl ContinuationContext {
+    /// Create a fresh evaluator initialized with this context's inherited fields.
+    ///
+    /// Requires: nothing.
+    /// Ensures: returned evaluator shares `registry`; inherits `handler_chain` and
+    ///   `active_namespace`; all other fields are fresh (empty stacks, no tx, etc.).
+    pub fn into_evaluator(self) -> Evaluator {
+        let store = self.registry.store.clone_handle();
+        Evaluator {
+            registry: self.registry,
+            store,
+            os: Arc::new(DefaultOsInterface),
+            handler_chain: RefCell::new(self.handler_chain),
+            active_namespace: RefCell::new(self.active_namespace),
+            method_stack: RefCell::new(Vec::new()),
+            method_depth: Cell::new(0),
+            current_block_home: Cell::new(None),
+            current_entity_id: Cell::new(None),
+            value_objects: RefCell::new(HashMap::new()),
+            current_tx: RefCell::new(None),
+        }
+    }
+}
+
 pub struct Evaluator {
     pub registry: Arc<ClassRegistry>,
     /// Shared store handle. Cloned from the registry's store; all evaluators and
     /// entities sharing the same registry share the same underlying store.
     pub store: Store,
+    /// OS/world interface. Provides timer scheduling and future OS primitives.
+    /// Defaults to `DefaultOsInterface`; tests may inject a fake.
+    pub os: Arc<dyn OsInterface>,
     pub(crate) method_stack: RefCell<Vec<SelfBinding>>,
     /// Content-hash-addressed value objects registered during this evaluator's lifetime.
     /// Used for EntityRef resolution of ValueObject facts.
@@ -146,6 +184,7 @@ impl Evaluator {
         Self {
             registry,
             store,
+            os: Arc::new(DefaultOsInterface),
             method_stack: RefCell::new(Vec::new()),
             method_depth: Cell::new(0),
             active_namespace: RefCell::new(kernel),
@@ -617,6 +656,7 @@ impl Evaluator {
         Self {
             registry,
             store,
+            os: Arc::new(DefaultOsInterface),
             method_stack: RefCell::new(Vec::new()),
             method_depth: Cell::new(0),
             active_namespace: RefCell::new(kernel),
@@ -625,6 +665,20 @@ impl Evaluator {
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
             handler_chain: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Snapshot this evaluator's inherited dynamic context for an async continuation.
+    ///
+    /// Requires: nothing.
+    /// Ensures: returns a `Send` snapshot of `handler_chain` and `active_namespace`.
+    ///   Call `ContinuationContext::into_evaluator()` inside the continuation closure
+    ///   to restore inherited context in the new coroutine.
+    pub fn fork_context(&self) -> ContinuationContext {
+        ContinuationContext {
+            registry: self.registry.clone(),
+            handler_chain: self.handler_chain.borrow().clone(),
+            active_namespace: self.active_namespace.borrow().clone(),
         }
     }
 

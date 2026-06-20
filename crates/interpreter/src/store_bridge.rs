@@ -59,6 +59,8 @@ pub fn value_to_bridge(v: &Value) -> BridgeResult {
         Value::Future(_) => BridgeResult::Skip,
         // Deferred: Namespace requires design for notebook/artifact storage.
         Value::Namespace(_) => BridgeResult::Skip,
+        // Handle is a transient runtime value; no persistent representation.
+        Value::Handle(_) => BridgeResult::Skip,
     }
 }
 
@@ -133,6 +135,7 @@ fn hash_value(v: &Value, hash: &mut u64) {
         Value::Block(_) => fnv_update(hash, &[10]),
         Value::Future(_) => fnv_update(hash, &[11]),
         Value::Namespace(_) => fnv_update(hash, &[12]),
+        Value::Handle(_) => fnv_update(hash, &[13]),
     }
 }
 

@@ -127,13 +127,13 @@ pub fn dispatch(
                 let blk = as_block(blk_val, &selector)?;
                 let result_future = crate::entity::FutureHandle::new();
                 let result_reply = result_future.clone();
-                let registry = ev.registry.clone();
+                let ctx = ev.fork_context();
                 crate::entity::init_coroutine_stack();
                 may::go!(move || {
                     match future.wait() {
                         Err(e) => result_reply.resolve_err(e),
                         Ok(_) => {
-                            let then_ev = Evaluator::with_registry(registry);
+                            let then_ev = ctx.into_evaluator();
                             let mut dummy_env = crate::env::Env::new();
                             let result = then_ev.eval_block(&blk, vec![], &mut dummy_env);
                             match result {
@@ -156,13 +156,13 @@ pub fn dispatch(
                     Value::Future(future) => {
                         let result_future = crate::entity::FutureHandle::new();
                         let result_reply = result_future.clone();
-                        let registry = ev.registry.clone();
+                        let ctx = ev.fork_context();
                         crate::entity::init_coroutine_stack();
                         may::go!(move || {
                             match future.wait() {
                                 Err(e) => result_reply.resolve_err(e),
                                 Ok(_) => {
-                                    let then_ev = Evaluator::with_registry(registry);
+                                    let then_ev = ctx.into_evaluator();
                                     let mut dummy_env = crate::env::Env::new();
                                     let r = then_ev.eval_block(&cont_blk, vec![], &mut dummy_env);
                                     match r {
@@ -207,6 +207,10 @@ pub fn dispatch(
              calling dispatch(), and then: intercepts Futures before force_value"
         ),
         Value::Namespace(ns) => dispatch_namespace(ev, ns, selector, args, env),
+        Value::Handle(_) => Err(EvalError::MessageNotUnderstood {
+            receiver_kind: "Handle",
+            selector,
+        }),
     }
 }
 
@@ -462,6 +466,7 @@ pub(crate) fn hash_value(v: &Value) -> i64 {
         Value::Future(_) => unreachable!("hash_value called on unresolved Future"),
         Value::Block(b) => fmix64(Arc::as_ptr(b) as usize as u64) as i64,
         Value::Namespace(ns) => fnv1a_hash(&ns.name),
+        Value::Handle(h) => fmix64(Arc::as_ptr(h) as *const () as usize as u64) as i64,
     }
 }
 
@@ -1571,6 +1576,34 @@ pub(crate) fn dispatch_object_primitive(
                 .collect();
             history_facts_to_array(ev, &facts)
         }
+        "_primCancelTimer:" => {
+            // Requires: args[0] is a Value::Handle returned by _primScheduleTimer:block:.
+            // Ensures: the timer callback will not be called if it has not already fired.
+            //   No-op if already fired. Returns Value::Nil.
+            expect_arity(sel, 1, args.len())?;
+            match force_value(args.remove(0))? {
+                Value::Handle(h) => {
+                    ev.os.cancel_timer(&h);
+                    Ok(Value::Nil)
+                }
+                other => Err(EvalError::TypeError(format!(
+                    "_primCancelTimer: argument must be a Handle, got {}",
+                    other.kind()
+                ))),
+            }
+        }
+        "_primTimerPending:" => {
+            // Requires: args[0] is a Value::Handle returned by _primScheduleTimer:block:.
+            // Ensures: returns Value::Bool(true) iff the timer has not fired and is not cancelled.
+            expect_arity(sel, 1, args.len())?;
+            match force_value(args.remove(0))? {
+                Value::Handle(h) => Ok(Value::Bool(ev.os.timer_pending(&h))),
+                other => Err(EvalError::TypeError(format!(
+                    "_primTimerPending: argument must be a Handle, got {}",
+                    other.kind()
+                ))),
+            }
+        }
         _ => Err(EvalError::MessageNotUnderstood {
             receiver_kind: "Object",
             selector: sel.clone(),
@@ -2021,6 +2054,26 @@ pub(crate) fn dispatch_class_builtin(
             ev.eval_block(&blk, vec![Value::Instance(inst.clone())], env)?;
             obj.freeze();
             Ok(Value::Instance(inst))
+        }
+        "_primScheduleTimer:block:" => {
+            // Requires: args[0] is Value::Int (≥ 0, milliseconds); args[1] is Value::Block.
+            // Ensures: after ms milliseconds (if not cancelled), evaluates the block in a
+            //   fresh may coroutine inheriting the current continuation context. The block
+            //   is responsible for all Smol-level dispatch (e.g. Timer >> pvtTimerFired).
+            //   Returns Value::Handle opaque to callers.
+            expect_arity(&selector, 2, args.len())?;
+            let ms = as_int(args.remove(0), &selector)?.max(0) as u64;
+            let blk = as_block(args.remove(0), &selector)?;
+            let ctx = ev.fork_context();
+            let callback = Box::new(move || {
+                may::go!(move || {
+                    let ev = ctx.into_evaluator();
+                    let mut env = blk.env.clone();
+                    let _ = ev.eval_block(&blk, vec![], &mut env);
+                });
+            });
+            let handle = ev.os.schedule_timer(ms, callback);
+            Ok(Value::Handle(handle))
         }
         "_primNew:" => {
             expect_arity(&selector, 1, args.len())?;

@@ -256,6 +256,10 @@ pub fn dispatch(
             dispatch(ev, resolved, selector, args, env)
         }
         Value::Namespace(ns) => dispatch_namespace(ev, ns, selector, args, env),
+        Value::Handle(_) => Err(EvalError::MessageNotUnderstood {
+            receiver_kind: "Handle",
+            selector,
+        }),
     }
 }
 
@@ -413,6 +417,7 @@ pub(crate) fn hash_value(v: &Value) -> i64 {
         Value::Future(f) => fmix64(Arc::as_ptr(&f.0) as usize as u64) as i64,
         Value::Block(b) => fmix64(Arc::as_ptr(b) as usize as u64) as i64,
         Value::Namespace(ns) => fnv1a_hash(&ns.name),
+        Value::Handle(h) => fmix64(Arc::as_ptr(h) as *const () as usize as u64) as i64,
     }
 }
 

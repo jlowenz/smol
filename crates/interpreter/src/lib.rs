@@ -21,6 +21,7 @@ pub(crate) mod eval_recursive;
 pub mod lexer;
 pub mod namespace;
 pub mod object;
+pub mod os_interface;
 pub mod parser;
 pub mod store_bridge;
 pub mod value;

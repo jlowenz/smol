@@ -705,7 +705,20 @@ False >> | other                    [ ^other ]
 
 Boolean >> ~= other                 [ ^(self = other) not ]
 
-"World — environment-level queries over the live entity registry."
+"── Duration ─────────────────────────────────────────────────────────────────"
+Value subclass: #Duration
+    instanceVariableNames: 'ms'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Duration class >> ms: n      [ ^self _primNewValue: [:d | d pvtMs: n] ]
+Duration class >> s: n       [ ^self _primNewValue: [:d | d pvtMs: n * 1000] ]
+Duration class >> minutes: n [ ^self _primNewValue: [:d | d pvtMs: n * 60000] ]
+Duration >> pvtMs: n         [ ms := n ]
+Duration >> asMilliseconds   [ ^ms ]
+Duration >> printString      [ ^ms printString, 'ms' ]
+
+"── World ────────────────────────────────────────────────────────────────────"
 Object subclass: #World
     instanceVariableNames: ''
     classVariableNames: ''

@@ -40,27 +40,19 @@ Note: `historyOf:` (C27) is read-only temporal access and is distinct from this.
 
 ---
 
-## Q2: Cross-entity transaction model — saga sufficiency
+## Q2: Cross-entity transaction model
 
-**Status**: Open — needs design session (C28 prerequisite)  
-**Raised**: C27 design discussion
+**Status**: Design substantially complete — see `docs/tx_design.md`  
+**Raised**: C27 design discussion  
+**Updated**: 2026-06-19 design session
 
-Message-handler boundaries are the natural within-entity transaction unit. For
-operations spanning multiple entities (e.g. fund transfer between two accounts),
-the saga pattern (forward steps with compensating messages) is the primary
-candidate, but it may not be sufficient for all cases.
-
-**Tensions to resolve:**
-
-- Which cross-entity scenarios cannot be expressed as sagas, and what alternative
-  model covers them?
-- What does the condition/signal system need to provide for saga compensation to be
-  reliable? (Error propagation, idempotency guarantees, timeout/cancellation.)
-- How do the parameterised transaction modes (`#atomic`, `#saga`, `#stm`,
-  `#bestEffort`) map to concrete implementation strategies?
-- STM-like optimistic concurrency (per-triple version numbers, message-based
-  version negotiation) is mentioned in the design — is this the implementation
-  path for `#stm`, and how does it interact with the actor model?
+All implementation questions resolved except OQ-TX-6 (saga/condition system,
+deferred to saga implementation). Key decisions: `Transaction` is an entity; shadow
+writes for reversible ivar changes; lazy participant discovery with wait-for graph
+deadlock detection; `#atomic` = mailbox lock + shadow writes; `#stm` = shadow writes
++ optimistic version conflict; nested transactions via savepoints; `OpaqueTransaction`
+default / `ObservableTransaction` opt-in. See `docs/tx_design.md` for full analysis
+and minimal primitive set.
 
 ---
 
@@ -161,7 +153,7 @@ are an analogue: a performance optimisation that doesn't change observable seman
 
 ---
 
-## Q8: Implementation/responsibility split and self-hosting boundary
+## Q7: Implementation/responsibility split and self-hosting boundary
 
 **Status**: Open — not urgent; needs design session when self-hosting becomes a near-term goal  
 **Raised**: C27 design discussion (surfaced by `content_hash_id` placement)
@@ -197,7 +189,7 @@ interpreter/compiler, in the spirit of Smalltalk's image?
 
 ---
 
-## Q7: Block and namespace storage (code as facts)
+## Q8: Block and namespace storage (code as facts)
 
 **Status**: Open — deferred from C27  
 **Raised**: C27 design discussion
@@ -224,7 +216,7 @@ important for the "code as facts" and notebook/literate programming goals.
 
 ----
 
-## Q8. Supporting ultra lightweight objects and massive parallelism on GPU
+## Q9. Supporting ultra lightweight objects and massive parallelism on GPU
 
 **Status**: Open - Research - Experimental
 

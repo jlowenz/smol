@@ -745,7 +745,44 @@ Int >> timesRepeat: aBlock [
     ^(self - 1) timesRepeat: aBlock
 ]
 
-"World — environment-level queries over the live entity registry."
+"── Duration ─────────────────────────────────────────────────────────────────"
+"Immutable millisecond-granularity time span.  No arithmetic or comparison."
+Value subclass: #Duration
+    instanceVariableNames: 'ms'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Duration class >> ms: n      [ ^self _primNewValue: [:d | d pvtMs: n] ]
+Duration class >> s: n       [ ^self _primNewValue: [:d | d pvtMs: n * 1000] ]
+Duration class >> minutes: n [ ^self _primNewValue: [:d | d pvtMs: n * 60000] ]
+Duration >> pvtMs: n         [ ms := n ]
+Duration >> asMilliseconds   [ ^ms ]
+Duration >> printString      [ ^ms printString, 'ms' ]
+
+"── Timer ────────────────────────────────────────────────────────────────────"
+"Cancellable one-shot timer.  Value object; immutable after construction."
+Value subclass: #Timer
+    instanceVariableNames: 'handle block'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Timer class >> after: duration do: userBlock [
+    | ms |
+    ms := duration asMilliseconds.
+    ^self _primNewValue: [:t |
+        t pvtBlock: userBlock.
+        t pvtHandle: (self _primScheduleTimer: ms block: [t pvtTimerFired])
+    ]
+]
+
+Timer >> pvtBlock: b   [ block := b ]
+Timer >> pvtHandle: h  [ handle := h ]
+Timer >> pvtTimerFired [ ^block value ]
+Timer >> cancel        [ self _primCancelTimer: handle ]
+Timer >> isPending     [ ^self _primTimerPending: handle ]
+
+"── World ────────────────────────────────────────────────────────────────────"
+"Environment-level queries over the live entity registry."
 Object subclass: #World
     instanceVariableNames: ''
     classVariableNames: ''
