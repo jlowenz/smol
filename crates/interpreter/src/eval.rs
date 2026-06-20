@@ -81,6 +81,9 @@ pub struct ContinuationContext {
     pub(crate) registry: Arc<ClassRegistry>,
     pub(crate) handler_chain: Vec<(Arc<Class>, Arc<Block>)>,
     pub(crate) active_namespace: Arc<Namespace>,
+    /// Active transaction context, so a `then:` continuation's outgoing entity
+    /// sends are tagged with the same transaction as the code that scheduled it.
+    pub(crate) current_tx_ctx: Option<Arc<crate::shared_tx::TxContext>>,
 }
 
 impl ContinuationContext {
@@ -103,6 +106,7 @@ impl ContinuationContext {
             current_entity_id: Cell::new(None),
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
+            current_tx_ctx: RefCell::new(self.current_tx_ctx),
         }
     }
 }
@@ -123,6 +127,11 @@ pub struct Evaluator {
     /// Set to `Some` by `run_entity_loop` before each dispatch; cleared on commit/rollback.
     /// `None` outside entity handler context (e.g. test-thread evaluations).
     pub(crate) current_tx: RefCell<Option<OwnedStoreTransaction>>,
+    /// Active multi-entity transaction context (C31), or `None` outside any
+    /// `atomic:` block. When `Some`, ivar writes go to the top shadow frame and
+    /// outgoing entity sends are tagged with this context; nested `atomic:`
+    /// pushes a `Child` whose `outer` is the previous head.
+    pub(crate) current_tx_ctx: RefCell<Option<Arc<crate::shared_tx::TxContext>>>,
     /// Depth of the active method stack. Maintained alongside `method_stack` so
     /// the common case — no active method — can be tested with a plain `Cell`
     /// read instead of a `RefCell` borrow.
@@ -192,6 +201,7 @@ impl Evaluator {
             current_entity_id: Cell::new(None),
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
+            current_tx_ctx: RefCell::new(None),
             handler_chain: RefCell::new(Vec::new()),
         }
     }
@@ -664,6 +674,7 @@ impl Evaluator {
             current_entity_id: Cell::new(None),
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
+            current_tx_ctx: RefCell::new(None),
             handler_chain: RefCell::new(Vec::new()),
         }
     }
@@ -679,6 +690,7 @@ impl Evaluator {
             registry: self.registry.clone(),
             handler_chain: self.handler_chain.borrow().clone(),
             active_namespace: self.active_namespace.borrow().clone(),
+            current_tx_ctx: self.current_tx_ctx.borrow().clone(),
         }
     }
 
