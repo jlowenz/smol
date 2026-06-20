@@ -65,6 +65,14 @@ impl TripleStore<StoredFact> for AlwaysFailingStore {
         Transaction::new(Arc::new(FailingApplier), TxId(0))
     }
 
+    fn alloc_tx_id(&self) -> TxId {
+        TxId(0)
+    }
+
+    fn new_transaction_with_id(&self, tx_id: TxId) -> Transaction<StoredFact> {
+        Transaction::new(Arc::new(FailingApplier), tx_id)
+    }
+
     fn now(&self) -> Timestamp {
         Timestamp(0)
     }

@@ -41,6 +41,22 @@ pub trait TripleStore<TFact: BitemporalFact>: Queryable<TFact> + Send + Sync {
     /// Ensures: returned transaction has an empty buffer and a unique `TxId`.
     fn new_transaction(&self) -> Transaction<TFact>;
 
+    /// Allocate a fresh, unique `TxId` without opening a transaction buffer.
+    ///
+    /// Ensures: the returned id is distinct from every id previously returned by
+    ///   `new_transaction`, `new_transaction_with_id` (via prior `alloc_tx_id`),
+    ///   or `alloc_tx_id` on this store instance.
+    fn alloc_tx_id(&self) -> crate::id::TxId;
+
+    /// Begin a new transaction bound to a caller-supplied `TxId`.
+    ///
+    /// Requires: `tx_id` was obtained from `alloc_tx_id` on this store instance
+    ///   (so it does not collide with any auto-allocated id).
+    /// Ensures: returned transaction has an empty buffer and commits under `tx_id`.
+    ///   Used for multi-participant transactions where several buffers must share
+    ///   one `TxId` so their commit is atomic.
+    fn new_transaction_with_id(&self, tx_id: crate::id::TxId) -> Transaction<TFact>;
+
     /// The current time according to the store's clock.
     fn now(&self) -> Timestamp;
 

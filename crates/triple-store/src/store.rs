@@ -370,6 +370,35 @@ impl Store {
         }
     }
 
+    /// Allocate a fresh, unique `TxId` without opening a transaction buffer.
+    ///
+    /// Ensures: the returned id is distinct from every id allocated by any
+    ///   handle in this store group (it advances the shared `TxId` counter).
+    ///   Intended for multi-participant transactions: the coordinator allocates
+    ///   one id, then each participant calls `begin_owned_with_id` so all buffers
+    ///   commit under it atomically.
+    pub fn alloc_tx_id(&self) -> crate::id::TxId {
+        self.backend.alloc_tx_id()
+    }
+
+    /// Begin an owned transaction bound to a caller-supplied `TxId`.
+    ///
+    /// Requires: `tx_id` was obtained from `alloc_tx_id` on this store group.
+    /// Ensures: like `begin_owned`, but the returned transaction commits under
+    ///   `tx_id` rather than a freshly allocated id; shares the same backend,
+    ///   registry, and entity counter as `self`.
+    pub fn begin_owned_with_id(
+        &self,
+        ctx: ExecContext,
+        tx_id: crate::id::TxId,
+    ) -> OwnedStoreTransaction {
+        OwnedStoreTransaction {
+            store: self.clone_handle(),
+            ctx,
+            tx: self.backend.new_transaction_with_id(tx_id),
+        }
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// All currently asserted-open facts at `(subject, predicate)`.
@@ -657,6 +686,19 @@ impl OwnedStoreTransaction {
     ///   If `commit()` returns `Err`, the value is discarded with no side effects.
     pub fn buffer_value(&mut self, id: EntityId, value: StoredValue) {
         self.tx.buffer_value(id, value);
+    }
+
+    /// Absorb another transaction's buffered ops and staged values into `self`.
+    ///
+    /// Requires: `other` was created (directly or via further `absorb`) under the
+    ///   same `TxId` as `self` — i.e. both came from `begin_owned_with_id` with
+    ///   the same id. Enforced via `debug_assert` in the inner buffer.
+    /// Ensures: `other`'s buffered work is appended to `self` and `other` is
+    ///   consumed; no access re-check (each op was access-checked when buffered).
+    ///   Used to merge a participant's or child transaction's buffer into its
+    ///   coordinator/parent before commit.
+    pub fn absorb(&mut self, other: OwnedStoreTransaction) {
+        self.tx.absorb(other.tx);
     }
 
     /// Commit all buffered ivar facts and staged values atomically.
@@ -1080,6 +1122,93 @@ mod tests {
         assert!(
             store.lookup_value(id).is_none(),
             "value must not be stored when facts fail"
+        );
+    }
+
+    // ── Shared TxId / per-participant buffers (C31 S0) ────────────────────────
+
+    #[test]
+    fn alloc_tx_id_returns_distinct_ids() {
+        let store = Store::in_memory();
+        let a = store.alloc_tx_id();
+        let b = store.alloc_tx_id();
+        assert_ne!(a, b, "successive alloc_tx_id calls must differ");
+    }
+
+    #[test]
+    fn alloc_tx_id_shared_across_handles() {
+        let store_a = Store::in_memory();
+        let store_b = store_a.clone_handle();
+        let ids = [
+            store_a.alloc_tx_id(),
+            store_b.alloc_tx_id(),
+            store_a.alloc_tx_id(),
+        ];
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), 3, "ids must be distinct across handles");
+    }
+
+    #[test]
+    fn two_buffers_under_one_tx_id_commit_atomically_via_absorb() {
+        let (store, prv, shr, _) = store_3();
+        let sys = ExecContext::System;
+
+        let tx_id = store.alloc_tx_id();
+        let mut coordinator = store.begin_owned_with_id(sys, tx_id);
+        let mut participant = store.begin_owned_with_id(sys, tx_id);
+
+        coordinator.assert_single(fact(e(1), prv, e(1))).unwrap();
+        participant.assert_single(fact(e(2), shr, e(2))).unwrap();
+
+        coordinator.absorb(participant);
+        coordinator.commit().unwrap();
+
+        // Both participants' facts are present after the single commit.
+        assert_eq!(store.query_open(&sys, e(1), prv, None).unwrap().len(), 1);
+        assert_eq!(store.query_open(&sys, e(2), shr, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn absorbed_facts_share_the_committed_tx_id() {
+        let (store, prv, shr, _) = store_3();
+        let sys = ExecContext::System;
+
+        let tx_id = store.alloc_tx_id();
+        let mut a = store.begin_owned_with_id(sys, tx_id);
+        let mut b = store.begin_owned_with_id(sys, tx_id);
+        a.assert_single(fact(e(1), prv, e(1))).unwrap();
+        b.assert_single(fact(e(2), shr, e(2))).unwrap();
+        a.absorb(b);
+        a.commit().unwrap();
+
+        let f1 = &store.query_open(&sys, e(1), prv, None).unwrap()[0];
+        let f2 = &store.query_open(&sys, e(2), shr, None).unwrap()[0];
+        assert_eq!(f1.tx_id, tx_id);
+        assert_eq!(
+            f2.tx_id, tx_id,
+            "absorbed buffer commits under the shared id"
+        );
+    }
+
+    #[test]
+    fn dropping_a_child_buffer_without_absorb_discards_its_ops() {
+        let (store, prv, shr, _) = store_3();
+        let sys = ExecContext::System;
+
+        let tx_id = store.alloc_tx_id();
+        let mut parent = store.begin_owned_with_id(sys, tx_id);
+        let mut child = store.begin_owned_with_id(sys, tx_id);
+        parent.assert_single(fact(e(1), prv, e(1))).unwrap();
+        child.assert_single(fact(e(2), shr, e(2))).unwrap();
+
+        // Child aborts: drop without absorbing.
+        child.rollback();
+        parent.commit().unwrap();
+
+        assert_eq!(store.query_open(&sys, e(1), prv, None).unwrap().len(), 1);
+        assert!(
+            store.query_open(&sys, e(2), shr, None).unwrap().is_empty(),
+            "aborted child's ops must not be committed"
         );
     }
 

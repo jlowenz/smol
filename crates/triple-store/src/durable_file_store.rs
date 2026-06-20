@@ -370,7 +370,14 @@ impl Queryable<StoredFact> for DurableFileTripleStore {
 
 impl TripleStore<StoredFact> for DurableFileTripleStore {
     fn new_transaction(&self) -> crate::transaction::Transaction<StoredFact> {
-        let tx_id = TxId(self.inner.next_tx.fetch_add(1, Ordering::Relaxed));
+        self.new_transaction_with_id(self.alloc_tx_id())
+    }
+
+    fn alloc_tx_id(&self) -> TxId {
+        TxId(self.inner.next_tx.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn new_transaction_with_id(&self, tx_id: TxId) -> crate::transaction::Transaction<StoredFact> {
         crate::transaction::Transaction::new(
             Arc::clone(&self.inner) as Arc<dyn Applier<StoredFact>>,
             tx_id,

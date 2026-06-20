@@ -664,7 +664,14 @@ impl Queryable<StoredFact> for InMemoryTripleStore {
 
 impl TripleStore<StoredFact> for InMemoryTripleStore {
     fn new_transaction(&self) -> Transaction<StoredFact> {
-        let tx_id = TxId(self.inner.next_tx.fetch_add(1, Ordering::Relaxed));
+        self.new_transaction_with_id(self.alloc_tx_id())
+    }
+
+    fn alloc_tx_id(&self) -> TxId {
+        TxId(self.inner.next_tx.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn new_transaction_with_id(&self, tx_id: TxId) -> Transaction<StoredFact> {
         Transaction::new(
             Arc::clone(&self.inner) as Arc<dyn Applier<StoredFact>>,
             tx_id,

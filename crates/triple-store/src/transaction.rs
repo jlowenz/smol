@@ -202,6 +202,25 @@ impl<TFact> Transaction<TFact> {
         self.value_buf.push((id, value));
     }
 
+    // === Merge (multi-participant transactions) ===
+
+    /// Absorb another transaction's buffered ops and staged values into `self`.
+    ///
+    /// Requires: `other.tx_id == self.tx_id` (both buffers commit under one
+    ///   `TxId`, so their union is a single atomic transaction). Enforced via
+    ///   `debug_assert`.
+    /// Ensures: `other`'s ops are appended after `self`'s (preserving each
+    ///   buffer's internal order), likewise its staged values; `other` is
+    ///   consumed.
+    pub(crate) fn absorb(&mut self, other: Transaction<TFact>) {
+        debug_assert_eq!(
+            self.tx_id, other.tx_id,
+            "absorb: buffers must share one TxId"
+        );
+        self.ops.extend(other.ops);
+        self.value_buf.extend(other.value_buf);
+    }
+
     // === Terminal operations (consume self) ===
 
     /// Apply all buffered operations and staged values atomically.
