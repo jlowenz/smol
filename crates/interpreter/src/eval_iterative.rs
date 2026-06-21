@@ -2036,6 +2036,27 @@ fn dispatch_to_stack(
         }
     }
 
+    // (1f) Class-side user method (synchronous case) flattened: push a class
+    // method `CallFrame` instead of recursing `step_loop` via
+    // `invoke_class_method`. Mirrors the instance self-send path and replicates
+    // `dispatch_class`'s sync condition; asynchronous (cross-entity behavioral)
+    // class sends fall through to `builtins::dispatch` → `dispatch_class`, which
+    // enqueues and returns a `Future`. Class-side builtins (no user method) also
+    // fall through to `dispatch_class_builtin`.
+    if let Value::Instance(ref handle) = receiver
+        && let InstanceKind::ClassEntity(d) = &handle.0.kind
+    {
+        let sync = ev.current_entity_id.get() == Some(d.id)
+            || selector.starts_with("subclass:")
+            || handle.0.class.inherits_is_value()
+            || matches!(selector.as_ref(), "=" | "~=");
+        if sync && let Some((method, def_class)) = handle.0.class.lookup_class_method(&selector) {
+            drain_tail_frames(ev, stack);
+            push_class_method_frame(ev, handle.clone(), def_class, method, args, env, stack)?;
+            return Ok(());
+        }
+    }
+
     // (2-5) Block dispatch.
     if let Value::Block(ref blk) = receiver {
         match selector.as_ref() {
