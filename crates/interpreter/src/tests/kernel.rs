@@ -1,5 +1,5 @@
 use crate::eval::EvalError;
-use crate::test_helpers::{eval, eval_diff, eval_err, eval_err_diff};
+use crate::test_helpers::{eval, eval_diff, eval_err_diff};
 use crate::value::Value;
 use std::sync::Arc;
 

@@ -70,6 +70,7 @@ fn instance_handle_entity_debug() {
             status: Mutex::new(EntityStatus::Running),
             shutdown: std::sync::atomic::AtomicBool::new(false),
             store: triple_store::store::Store::in_memory(),
+            tx_frames: Mutex::new(Vec::new()),
         })),
     }));
     assert!(format!("{handle:?}").contains("99"));
@@ -243,6 +244,7 @@ fn handle_commit_error_faults_entity_drains_mailbox() {
         status: Mutex::new(EntityStatus::Running),
         shutdown: std::sync::atomic::AtomicBool::new(false),
         store: triple_store::store::Store::in_memory(),
+        tx_frames: Mutex::new(Vec::new()),
     };
 
     // Queue a second message so the mailbox-drain path is exercised.
@@ -548,4 +550,152 @@ fn entity_stack_depth_probe() {
         tx.send(v).unwrap();
     });
     assert_eq!(rx.recv().unwrap(), Value::Int(210));
+}
+
+// ── C31 S2: transaction lock + shadow frames ──────────────────────────────────
+
+#[cfg(test)]
+mod tx_frames {
+    use super::*;
+
+    /// Build a bare entity `EntityData` with one declared ivar `slot` seeded to
+    /// `Value::Int(seed)` in its live slots.
+    fn entity_with_slot(seed: i64) -> EntityData {
+        use crate::class::Class;
+        use parking_lot::RwLock;
+        use std::collections::HashMap;
+        let cls = Arc::new(Class {
+            name: Arc::from("Cell"),
+            superclass: None,
+            own_instance_vars: vec![Arc::from("slot")],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(HashMap::new()),
+            indexed_slot_kind: None,
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
+            class_object: std::sync::OnceLock::new(),
+        });
+        let obj = Arc::new(crate::object::Object::new(cls.clone()));
+        obj.set_slot(Arc::from("slot"), Value::Int(seed));
+        EntityData {
+            id: EntityId(1),
+            data: obj,
+            mailbox: Mutex::new(VecDeque::new()),
+            mailbox_ready: Condvar::new(),
+            status: Mutex::new(EntityStatus::Running),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+            store: triple_store::store::Store::in_memory(),
+            tx_frames: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// One shared TxId reused across all of an entity's frames (tree invariant).
+    fn shared_id(d: &EntityData) -> triple_store::id::TxId {
+        d.store.alloc_tx_id()
+    }
+
+    #[test]
+    fn fresh_entity_is_not_in_tx() {
+        let d = entity_with_slot(0);
+        assert!(!d.in_tx());
+        assert_eq!(d.tx_depth(), 0);
+        assert_eq!(d.tx_holder(), None);
+    }
+
+    #[test]
+    fn push_frame_sets_depth_and_holder_but_not_live_slot() {
+        let d = entity_with_slot(1);
+        d.tx_push_frame(7, shared_id(&d));
+        assert!(d.in_tx());
+        assert_eq!(d.tx_depth(), 1);
+        assert_eq!(d.tx_holder(), Some(7));
+        // Live slot untouched by enrollment.
+        assert_eq!(d.data.get_slot("slot"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn shadow_write_masks_live_slot_via_shadow_get() {
+        let d = entity_with_slot(1);
+        d.tx_push_frame(7, shared_id(&d));
+        d.tx_shadow_set(Arc::from("slot"), Value::Int(99));
+        // Read-your-writes through the shadow; live slot still the old value.
+        assert_eq!(d.tx_shadow_get("slot"), Some(Value::Int(99)));
+        assert_eq!(d.data.get_slot("slot"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn root_commit_applies_shadow_to_live_and_returns_buffer() {
+        let d = entity_with_slot(1);
+        d.tx_push_frame(7, shared_id(&d));
+        d.tx_shadow_set(Arc::from("slot"), Value::Int(99));
+        let buffer = d.tx_commit_frame(None); // root commit
+        assert!(buffer.is_some(), "root commit hands its durable buffer up");
+        assert!(!d.in_tx());
+        assert_eq!(d.data.get_slot("slot"), Some(Value::Int(99)));
+    }
+
+    #[test]
+    fn root_abort_discards_shadow_and_leaves_live_slot() {
+        let d = entity_with_slot(1);
+        d.tx_push_frame(7, shared_id(&d));
+        d.tx_shadow_set(Arc::from("slot"), Value::Int(99));
+        d.tx_abort_frame();
+        assert!(!d.in_tx());
+        assert_eq!(d.data.get_slot("slot"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn child_commit_merges_into_parent_frame_not_live() {
+        // Entity enrolled at root (ctx 1) then a child (ctx 2), one shared TxId.
+        let d = entity_with_slot(1);
+        let tx_id = shared_id(&d);
+        d.tx_push_frame(1, tx_id);
+        d.tx_shadow_set(Arc::from("slot"), Value::Int(10)); // root-level write
+        d.tx_push_frame(2, tx_id);
+        d.tx_shadow_set(Arc::from("slot"), Value::Int(20)); // child-level write
+        let buffer = d.tx_commit_frame(Some(1)); // child commits into parent
+        assert!(
+            buffer.is_none(),
+            "child commit merges up, returns no buffer"
+        );
+        assert_eq!(d.tx_depth(), 1, "back to the root level");
+        // Child write superseded the root write within the surviving frame.
+        assert_eq!(d.tx_shadow_get("slot"), Some(Value::Int(20)));
+        // Still not live until the root commits.
+        assert_eq!(d.data.get_slot("slot"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn child_abort_discards_only_child_frame() {
+        let d = entity_with_slot(1);
+        let tx_id = shared_id(&d);
+        d.tx_push_frame(1, tx_id);
+        d.tx_shadow_set(Arc::from("slot"), Value::Int(10));
+        d.tx_push_frame(2, tx_id);
+        d.tx_shadow_set(Arc::from("slot"), Value::Int(20));
+        d.tx_abort_frame(); // child aborts
+        assert_eq!(d.tx_depth(), 1);
+        // Root-level write survives; child write gone.
+        assert_eq!(d.tx_shadow_get("slot"), Some(Value::Int(10)));
+    }
+
+    #[test]
+    fn child_commit_passes_lock_up_when_parent_never_enrolled() {
+        // Entity first touched during the child (ctx 2); root (ctx 1) never
+        // separately enrolled it, so depth is 1.
+        let d = entity_with_slot(1);
+        d.tx_push_frame(2, shared_id(&d));
+        d.tx_shadow_set(Arc::from("slot"), Value::Int(20));
+        let buffer = d.tx_commit_frame(Some(1)); // lock passes up to parent
+        assert!(
+            buffer.is_none(),
+            "lock pass-up keeps the buffer in the frame"
+        );
+        assert_eq!(d.tx_depth(), 1, "still locked, now under the parent");
+        assert_eq!(d.tx_holder(), Some(1));
+        // Speculative write retained at the parent level, not yet live.
+        assert_eq!(d.tx_shadow_get("slot"), Some(Value::Int(20)));
+        assert_eq!(d.data.get_slot("slot"), Some(Value::Int(1)));
+    }
 }

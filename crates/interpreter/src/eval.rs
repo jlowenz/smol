@@ -277,7 +277,14 @@ impl Evaluator {
                 if let Some(v) = env.lookup_top_frame(name) {
                     return Some(v);
                 }
-                // 2. instance variables
+                // 2. instance variables — inside a shared transaction, the
+                //    entity's shadow frames mask the live slot (read-your-writes).
+                if let InstanceKind::Entity(d) = &handle.0.kind
+                    && d.in_tx()
+                    && let Some(v) = d.tx_shadow_get(name)
+                {
+                    return Some(v);
+                }
                 if let Some(v) = handle.ivar_storage().get_slot(name) {
                     return Some(v);
                 }
@@ -355,7 +362,15 @@ impl Evaluator {
                             )));
                         }
                         if let InstanceKind::Entity(d) = &handle.0.kind {
+                            // Durable intent always flows to the private current_tx.
                             crate::store_bridge::buffer_ivar(self, d.id, name, &value);
+                            // Inside a shared transaction the live slot must not
+                            // change until commit — redirect to the top shadow frame.
+                            if d.in_tx() {
+                                let ret = value.clone();
+                                d.tx_shadow_set(name.clone(), value);
+                                return Ok(ret);
+                            }
                         }
                         let ret = value.clone();
                         obj.set_slot(name.clone(), value);

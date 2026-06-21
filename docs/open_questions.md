@@ -227,3 +227,43 @@ Can the system support designs where 10-100s millions of objects are run in a ki
 Example: large, complex, constructive solid geometry models and real-time raytracing or analysis. 
 
 This concept is very ambiguous, but worth recording for future consideration.
+
+## Q10: Transactional message dispatch (handler as a depth-1 transaction)
+
+**Status**: Open — candidate future chunk
+**Raised**: 2026-06-20 C31 implementation session
+
+While building the shadow-write + per-frame durable-buffer machinery for C31's
+multi-entity transactions, an observation: a single message handler is *already*
+effectively transactional at the store level (durable ops buffer into `current_tx`
+and commit on success / roll back on crash). The in-memory live slots, however,
+are written **directly** during the handler, not shadowed.
+
+The question: should a normal message handler be a true depth-1 transaction —
+shadowing its in-memory writes too, and atomically **applying or reverting both
+the shadow and the store buffer** based on whether the handler completed without
+error?
+
+Two distinct things this would buy:
+
+1. **A different failure policy.** Today the actor model is *let-it-crash*: an
+   unhandled signal terminates the entity. A transactional handler could instead
+   **fully revert (in-memory + store) and keep the entity alive and clean** — an
+   "atomic apply-or-revert message" alternative to crash-and-die. This is a
+   substantive change to the actor failure model and deserves its own discussion.
+2. **Unification.** A normal handler becomes a depth-1 transaction reusing the
+   exact shadow + per-frame buffer machinery built for C31. The two-path
+   "shadow vs. direct" split in `assign_var`/`lookup_var` collapses into one path,
+   and the multi-entity tx code becomes a strict generalization.
+
+**Why deferred (not in C31):** (a) it changes the actor failure model — a
+philosophical decision, not a side effect of C31; (b) it puts the shadow on the
+hot path of *every* message, so it needs a performance story (e.g. lazy frame
+creation, only when the first write occurs); (c) folding it in re-expands C31's
+scope. Nothing in C31 blocks it — C31's machinery is exactly what it would reuse.
+
+**Note:** there is no current *consistency bug* to fix here. For a surviving
+entity the existing path always commits on success, so live slots and the store
+do not diverge; the crash case terminates the entity, making leftover live slots
+moot. The value of this idea is the new failure policy and the unification, not a
+correctness repair.

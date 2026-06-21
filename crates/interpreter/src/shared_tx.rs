@@ -73,11 +73,20 @@ pub struct ChildTxInner {
 }
 
 /// One frame of an entity's lock + shadow stack. Each frame is owned by the
-/// context that pushed it; `shadow` holds that level's speculative named-ivar
-/// writes (applied on commit, discarded on abort).
+/// context that pushed it and holds that level's speculative state for this
+/// entity:
+///   - `shadow` — in-memory named-ivar writes (mask the live slot; applied on
+///     commit, discarded on abort);
+///   - `tx` — durable store ops, buffered under the shared `TxId`. On commit it
+///     merges into the frame below (or is handed to the coordinator's context
+///     buffer at the last frame); on abort it is dropped (its ops never commit).
+///
+/// Keeping both in one frame makes the per-level push/merge/discard atomic — the
+/// in-memory and durable speculative state can never desync.
 pub struct TxFrame {
     pub ctx_id: TxCtxId,
     pub shadow: HashMap<Arc<str>, Value>,
+    pub tx: OwnedStoreTransaction,
 }
 
 impl TxContext {

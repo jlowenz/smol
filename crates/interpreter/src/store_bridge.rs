@@ -246,6 +246,49 @@ pub(crate) fn collect_value_subtree(v: &Value, buf: &mut Vec<(EntityId, StoredVa
     root_id
 }
 
+// ── Durable-buffer routing ─────────────────────────────────────────────────────
+
+/// Run `f` with the durable store buffer that should receive `entity_id`'s ops
+/// right now, and return its result (or `None` if no buffer is active).
+///
+/// Routing — the single place that distinguishes shared vs. private transactions:
+///   - **Inside a shared transaction** (`ev.current_tx_ctx` set and the entity is
+///     enrolled): the entity's **top frame buffer**, so the op commits/rolls back
+///     with that transaction level.
+///   - **Otherwise**: the evaluator's private per-message `current_tx`.
+///
+/// Ensures: `None` (no-op) when neither buffer is active (e.g. outside any
+///   handler). The shared-tx lookup is gated behind a cheap `current_tx_ctx`
+///   check, so the common non-transactional path is unchanged.
+fn with_durable_tx<R>(
+    ev: &Evaluator,
+    entity_id: EntityId,
+    f: impl FnOnce(&mut triple_store::store::OwnedStoreTransaction) -> R,
+) -> Option<R> {
+    if ev.current_tx_ctx.borrow().is_some() {
+        let state = ev
+            .registry
+            .instance_entities
+            .read()
+            .get(&entity_id)
+            .cloned()
+            .or_else(|| ev.registry.class_entities.read().get(&entity_id).cloned());
+        if let Some(state) = state {
+            let data = match &state.kind {
+                InstanceKind::Entity(d) | InstanceKind::ClassEntity(d) => Some(d.as_ref()),
+                InstanceKind::ValueObject(_) => None,
+            };
+            if let Some(d) = data
+                && d.in_tx()
+            {
+                return Some(d.with_frame_tx(f));
+            }
+        }
+    }
+    let mut tx_ref = ev.current_tx.borrow_mut();
+    tx_ref.as_mut().map(f)
+}
+
 // ── Store buffer helpers ──────────────────────────────────────────────────────
 
 /// Buffer a named-ivar fact into the entity's current transaction.
@@ -282,85 +325,85 @@ pub(crate) fn buffer_indexed_slot(
 ) {
     let pred = ev.registry.indexed_slots_pred;
     let key = OrderingKey::new(index as f64).expect("index as f64 is always finite");
-    let mut tx_ref = ev.current_tx.borrow_mut();
-    let Some(tx) = tx_ref.as_mut() else { return };
-    // For value objects, collect the full subtree and stage structural records.
-    if let Value::Instance(h) = value
-        && matches!(h.0.kind, InstanceKind::ValueObject(_))
-    {
-        let mut val_buf = Vec::new();
-        let hash_id = collect_value_subtree(value, &mut val_buf);
-        for (id, sv) in val_buf {
-            tx.buffer_value(id, sv);
-        }
-        let _ = tx.assert_indexed(
-            Fact {
-                subject: entity_id,
-                predicate: pred,
-                object: Term::ValueRef(hash_id),
-                asserter: entity_id,
-                valid: None,
-            },
-            key,
-        );
-        return;
-    }
-    match value_to_bridge(value) {
-        BridgeResult::Assert(term) => {
+    with_durable_tx(ev, entity_id, |tx| {
+        // For value objects, collect the full subtree and stage structural records.
+        if let Value::Instance(h) = value
+            && matches!(h.0.kind, InstanceKind::ValueObject(_))
+        {
+            let mut val_buf = Vec::new();
+            let hash_id = collect_value_subtree(value, &mut val_buf);
+            for (id, sv) in val_buf {
+                tx.buffer_value(id, sv);
+            }
             let _ = tx.assert_indexed(
                 Fact {
                     subject: entity_id,
                     predicate: pred,
-                    object: term,
+                    object: Term::ValueRef(hash_id),
                     asserter: entity_id,
                     valid: None,
                 },
                 key,
             );
+            return;
         }
-        BridgeResult::Retract => {
-            let _ = tx.retract_indexed(entity_id, pred, entity_id, key);
+        match value_to_bridge(value) {
+            BridgeResult::Assert(term) => {
+                let _ = tx.assert_indexed(
+                    Fact {
+                        subject: entity_id,
+                        predicate: pred,
+                        object: term,
+                        asserter: entity_id,
+                        valid: None,
+                    },
+                    key,
+                );
+            }
+            BridgeResult::Retract => {
+                let _ = tx.retract_indexed(entity_id, pred, entity_id, key);
+            }
+            BridgeResult::Skip => {}
         }
-        BridgeResult::Skip => {}
-    }
+    });
 }
 
 fn buffer_fact(ev: &Evaluator, entity_id: EntityId, pred: Predicate, value: &Value) {
-    let mut tx_ref = ev.current_tx.borrow_mut();
-    let Some(tx) = tx_ref.as_mut() else { return };
-    // For value objects, collect the full subtree and stage structural records.
-    if let Value::Instance(h) = value
-        && matches!(h.0.kind, InstanceKind::ValueObject(_))
-    {
-        let mut val_buf = Vec::new();
-        let hash_id = collect_value_subtree(value, &mut val_buf);
-        for (id, sv) in val_buf {
-            tx.buffer_value(id, sv);
-        }
-        let _ = tx.assert_single(Fact {
-            subject: entity_id,
-            predicate: pred,
-            object: Term::ValueRef(hash_id),
-            asserter: entity_id,
-            valid: None,
-        });
-        return;
-    }
-    match value_to_bridge(value) {
-        BridgeResult::Assert(term) => {
+    with_durable_tx(ev, entity_id, |tx| {
+        // For value objects, collect the full subtree and stage structural records.
+        if let Value::Instance(h) = value
+            && matches!(h.0.kind, InstanceKind::ValueObject(_))
+        {
+            let mut val_buf = Vec::new();
+            let hash_id = collect_value_subtree(value, &mut val_buf);
+            for (id, sv) in val_buf {
+                tx.buffer_value(id, sv);
+            }
             let _ = tx.assert_single(Fact {
                 subject: entity_id,
                 predicate: pred,
-                object: term,
+                object: Term::ValueRef(hash_id),
                 asserter: entity_id,
                 valid: None,
             });
+            return;
         }
-        BridgeResult::Retract => {
-            let _ = tx.retract_single(entity_id, pred, entity_id);
+        match value_to_bridge(value) {
+            BridgeResult::Assert(term) => {
+                let _ = tx.assert_single(Fact {
+                    subject: entity_id,
+                    predicate: pred,
+                    object: term,
+                    asserter: entity_id,
+                    valid: None,
+                });
+            }
+            BridgeResult::Retract => {
+                let _ = tx.retract_single(entity_id, pred, entity_id);
+            }
+            BridgeResult::Skip => {}
         }
-        BridgeResult::Skip => {}
-    }
+    });
 }
 
 // ── term_to_primitive ─────────────────────────────────────────────────────────

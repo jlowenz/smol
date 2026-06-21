@@ -1,4 +1,5 @@
 use may::sync::{Condvar, Mutex};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -9,8 +10,10 @@ use crate::class_registry::ClassRegistry;
 use crate::env::Env;
 use crate::eval::EvalError;
 use crate::object::Object;
+use crate::shared_tx::{TxCtxId, TxFrame};
 use crate::value::{Block, Value};
 use triple_store::exec_context::ExecContext;
+use triple_store::id::TxId;
 use triple_store::store::{OwnedStoreTransaction, Store, StoreError};
 
 pub use triple_store::id::EntityId;
@@ -163,6 +166,16 @@ pub struct EntityData {
     /// Shared store handle for temporal fact recording. All entities share the
     /// same underlying store; this is a cheap clone of the shared handle.
     pub store: Store,
+    /// Lock + shadow stack for multi-entity transactions (C31). Empty when the
+    /// entity is in no transaction. Each frame is owned by the context that
+    /// pushed it (one per held level along the current ancestry path) and holds
+    /// that level's speculative named-ivar writes. A non-empty stack means the
+    /// mailbox is locked; the depth is the nesting/lock count.
+    ///
+    /// Invariant: while non-empty, the frames' `ctx_id`s run from an ancestor
+    /// (bottom) to a descendant (top) of a single transaction tree — siblings
+    /// never coexist here because they serialize on the entity.
+    pub tx_frames: Mutex<Vec<TxFrame>>,
 }
 
 impl EntityData {
@@ -174,6 +187,151 @@ impl EntityData {
     pub fn signal_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         self.mailbox_ready.notify_all();
+    }
+
+    // ── Transaction lock + shadow frames (C31) ────────────────────────────────
+    //
+    // These methods are the single place that manipulates `tx_frames`. The
+    // evaluator (`assign_var`/`lookup_var`) and the tx primitives call them
+    // rather than locking the stack directly, so the shadow-vs-live and
+    // merge/discard rules live in one spot. They concern the *shared*
+    // transaction's in-memory visibility only — durable store ops still flow
+    // through the entity's private `current_tx` (see `store_bridge::buffer_ivar`).
+
+    /// Number of transaction levels this entity is currently enrolled in along
+    /// the active ancestry path; also the lock count.
+    pub fn tx_depth(&self) -> usize {
+        self.tx_frames.lock().unwrap().len()
+    }
+
+    /// Whether the entity is enrolled in any transaction (mailbox locked).
+    pub fn in_tx(&self) -> bool {
+        !self.tx_frames.lock().unwrap().is_empty()
+    }
+
+    /// `ctx_id` of the context currently holding the entity (top frame), if any.
+    pub fn tx_holder(&self) -> Option<TxCtxId> {
+        self.tx_frames.lock().unwrap().last().map(|f| f.ctx_id)
+    }
+
+    /// Enroll at a new level: push a fresh frame owned by `ctx_id`, opening this
+    /// entity's durable buffer under the shared `tx_id`.
+    ///
+    /// Ensures: durable ops buffered while this frame is on top commit under
+    ///   `tx_id`, so the whole transaction tree commits atomically.
+    pub fn tx_push_frame(&self, ctx_id: TxCtxId, tx_id: TxId) {
+        let tx = self
+            .store
+            .begin_owned_with_id(ExecContext::Entity(self.id), tx_id);
+        self.tx_frames.lock().unwrap().push(TxFrame {
+            ctx_id,
+            shadow: HashMap::new(),
+            tx,
+        });
+    }
+
+    /// Run `f` with this entity's top frame's durable buffer.
+    ///
+    /// Requires: `in_tx()`. Used by `store_bridge` to route durable ops to the
+    ///   active level's buffer instead of the private `current_tx`.
+    pub fn with_frame_tx<R>(&self, f: impl FnOnce(&mut OwnedStoreTransaction) -> R) -> R {
+        let mut frames = self.tx_frames.lock().unwrap();
+        let top = frames
+            .last_mut()
+            .expect("with_frame_tx: entity has no active transaction frame");
+        f(&mut top.tx)
+    }
+
+    /// Speculatively write a named ivar into the top shadow frame.
+    ///
+    /// Requires: `in_tx()`.
+    pub fn tx_shadow_set(&self, name: Arc<str>, value: Value) {
+        let mut frames = self.tx_frames.lock().unwrap();
+        let top = frames
+            .last_mut()
+            .expect("tx_shadow_set: entity has no active transaction frame");
+        top.shadow.insert(name, value);
+    }
+
+    /// Read a named ivar from the shadow stack, scanning top-to-bottom.
+    ///
+    /// Ensures: `Some(v)` iff some frame holds a speculative value for `name`
+    ///   (read-your-writes with nesting); `None` if no frame does — the caller
+    ///   then falls through to the live slot.
+    pub fn tx_shadow_get(&self, name: &str) -> Option<Value> {
+        let frames = self.tx_frames.lock().unwrap();
+        frames
+            .iter()
+            .rev()
+            .find_map(|f| f.shadow.get(name).cloned())
+    }
+
+    /// Commit the top transaction level, merging its speculative writes upward.
+    ///
+    /// `parent_ctx_id`:
+    ///   - `None` → committing the root level for this entity: the frame's shadow
+    ///     is applied to the live slots, the frame is popped (entity unlocks),
+    ///     and its durable buffer is **returned** so the caller can absorb it
+    ///     into the coordinator's context buffer for the eventual store commit.
+    ///   - `Some(parent)` → committing a child level. If an ancestor frame is
+    ///     below, the top frame's shadow and durable buffer are merged into it
+    ///     (`None` returned). If the top is the only frame (the entity first
+    ///     joined during this child; ancestors never touched it), the frame is
+    ///     retagged to `parent` so the lock passes up — the entity stays locked,
+    ///     keeping its durable buffer, and `None` is returned.
+    ///
+    /// Requires: `in_tx()`.
+    /// Ensures: returns `Some(buffer)` exactly when the entity's last frame is a
+    ///   root commit (`parent_ctx_id == None`); `None` otherwise.
+    #[must_use]
+    pub fn tx_commit_frame(&self, parent_ctx_id: Option<TxCtxId>) -> Option<OwnedStoreTransaction> {
+        let mut frames = self.tx_frames.lock().unwrap();
+        let top = frames
+            .pop()
+            .expect("tx_commit_frame: entity has no active transaction frame");
+        match frames.last_mut() {
+            // An ancestor level remains: child writes supersede ancestor writes
+            // for shared keys (read-your-writes), and durable ops merge up.
+            Some(below) => {
+                below.shadow.extend(top.shadow);
+                below.tx.absorb(top.tx);
+                None
+            }
+            None => match parent_ctx_id {
+                // Lock passes up to a parent that never separately enrolled: keep
+                // the frame's shadow and durable buffer, retagged to the parent.
+                Some(parent) => {
+                    frames.push(TxFrame {
+                        ctx_id: parent,
+                        shadow: top.shadow,
+                        tx: top.tx,
+                    });
+                    None
+                }
+                // Root commit: speculative writes become live; hand the durable
+                // buffer to the caller to absorb into the context buffer.
+                None => {
+                    for (name, value) in top.shadow {
+                        self.data.set_slot(name, value);
+                    }
+                    Some(top.tx)
+                }
+            },
+        }
+    }
+
+    /// Abort the top transaction level: pop and discard its speculative writes
+    /// and its durable buffer (dropping the buffer rolls back its ops — they were
+    /// never absorbed into the context, so they never commit). Live slots are
+    /// untouched.
+    ///
+    /// Requires: `in_tx()`.
+    pub fn tx_abort_frame(&self) {
+        self.tx_frames
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("tx_abort_frame: entity has no active transaction frame");
     }
 }
 
@@ -257,6 +415,7 @@ pub(crate) fn new_entity_data(class: &Arc<Class>, store: Store) -> EntityData {
         status: Mutex::new(EntityStatus::Running),
         shutdown: AtomicBool::new(false),
         store,
+        tx_frames: Mutex::new(Vec::new()),
     }
 }
 
@@ -326,6 +485,7 @@ pub fn spawn_entity_bare(
             status: Mutex::new(EntityStatus::Running),
             shutdown: AtomicBool::new(false),
             store,
+            tx_frames: Mutex::new(Vec::new()),
         })),
     });
 
