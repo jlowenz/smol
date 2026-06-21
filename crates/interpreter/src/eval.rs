@@ -439,19 +439,10 @@ impl Evaluator {
                 }
             }
         }
-        let frame = Cont::CallFrame {
-            self_binding: None,
-            depth: 0,
+        let frame = Cont::ProgramFrame {
             pending: stmts.iter().cloned().collect(),
             env: env.clone(),
-            implicit_return: Value::Nil,
-            is_method: false,
-            pops_env: false,
             saved_block_home: self.current_block_home.get(),
-            frame_block_home: None,
-            block_home_self: None,
-            defining_class: None,
-            sync: false,
         };
         step_loop(self, frame)
     }
@@ -571,18 +562,11 @@ impl Evaluator {
             });
         }
         let saved_home = self.current_block_home.get();
-        let frame = Cont::CallFrame {
-            self_binding: None,
-            depth: 0,
+        let frame = Cont::BlockFrame {
             pending: block.body.iter().cloned().collect(),
             env: block_env,
-            implicit_return: Value::Nil,
-            is_method: false,
-            pops_env: true,
             saved_block_home: saved_home,
-            frame_block_home: Some(block.home_depth),
             block_home_self: block.home_self.clone(),
-            defining_class: None,
             sync: false,
         };
         self.current_block_home.set(Some(block.home_depth));
@@ -655,25 +639,18 @@ impl Evaluator {
         }
         let binding = SelfBinding::ClassSide {
             handle,
-            defining_class: defining_class.clone(),
+            defining_class,
         };
-        self.push_self(binding.clone());
+        self.push_self(binding);
         let depth = self.method_depth.get();
         let saved_block_home = self.current_block_home.get();
         self.current_block_home.set(None);
-        let frame = Cont::CallFrame {
-            self_binding: Some(binding),
+        let frame = Cont::MethodFrame {
             depth,
             pending: method.body.iter().cloned().collect(),
             env: method_env,
-            implicit_return: self_val,
-            is_method: true,
-            pops_env: true,
+            implicit_self: self_val,
             saved_block_home,
-            frame_block_home: None,
-            block_home_self: None,
-            defining_class: Some(defining_class),
-            sync: false,
         };
         step_loop(self, frame)
     }

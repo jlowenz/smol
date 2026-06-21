@@ -164,48 +164,59 @@ pub(crate) enum Cont {
     /// `CallFrame` whose `depth` matches `block.home_depth`.
     ReturnUnwind { target_depth: usize },
 
-    /// An active method or block invocation frame.
+    /// An active user-method (instance, primitive, or class-side) invocation.
     ///
-    /// Pushed by `invoke_method` / `eval_block`. Popped when `pending`
-    /// statements are exhausted or a matching `^`-return unwinds to it.
-    CallFrame {
-        /// For method frames: the `SelfBinding` pushed to `method_stack`.
-        /// `None` for block frames (blocks do not push a self binding).
-        self_binding: Option<SelfBinding>,
-        /// Stack depth of this frame (for matching `EvalError::Return`).
-        /// Zero for program-level and block frames.
+    /// Pushed by `push_method_call_frame` / `push_class_method_frame` /
+    /// `invoke_*method`. A `SelfBinding` was pushed onto `method_stack` when the
+    /// frame was created, so teardown always calls `pop_self`. Exits returning
+    /// `implicit_self` (Smalltalk methods answer `self` absent an explicit `^`).
+    MethodFrame {
+        /// Method-stack depth of this frame (matches `EvalError::Return`).
         depth: usize,
-        /// Remaining statements for this frame.
+        /// Remaining statements to run.
         pending: VecDeque<Stmt>,
-        /// Environment for this frame.
+        /// Method environment (always `push_frame`d on setup; popped on teardown).
         env: Env,
-        /// Value returned when the frame exits without an explicit `^`.
-        /// Methods: `Value::Instance(self)`. Blocks/program: last `acc`.
-        implicit_return: Value,
-        /// `true` for method frames (implicit return = self), `false` for
-        /// blocks and program-level frames (implicit return = last acc).
-        is_method: bool,
-        /// Whether to call `env.pop_frame()` when this frame is popped.
-        /// `true` for method and block frames (which called `push_frame` on setup);
-        /// `false` for program-level frames (eval_program does not push a frame).
-        pops_env: bool,
-        /// `current_block_home` on the evaluator before this frame was entered;
-        /// restored when the frame is popped.
+        /// The receiver, returned when the body ends without an explicit `^`.
+        implicit_self: Value,
+        /// `current_block_home` before this frame; restored on teardown.
         saved_block_home: Option<usize>,
-        /// `current_block_home` to set for the duration of this frame.
-        /// `None` for method frames (they reset home tracking to None).
-        frame_block_home: Option<usize>,
-        /// Defining class for super-send lookups within this frame (S6).
-        defining_class: Option<Arc<Class>>,
-        /// When `true`, `ForceAcc` is pushed after each statement so that
-        /// `Value::Future` results are resolved before the next statement runs.
+    },
+
+    /// An active block invocation (`value`, `ifTrue:` arm, `on:do:` body, …).
+    ///
+    /// Pushed by `push_block_frame`. Blocks do not push a self binding *unless*
+    /// they captured a `home_self` (then a synthetic `SelfBinding::Instance` was
+    /// pushed and `block_home_self` records the handle to pop). A block answers
+    /// its last expression's value, so there is no implicit-return override.
+    BlockFrame {
+        /// Remaining statements to run.
+        pending: VecDeque<Stmt>,
+        /// Block environment (always `push_frame`d on setup; popped on teardown).
+        env: Env,
+        /// `current_block_home` before this frame; restored on teardown.
+        saved_block_home: Option<usize>,
+        /// `Some(h)` if a synthetic self binding for the captured home instance
+        /// was pushed onto `method_stack` and must be popped on teardown.
+        block_home_self: Option<InstanceHandle>,
+        /// When `true`, a `ForceAcc` is pushed after each statement so that
+        /// `Value::Future` results resolve before the next statement runs.
         /// Used by `syncValue`, `on:do:` body, and `ensure:` body.
         sync: bool,
-        /// For block frames only: the `InstanceHandle` that was pushed onto
-        /// `method_stack` as a synthetic `SelfBinding::Instance` when this
-        /// frame was created. `Some(h)` means pop the binding on cleanup;
-        /// `None` means this is a method frame or a block with no home instance.
-        block_home_self: Option<InstanceHandle>,
+    },
+
+    /// The top-level program frame pushed by `eval_program`.
+    ///
+    /// Unlike method/block frames it does not own an env frame (`eval_program`
+    /// evaluates in the caller's env) and pushes no self binding, so teardown
+    /// only restores `current_block_home`. Answers its last expression's value.
+    ProgramFrame {
+        /// Remaining statements to run.
+        pending: VecDeque<Stmt>,
+        /// Program environment (not `push_frame`d; not popped on teardown).
+        env: Env,
+        /// `current_block_home` before this frame; restored on teardown.
+        saved_block_home: Option<usize>,
     },
 
     /// Force `acc` via `force_value` before the next continuation fires.
@@ -283,7 +294,51 @@ enum UnwindOutcome {
     Exhausted,
 }
 
-/// Unwind heap `CallFrame`s until one with `depth == target_depth` is found,
+/// Run the evaluator-side teardown for a popped frame continuation.
+///
+/// Requires: `frame` was just popped from the step-loop stack.
+/// Ensures: if `frame` is a `MethodFrame` / `BlockFrame` / `ProgramFrame`, its
+///   self binding (if any) is popped, `current_block_home` is restored, and its
+///   owned env frame (if any) is popped; returns `Some(depth)` where `depth` is
+///   the frame's `^`-return match depth (`0` for block/program frames). For any
+///   other continuation `frame` is dropped and `None` is returned.
+fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
+    match frame {
+        Cont::MethodFrame {
+            depth,
+            mut env,
+            saved_block_home,
+            ..
+        } => {
+            ev.pop_self();
+            ev.current_block_home.set(saved_block_home);
+            env.pop_frame();
+            Some(depth)
+        }
+        Cont::BlockFrame {
+            mut env,
+            saved_block_home,
+            block_home_self,
+            ..
+        } => {
+            if block_home_self.is_some() {
+                ev.pop_self();
+            }
+            ev.current_block_home.set(saved_block_home);
+            env.pop_frame();
+            Some(0)
+        }
+        Cont::ProgramFrame {
+            saved_block_home, ..
+        } => {
+            ev.current_block_home.set(saved_block_home);
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+/// Unwind heap call frames until one with `depth == target_depth` is found,
 /// intercepting any `EnsureGuard` encountered along the way.
 ///
 /// Requires: `return_val` is the value being returned; `target_depth` is the
@@ -301,30 +356,6 @@ fn unwind_stack_to_depth(
 ) -> Result<UnwindOutcome, EvalError> {
     while let Some(frame) = stack.pop() {
         match frame {
-            Cont::CallFrame {
-                self_binding,
-                depth,
-                saved_block_home,
-                mut env,
-                is_method,
-                pops_env,
-                block_home_self,
-                ..
-            } => {
-                if is_method {
-                    debug_assert!(self_binding.is_some());
-                    ev.pop_self();
-                } else if block_home_self.is_some() {
-                    ev.pop_self();
-                }
-                ev.current_block_home.set(saved_block_home);
-                if pops_env {
-                    env.pop_frame();
-                }
-                if depth == target_depth {
-                    return Ok(UnwindOutcome::Reached);
-                }
-            }
             Cont::EnsureGuard { ensure_blk } => {
                 // Intercept: run ensure block, then resume the unwind.
                 stack.push(Cont::ContinueUnwind {
@@ -335,36 +366,23 @@ fn unwind_stack_to_depth(
                 push_block_frame(ev, &ensure_blk, vec![], false, stack)?;
                 return Ok(UnwindOutcome::Interrupted);
             }
-            _ => {} // OnDoCatch and other non-frame entries are discarded during ^-return
+            // Frames are torn down; OnDoCatch and other entries are discarded.
+            other => {
+                if let Some(depth) = teardown_frame(ev, other)
+                    && depth == target_depth
+                {
+                    return Ok(UnwindOutcome::Reached);
+                }
+            }
         }
     }
     Ok(UnwindOutcome::Exhausted)
 }
 
-/// Pop and clean up all `CallFrame`s remaining on the stack (for terminal error propagation).
+/// Pop and clean up all remaining frames on the stack (for terminal error propagation).
 fn cleanup_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
     while let Some(frame) = stack.pop() {
-        if let Cont::CallFrame {
-            self_binding,
-            saved_block_home,
-            mut env,
-            is_method,
-            pops_env,
-            block_home_self,
-            ..
-        } = frame
-        {
-            if is_method {
-                debug_assert!(self_binding.is_some());
-                ev.pop_self();
-            } else if block_home_self.is_some() {
-                ev.pop_self();
-            }
-            ev.current_block_home.set(saved_block_home);
-            if pops_env {
-                env.pop_frame();
-            }
-        }
+        teardown_frame(ev, frame);
     }
 }
 
@@ -404,29 +422,9 @@ fn handle_step_error(
         }
         other => {
             // Scan the stack for the nearest EnsureGuard (cleanup) or OnDoCatch/
-            // HandleOnDoResult (condition handling), cleaning up CallFrames along the way.
+            // HandleOnDoResult (condition handling), cleaning up frames along the way.
             while let Some(cont) = stack.pop() {
                 match cont {
-                    Cont::CallFrame {
-                        self_binding,
-                        saved_block_home,
-                        mut env,
-                        is_method,
-                        pops_env,
-                        block_home_self,
-                        ..
-                    } => {
-                        if is_method {
-                            debug_assert!(self_binding.is_some());
-                            ev.pop_self();
-                        } else if block_home_self.is_some() {
-                            ev.pop_self();
-                        }
-                        ev.current_block_home.set(saved_block_home);
-                        if pops_env {
-                            env.pop_frame();
-                        }
-                    }
                     Cont::EnsureGuard { ensure_blk } => {
                         // Run ensure block, then re-raise the original error.
                         stack.push(Cont::Rethrow { error: other });
@@ -485,9 +483,10 @@ fn handle_step_error(
                             }
                         }
                     }
-                    _ => {
-                        // All other continuations (ForceAcc, RestoreAcc, CollectArgs, etc.)
-                        // are discarded during error propagation.
+                    // Frames are torn down; all other continuations (ForceAcc,
+                    // RestoreAcc, CollectArgs, …) are discarded during propagation.
+                    other_cont => {
+                        teardown_frame(ev, other_cont);
                     }
                 }
             }
@@ -683,64 +682,88 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 }
             }
 
-            // ── CallFrame dispatch ────────────────────────────────────────
-            Cont::CallFrame {
-                self_binding,
+            // ── MethodFrame dispatch ──────────────────────────────────────
+            Cont::MethodFrame {
                 depth,
                 mut pending,
                 mut env,
-                implicit_return,
-                is_method,
-                pops_env,
+                implicit_self,
                 saved_block_home,
-                frame_block_home,
-                defining_class,
-                sync,
-                block_home_self,
             } => {
                 if pending.is_empty() {
-                    // Frame exhausted — pop method stack and restore home.
-                    if is_method {
-                        debug_assert!(
-                            self_binding.is_some(),
-                            "method CallFrame must have a self_binding"
-                        );
-                        ev.pop_self();
-                    } else if block_home_self.is_some() {
-                        ev.pop_self();
-                    }
+                    // Frame exhausted — pop self binding, restore home, pop env.
+                    ev.pop_self();
                     ev.current_block_home.set(saved_block_home);
-                    if pops_env {
-                        env.pop_frame();
-                    }
-                    // Method frames return implicit self; block/program frames
-                    // return the last accumulated value.
-                    if is_method {
-                        acc = implicit_return;
-                    }
-                    // else acc stays as the last expression result
+                    env.pop_frame();
+                    // Methods answer `self` absent an explicit `^`.
+                    acc = implicit_self;
                 } else {
                     let stmt = pending.pop_front().unwrap();
                     // Push the frame back first (continuing frame is below new work).
-                    stack.push(Cont::CallFrame {
-                        self_binding,
+                    stack.push(Cont::MethodFrame {
                         depth,
                         pending,
                         env: env.clone(),
-                        implicit_return,
-                        is_method,
-                        pops_env,
+                        implicit_self,
                         saved_block_home,
-                        frame_block_home,
-                        defining_class,
-                        sync,
+                    });
+                    dispatch_stmt(ev, stmt, &env, depth, &mut stack, &mut acc)?;
+                }
+            }
+
+            // ── BlockFrame dispatch ───────────────────────────────────────
+            Cont::BlockFrame {
+                mut pending,
+                mut env,
+                saved_block_home,
+                block_home_self,
+                sync,
+            } => {
+                if pending.is_empty() {
+                    // Frame exhausted — pop synthetic self (if any), restore home, pop env.
+                    if block_home_self.is_some() {
+                        ev.pop_self();
+                    }
+                    ev.current_block_home.set(saved_block_home);
+                    env.pop_frame();
+                    // acc stays as the last expression result.
+                } else {
+                    let stmt = pending.pop_front().unwrap();
+                    stack.push(Cont::BlockFrame {
+                        pending,
+                        env: env.clone(),
+                        saved_block_home,
                         block_home_self,
+                        sync,
                     });
                     // For sync frames, force the statement result before the frame resumes.
                     if sync {
                         stack.push(Cont::ForceAcc);
                     }
-                    dispatch_stmt(ev, stmt, &env, depth, &mut stack, &mut acc)?;
+                    // Blocks match `^`-returns against `current_block_home` (always
+                    // set during a block), so the frame depth here is irrelevant.
+                    dispatch_stmt(ev, stmt, &env, 0, &mut stack, &mut acc)?;
+                }
+            }
+
+            // ── ProgramFrame dispatch ─────────────────────────────────────
+            Cont::ProgramFrame {
+                mut pending,
+                env,
+                saved_block_home,
+            } => {
+                if pending.is_empty() {
+                    // Top-level frame: restore home only (no self binding, no owned env).
+                    ev.current_block_home.set(saved_block_home);
+                    // acc stays as the last expression result.
+                } else {
+                    let stmt = pending.pop_front().unwrap();
+                    stack.push(Cont::ProgramFrame {
+                        pending,
+                        env: env.clone(),
+                        saved_block_home,
+                    });
+                    dispatch_stmt(ev, stmt, &env, 0, &mut stack, &mut acc)?;
                 }
             }
 
@@ -1115,93 +1138,68 @@ pub(crate) fn push_block_frame(
     }
     let saved_home = ev.current_block_home.get();
     ev.current_block_home.set(Some(block.home_depth));
-    stack.push(Cont::CallFrame {
-        self_binding: None,
-        depth: 0,
+    stack.push(Cont::BlockFrame {
         pending: block.body.iter().cloned().collect(),
         env: block_env,
-        implicit_return: Value::Nil,
-        is_method: false,
-        pops_env: true,
         saved_block_home: saved_home,
-        frame_block_home: Some(block.home_depth),
         block_home_self: block.home_self.clone(),
-        defining_class: None,
         sync,
     });
     Ok(())
+}
+
+/// `true` if the top of `stack` is an empty `BlockFrame` or `ProgramFrame`.
+fn top_is_empty_nonmethod(stack: &[Cont]) -> bool {
+    matches!(
+        stack.last(),
+        Some(Cont::BlockFrame { pending, .. } | Cont::ProgramFrame { pending, .. })
+            if pending.is_empty()
+    )
 }
 
 /// Drain tail-call frame patterns from the stack before pushing a new callee.
 ///
 /// Requires: none (safe to call on any stack state; no-op if no pattern matches).
 /// Ensures:
-///   (1) All empty block frames (`is_method=false`, `pending` empty) at the top are
-///       drained (env popped, `current_block_home` restored).
+///   (1) All empty block/program frames at the top are drained (teardown run).
 ///   (2) If the top is then `ReturnUnwind(D)` and, scanning past any further empty
-///       block frames, the next is an empty method frame at depth D, the entire
-///       sequence (ReturnUnwind + intervening block frames + method frame) is drained.
+///       block/program frames, the next is an empty `MethodFrame` at depth D, the
+///       entire sequence (ReturnUnwind + intervening frames + method frame) is drained.
 ///   (3) Steps (1)–(2) repeat until no further pattern applies.
-///   Safe: empty block frames return `acc` unchanged; `ReturnUnwind(D)` would have
-///   overridden the method's implicit self-return with the same value the new callee
-///   will produce.
+///   Safe: empty block/program frames return `acc` unchanged; `ReturnUnwind(D)` would
+///   have overridden the method's implicit self-return with the same value the new
+///   callee will produce.
 fn drain_tail_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
     loop {
-        // Phase 1: drain leading empty block frames.
-        loop {
-            let should_drain = matches!(
-                stack.last(),
-                Some(Cont::CallFrame { is_method: false, pending, .. }) if pending.is_empty()
-            );
-            if !should_drain {
-                break;
-            }
-            if let Some(Cont::CallFrame {
-                saved_block_home,
-                pops_env,
-                block_home_self,
-                mut env,
-                ..
-            }) = stack.pop()
-            {
-                if block_home_self.is_some() {
-                    ev.pop_self();
-                }
-                ev.current_block_home.set(saved_block_home);
-                if pops_env {
-                    env.pop_frame();
-                }
-            }
+        // Phase 1: drain leading empty block/program frames.
+        while top_is_empty_nonmethod(stack) {
+            let frame = stack.pop().unwrap();
+            teardown_frame(ev, frame);
         }
 
-        // Phase 2: check for ReturnUnwind(D) followed (past empty block frames)
-        // by an empty method frame at depth D.
+        // Phase 2: check for ReturnUnwind(D) followed (past empty block/program
+        // frames) by an empty MethodFrame at depth D.
         let target = match stack.last() {
             Some(Cont::ReturnUnwind { target_depth }) => *target_depth,
             _ => break,
         };
 
-        // Scan downward past empty block frames to find the matching method frame.
+        // Scan downward past empty block/program frames to find the matching method frame.
         let mut scan_idx = stack.len().checked_sub(2);
         let mut intermediate = 0usize;
         let found_method = loop {
             match scan_idx {
                 None => break false,
                 Some(idx) => match stack.get(idx) {
-                    Some(Cont::CallFrame {
-                        is_method: false,
-                        pending,
-                        ..
-                    }) if pending.is_empty() => {
+                    Some(Cont::BlockFrame { pending, .. } | Cont::ProgramFrame { pending, .. })
+                        if pending.is_empty() =>
+                    {
                         intermediate += 1;
                         scan_idx = idx.checked_sub(1);
                     }
-                    Some(Cont::CallFrame {
-                        is_method: true,
-                        depth,
-                        pending,
-                        ..
-                    }) if *depth == target && pending.is_empty() => {
+                    Some(Cont::MethodFrame { depth, pending, .. })
+                        if *depth == target && pending.is_empty() =>
+                    {
                         break true;
                     }
                     _ => break false,
@@ -1213,39 +1211,16 @@ fn drain_tail_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
             break;
         }
 
-        // Drain: ReturnUnwind, then intermediate empty block frames, then the method frame.
+        // Drain: ReturnUnwind, then intermediate empty frames, then the method frame.
         stack.pop(); // ReturnUnwind
         for _ in 0..intermediate {
-            if let Some(Cont::CallFrame {
-                saved_block_home,
-                pops_env,
-                block_home_self,
-                mut env,
-                ..
-            }) = stack.pop()
-            {
-                if block_home_self.is_some() {
-                    ev.pop_self();
-                }
-                ev.current_block_home.set(saved_block_home);
-                if pops_env {
-                    env.pop_frame();
-                }
+            if let Some(frame) = stack.pop() {
+                teardown_frame(ev, frame);
             }
         }
-        if let Some(Cont::CallFrame {
-            saved_block_home,
-            pops_env,
-            mut env,
-            is_method: true,
-            ..
-        }) = stack.pop()
-        {
-            ev.pop_self();
-            ev.current_block_home.set(saved_block_home);
-            if pops_env {
-                env.pop_frame();
-            }
+        if let Some(frame) = stack.pop() {
+            debug_assert!(matches!(frame, Cont::MethodFrame { .. }));
+            teardown_frame(ev, frame);
         }
         // Repeat: there may be another drainable layer above.
     }
@@ -1305,23 +1280,16 @@ fn push_class_method_frame(
         handle,
         defining_class: def_class.clone(),
     };
-    ev.push_self(binding.clone());
+    ev.push_self(binding);
     let depth = ev.method_depth.get();
     let saved_block_home = ev.current_block_home.get();
     ev.current_block_home.set(None);
-    stack.push(Cont::CallFrame {
-        self_binding: Some(binding),
+    stack.push(Cont::MethodFrame {
         depth,
         pending: method.body.iter().cloned().collect(),
         env: method_env,
-        implicit_return: self_val,
-        is_method: true,
-        pops_env: true,
+        implicit_self: self_val,
         saved_block_home,
-        frame_block_home: None,
-        block_home_self: None,
-        defining_class: Some(def_class),
-        sync: false,
     });
     Ok(())
 }
@@ -1684,26 +1652,19 @@ pub(crate) fn push_method_call_frame(
                 }
             }
             let binding = SelfBinding::Instance {
-                handle: handle.clone(),
-                defining_class: def_class.clone(),
+                handle,
+                defining_class: def_class,
             };
-            ev.push_self(binding.clone());
+            ev.push_self(binding);
             let depth = ev.method_depth.get();
             let saved_block_home = ev.current_block_home.get();
             ev.current_block_home.set(None);
-            stack.push(Cont::CallFrame {
-                self_binding: Some(binding),
+            stack.push(Cont::MethodFrame {
                 depth,
                 pending: method.body.iter().cloned().collect(),
                 env: method_env,
-                implicit_return: self_value,
-                is_method: true,
-                pops_env: true,
+                implicit_self: self_value,
                 saved_block_home,
-                frame_block_home: None,
-                block_home_self: None,
-                defining_class: Some(def_class),
-                sync: false,
             });
         }
         UserMethodFound::Primitive {
@@ -1735,26 +1696,19 @@ pub(crate) fn push_method_call_frame(
                 }
             }
             let binding = SelfBinding::Primitive {
-                defining_class: def_class.clone(),
+                defining_class: def_class,
                 self_value: self_value.clone(),
             };
-            ev.push_self(binding.clone());
+            ev.push_self(binding);
             let depth = ev.method_depth.get();
             let saved_block_home = ev.current_block_home.get();
             ev.current_block_home.set(None);
-            stack.push(Cont::CallFrame {
-                self_binding: Some(binding),
+            stack.push(Cont::MethodFrame {
                 depth,
                 pending: method.body.iter().cloned().collect(),
                 env: method_env,
-                implicit_return: self_value,
-                is_method: true,
-                pops_env: true,
+                implicit_self: self_value,
                 saved_block_home,
-                frame_block_home: None,
-                block_home_self: None,
-                defining_class: Some(def_class),
-                sync: false,
             });
         }
     }

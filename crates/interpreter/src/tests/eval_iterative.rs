@@ -698,23 +698,18 @@ fn cleanup_frames_empty_stack() {
 
 #[test]
 fn cleanup_frames_plain_block_frame_no_pop_self() {
-    // is_method=false, block_home_self=None → pop_self must NOT be called;
-    // saved_block_home is restored.
+    // BlockFrame with block_home_self=None → pop_self must NOT be called;
+    // saved_block_home is restored. (Block frames always own an env frame.)
     let ev = crate::eval::Evaluator::new_without_kernel();
     ev.current_block_home.set(Some(99));
-    let mut stack = vec![Cont::CallFrame {
-        self_binding: None,
-        depth: 0,
+    let mut env = crate::env::Env::new();
+    env.push_frame();
+    let mut stack = vec![Cont::BlockFrame {
         pending: std::collections::VecDeque::new(),
-        env: crate::env::Env::new(),
-        implicit_return: Value::Nil,
-        is_method: false,
-        pops_env: false,
+        env,
         saved_block_home: Some(3),
-        frame_block_home: None,
-        defining_class: None,
-        sync: false,
         block_home_self: None,
+        sync: false,
     }];
     super::cleanup_frames(&ev, &mut stack);
     assert!(stack.is_empty());
@@ -732,7 +727,7 @@ fn cleanup_frames_plain_block_frame_no_pop_self() {
 
 #[test]
 fn cleanup_frames_method_frame_pops_self() {
-    // is_method=true → pop_self called once; current_block_home restored to None.
+    // MethodFrame → pop_self called once; current_block_home restored to None.
     let ev = crate::eval::Evaluator::new_without_kernel();
     let nil_class = ev
         .registry
@@ -743,26 +738,18 @@ fn cleanup_frames_method_frame_pops_self() {
         .class
         .clone();
     ev.push_self(crate::eval::SelfBinding::Primitive {
-        defining_class: nil_class.clone(),
+        defining_class: nil_class,
         self_value: Value::Nil,
     });
     ev.current_block_home.set(Some(7));
-    let mut stack = vec![Cont::CallFrame {
-        self_binding: Some(crate::eval::SelfBinding::Primitive {
-            defining_class: nil_class,
-            self_value: Value::Nil,
-        }),
+    let mut env = crate::env::Env::new();
+    env.push_frame();
+    let mut stack = vec![Cont::MethodFrame {
         depth: 1,
         pending: std::collections::VecDeque::new(),
-        env: crate::env::Env::new(),
-        implicit_return: Value::Nil,
-        is_method: true,
-        pops_env: false,
+        env,
+        implicit_self: Value::Nil,
         saved_block_home: None,
-        frame_block_home: None,
-        defining_class: None,
-        sync: false,
-        block_home_self: None,
     }];
     super::cleanup_frames(&ev, &mut stack);
     assert!(stack.is_empty());
@@ -801,19 +788,14 @@ fn cleanup_frames_block_with_home_self_pops_self() {
         kind: InstanceKind::ValueObject(std::sync::Arc::new(Object::new(nil_class))),
     }));
     ev.current_block_home.set(Some(5));
-    let mut stack = vec![Cont::CallFrame {
-        self_binding: None,
-        depth: 0,
+    let mut env = crate::env::Env::new();
+    env.push_frame();
+    let mut stack = vec![Cont::BlockFrame {
         pending: std::collections::VecDeque::new(),
-        env: crate::env::Env::new(),
-        implicit_return: Value::Nil,
-        is_method: false,
-        pops_env: false,
+        env,
         saved_block_home: Some(2),
-        frame_block_home: None,
-        defining_class: None,
-        sync: false,
         block_home_self: Some(home_handle),
+        sync: false,
     }];
     super::cleanup_frames(&ev, &mut stack);
     assert!(stack.is_empty());
@@ -827,23 +809,17 @@ fn cleanup_frames_block_with_home_self_pops_self() {
 
 #[test]
 fn cleanup_frames_pops_env_frame_when_flagged() {
-    // pops_env=true → env.pop_frame() is called without panic (requires ≥2 frames).
+    // A BlockFrame owns an env frame → env.pop_frame() is called without panic
+    // (requires ≥2 frames).
     let ev = crate::eval::Evaluator::new_without_kernel();
     let mut env = crate::env::Env::new();
     env.push_frame();
-    let mut stack = vec![Cont::CallFrame {
-        self_binding: None,
-        depth: 0,
+    let mut stack = vec![Cont::BlockFrame {
         pending: std::collections::VecDeque::new(),
         env,
-        implicit_return: Value::Nil,
-        is_method: false,
-        pops_env: true,
         saved_block_home: None,
-        frame_block_home: None,
-        defining_class: None,
-        sync: false,
         block_home_self: None,
+        sync: false,
     }];
     super::cleanup_frames(&ev, &mut stack);
     assert!(stack.is_empty());
@@ -885,22 +861,16 @@ fn cleanup_frames_multiple_mixed_frames() {
         defining_class: nil_class.clone(),
         self_value: Value::Nil,
     });
-    let make_frame = |saved: Option<usize>| Cont::CallFrame {
-        self_binding: Some(crate::eval::SelfBinding::Primitive {
-            defining_class: nil_class.clone(),
-            self_value: Value::Nil,
-        }),
-        depth: 1,
-        pending: std::collections::VecDeque::new(),
-        env: crate::env::Env::new(),
-        implicit_return: Value::Nil,
-        is_method: true,
-        pops_env: false,
-        saved_block_home: saved,
-        frame_block_home: None,
-        defining_class: None,
-        sync: false,
-        block_home_self: None,
+    let make_frame = |saved: Option<usize>| {
+        let mut env = crate::env::Env::new();
+        env.push_frame();
+        Cont::MethodFrame {
+            depth: 1,
+            pending: std::collections::VecDeque::new(),
+            env,
+            implicit_self: Value::Nil,
+            saved_block_home: saved,
+        }
     };
     // Stack bottom→top: frame(saved=None), ForceAcc, frame(saved=Some(1))
     // Pop order: frame(saved=Some(1)), ForceAcc (skipped), frame(saved=None)
@@ -998,7 +968,7 @@ fn push_class_method_frame_arity_mismatch() {
 
 #[test]
 fn push_class_method_frame_unary_fields() {
-    // Unary method, no params, no locals: verify all CallFrame fields.
+    // Unary method, no params, no locals: verify the MethodFrame fields.
     let ev = crate::eval::Evaluator::new_without_kernel();
     let class = make_class("MyClass");
     let handle = make_class_handle(class.clone());
@@ -1030,44 +1000,24 @@ fn push_class_method_frame_unary_fields() {
     assert_eq!(ev.current_block_home.get(), None);
 
     let frame = stack.pop().unwrap();
-    let Cont::CallFrame {
-        self_binding,
+    let Cont::MethodFrame {
         depth,
-        implicit_return,
-        is_method,
-        pops_env,
+        implicit_self,
         saved_block_home,
-        frame_block_home,
-        defining_class,
-        sync,
-        block_home_self,
         ..
     } = frame
     else {
-        panic!("expected CallFrame");
+        panic!("expected MethodFrame");
     };
 
-    assert!(matches!(
-        self_binding,
-        Some(crate::eval::SelfBinding::ClassSide { .. })
-    ));
+    // The ClassSide binding and defining class are verified via method_stack above.
     assert_eq!(depth, 1, "depth must equal method_depth after push_self");
     assert_eq!(
-        implicit_return,
+        implicit_self,
         Value::Instance(handle),
         "implicit return must be self"
     );
-    assert!(is_method);
-    assert!(pops_env);
     assert_eq!(saved_block_home, None);
-    assert_eq!(frame_block_home, None);
-    assert!(
-        defining_class
-            .as_ref()
-            .is_some_and(|c| c.name.as_ref() == "MyClass")
-    );
-    assert!(!sync);
-    assert!(block_home_self.is_none());
 }
 
 #[test]
@@ -1101,8 +1051,8 @@ fn push_class_method_frame_params_bound_in_env() {
     )
     .unwrap();
 
-    let Cont::CallFrame { env: frame_env, .. } = stack.pop().unwrap() else {
-        panic!("expected CallFrame");
+    let Cont::MethodFrame { env: frame_env, .. } = stack.pop().unwrap() else {
+        panic!("expected MethodFrame");
     };
     assert_eq!(frame_env.get("x"), Some(Value::Int(3)));
     assert_eq!(frame_env.get("y"), Some(Value::Int(4)));
@@ -1121,8 +1071,8 @@ fn push_class_method_frame_self_bound_in_env() {
     super::push_class_method_frame(&ev, handle.clone(), class, method, vec![], &env, &mut stack)
         .unwrap();
 
-    let Cont::CallFrame { env: frame_env, .. } = stack.pop().unwrap() else {
-        panic!("expected CallFrame");
+    let Cont::MethodFrame { env: frame_env, .. } = stack.pop().unwrap() else {
+        panic!("expected MethodFrame");
     };
     assert_eq!(frame_env.get("self"), Some(Value::Instance(handle)));
 }
@@ -1145,8 +1095,8 @@ fn push_class_method_frame_locals_initialized_nil() {
 
     super::push_class_method_frame(&ev, handle, class, method, vec![], &env, &mut stack).unwrap();
 
-    let Cont::CallFrame { env: frame_env, .. } = stack.pop().unwrap() else {
-        panic!("expected CallFrame");
+    let Cont::MethodFrame { env: frame_env, .. } = stack.pop().unwrap() else {
+        panic!("expected MethodFrame");
     };
     assert_eq!(
         frame_env.get("a"),
@@ -1179,11 +1129,11 @@ fn push_class_method_frame_saves_block_home() {
         None,
         "must be reset to None after push"
     );
-    let Cont::CallFrame {
+    let Cont::MethodFrame {
         saved_block_home, ..
     } = stack.pop().unwrap()
     else {
-        panic!("expected CallFrame");
+        panic!("expected MethodFrame");
     };
     assert_eq!(
         saved_block_home,
@@ -1210,8 +1160,8 @@ fn push_class_method_frame_depth_with_existing_method_stack() {
 
     super::push_class_method_frame(&ev, handle, class, method, vec![], &env, &mut stack).unwrap();
 
-    let Cont::CallFrame { depth, .. } = stack.pop().unwrap() else {
-        panic!("expected CallFrame");
+    let Cont::MethodFrame { depth, .. } = stack.pop().unwrap() else {
+        panic!("expected MethodFrame");
     };
     assert_eq!(
         depth, 2,
