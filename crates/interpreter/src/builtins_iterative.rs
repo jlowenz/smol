@@ -514,6 +514,34 @@ pub(crate) fn make_error_value(
     })))
 }
 
+/// Allocate a fresh, **unfrozen** Value-subclass instance for `_primNewValue:`.
+///
+/// Requires: `class.inherits_is_value()`. `indexed_size` is `Some(n)` for indexed
+///   classes (n slots), `None` for plain ones.
+/// Ensures: returns a `ValueObject` instance the caller mutates via an init block
+///   and then freezes with [`freeze_value_instance`].
+pub(crate) fn make_value_instance(
+    class: Arc<Class>,
+    indexed_size: Option<usize>,
+) -> InstanceHandle {
+    let obj = match indexed_size {
+        Some(n) => Arc::new(Object::new_with_indexed(class.clone(), n)),
+        None => Arc::new(Object::new(class.clone())),
+    };
+    InstanceHandle(Arc::new(InstanceState {
+        class,
+        kind: InstanceKind::ValueObject(obj),
+    }))
+}
+
+/// Freeze a Value-subclass instance built by [`make_value_instance`] once its
+/// init block has run. No-op if `inst` is not a `ValueObject`.
+pub(crate) fn freeze_value_instance(inst: &InstanceHandle) {
+    if let InstanceKind::ValueObject(obj) = &inst.0.kind {
+        obj.freeze();
+    }
+}
+
 /// Fallback dispatch for primitive value types (Int, Float, Bool, Nil, Str,
 /// Symbol, Block, LargeInt). Called from the `_` arm of each type-specific
 /// dispatch function after type-specific cases are exhausted.
@@ -2459,17 +2487,14 @@ pub(crate) fn dispatch_class_builtin(
                 ));
             }
             let blk = as_block(args.remove(0), &selector)?;
-            let obj = if class.indexed_slot_kind.is_some() {
-                Arc::new(Object::new_with_indexed(class.clone(), 0))
+            let indexed = if class.indexed_slot_kind.is_some() {
+                Some(0)
             } else {
-                Arc::new(Object::new(class.clone()))
+                None
             };
-            let inst = InstanceHandle(Arc::new(InstanceState {
-                class,
-                kind: InstanceKind::ValueObject(obj.clone()),
-            }));
+            let inst = make_value_instance(class, indexed);
             ev.eval_block(&blk, vec![Value::Instance(inst.clone())], env)?;
-            obj.freeze();
+            freeze_value_instance(&inst);
             Ok(Value::Instance(inst))
         }
         "_primNewValueIndexed:init:" => {
@@ -2492,13 +2517,9 @@ pub(crate) fn dispatch_class_builtin(
             }
             let n = as_int(args.remove(0), &selector)?;
             let blk = as_block(args.remove(0), &selector)?;
-            let obj = Arc::new(Object::new_with_indexed(class.clone(), n.max(0) as usize));
-            let inst = InstanceHandle(Arc::new(InstanceState {
-                class,
-                kind: InstanceKind::ValueObject(obj.clone()),
-            }));
+            let inst = make_value_instance(class, Some(n.max(0) as usize));
             ev.eval_block(&blk, vec![Value::Instance(inst.clone())], env)?;
-            obj.freeze();
+            freeze_value_instance(&inst);
             Ok(Value::Instance(inst))
         }
         "_primScheduleTimer:block:" => {

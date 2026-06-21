@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::ast::{Expr, Message, MethodDef, Stmt};
 use crate::builtins::{UserMethodFound, as_block, force_value, lookup_user_method};
 use crate::class::{Class, Method};
-use crate::entity::InstanceHandle;
+use crate::entity::{InstanceHandle, InstanceKind};
 use crate::env::Env;
 use crate::eval::{
     EvalError, Evaluator, SelfBinding, check_prim_sends_in_body, eval_literal, self_sym,
@@ -391,6 +391,13 @@ pub(crate) enum Cont {
     SignalGuard {
         removed: Vec<crate::eval::HandlerPair>,
     },
+
+    /// Sits below a `_primNewValue:` / `_primNewValueIndexed:init:` init block.
+    /// The freshly-allocated (unfrozen) `inst` runs its init block on the heap
+    /// `Cont` stack; on normal completion this guard freezes `inst` and makes it
+    /// the result. A `^`-return / error from the init block abandons the instance
+    /// (no freeze), matching the recursive builtin.
+    NewValueGuard { inst: InstanceHandle },
 }
 
 /// Outcome of a `^`-return unwind scan.
@@ -976,6 +983,13 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 // Re-enable the disabled handlers; acc (handler result) becomes
                 // the signal expression's value and the continuation resumes.
                 ev.handler_chain.borrow_mut().extend(removed);
+            }
+
+            // ── NewValueGuard (init block completed) ──────────────────────
+            Cont::NewValueGuard { inst } => {
+                // Init block finished; freeze the instance and answer it.
+                crate::builtins_iterative::freeze_value_instance(&inst);
+                acc = Value::Instance(inst);
             }
 
             // ── ToDoStep (numeric loop iteration) ─────────────────────────
@@ -1958,6 +1972,67 @@ fn dispatch_to_stack(
             };
             let condition = crate::builtins_iterative::make_error_value(&ev.registry, &msg);
             return dispatch_signal(ev, condition, stack, acc);
+        }
+    }
+
+    // (1e) `_primNewValue:` / `_primNewValueIndexed:init:` flattened: run the init
+    // block on the heap `Cont` stack (NewValueGuard) instead of recursing
+    // `step_loop` via `eval_block`, so object construction is O(1) Rust stack.
+    if let Value::Instance(ref handle) = receiver
+        && matches!(handle.0.kind, InstanceKind::ClassEntity(_))
+    {
+        match selector.as_ref() {
+            "_primNewValue:" => {
+                if args.len() != 1 {
+                    return Err(EvalError::ArityMismatch {
+                        expected: 1,
+                        got: args.len(),
+                    });
+                }
+                let class = handle.0.class.clone();
+                if !class.inherits_is_value() {
+                    return Err(EvalError::TypeError(
+                        "_primNewValue: requires a Value subclass".into(),
+                    ));
+                }
+                let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+                let indexed = if class.indexed_slot_kind.is_some() {
+                    Some(0)
+                } else {
+                    None
+                };
+                let inst = crate::builtins_iterative::make_value_instance(class, indexed);
+                stack.push(Cont::NewValueGuard { inst: inst.clone() });
+                push_block_frame(ev, &blk, vec![Value::Instance(inst)], false, stack)?;
+                return Ok(());
+            }
+            "_primNewValueIndexed:init:" => {
+                if args.len() != 2 {
+                    return Err(EvalError::ArityMismatch {
+                        expected: 2,
+                        got: args.len(),
+                    });
+                }
+                let class = handle.0.class.clone();
+                if !class.inherits_is_value() {
+                    return Err(EvalError::TypeError(
+                        "_primNewValueIndexed:init: requires a Value subclass".into(),
+                    ));
+                }
+                if class.indexed_slot_kind.is_none() {
+                    return Err(EvalError::TypeError(
+                        "_primNewValueIndexed:init: requires class to declare indexedSlots:".into(),
+                    ));
+                }
+                let n = crate::builtins_iterative::as_int(args.remove(0), &selector)?;
+                let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+                let inst =
+                    crate::builtins_iterative::make_value_instance(class, Some(n.max(0) as usize));
+                stack.push(Cont::NewValueGuard { inst: inst.clone() });
+                push_block_frame(ev, &blk, vec![Value::Instance(inst)], false, stack)?;
+                return Ok(());
+            }
+            _ => {}
         }
     }
 
