@@ -2021,7 +2021,8 @@ pub(crate) fn signal_condition(
     #[cfg(feature = "step_probe")]
     {
         let sp_probe = 0u8;
-        crate::eval_iterative::probe::sample_signal_condition(&sp_probe as *const u8 as usize);
+        ev.probe
+            .sample_signal_condition(&sp_probe as *const u8 as usize);
     }
     let cond_class = match &condition {
         Value::Instance(h) => h.0.class.clone(),

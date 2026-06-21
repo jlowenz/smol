@@ -153,7 +153,6 @@ pub(crate) struct ProbeResult {
 
 #[cfg(feature = "step_probe")]
 pub(crate) fn eval_probe(src: &str) -> ProbeResult {
-    use crate::eval_iterative::probe;
     const BIG_STACK: usize = 0x80000; // 4 MB — far above any scenario under test
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -163,18 +162,17 @@ pub(crate) fn eval_probe(src: &str) -> ProbeResult {
         let ev = Evaluator::new();
         let mut env = Env::new();
         ev.registry.populate_env(&mut env);
-        probe::reset();
+        ev.probe.reset();
         let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
         let v = resolve(v).expect("eval future resolution");
-        // Capture the probe marks on this thread *before* shutdown, which can
-        // yield/migrate the coroutine (the marks are thread-local).
+        // Read the probe marks from this evaluator before shutdown.
         let result = ProbeResult {
             value: v,
-            max_depth: probe::max_depth(),
-            cont_size: probe::cont_size(),
-            stack_span: probe::stack_span(),
-            level_delta: probe::level_delta(),
-            sigcond_delta: probe::sigcond_delta(),
+            max_depth: ev.probe.max_depth(),
+            cont_size: ev.probe.cont_size(),
+            stack_span: ev.probe.stack_span(),
+            level_delta: ev.probe.level_delta(),
+            sigcond_delta: ev.probe.sigcond_delta(),
         };
         ev.shutdown();
         tx.send(result).unwrap();

@@ -24,148 +24,149 @@ const YIELD_INTERVAL: u32 = 1024;
 /// unless the `step_probe` feature is enabled.
 /// Debug-only `step_loop` stack instrumentation (C31.5).
 ///
-/// All probe state is **thread-local**, not global. The measured run is a single
-/// synchronous coroutine that does not yield (so it stays on one OS thread
-/// between `reset` and the report reads), which makes thread-locals both
-/// accurate and naturally isolated from other tests running concurrently on
-/// other threads. (`may` work-steals across threads, so global atomics would be
-/// cross-contaminated by sibling tests and by the kernel-load phase;
-/// thread-locals avoid both.)
+/// State lives on the owning [`Evaluator`](crate::eval::Evaluator) (one per
+/// coroutine), **not** in thread-locals or globals. Because `may` work-steals
+/// coroutines across OS threads, thread-local state would be wrong whenever a
+/// measured run migrated; Evaluator-held state follows the computation, so it is
+/// migration-correct and naturally isolated per coroutine.
 #[cfg(feature = "step_probe")]
 pub mod probe {
     use std::cell::{Cell, RefCell};
 
-    thread_local! {
-        static DEPTH: Cell<usize> = const { Cell::new(0) };
-        static MAX_DEPTH: Cell<usize> = const { Cell::new(0) };
-        /// Shallowest (largest-address) stack pointer sampled at a `step_loop` entry.
-        static MAX_SP: Cell<usize> = const { Cell::new(0) };
-        /// Deepest (smallest-address) stack pointer sampled at a `step_loop` entry.
-        static MIN_SP: Cell<usize> = const { Cell::new(usize::MAX) };
-        /// Largest Rust-stack delta between a `step_loop` entry and its *parent*
-        /// `step_loop` entry — the stack consumed by one full
-        /// `step_loop → builtins → eval_block → step_loop` recursion, i.e. the
-        /// per-nesting-level growth a flattened evaluator drives toward zero.
-        static MAX_LEVEL_DELTA: Cell<usize> = const { Cell::new(0) };
+    /// Per-evaluator `step_loop` stack measurements.
+    pub struct ProbeState {
+        /// Current `step_loop` recursion depth.
+        depth: Cell<usize>,
+        /// Maximum recursion depth observed since the last `reset`.
+        max_depth: Cell<usize>,
+        /// Shallowest (largest-address) stack pointer at a `step_loop` entry.
+        max_sp: Cell<usize>,
+        /// Deepest (smallest-address) stack pointer at a `step_loop` entry.
+        min_sp: Cell<usize>,
+        /// Largest Rust-stack delta between a `step_loop` entry and its parent —
+        /// the stack consumed by one `step_loop → builtins → eval_block →
+        /// step_loop` recursion, i.e. the per-nesting-level growth a flattened
+        /// evaluator drives toward zero.
+        max_level_delta: Cell<usize>,
         /// Max stack from the enclosing `step_loop` entry down to a
         /// `signal_condition` entry — the dispatch chain above the handler eval.
-        static MAX_SIGCOND_DELTA: Cell<usize> = const { Cell::new(0) };
-        /// Stack-pointer of each currently-active `step_loop` entry, parent-first.
-        static ENTRY_SPS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        max_sigcond_delta: Cell<usize>,
+        /// Stack pointer of each currently-active `step_loop` entry, parent-first.
+        entry_sps: RefCell<Vec<usize>>,
     }
 
-    #[inline]
-    fn cell_max(cell: &'static std::thread::LocalKey<Cell<usize>>, v: usize) {
-        cell.with(|c| c.set(c.get().max(v)));
-    }
-
-    /// Sample the stack pointer at a `signal_condition` entry to attribute the
-    /// per-level delta to the dispatch chain. `sp` is the address of a local in
-    /// `signal_condition`'s frame.
-    pub fn sample_signal_condition(sp: usize) {
-        ENTRY_SPS.with(|s| {
-            if let Some(&parent) = s.borrow().last() {
-                cell_max(&MAX_SIGCOND_DELTA, parent.saturating_sub(sp));
+    impl Default for ProbeState {
+        fn default() -> Self {
+            ProbeState {
+                depth: Cell::new(0),
+                max_depth: Cell::new(0),
+                max_sp: Cell::new(0),
+                min_sp: Cell::new(usize::MAX),
+                max_level_delta: Cell::new(0),
+                max_sigcond_delta: Cell::new(0),
+                entry_sps: RefCell::new(Vec::new()),
             }
-        });
+        }
     }
 
-    /// RAII guard: increments the per-thread `step_loop` depth on entry, updates
-    /// the depth/SP high-water marks and the max parent→child entry delta, and
-    /// restores the depth and entry-SP stack on drop.
-    pub(super) struct DepthGuard;
+    impl ProbeState {
+        /// Sample the stack pointer at a `signal_condition` entry to attribute the
+        /// per-level delta to the dispatch chain. `sp` is the address of a local
+        /// in `signal_condition`'s frame.
+        pub fn sample_signal_condition(&self, sp: usize) {
+            if let Some(&parent) = self.entry_sps.borrow().last() {
+                let d = parent.saturating_sub(sp);
+                self.max_sigcond_delta
+                    .set(self.max_sigcond_delta.get().max(d));
+            }
+        }
 
-    impl DepthGuard {
-        /// `sp` is the address of a local in the calling `step_loop` frame
-        /// (a proxy for the current stack pointer). Stacks grow downward on all
-        /// supported targets, so deeper recursion yields smaller `sp`.
-        pub(super) fn enter(sp: usize) -> Self {
-            let d = DEPTH.with(|c| {
-                let n = c.get() + 1;
-                c.set(n);
-                n
-            });
-            cell_max(&MAX_DEPTH, d);
-            cell_max(&MAX_SP, sp);
-            MIN_SP.with(|c| c.set(c.get().min(sp)));
-            ENTRY_SPS.with(|s| {
-                let mut s = s.borrow_mut();
-                if let Some(&parent) = s.last() {
+        /// Reset all recorded marks (call before a measured run).
+        #[cfg(test)]
+        pub fn reset(&self) {
+            self.depth.set(0);
+            self.max_depth.set(0);
+            self.max_sp.set(0);
+            self.min_sp.set(usize::MAX);
+            self.max_level_delta.set(0);
+            self.max_sigcond_delta.set(0);
+            self.entry_sps.borrow_mut().clear();
+        }
+
+        /// Maximum `step_loop` recursion depth observed since the last `reset`.
+        #[cfg(test)]
+        pub fn max_depth(&self) -> usize {
+            self.max_depth.get()
+        }
+
+        /// Largest Rust-stack delta (bytes) between a `step_loop` entry and its
+        /// parent entry — the true per-nesting-level cost (not averaged).
+        #[cfg(test)]
+        pub fn level_delta(&self) -> usize {
+            self.max_level_delta.get()
+        }
+
+        /// Max stack from a `step_loop` entry down to a `signal_condition` entry.
+        #[cfg(test)]
+        pub fn sigcond_delta(&self) -> usize {
+            self.max_sigcond_delta.get()
+        }
+
+        /// Total Rust stack span (bytes) between the shallowest and deepest
+        /// `step_loop` entry. Returns 0 if fewer than two entries were sampled.
+        #[cfg(test)]
+        pub fn stack_span(&self) -> usize {
+            let lo = self.min_sp.get();
+            let hi = self.max_sp.get();
+            if lo == usize::MAX || hi <= lo {
+                0
+            } else {
+                hi - lo
+            }
+        }
+
+        /// `size_of::<Cont>()` in bytes — the per-element cost of the `Vec<Cont>`.
+        #[cfg(test)]
+        pub fn cont_size(&self) -> usize {
+            std::mem::size_of::<super::Cont>()
+        }
+    }
+
+    /// RAII guard borrowing the evaluator's [`ProbeState`]: bumps `step_loop`
+    /// depth and the high-water marks on entry, restores depth + entry-SP stack
+    /// on drop.
+    pub(super) struct DepthGuard<'a> {
+        st: &'a ProbeState,
+    }
+
+    impl<'a> DepthGuard<'a> {
+        /// `sp` is the address of a local in the calling `step_loop` frame (a
+        /// proxy for the stack pointer). Stacks grow downward on all supported
+        /// targets, so deeper recursion yields smaller `sp`.
+        pub(super) fn enter(st: &'a ProbeState, sp: usize) -> Self {
+            let n = st.depth.get() + 1;
+            st.depth.set(n);
+            st.max_depth.set(st.max_depth.get().max(n));
+            st.max_sp.set(st.max_sp.get().max(sp));
+            st.min_sp.set(st.min_sp.get().min(sp));
+            {
+                let mut sps = st.entry_sps.borrow_mut();
+                if let Some(&parent) = sps.last() {
                     // Parent entered shallower (larger address); child is deeper.
-                    cell_max(&MAX_LEVEL_DELTA, parent.saturating_sub(sp));
+                    let d = parent.saturating_sub(sp);
+                    st.max_level_delta.set(st.max_level_delta.get().max(d));
                 }
-                s.push(sp);
-            });
-            DepthGuard
+                sps.push(sp);
+            }
+            DepthGuard { st }
         }
     }
 
-    impl Drop for DepthGuard {
+    impl Drop for DepthGuard<'_> {
         fn drop(&mut self) {
-            // Saturate defensively: a guard from the (pre-`reset`) kernel-load
-            // phase can be dropped on a migrated thread. The measured window is
-            // synchronous and does not migrate, so its counts stay exact.
-            DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
-            ENTRY_SPS.with(|s| {
-                s.borrow_mut().pop();
-            });
+            self.st.depth.set(self.st.depth.get().saturating_sub(1));
+            self.st.entry_sps.borrow_mut().pop();
         }
-    }
-
-    // Reporting entry points are only ever called from `#[cfg(test)]` helpers,
-    // on the same coroutine/thread as the measured run; `DepthGuard` above is
-    // what the lib's `step_loop` uses.
-
-    /// Reset all recorded marks on the current thread (call before a measured run).
-    #[cfg(test)]
-    pub fn reset() {
-        DEPTH.with(|c| c.set(0));
-        MAX_DEPTH.with(|c| c.set(0));
-        MAX_SP.with(|c| c.set(0));
-        MIN_SP.with(|c| c.set(usize::MAX));
-        MAX_LEVEL_DELTA.with(|c| c.set(0));
-        MAX_SIGCOND_DELTA.with(|c| c.set(0));
-        ENTRY_SPS.with(|s| s.borrow_mut().clear());
-    }
-
-    /// The maximum `step_loop` recursion depth observed since the last `reset`.
-    #[cfg(test)]
-    pub fn max_depth() -> usize {
-        MAX_DEPTH.with(|c| c.get())
-    }
-
-    /// Largest Rust-stack delta (bytes) between a `step_loop` entry and its
-    /// parent entry — the true per-nesting-level cost (not averaged).
-    #[cfg(test)]
-    pub fn level_delta() -> usize {
-        MAX_LEVEL_DELTA.with(|c| c.get())
-    }
-
-    /// Max stack from a `step_loop` entry down to a `signal_condition` entry.
-    #[cfg(test)]
-    pub fn sigcond_delta() -> usize {
-        MAX_SIGCOND_DELTA.with(|c| c.get())
-    }
-
-    /// Total Rust stack span (bytes) between the shallowest and deepest
-    /// `step_loop` entry sampled since the last `reset`. Returns 0 if fewer than
-    /// two entries were sampled.
-    #[cfg(test)]
-    pub fn stack_span() -> usize {
-        let lo = MIN_SP.with(|c| c.get());
-        let hi = MAX_SP.with(|c| c.get());
-        if lo == usize::MAX || hi <= lo {
-            0
-        } else {
-            hi - lo
-        }
-    }
-
-    /// `size_of::<Cont>()` in bytes — the per-element cost of the `Vec<Cont>`
-    /// stack and a proxy for how large each suspended continuation is.
-    #[cfg(test)]
-    pub fn cont_size() -> usize {
-        std::mem::size_of::<super::Cont>()
     }
 }
 
@@ -784,7 +785,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
     let _depth_guard = {
         // Address of a local in this frame — a proxy for the current stack pointer.
         let sp_probe = 0u8;
-        probe::DepthGuard::enter(&sp_probe as *const u8 as usize)
+        probe::DepthGuard::enter(&ev.probe, &sp_probe as *const u8 as usize)
     };
 
     let mut stack: Vec<Cont> = vec![initial_cont];

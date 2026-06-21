@@ -115,6 +115,8 @@ impl ContinuationContext {
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
             current_tx_ctx: RefCell::new(self.current_tx_ctx),
+            #[cfg(feature = "step_probe")]
+            probe: crate::eval_iterative::probe::ProbeState::default(),
         }
     }
 }
@@ -166,6 +168,10 @@ pub struct Evaluator {
     /// in reverse (most-recently-pushed first) before raising `EvalError::Signal`.
     /// Pushed/popped by `_primHCRun:`; always empty outside a `HandlerContext run:`.
     pub handler_chain: RefCell<Vec<HandlerPair>>,
+    /// Debug-only `step_loop` stack instrumentation (C31.5). Per-evaluator (i.e.
+    /// per-coroutine) so it is migration-correct under `may` work-stealing.
+    #[cfg(feature = "step_probe")]
+    pub(crate) probe: crate::eval_iterative::probe::ProbeState,
 }
 
 /// A `HandlerContext` handler registration: `(condition class, handler block)`.
@@ -214,6 +220,8 @@ impl Evaluator {
             current_tx: RefCell::new(None),
             current_tx_ctx: RefCell::new(None),
             handler_chain: RefCell::new(Vec::new()),
+            #[cfg(feature = "step_probe")]
+            probe: crate::eval_iterative::probe::ProbeState::default(),
         }
     }
 
@@ -679,6 +687,8 @@ impl Evaluator {
             current_tx: RefCell::new(None),
             current_tx_ctx: RefCell::new(None),
             handler_chain: RefCell::new(Vec::new()),
+            #[cfg(feature = "step_probe")]
+            probe: crate::eval_iterative::probe::ProbeState::default(),
         }
     }
 
