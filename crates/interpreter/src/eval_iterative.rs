@@ -22,46 +22,57 @@ const YIELD_INTERVAL: u32 = 1024;
 /// `step_loop`. This probe records the maximum nesting reached so the C31.5
 /// frame-shrinking work can be measured before/after. Compiled out entirely
 /// unless the `step_probe` feature is enabled.
+/// Debug-only `step_loop` stack instrumentation (C31.5).
+///
+/// All probe state is **thread-local**, not global. The measured run is a single
+/// synchronous coroutine that does not yield (so it stays on one OS thread
+/// between `reset` and the report reads), which makes thread-locals both
+/// accurate and naturally isolated from other tests running concurrently on
+/// other threads. (`may` work-steals across threads, so global atomics would be
+/// cross-contaminated by sibling tests and by the kernel-load phase;
+/// thread-locals avoid both.)
 #[cfg(feature = "step_probe")]
 pub mod probe {
     use std::cell::{Cell, RefCell};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     thread_local! {
         static DEPTH: Cell<usize> = const { Cell::new(0) };
+        static MAX_DEPTH: Cell<usize> = const { Cell::new(0) };
+        /// Shallowest (largest-address) stack pointer sampled at a `step_loop` entry.
+        static MAX_SP: Cell<usize> = const { Cell::new(0) };
+        /// Deepest (smallest-address) stack pointer sampled at a `step_loop` entry.
+        static MIN_SP: Cell<usize> = const { Cell::new(usize::MAX) };
+        /// Largest Rust-stack delta between a `step_loop` entry and its *parent*
+        /// `step_loop` entry — the stack consumed by one full
+        /// `step_loop → builtins → eval_block → step_loop` recursion, i.e. the
+        /// per-nesting-level growth a flattened evaluator drives toward zero.
+        static MAX_LEVEL_DELTA: Cell<usize> = const { Cell::new(0) };
+        /// Max stack from the enclosing `step_loop` entry down to a
+        /// `signal_condition` entry — the dispatch chain above the handler eval.
+        static MAX_SIGCOND_DELTA: Cell<usize> = const { Cell::new(0) };
         /// Stack-pointer of each currently-active `step_loop` entry, parent-first.
         static ENTRY_SPS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     }
-    static MAX_DEPTH: AtomicUsize = AtomicUsize::new(0);
-    /// Shallowest (largest-address) stack pointer sampled at a `step_loop` entry.
-    static MAX_SP: AtomicUsize = AtomicUsize::new(0);
-    /// Deepest (smallest-address) stack pointer sampled at a `step_loop` entry.
-    static MIN_SP: AtomicUsize = AtomicUsize::new(usize::MAX);
-    /// Largest Rust-stack delta between a `step_loop` entry and its *parent*
-    /// `step_loop` entry — i.e. the stack consumed by one full
-    /// `step_loop → builtins → eval_block → step_loop` recursion. This is the
-    /// per-nesting-level growth a flattened evaluator must drive toward zero.
-    static MAX_LEVEL_DELTA: AtomicUsize = AtomicUsize::new(0);
-    /// Max stack consumed from the enclosing `step_loop` entry down to a
-    /// `signal_condition` entry — i.e. everything above the signal handler eval,
-    /// dominated by the `builtins::dispatch` / `dispatch_object_primitive` chain.
-    static MAX_SIGCOND_DELTA: AtomicUsize = AtomicUsize::new(0);
 
-    /// Sample the stack pointer at a `signal_condition` entry (temporary probe to
-    /// attribute the per-level delta to the dispatch chain). `sp` is the address
-    /// of a local in `signal_condition`'s frame.
+    #[inline]
+    fn cell_max(cell: &'static std::thread::LocalKey<Cell<usize>>, v: usize) {
+        cell.with(|c| c.set(c.get().max(v)));
+    }
+
+    /// Sample the stack pointer at a `signal_condition` entry to attribute the
+    /// per-level delta to the dispatch chain. `sp` is the address of a local in
+    /// `signal_condition`'s frame.
     pub fn sample_signal_condition(sp: usize) {
         ENTRY_SPS.with(|s| {
             if let Some(&parent) = s.borrow().last() {
-                MAX_SIGCOND_DELTA.fetch_max(parent.saturating_sub(sp), Ordering::Relaxed);
+                cell_max(&MAX_SIGCOND_DELTA, parent.saturating_sub(sp));
             }
         });
     }
 
-    /// RAII guard: increments the per-thread `step_loop` depth on entry,
-    /// updates the global max depth, records the stack-pointer high/low water
-    /// marks, and tracks the max parent→child entry delta. Restores depth and
-    /// the entry-SP stack on drop.
+    /// RAII guard: increments the per-thread `step_loop` depth on entry, updates
+    /// the depth/SP high-water marks and the max parent→child entry delta, and
+    /// restores the depth and entry-SP stack on drop.
     pub(super) struct DepthGuard;
 
     impl DepthGuard {
@@ -74,15 +85,14 @@ pub mod probe {
                 c.set(n);
                 n
             });
-            MAX_DEPTH.fetch_max(d, Ordering::Relaxed);
-            MAX_SP.fetch_max(sp, Ordering::Relaxed);
-            MIN_SP.fetch_min(sp, Ordering::Relaxed);
+            cell_max(&MAX_DEPTH, d);
+            cell_max(&MAX_SP, sp);
+            MIN_SP.with(|c| c.set(c.get().min(sp)));
             ENTRY_SPS.with(|s| {
                 let mut s = s.borrow_mut();
                 if let Some(&parent) = s.last() {
                     // Parent entered shallower (larger address); child is deeper.
-                    let delta = parent.saturating_sub(sp);
-                    MAX_LEVEL_DELTA.fetch_max(delta, Ordering::Relaxed);
+                    cell_max(&MAX_LEVEL_DELTA, parent.saturating_sub(sp));
                 }
                 s.push(sp);
             });
@@ -92,55 +102,58 @@ pub mod probe {
 
     impl Drop for DepthGuard {
         fn drop(&mut self) {
-            DEPTH.with(|c| c.set(c.get() - 1));
+            // Saturate defensively: a guard from the (pre-`reset`) kernel-load
+            // phase can be dropped on a migrated thread. The measured window is
+            // synchronous and does not migrate, so its counts stay exact.
+            DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
             ENTRY_SPS.with(|s| {
                 s.borrow_mut().pop();
             });
         }
     }
 
-    // Reporting entry points are only ever called from `#[cfg(test)]` helpers;
-    // `DepthGuard` above is what the lib's `step_loop` uses.
+    // Reporting entry points are only ever called from `#[cfg(test)]` helpers,
+    // on the same coroutine/thread as the measured run; `DepthGuard` above is
+    // what the lib's `step_loop` uses.
 
-    /// Reset all recorded high-water marks (call before a measured run).
+    /// Reset all recorded marks on the current thread (call before a measured run).
     #[cfg(test)]
     pub fn reset() {
-        MAX_DEPTH.store(0, Ordering::Relaxed);
-        MAX_SP.store(0, Ordering::Relaxed);
-        MIN_SP.store(usize::MAX, Ordering::Relaxed);
-        MAX_LEVEL_DELTA.store(0, Ordering::Relaxed);
-        MAX_SIGCOND_DELTA.store(0, Ordering::Relaxed);
+        DEPTH.with(|c| c.set(0));
+        MAX_DEPTH.with(|c| c.set(0));
+        MAX_SP.with(|c| c.set(0));
+        MIN_SP.with(|c| c.set(usize::MAX));
+        MAX_LEVEL_DELTA.with(|c| c.set(0));
+        MAX_SIGCOND_DELTA.with(|c| c.set(0));
         ENTRY_SPS.with(|s| s.borrow_mut().clear());
     }
 
     /// The maximum `step_loop` recursion depth observed since the last `reset`.
     #[cfg(test)]
     pub fn max_depth() -> usize {
-        MAX_DEPTH.load(Ordering::Relaxed)
+        MAX_DEPTH.with(|c| c.get())
     }
 
     /// Largest Rust-stack delta (bytes) between a `step_loop` entry and its
-    /// parent entry — the per-nesting-level growth. Unlike `stack_span` this is
-    /// not averaged: it is the true cost of one recursion step.
+    /// parent entry — the true per-nesting-level cost (not averaged).
     #[cfg(test)]
     pub fn level_delta() -> usize {
-        MAX_LEVEL_DELTA.load(Ordering::Relaxed)
+        MAX_LEVEL_DELTA.with(|c| c.get())
     }
 
     /// Max stack from a `step_loop` entry down to a `signal_condition` entry.
     #[cfg(test)]
     pub fn sigcond_delta() -> usize {
-        MAX_SIGCOND_DELTA.load(Ordering::Relaxed)
+        MAX_SIGCOND_DELTA.with(|c| c.get())
     }
 
     /// Total Rust stack span (bytes) between the shallowest and deepest
-    /// `step_loop` entry sampled since the last `reset`. Returns 0 if fewer
-    /// than two entries were sampled. Divide by `max_depth() - 1` for an
-    /// approximate per-level frame cost.
+    /// `step_loop` entry sampled since the last `reset`. Returns 0 if fewer than
+    /// two entries were sampled.
     #[cfg(test)]
     pub fn stack_span() -> usize {
-        let lo = MIN_SP.load(Ordering::Relaxed);
-        let hi = MAX_SP.load(Ordering::Relaxed);
+        let lo = MIN_SP.with(|c| c.get());
+        let hi = MAX_SP.with(|c| c.get());
         if lo == usize::MAX || hi <= lo {
             0
         } else {
@@ -348,6 +361,21 @@ pub(crate) enum Cont {
     HCRunGuard {
         chain_start_len: usize,
         body_blk: Arc<crate::value::Block>,
+    },
+
+    /// Drives a `to:do:` / `to:by:do:` numeric loop on the heap `Cont` stack so
+    /// that nested iteration (and thus all collection iteration, which bottoms
+    /// out in `to:do:`) does not grow the Rust stack per nesting level.
+    ///
+    /// Each fire runs `blk` with the current index `next` (discarding its result)
+    /// and re-pushes itself advanced by `step`, until `next` passes `stop`. A
+    /// `^`-return or signal from the body unwinds past this `Cont` (it is not a
+    /// frame), stopping the loop. Answers `nil` when the range is exhausted.
+    ToDoStep {
+        blk: Arc<crate::value::Block>,
+        next: i64,
+        stop: i64,
+        step: i64,
     },
 }
 
@@ -911,6 +939,30 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
             } => {
                 // Body completed normally; drop this HC's handlers, pass acc through.
                 ev.handler_chain.borrow_mut().truncate(chain_start_len);
+            }
+
+            // ── ToDoStep (numeric loop iteration) ─────────────────────────
+            Cont::ToDoStep {
+                blk,
+                next,
+                stop,
+                step,
+            } => {
+                let cont = if step > 0 { next <= stop } else { next >= stop };
+                if cont {
+                    bump_reductions(&mut reductions);
+                    stack.push(Cont::ToDoStep {
+                        blk: blk.clone(),
+                        next: next + step,
+                        stop,
+                        step,
+                    });
+                    // Per-iteration result is discarded; the next ToDoStep (or the
+                    // final acc=nil) overwrites it.
+                    push_block_frame(ev, &blk, vec![Value::Int(next)], false, &mut stack)?;
+                } else {
+                    acc = Value::Nil; // to:do: / to:by:do: answer nil
+                }
             }
 
             // ── ContinueUnwind ────────────────────────────────────────────
@@ -1647,7 +1699,7 @@ fn dispatch_to_stack(
     ev: &Evaluator,
     receiver: Value,
     selector: Arc<str>,
-    args: Vec<Value>,
+    mut args: Vec<Value>,
     env: &mut Env,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
@@ -1736,6 +1788,56 @@ fn dispatch_to_stack(
         });
         push_block_frame(ev, &body, vec![], false, stack)?;
         return Ok(());
+    }
+
+    // (1c) `to:do:` / `to:by:do:` flattened: drive the numeric loop on the heap
+    // `Cont` stack (ToDoStep) instead of recursing `step_loop` via `eval_block`
+    // per iteration. All collection iteration bottoms out here, so this makes
+    // nested iteration O(1) in Rust stack.
+    if let Value::Int(n) = receiver {
+        match selector.as_ref() {
+            "to:do:" => {
+                if args.len() != 2 {
+                    return Err(EvalError::ArityMismatch {
+                        expected: 2,
+                        got: args.len(),
+                    });
+                }
+                let stop = crate::builtins_iterative::as_int(args.remove(0), &selector)?;
+                let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+                stack.push(Cont::ToDoStep {
+                    blk,
+                    next: n,
+                    stop,
+                    step: 1,
+                });
+                return Ok(());
+            }
+            "to:by:do:" => {
+                if args.len() != 3 {
+                    return Err(EvalError::ArityMismatch {
+                        expected: 3,
+                        got: args.len(),
+                    });
+                }
+                let stop = crate::builtins_iterative::as_int(args.remove(0), &selector)?;
+                let step = crate::builtins_iterative::as_int(args.remove(0), &selector)?;
+                if step == 0 {
+                    return Err(EvalError::TypeError(
+                        "to:by:do: step must be non-zero".into(),
+                    ));
+                }
+                let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+                stack.push(Cont::ToDoStep {
+                    blk,
+                    next: n,
+                    stop,
+                    step,
+                });
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     // (2-5) Block dispatch.

@@ -166,16 +166,18 @@ pub(crate) fn eval_probe(src: &str) -> ProbeResult {
         probe::reset();
         let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
         let v = resolve(v).expect("eval future resolution");
-        ev.shutdown();
-        tx.send(ProbeResult {
+        // Capture the probe marks on this thread *before* shutdown, which can
+        // yield/migrate the coroutine (the marks are thread-local).
+        let result = ProbeResult {
             value: v,
             max_depth: probe::max_depth(),
             cont_size: probe::cont_size(),
             stack_span: probe::stack_span(),
             level_delta: probe::level_delta(),
             sigcond_delta: probe::sigcond_delta(),
-        })
-        .unwrap();
+        };
+        ev.shutdown();
+        tx.send(result).unwrap();
     });
     rx.recv().expect("eval_probe coroutine panicked")
 }

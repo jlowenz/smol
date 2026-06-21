@@ -367,7 +367,7 @@ pub(crate) fn force_value(v: Value) -> Result<Value, EvalError> {
     }
 }
 
-fn as_int(v: Value, selector: &Arc<str>) -> Result<i64, EvalError> {
+pub(crate) fn as_int(v: Value, selector: &Arc<str>) -> Result<i64, EvalError> {
     match force_value(v)? {
         Value::Int(n) => Ok(n),
         _ => Err(EvalError::TypeError(format!(

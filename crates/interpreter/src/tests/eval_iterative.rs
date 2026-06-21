@@ -26,6 +26,40 @@ outer run: [
     assert_eq!(r.value, Value::Str(Arc::from("inner")));
 }
 
+/// C31.5 S4: nested numeric iteration must NOT grow the Rust stack per nesting
+/// level — `to:do:` runs on the heap `Cont` stack (ToDoStep), so depth stays a
+/// small constant regardless of how deeply loops nest.
+#[cfg(feature = "step_probe")]
+#[test]
+fn step_probe_nested_loops() {
+    use crate::test_helpers::eval_probe;
+    // 5-deep nested to:do: with a pure body (Int arithmetic only) — fully
+    // synchronous, so the measured coroutine never parks/migrates and the
+    // thread-local probe stays accurate. Without flattening each nesting level
+    // would add a step_loop recursion (depth ≈ 6+); flattened it stays ≈ 1.
+    // (to:do: answers nil.)
+    let src = r#"
+1 to: 2 do: [:a |
+  1 to: 2 do: [:b |
+    1 to: 2 do: [:c |
+      1 to: 2 do: [:d |
+        1 to: 2 do: [:e | e + a]]]]]
+"#;
+    let r = eval_probe(src);
+    eprintln!(
+        "[step_probe] nested loops (5-deep): depth = {}, per-level delta = {} B",
+        r.max_depth, r.level_delta,
+    );
+    assert_eq!(r.value, Value::Nil);
+    // Flattened iteration: step_loop depth must not scale with loop nesting.
+    // 5-deep nesting would reach depth ≈ 6+ if each `to:do:` recursed.
+    assert!(
+        r.max_depth <= 2,
+        "nested to:do: should not grow step_loop depth with nesting, got {}",
+        r.max_depth
+    );
+}
+
 #[test]
 fn s1_literal_return() {
     let v = eval("^42");
