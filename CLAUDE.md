@@ -31,7 +31,9 @@ Rust source only, so `just cov` numbers say nothing about Smol kernel code cover
 
 ### Interpreter and `may` coroutines
 
-The coroutine stack size (`COROUTINE_STACK_SIZE` in `entity.rs`) is 32 KB (0x8000). The iterative evaluator uses heap `CallFrame`s for Smol method calls, so the dominant Rust stack cost is nested builtin→`eval_block` chains. Measured debug-build minimum for the test suite: ~27 KB; the 32 KB constant provides headroom. The previous doc comment claiming 128 KB was incorrect — the code value was always 32 KB.
+`COROUTINE_STACK_SIZE` in `entity.rs` is given in **`usize` words** (`may`'s `set_stack_size` multiplies by 8 bytes), so `0x8000` = **256 KB**, not 32 KB (an earlier note had the unit wrong). As of C31.5 it is split by build: **debug = 256 KB** (`0x8000`), **release = 64 KB** (`0x2000`). Debug match-arm locals are laid out non-overlapping, so debug frames are ~8× release; the split keeps dev headroom while sizing release for per-entity density.
+
+C31.5 flattened essentially all synchronous nesting onto the heap `Cont` stack — instance/class method calls, `value`/`on:do:`/`ensure:`/`then:`, `HandlerContext run:`, signals (CL handler-scoping), value construction (`_primNewValue:`), and all iteration (`to:do:` and everything built on it) — so the Rust stack per coroutine is a small constant independent of Smol nesting depth (nested loops = `step_loop` depth 1; nested HC = depth ~2). The remaining per-dispatch cost is the depth of one builtin-dispatch chain (~5 KB release / ~40 KB debug). A debug-only `step_probe` Cargo feature (`probe::ProbeState` on `Evaluator`) measures `step_loop` depth and per-level Rust-stack deltas. The one not-yet-flattened recursion is the synchronous `then:` arm (`dispatch_then` → `eval_block`); deep `then:` chains still grow the Rust stack.
 
 ### Futures
 
