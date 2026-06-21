@@ -31,11 +31,9 @@ pub type SharedTxId = u64;
 /// lock admission (ancestry checks) and as the node key in deadlock detection.
 pub type TxCtxId = u64;
 
-#[allow(dead_code)] // consumed by `_primBeginSharedTx` in S4
 static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Mint a fresh, process-unique `TxCtxId`.
-#[allow(dead_code)] // consumed by `_primBeginSharedTx` in S4
 pub(crate) fn next_ctx_id() -> TxCtxId {
     NEXT_CTX_ID.fetch_add(1, Ordering::Relaxed)
 }

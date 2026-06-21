@@ -635,8 +635,11 @@ mod tx_frames {
         let d = entity_with_slot(1);
         d.tx_push_frame(7, shared_id(&d));
         d.tx_shadow_set(Arc::from("slot"), Value::Int(99));
-        let buffer = d.tx_commit_frame(None); // root commit
-        assert!(buffer.is_some(), "root commit hands its durable buffer up");
+        let outcome = d.tx_commit_frame(None); // root commit
+        assert!(
+            matches!(outcome, crate::entity::FrameCommitOutcome::RootCommitted(_)),
+            "root commit hands its durable buffer up"
+        );
         assert!(!d.in_tx());
         assert_eq!(d.data.get_slot("slot"), Some(Value::Int(99)));
     }
@@ -660,10 +663,13 @@ mod tx_frames {
         d.tx_shadow_set(Arc::from("slot"), Value::Int(10)); // root-level write
         d.tx_push_frame(2, tx_id);
         d.tx_shadow_set(Arc::from("slot"), Value::Int(20)); // child-level write
-        let buffer = d.tx_commit_frame(Some(1)); // child commits into parent
+        let outcome = d.tx_commit_frame(Some(1)); // child commits into parent
         assert!(
-            buffer.is_none(),
-            "child commit merges up, returns no buffer"
+            matches!(
+                outcome,
+                crate::entity::FrameCommitOutcome::MergedIntoAncestor
+            ),
+            "child commit merges into the ancestor frame"
         );
         assert_eq!(d.tx_depth(), 1, "back to the root level");
         // Child write superseded the root write within the surviving frame.
@@ -693,10 +699,10 @@ mod tx_frames {
         let d = entity_with_slot(1);
         d.tx_push_frame(2, shared_id(&d));
         d.tx_shadow_set(Arc::from("slot"), Value::Int(20));
-        let buffer = d.tx_commit_frame(Some(1)); // lock passes up to parent
+        let outcome = d.tx_commit_frame(Some(1)); // lock passes up to parent
         assert!(
-            buffer.is_none(),
-            "lock pass-up keeps the buffer in the frame"
+            matches!(outcome, crate::entity::FrameCommitOutcome::PassedUpTo(1)),
+            "lock pass-up retags the frame to the parent"
         );
         assert_eq!(d.tx_depth(), 1, "still locked, now under the parent");
         assert_eq!(d.tx_holder(), Some(1));
@@ -805,5 +811,231 @@ mod tx_admission {
         let _child = child_ctx(2, root.clone());
         let mb = queue(vec![Some(root)]);
         assert_eq!(crate::entity::admissible_index(&mb, Some(2)), None);
+    }
+}
+
+// ── C31 S4: transaction primitives ────────────────────────────────────────────
+
+#[cfg(test)]
+mod tx_primitives {
+    use super::*;
+    use crate::builtins_iterative::dispatch_object_primitive;
+    use crate::eval::Evaluator;
+    use crate::shared_tx::TxContext;
+
+    /// Build a standalone entity handle (no coroutine) with one ivar `slot`,
+    /// sharing `ev`'s store so committed facts are visible through `ev.store`.
+    fn cell_entity(ev: &Evaluator, seed: i64) -> InstanceHandle {
+        use crate::class::Class;
+        use parking_lot::RwLock;
+        use std::collections::HashMap;
+        let cls = Arc::new(Class {
+            name: Arc::from("Cell"),
+            superclass: None,
+            own_instance_vars: vec![Arc::from("slot")],
+            own_class_vars: vec![],
+            class_var_storage: RwLock::new(HashMap::new()),
+            indexed_slot_kind: None,
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value: false,
+            class_object: std::sync::OnceLock::new(),
+        });
+        let data = crate::entity::new_entity_data(&cls, ev.store.clone_handle());
+        data.data.set_slot(Arc::from("slot"), Value::Int(seed));
+        InstanceHandle(Arc::new(InstanceState {
+            class: cls,
+            kind: InstanceKind::Entity(Box::new(data)),
+        }))
+    }
+
+    fn call(
+        ev: &Evaluator,
+        recv: &InstanceHandle,
+        sel: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        let mut env = crate::env::Env::new();
+        dispatch_object_primitive(ev, recv.clone(), &Arc::from(sel), args, &mut env)
+    }
+
+    fn entity_data(h: &InstanceHandle) -> &crate::entity::EntityData {
+        match &h.0.kind {
+            InstanceKind::Entity(d) => d,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn begin_creates_root_and_sets_ctx() {
+        let ev = Evaluator::new_without_kernel();
+        let coord = cell_entity(&ev, 0);
+        let h = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        let ctx = match h {
+            Value::Handle(h) => h.downcast::<TxContext>().unwrap(),
+            _ => panic!("expected a handle"),
+        };
+        assert!(matches!(&*ctx, TxContext::Root(_)));
+        assert!(ev.current_tx_ctx.borrow().is_some());
+        assert_eq!(
+            ev.current_tx_ctx.borrow().as_ref().unwrap().ctx_id(),
+            ctx.ctx_id()
+        );
+    }
+
+    #[test]
+    fn nested_begin_creates_child_of_root() {
+        let ev = Evaluator::new_without_kernel();
+        let coord = cell_entity(&ev, 0);
+        let root = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        let root_ctx = match &root {
+            Value::Handle(h) => h.clone().downcast::<TxContext>().unwrap(),
+            _ => unreachable!(),
+        };
+        let child = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        let child_ctx = match child {
+            Value::Handle(h) => h.downcast::<TxContext>().unwrap(),
+            _ => unreachable!(),
+        };
+        match &*child_ctx {
+            TxContext::Child(c) => assert_eq!(c.outer.ctx_id(), root_ctx.ctx_id()),
+            _ => panic!("expected a child"),
+        }
+        // Child shares the root's store TxId (one atomic commit for the tree).
+        assert_eq!(child_ctx.tx_id(), root_ctx.tx_id());
+        // Active context is now the child.
+        assert_eq!(
+            ev.current_tx_ctx.borrow().as_ref().unwrap().ctx_id(),
+            child_ctx.ctx_id()
+        );
+    }
+
+    #[test]
+    fn commit_root_clears_ctx() {
+        let ev = Evaluator::new_without_kernel();
+        let coord = cell_entity(&ev, 0);
+        let root = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        call(&ev, &coord, "_primCommitSharedTx:", vec![root]).unwrap();
+        assert!(ev.current_tx_ctx.borrow().is_none());
+    }
+
+    #[test]
+    fn child_commit_restores_parent_as_active() {
+        let ev = Evaluator::new_without_kernel();
+        let coord = cell_entity(&ev, 0);
+        let root = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        let root_id = match &root {
+            Value::Handle(h) => h.clone().downcast::<TxContext>().unwrap().ctx_id(),
+            _ => unreachable!(),
+        };
+        let child = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        call(&ev, &coord, "_primCommitSharedTx:", vec![child]).unwrap();
+        assert_eq!(
+            ev.current_tx_ctx.borrow().as_ref().unwrap().ctx_id(),
+            root_id
+        );
+    }
+
+    #[test]
+    fn rollback_root_clears_ctx() {
+        let ev = Evaluator::new_without_kernel();
+        let coord = cell_entity(&ev, 0);
+        let root = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        call(&ev, &coord, "_primRollbackSharedTx:", vec![root]).unwrap();
+        assert!(ev.current_tx_ctx.borrow().is_none());
+    }
+
+    #[test]
+    fn enrolled_participants_returns_array_of_entities() {
+        let ev = Evaluator::new(); // build_array needs the kernel Array class
+        let coord = cell_entity(&ev, 0);
+        let root = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        let ctx = match &root {
+            Value::Handle(h) => h.clone().downcast::<TxContext>().unwrap(),
+            _ => unreachable!(),
+        };
+        // Simulate two participants enrolled at the root level.
+        let p1 = cell_entity(&ev, 1);
+        let p2 = cell_entity(&ev, 2);
+        ctx.participants().lock().unwrap().push(p1.clone());
+        ctx.participants().lock().unwrap().push(p2.clone());
+        let arr = call(&ev, &coord, "_primEnrolledParticipants:", vec![root]).unwrap();
+        match arr {
+            Value::Instance(h) => {
+                if let InstanceKind::Entity(d) = &h.0.kind
+                    && let Some(crate::object::IndexedStorage::Pointer(slots)) = &d.data.indexed
+                {
+                    assert_eq!(slots.lock().len(), 2);
+                } else {
+                    panic!("expected an Array entity");
+                }
+            }
+            _ => panic!("expected an Array"),
+        }
+    }
+
+    #[test]
+    fn exit_commit_applies_shadow_to_live_and_unlocks() {
+        let ev = Evaluator::new_without_kernel();
+        let coord = cell_entity(&ev, 0);
+        let root = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        let ctx = match &root {
+            Value::Handle(h) => h.clone().downcast::<TxContext>().unwrap(),
+            _ => unreachable!(),
+        };
+        // Enroll a participant at root and stage a speculative write.
+        let p = cell_entity(&ev, 1);
+        let pd = entity_data(&p);
+        pd.tx_push_frame(ctx.ctx_id(), ctx.tx_id());
+        pd.tx_shadow_set(Arc::from("slot"), Value::Int(42));
+        assert_eq!(pd.data.get_slot("slot"), Some(Value::Int(1))); // live untouched
+
+        // The coordinator's pvtExitTx arrives tagged with the context.
+        *ev.current_tx_ctx.borrow_mut() = Some(ctx.clone());
+        call(
+            &ev,
+            &p,
+            "_primExitTxMode:",
+            vec![Value::Symbol(Arc::from("commit"))],
+        )
+        .unwrap();
+
+        assert!(!pd.in_tx(), "participant unlocks after exit");
+        assert_eq!(
+            pd.data.get_slot("slot"),
+            Some(Value::Int(42)),
+            "shadow applied to live"
+        );
+    }
+
+    #[test]
+    fn exit_rollback_discards_shadow_and_leaves_live() {
+        let ev = Evaluator::new_without_kernel();
+        let coord = cell_entity(&ev, 0);
+        let root = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        let ctx = match &root {
+            Value::Handle(h) => h.clone().downcast::<TxContext>().unwrap(),
+            _ => unreachable!(),
+        };
+        let p = cell_entity(&ev, 1);
+        let pd = entity_data(&p);
+        pd.tx_push_frame(ctx.ctx_id(), ctx.tx_id());
+        pd.tx_shadow_set(Arc::from("slot"), Value::Int(42));
+
+        *ev.current_tx_ctx.borrow_mut() = Some(ctx.clone());
+        call(
+            &ev,
+            &p,
+            "_primExitTxMode:",
+            vec![Value::Symbol(Arc::from("rollback"))],
+        )
+        .unwrap();
+
+        assert!(!pd.in_tx());
+        assert_eq!(
+            pd.data.get_slot("slot"),
+            Some(Value::Int(1)),
+            "live unchanged on rollback"
+        );
     }
 }

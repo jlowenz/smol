@@ -154,6 +154,21 @@ pub struct Envelope {
     pub tx_tag: Option<Arc<crate::shared_tx::TxContext>>,
 }
 
+/// Outcome of committing one transaction frame on an entity (see
+/// `EntityData::tx_commit_frame`). Tells the caller how to finalize.
+pub enum FrameCommitOutcome {
+    /// The frame's writes merged into an existing ancestor frame; the entity was
+    /// already a participant of that ancestor. Nothing more to do.
+    MergedIntoAncestor,
+    /// The entity's only frame was retagged to the given parent context (lock
+    /// passed up). The caller must enroll the entity as that parent's participant.
+    PassedUpTo(TxCtxId),
+    /// Root-level commit: shadow applied to live slots, frame popped (entity
+    /// unlocked). The durable buffer is handed back for the caller to absorb into
+    /// the coordinator's context buffer before the store commit.
+    RootCommitted(OwnedStoreTransaction),
+}
+
 /// Per-entity isolated data: instance variables, mailbox, status.
 ///
 /// `class` is held in the enclosing `InstanceState`; this struct carries only
@@ -271,46 +286,40 @@ impl EntityData {
     }
 
     /// Commit the top transaction level, merging its speculative writes upward.
+    /// The returned `FrameCommitOutcome` tells the caller what happened so it can
+    /// finalize correctly (see the variants).
     ///
     /// `parent_ctx_id`:
-    ///   - `None` → committing the root level for this entity: the frame's shadow
-    ///     is applied to the live slots, the frame is popped (entity unlocks),
-    ///     and its durable buffer is **returned** so the caller can absorb it
-    ///     into the coordinator's context buffer for the eventual store commit.
-    ///   - `Some(parent)` → committing a child level. If an ancestor frame is
-    ///     below, the top frame's shadow and durable buffer are merged into it
-    ///     (`None` returned). If the top is the only frame (the entity first
-    ///     joined during this child; ancestors never touched it), the frame is
-    ///     retagged to `parent` so the lock passes up — the entity stays locked,
-    ///     keeping its durable buffer, and `None` is returned.
+    ///   - `None` → committing the root level for this entity.
+    ///   - `Some(parent)` → committing a child level, `parent` = the enclosing
+    ///     context's id.
     ///
     /// Requires: `in_tx()`.
-    /// Ensures: returns `Some(buffer)` exactly when the entity's last frame is a
-    ///   root commit (`parent_ctx_id == None`); `None` otherwise.
-    #[must_use]
-    pub fn tx_commit_frame(&self, parent_ctx_id: Option<TxCtxId>) -> Option<OwnedStoreTransaction> {
+    pub fn tx_commit_frame(&self, parent_ctx_id: Option<TxCtxId>) -> FrameCommitOutcome {
         let mut frames = self.tx_frames.lock().unwrap();
         let top = frames
             .pop()
             .expect("tx_commit_frame: entity has no active transaction frame");
         match frames.last_mut() {
-            // An ancestor level remains: child writes supersede ancestor writes
-            // for shared keys (read-your-writes), and durable ops merge up.
+            // An ancestor frame remains: child writes supersede ancestor writes
+            // for shared keys (read-your-writes), and durable ops merge up. The
+            // entity is already a participant of that ancestor.
             Some(below) => {
                 below.shadow.extend(top.shadow);
                 below.tx.absorb(top.tx);
-                None
+                FrameCommitOutcome::MergedIntoAncestor
             }
             None => match parent_ctx_id {
-                // Lock passes up to a parent that never separately enrolled: keep
-                // the frame's shadow and durable buffer, retagged to the parent.
+                // Lock passes up to a parent that never separately enrolled this
+                // entity: keep the frame's shadow and durable buffer, retagged to
+                // the parent. The caller must enroll it as the parent's participant.
                 Some(parent) => {
                     frames.push(TxFrame {
                         ctx_id: parent,
                         shadow: top.shadow,
                         tx: top.tx,
                     });
-                    None
+                    FrameCommitOutcome::PassedUpTo(parent)
                 }
                 // Root commit: speculative writes become live; hand the durable
                 // buffer to the caller to absorb into the context buffer.
@@ -318,7 +327,7 @@ impl EntityData {
                     for (name, value) in top.shadow {
                         self.data.set_slot(name, value);
                     }
-                    Some(top.tx)
+                    FrameCommitOutcome::RootCommitted(top.tx)
                 }
             },
         }
