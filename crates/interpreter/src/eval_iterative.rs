@@ -15,6 +15,96 @@ use crate::value::Value;
 /// per function call" granularity. At ~1M msg/s this yields every ~1 ms.
 const YIELD_INTERVAL: u32 = 1024;
 
+/// Debug-only instrumentation for measuring `step_loop` recursion depth.
+///
+/// `step_loop` recurses indirectly: a block-taking builtin that calls
+/// `ev.eval_block(...)` (rather than pushing a `Cont`) enters a fresh
+/// `step_loop`. This probe records the maximum nesting reached so the C31.5
+/// frame-shrinking work can be measured before/after. Compiled out entirely
+/// unless the `step_probe` feature is enabled.
+#[cfg(feature = "step_probe")]
+pub mod probe {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    thread_local! {
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+    static MAX_DEPTH: AtomicUsize = AtomicUsize::new(0);
+    /// Shallowest (largest-address) stack pointer sampled at a `step_loop` entry.
+    static MAX_SP: AtomicUsize = AtomicUsize::new(0);
+    /// Deepest (smallest-address) stack pointer sampled at a `step_loop` entry.
+    static MIN_SP: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    /// RAII guard: increments the per-thread `step_loop` depth on entry,
+    /// updates the global max depth, and records the stack-pointer high/low
+    /// water marks so the actual Rust stack consumed per recursion level can be
+    /// derived. Decrements the depth on drop.
+    pub(super) struct DepthGuard;
+
+    impl DepthGuard {
+        /// `sp` is the address of a local in the calling `step_loop` frame
+        /// (a proxy for the current stack pointer). Stacks grow downward on all
+        /// supported targets, so deeper recursion yields smaller `sp`.
+        pub(super) fn enter(sp: usize) -> Self {
+            let d = DEPTH.with(|c| {
+                let n = c.get() + 1;
+                c.set(n);
+                n
+            });
+            MAX_DEPTH.fetch_max(d, Ordering::Relaxed);
+            MAX_SP.fetch_max(sp, Ordering::Relaxed);
+            MIN_SP.fetch_min(sp, Ordering::Relaxed);
+            DepthGuard
+        }
+    }
+
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            DEPTH.with(|c| c.set(c.get() - 1));
+        }
+    }
+
+    // Reporting entry points are only ever called from `#[cfg(test)]` helpers;
+    // `DepthGuard` above is what the lib's `step_loop` uses.
+
+    /// Reset all recorded high-water marks (call before a measured run).
+    #[cfg(test)]
+    pub fn reset() {
+        MAX_DEPTH.store(0, Ordering::Relaxed);
+        MAX_SP.store(0, Ordering::Relaxed);
+        MIN_SP.store(usize::MAX, Ordering::Relaxed);
+    }
+
+    /// The maximum `step_loop` recursion depth observed since the last `reset`.
+    #[cfg(test)]
+    pub fn max_depth() -> usize {
+        MAX_DEPTH.load(Ordering::Relaxed)
+    }
+
+    /// Total Rust stack span (bytes) between the shallowest and deepest
+    /// `step_loop` entry sampled since the last `reset`. Returns 0 if fewer
+    /// than two entries were sampled. Divide by `max_depth() - 1` for an
+    /// approximate per-level frame cost.
+    #[cfg(test)]
+    pub fn stack_span() -> usize {
+        let lo = MIN_SP.load(Ordering::Relaxed);
+        let hi = MAX_SP.load(Ordering::Relaxed);
+        if lo == usize::MAX || hi <= lo {
+            0
+        } else {
+            hi - lo
+        }
+    }
+
+    /// `size_of::<Cont>()` in bytes — the per-element cost of the `Vec<Cont>`
+    /// stack and a proxy for how large each suspended continuation is.
+    #[cfg(test)]
+    pub fn cont_size() -> usize {
+        std::mem::size_of::<super::Cont>()
+    }
+}
+
 /// Heap-allocated continuation for the iterative evaluator.
 ///
 /// Each variant represents a suspended computation waiting for `acc` (the
@@ -415,6 +505,13 @@ fn handle_step_error(
 /// Ensures: returns the value accumulated when the continuation stack
 ///   is empty, or propagates the first terminal error.
 pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, EvalError> {
+    #[cfg(feature = "step_probe")]
+    let _depth_guard = {
+        // Address of a local in this frame — a proxy for the current stack pointer.
+        let sp_probe = 0u8;
+        probe::DepthGuard::enter(&sp_probe as *const u8 as usize)
+    };
+
     let mut stack: Vec<Cont> = vec![initial_cont];
     let mut acc: Value = Value::Nil;
     let mut reductions: u32 = 0;

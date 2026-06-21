@@ -10,6 +10,12 @@ publish.workspace = true
 name = "smol"
 path = "src/main.rs"
 
+[features]
+# Debug-only instrumentation: records max `step_loop` recursion depth and prints
+# `size_of::<Cont>()`. Used by C31.5 to measure per-level stack cost before/after
+# the frame-shrinking work. Off by default; never affects release behavior.
+step_probe = []
+
 [dependencies]
 thiserror = { workspace = true }
 num-bigint = { workspace = true }

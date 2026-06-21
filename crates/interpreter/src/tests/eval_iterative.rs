@@ -1,6 +1,36 @@
 use super::*;
 use crate::test_helpers::eval;
 
+/// C31.5 S0 baseline probe: records max `step_loop` recursion depth and
+/// `size_of::<Cont>()` for nested synchronous `HandlerContext run:`, the
+/// scenario that overflows the 256 KB production stack. Run with:
+///   `cargo test --features step_probe step_probe_nested_hc -- --nocapture`
+#[cfg(feature = "step_probe")]
+#[test]
+fn step_probe_nested_hc() {
+    use crate::test_helpers::eval_probe;
+    let src = r#"
+| outer |
+outer := HandlerContext new on: Error do: [:e | 'outer'].
+outer run: [
+    (HandlerContext new on: Error do: [:e | 'inner'])
+        run: [Error signal: 'x']
+]
+"#;
+    let r = eval_probe(src);
+    let per_level = if r.max_depth > 1 {
+        r.stack_span / (r.max_depth - 1)
+    } else {
+        0
+    };
+    eprintln!(
+        "[step_probe] nested HC: max step_loop depth = {}, size_of::<Cont>() = {} bytes, \
+         stack span = {} bytes (~{} bytes/level)",
+        r.max_depth, r.cont_size, r.stack_span, per_level,
+    );
+    assert_eq!(r.value, Value::Str(Arc::from("inner")));
+}
+
 #[test]
 fn s1_literal_return() {
     let v = eval("^42");

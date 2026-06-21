@@ -127,6 +127,53 @@ pub(crate) fn eval(src: &str) -> Value {
     rx.recv().expect("eval coroutine panicked")
 }
 
+/// Evaluate Smol source on an oversized coroutine stack and report the maximum
+/// `step_loop` recursion depth reached plus `size_of::<Cont>()`.
+///
+/// Used by C31.5 to measure per-level stack cost on scenarios that overflow the
+/// production `COROUTINE_STACK_SIZE` (e.g. nested synchronous `HandlerContext`
+/// `run:`). The generous stack lets the scenario complete so the depth can be
+/// recorded; it says nothing about whether the scenario fits in 256 KB.
+///
+/// Requires: `src` is valid Smol; program must not error. The `step_probe`
+///   feature must be enabled.
+/// Ensures: returns `ProbeResult` with the result value and the recorded marks.
+#[cfg(feature = "step_probe")]
+pub(crate) struct ProbeResult {
+    pub value: Value,
+    pub max_depth: usize,
+    pub cont_size: usize,
+    /// Total Rust stack span (bytes) across all `step_loop` entries.
+    pub stack_span: usize,
+}
+
+#[cfg(feature = "step_probe")]
+pub(crate) fn eval_probe(src: &str) -> ProbeResult {
+    use crate::eval_iterative::probe;
+    const BIG_STACK: usize = 0x80000; // 4 MB — far above any scenario under test
+    let src = src.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::entity::init_coroutine_stack();
+    let _ = may::go_with!(BIG_STACK, move || {
+        let prog = Parser::parse(&src).expect("parse");
+        let ev = Evaluator::new();
+        let mut env = Env::new();
+        ev.registry.populate_env(&mut env);
+        probe::reset();
+        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        let v = resolve(v).expect("eval future resolution");
+        ev.shutdown();
+        tx.send(ProbeResult {
+            value: v,
+            max_depth: probe::max_depth(),
+            cont_size: probe::cont_size(),
+            stack_span: probe::stack_span(),
+        })
+        .unwrap();
+    });
+    rx.recv().expect("eval_probe coroutine panicked")
+}
+
 /// Evaluate Smol source using the iterative evaluator and return the error.
 ///
 /// Requires: `src` is valid Smol; program must produce an error.
