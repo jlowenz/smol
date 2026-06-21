@@ -148,6 +148,10 @@ pub struct Envelope {
     /// Empty for ordinary sends; populated by cross-entity sends that originate
     /// inside a HandlerContext body.
     pub inherited_chain: Vec<(Arc<Class>, Arc<Block>)>,
+    /// Transaction context this message is sent under (C31), or `None` for an
+    /// ordinary send. Set from the sender's `current_tx_ctx`. The receiving
+    /// entity uses it for ancestry-based mailbox admission and auto-enrollment.
+    pub tx_tag: Option<Arc<crate::shared_tx::TxContext>>,
 }
 
 /// Per-entity isolated data: instance variables, mailbox, status.
@@ -512,6 +516,7 @@ pub fn send_to_entity(
     selector: Arc<str>,
     args: Vec<Value>,
     chain: Vec<(Arc<Class>, Arc<Block>)>,
+    tx_tag: Option<Arc<crate::shared_tx::TxContext>>,
 ) -> FutureHandle {
     let future = FutureHandle::new();
     let mut mb = data.mailbox.lock().unwrap();
@@ -520,6 +525,7 @@ pub fn send_to_entity(
         args,
         reply: future.clone(),
         inherited_chain: chain,
+        tx_tag,
     });
     data.mailbox_ready.notify_one();
     future
@@ -578,6 +584,25 @@ fn commit_or_warn(tx: OwnedStoreTransaction) -> Result<(), StoreError> {
     }
 }
 
+/// Index of the first mailbox envelope admissible given the current lock holder.
+///
+/// - `holder == None` (entity in no transaction): FIFO — the front envelope.
+/// - `holder == Some(h)` (entity locked by context `h`): the first **tagged**
+///   envelope whose context is `h` or a descendant of `h` (so the holder or a
+///   deeper nested level may proceed). Untagged envelopes and envelopes from
+///   sibling/unrelated contexts are skipped — they park in the mailbox until the
+///   entity unlocks back to a common ancestor (sibling serialization).
+pub(crate) fn admissible_index(mb: &VecDeque<Envelope>, holder: Option<TxCtxId>) -> Option<usize> {
+    match holder {
+        None => (!mb.is_empty()).then_some(0),
+        Some(h) => mb.iter().position(|e| {
+            e.tx_tag
+                .as_ref()
+                .is_some_and(|ctx| ctx.has_ancestor_or_self(h))
+        }),
+    }
+}
+
 fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, global_env: Env) {
     use crate::builtins::make_error_value;
     use crate::eval::EvalError;
@@ -608,8 +633,13 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
                     *data.status.lock().unwrap() = EntityStatus::Terminated;
                     return;
                 }
-                if let Some(env) = mb.pop_front() {
-                    break env;
+                // Ancestry-based admission: while locked into a transaction, only
+                // take envelopes from the holding context or a descendant.
+                let holder = data.tx_holder();
+                if let Some(i) = admissible_index(&mb, holder) {
+                    break mb
+                        .remove(i)
+                        .expect("admissible_index returns a valid index");
                 }
                 mb = data.mailbox_ready.wait(mb).unwrap();
             }
@@ -625,8 +655,32 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
             }
         }
 
+        // C31: enroll into the tagged transaction level on the first message at
+        // that level (push a frame, opening this entity's durable buffer under the
+        // shared TxId, and record participation). Subsequent messages at the same
+        // level reuse the existing frame.
+        let tx_tag = envelope.tx_tag.clone();
+        if let Some(ctx) = &tx_tag
+            && data.tx_holder() != Some(ctx.ctx_id())
+        {
+            data.tx_push_frame(ctx.ctx_id(), ctx.tx_id());
+            ctx.participants()
+                .lock()
+                .unwrap()
+                .push(InstanceHandle(state.clone()));
+        }
+
+        // The private per-message transaction. For a tagged message this stays
+        // empty — durable ivar writes route to the entity's frame buffer (see
+        // `store_bridge::with_durable_tx`) — so its boundary commit is a harmless
+        // no-op; the frame persists until `exitTx`.
         let tx = data.store.begin_owned(ExecContext::Entity(data.id));
         *ev.current_tx.borrow_mut() = Some(tx);
+
+        // Propagate the transaction tag for the duration of this dispatch: it
+        // routes durable writes to the frame buffer and tags any outgoing entity
+        // sends so callees auto-enroll.
+        *ev.current_tx_ctx.borrow_mut() = tx_tag;
 
         // Push inherited HC handlers so signal_condition can walk them.
         // Entity-local handlers (from _primHCRun: inside this dispatch) are
@@ -678,6 +732,9 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
         if inherited_len > 0 {
             ev.handler_chain.borrow_mut().clear();
         }
+
+        // Clear the transaction tag; the next message sets its own.
+        *ev.current_tx_ctx.borrow_mut() = None;
 
         match result {
             Ok(v) => {

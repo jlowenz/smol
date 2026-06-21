@@ -1157,8 +1157,9 @@ fn dispatch_entity(
             chain.clone()
         }
     };
+    let tx_tag = ev.current_tx_ctx.borrow().clone();
     let future = match &handle.0.kind {
-        InstanceKind::Entity(d) => send_to_entity(d, selector, args, chain_snapshot),
+        InstanceKind::Entity(d) => send_to_entity(d, selector, args, chain_snapshot, tx_tag),
         _ => unreachable!(),
     };
     Ok(Value::Future(future))
@@ -1931,8 +1932,9 @@ fn dispatch_class(
             chain.clone()
         }
     };
+    let tx_tag = ev.current_tx_ctx.borrow().clone();
     let future = match &handle.0.kind {
-        InstanceKind::ClassEntity(d) => send_to_entity(d, selector, args, chain_snapshot),
+        InstanceKind::ClassEntity(d) => send_to_entity(d, selector, args, chain_snapshot, tx_tag),
         _ => unreachable!(),
     };
     Ok(Value::Future(future))

@@ -254,6 +254,7 @@ fn handle_commit_error_faults_entity_drains_mailbox() {
         args: vec![],
         reply: queued_reply.clone(),
         inherited_chain: vec![],
+        tx_tag: None,
     });
 
     let ev = crate::eval::Evaluator::new_without_kernel();
@@ -262,6 +263,7 @@ fn handle_commit_error_faults_entity_drains_mailbox() {
         args: vec![],
         reply: FutureHandle::new(),
         inherited_chain: vec![],
+        tx_tag: None,
     };
 
     handle_commit_error(
@@ -366,6 +368,7 @@ fn nlr_with_failing_commit_faults_entity() {
             args: vec![Value::Block(nlr_block)],
             reply: reply.clone(),
             inherited_chain: vec![],
+            tx_tag: None,
         });
         d.mailbox_ready.notify_all();
     }
@@ -472,18 +475,21 @@ fn type_error_crash_drains_queued_mailbox() {
             args: vec![],
             reply: reply_bad.clone(),
             inherited_chain: vec![],
+            tx_tag: None,
         });
         mb.push_back(Envelope {
             selector: Arc::from("noop"),
             args: vec![],
             reply: reply_a.clone(),
             inherited_chain: vec![],
+            tx_tag: None,
         });
         mb.push_back(Envelope {
             selector: Arc::from("noop"),
             args: vec![],
             reply: reply_b.clone(),
             inherited_chain: vec![],
+            tx_tag: None,
         });
         drop(mb);
         d.mailbox_ready.notify_all();
@@ -697,5 +703,107 @@ mod tx_frames {
         // Speculative write retained at the parent level, not yet live.
         assert_eq!(d.tx_shadow_get("slot"), Some(Value::Int(20)));
         assert_eq!(d.data.get_slot("slot"), Some(Value::Int(1)));
+    }
+}
+
+// ── C31 S3: ancestry-based mailbox admission ──────────────────────────────────
+
+#[cfg(test)]
+mod tx_admission {
+    use super::*;
+    use crate::shared_tx::{ChildTxInner, RootTxInner, TxContext};
+    use std::collections::VecDeque;
+    use triple_store::id::TxId;
+
+    fn root_ctx(ctx_id: u64) -> Arc<TxContext> {
+        Arc::new(TxContext::Root(Arc::new(RootTxInner {
+            ctx_id,
+            tx_id: TxId(1),
+            tx: Mutex::new(None),
+            enrolled: Mutex::new(Vec::new()),
+        })))
+    }
+
+    fn child_ctx(ctx_id: u64, outer: Arc<TxContext>) -> Arc<TxContext> {
+        Arc::new(TxContext::Child(Arc::new(ChildTxInner {
+            ctx_id,
+            outer,
+            tx: Mutex::new(None),
+            participants: Mutex::new(Vec::new()),
+        })))
+    }
+
+    fn envelope(tag: Option<Arc<TxContext>>) -> Envelope {
+        Envelope {
+            selector: Arc::from("ping"),
+            args: vec![],
+            reply: FutureHandle::new(),
+            inherited_chain: vec![],
+            tx_tag: tag,
+        }
+    }
+
+    fn queue(tags: Vec<Option<Arc<TxContext>>>) -> VecDeque<Envelope> {
+        tags.into_iter().map(envelope).collect()
+    }
+
+    #[test]
+    fn not_in_tx_admits_front_fifo_regardless_of_tag() {
+        let mb = queue(vec![None, None]);
+        assert_eq!(crate::entity::admissible_index(&mb, None), Some(0));
+        let mb = queue(vec![Some(root_ctx(1)), None]);
+        assert_eq!(crate::entity::admissible_index(&mb, None), Some(0));
+    }
+
+    #[test]
+    fn not_in_tx_empty_mailbox_admits_nothing() {
+        let mb: VecDeque<Envelope> = VecDeque::new();
+        assert_eq!(crate::entity::admissible_index(&mb, None), None);
+    }
+
+    #[test]
+    fn locked_parks_untagged_and_admits_holder_tagged() {
+        let root = root_ctx(1);
+        // Untagged in front parks; the holder-tagged one behind is admitted.
+        let mb = queue(vec![None, Some(root.clone())]);
+        assert_eq!(crate::entity::admissible_index(&mb, Some(1)), Some(1));
+    }
+
+    #[test]
+    fn root_holder_admits_descendant_child() {
+        let root = root_ctx(1);
+        let child = child_ctx(2, root.clone());
+        // Held at root; a child-tagged message is a descendant → admitted.
+        let mb = queue(vec![Some(child)]);
+        assert_eq!(crate::entity::admissible_index(&mb, Some(1)), Some(0));
+    }
+
+    #[test]
+    fn child_holder_parks_sibling() {
+        let root = root_ctx(1);
+        let child_a = child_ctx(2, root.clone());
+        let sibling_b = child_ctx(3, root.clone());
+        // Held at child A (ctx 2); sibling B (ctx 3) is neither A nor a descendant
+        // of A → parks. A same-context message is admitted.
+        let mb = queue(vec![Some(sibling_b), Some(child_a)]);
+        assert_eq!(crate::entity::admissible_index(&mb, Some(2)), Some(1));
+    }
+
+    #[test]
+    fn child_holder_parks_everything_when_only_siblings_present() {
+        let root = root_ctx(1);
+        let sibling_b = child_ctx(3, root.clone());
+        let mb = queue(vec![Some(sibling_b), None]);
+        assert_eq!(crate::entity::admissible_index(&mb, Some(2)), None);
+    }
+
+    #[test]
+    fn ancestor_tagged_message_parks_while_descendant_holds() {
+        // Held at child (ctx 2); a message tagged with the root (ctx 1, an
+        // ancestor) parks — the child must exit first.
+        let root = root_ctx(1);
+        let _child = child_ctx(2, root.clone());
+        let mb = queue(vec![Some(root)]);
+        assert_eq!(crate::entity::admissible_index(&mb, Some(2)), None);
     }
 }
