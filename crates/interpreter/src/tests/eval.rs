@@ -2151,13 +2151,9 @@ outer run: [
     assert_eq!(eval(src), Value::Str(Arc::from("outer caught")));
 }
 
-// Ignored pending the evaluator chunk (docs/chunk_31_5_plan.md): nested
-// synchronous HandlerContext run: overflows the 256 KB coroutine stack because
-// block-taking builtins (_primHCRun etc.) still recurse a full step_loop frame
-// per level. Correct in the REPL (larger stack); fix = shrink step_loop frame +
-// flatten block-taking builtins. Not a logic bug.
+// C31.5: nested synchronous HandlerContext run: now runs entirely on the heap
+// Cont stack (flattened _primHCRun: + signals), so this no longer overflows.
 #[test]
-#[ignore = "evaluator stack-frame size (chunk_31_5): nested synchronous HC overflows 256 KB"]
 fn handler_context_most_recent_handler_matches_first() {
     let src = r#"
 | outer |
@@ -2268,11 +2264,8 @@ hc run: [actor signalTwiceThenReturn]
     assert_eq!(eval(src), Value::Int(3));
 }
 
-// Ignored pending the evaluator chunk (docs/chunk_31_5_plan.md) — same cause as
-// handler_context_most_recent_handler_matches_first: nested synchronous HC
-// run: exceeds the 256 KB coroutine stack via recursive step_loop frames.
+// C31.5: nested synchronous HC run: is now flattened onto the heap Cont stack.
 #[test]
-#[ignore = "evaluator stack-frame size (chunk_31_5): nested synchronous HC overflows 256 KB"]
 fn cross_entity_hc_inner_handler_takes_priority() {
     // Actor registers an inner HC handler for Error. Entity-local handlers (pushed
     // later, higher in the chain) take priority over inherited ones.
@@ -2294,10 +2287,8 @@ outerHC run: [actor signalWithInnerHC]
     assert_eq!(eval(src), Value::Str(Arc::from("inner")));
 }
 
-// Ignored pending the evaluator chunk (docs/chunk_31_5_plan.md) — same cause:
-// nested synchronous HandlerContext run: overflows the 256 KB coroutine stack.
+// C31.5: nested synchronous HC run: is now flattened onto the heap Cont stack.
 #[test]
-#[ignore = "evaluator stack-frame size (chunk_31_5): nested synchronous HC overflows 256 KB"]
 fn cross_entity_retry_targets_nearest_hcrun_boundary() {
     // retry from an inherited handler targets the nearest _primHCRun: in the
     // signaling entity's stack, not the outer sender's run: boundary.

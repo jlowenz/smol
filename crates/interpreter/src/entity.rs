@@ -18,14 +18,25 @@ use triple_store::store::{OwnedStoreTransaction, Store, StoreError};
 
 pub use triple_store::id::EntityId;
 
-/// Coroutine stack size for all entity and continuation coroutines.
+/// Coroutine stack size for all entity and continuation coroutines, in `usize`
+/// words (× 8 bytes on 64-bit). This is the per-entity stack, so it bounds how
+/// many entities can coexist — the smaller, the more entities.
 ///
-/// Sized empirically with the iterative evaluator, which uses heap `CallFrame`s
-/// for Smol method calls. The dominant Rust stack cost is nested
-/// builtin→`eval_block` chains (e.g. `on:do:` wrapping `ensure:` wrapping
-/// `do:`). Measured debug-build minimum: ~27 KB; release builds use noticeably
-/// less due to inlining. Constant set to 32 KB for headroom.
-pub(crate) const COROUTINE_STACK_SIZE: usize = 0x8000; // 256 KB — see S6 notes in chunk_30_plan.md
+/// After C31.5 the evaluator keeps essentially all nesting on the heap `Cont`
+/// stack: method/class-method calls, `value`/`on:do:`/`ensure:`/`then:`,
+/// `HandlerContext run:`, signals, value construction, and all iteration
+/// (`to:do:` and everything built on it) are flattened, so the Rust stack is a
+/// small constant independent of Smol nesting depth. The remaining cost is the
+/// depth of one builtin-dispatch chain.
+///
+/// Debug frames are ~8× release (non-overlapping match-arm locals), so the two
+/// builds get different sizes: debug keeps generous headroom for development;
+/// release is sized for production density. Measured floor: ~5 KB per dispatch
+/// chain in release, single-digit depth in normal code.
+#[cfg(debug_assertions)]
+pub(crate) const COROUTINE_STACK_SIZE: usize = 0x8000; // 256 KB (debug; fat frames)
+#[cfg(not(debug_assertions))]
+pub(crate) const COROUTINE_STACK_SIZE: usize = 0x2000; // 64 KB (release; 32 KB also passes the suite)
 
 /// Set the global `may` stack size exactly once. Idempotent — safe to call from
 /// any spawn site; subsequent calls are a no-op.
