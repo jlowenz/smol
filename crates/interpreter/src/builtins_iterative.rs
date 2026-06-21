@@ -125,70 +125,7 @@ pub fn dispatch(
     if selector.as_ref() == "then:" {
         expect_arity(&selector, 1, args.len())?;
         let blk_val = args.into_iter().next().unwrap();
-        return match recv {
-            Value::Future(future) => {
-                let blk = as_block(blk_val, &selector)?;
-                let result_future = crate::entity::FutureHandle::new();
-                let result_reply = result_future.clone();
-                let ctx = ev.fork_context();
-                crate::entity::init_coroutine_stack();
-                may::go!(move || {
-                    match future.wait() {
-                        Err(e) => result_reply.resolve_err(e),
-                        Ok(_) => {
-                            let then_ev = ctx.into_evaluator();
-                            let mut dummy_env = crate::env::Env::new();
-                            let result = then_ev.eval_block(&blk, vec![], &mut dummy_env);
-                            match result {
-                                Ok(v) => match force_value(v) {
-                                    Ok(forced) => result_reply.resolve_ok(forced),
-                                    Err(e) => result_reply.resolve_err(e),
-                                },
-                                Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
-                                Err(e) => result_reply.resolve_err(e),
-                            }
-                        }
-                    }
-                });
-                Ok(Value::Future(result_future))
-            }
-            Value::Block(recv_blk) => {
-                let cont_blk = as_block(blk_val, &selector)?;
-                let result = ev.eval_block(&recv_blk, vec![], env)?;
-                match result {
-                    Value::Future(future) => {
-                        let result_future = crate::entity::FutureHandle::new();
-                        let result_reply = result_future.clone();
-                        let ctx = ev.fork_context();
-                        crate::entity::init_coroutine_stack();
-                        may::go!(move || {
-                            match future.wait() {
-                                Err(e) => result_reply.resolve_err(e),
-                                Ok(_) => {
-                                    let then_ev = ctx.into_evaluator();
-                                    let mut dummy_env = crate::env::Env::new();
-                                    let r = then_ev.eval_block(&cont_blk, vec![], &mut dummy_env);
-                                    match r {
-                                        Ok(v) => match force_value(v) {
-                                            Ok(forced) => result_reply.resolve_ok(forced),
-                                            Err(e) => result_reply.resolve_err(e),
-                                        },
-                                        Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
-                                        Err(e) => result_reply.resolve_err(e),
-                                    }
-                                }
-                            }
-                        });
-                        Ok(Value::Future(result_future))
-                    }
-                    _ => ev.eval_block(&cont_blk, vec![], env),
-                }
-            }
-            _ => {
-                let blk = as_block(blk_val, &selector)?;
-                ev.eval_block(&blk, vec![], env)
-            }
-        };
+        return dispatch_then(ev, recv, blk_val, &selector, env);
     }
 
     match recv {
@@ -214,6 +151,88 @@ pub fn dispatch(
             receiver_kind: "Handle",
             selector,
         }),
+    }
+}
+
+/// `then:` — chains a block after this value resolves. Extracted `#[inline(never)]`
+/// from `dispatch` so its `may::go!` continuation closures (large debug frames)
+/// don't inflate `dispatch`'s frame on every dispatch.
+///
+/// Future receiver: spawns an async continuation, returns a new Future.
+/// Block receiver: runs it (≡ `value`); if the result is a Future, chains
+///   asynchronously, else runs the continuation synchronously.
+/// Any other value: already resolved; the continuation runs synchronously.
+#[inline(never)]
+fn dispatch_then(
+    ev: &Evaluator,
+    recv: Value,
+    blk_val: Value,
+    selector: &Arc<str>,
+    env: &mut Env,
+) -> Result<Value, EvalError> {
+    match recv {
+        Value::Future(future) => {
+            let blk = as_block(blk_val, selector)?;
+            let result_future = crate::entity::FutureHandle::new();
+            let result_reply = result_future.clone();
+            let ctx = ev.fork_context();
+            crate::entity::init_coroutine_stack();
+            may::go!(move || {
+                match future.wait() {
+                    Err(e) => result_reply.resolve_err(e),
+                    Ok(_) => {
+                        let then_ev = ctx.into_evaluator();
+                        let mut dummy_env = crate::env::Env::new();
+                        let result = then_ev.eval_block(&blk, vec![], &mut dummy_env);
+                        match result {
+                            Ok(v) => match force_value(v) {
+                                Ok(forced) => result_reply.resolve_ok(forced),
+                                Err(e) => result_reply.resolve_err(e),
+                            },
+                            Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
+                            Err(e) => result_reply.resolve_err(e),
+                        }
+                    }
+                }
+            });
+            Ok(Value::Future(result_future))
+        }
+        Value::Block(recv_blk) => {
+            let cont_blk = as_block(blk_val, selector)?;
+            let result = ev.eval_block(&recv_blk, vec![], env)?;
+            match result {
+                Value::Future(future) => {
+                    let result_future = crate::entity::FutureHandle::new();
+                    let result_reply = result_future.clone();
+                    let ctx = ev.fork_context();
+                    crate::entity::init_coroutine_stack();
+                    may::go!(move || {
+                        match future.wait() {
+                            Err(e) => result_reply.resolve_err(e),
+                            Ok(_) => {
+                                let then_ev = ctx.into_evaluator();
+                                let mut dummy_env = crate::env::Env::new();
+                                let r = then_ev.eval_block(&cont_blk, vec![], &mut dummy_env);
+                                match r {
+                                    Ok(v) => match force_value(v) {
+                                        Ok(forced) => result_reply.resolve_ok(forced),
+                                        Err(e) => result_reply.resolve_err(e),
+                                    },
+                                    Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
+                                    Err(e) => result_reply.resolve_err(e),
+                                }
+                            }
+                        }
+                    });
+                    Ok(Value::Future(result_future))
+                }
+                _ => ev.eval_block(&cont_blk, vec![], env),
+            }
+        }
+        _ => {
+            let blk = as_block(blk_val, selector)?;
+            ev.eval_block(&blk, vec![], env)
+        }
     }
 }
 
@@ -1213,6 +1232,22 @@ fn tx_ctx_from_handle(v: Value) -> Result<Arc<TxContext>, EvalError> {
     }
 }
 
+/// Shared receiver context for the `dispatch_object_primitive` chunk handlers.
+///
+/// `dispatch_object_primitive`'s `match sel` was one ~900-line function whose
+/// debug frame summed *every* arm's locals — and that frame is live at the
+/// signal/eval_block recursion point, dominating the per-nesting-level Rust
+/// stack (C31.5: ~52 KB of the ~60 KB/level). Splitting the arms into
+/// `#[inline(never)]` chunk handlers means only the matched chunk's frame is
+/// live at any recursion, not all arms'.
+struct ObjPrim<'a> {
+    ev: &'a Evaluator,
+    handle: &'a InstanceHandle,
+    obj: &'a Arc<Object>,
+    entity_id: Option<EntityId>,
+    self_val: &'a Value,
+}
+
 pub(crate) fn dispatch_object_primitive(
     ev: &Evaluator,
     handle: InstanceHandle,
@@ -1220,7 +1255,6 @@ pub(crate) fn dispatch_object_primitive(
     mut args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
-    use crate::object::IndexedStorage;
     let entity_id = match &handle.0.kind {
         InstanceKind::Entity(d) => Some(d.id),
         _ => None,
@@ -1236,28 +1270,89 @@ pub(crate) fn dispatch_object_primitive(
         }
     };
     let self_val = Value::Instance(handle.clone());
-    match sel.as_ref() {
+    let cx = ObjPrim {
+        ev,
+        handle: &handle,
+        obj: &obj,
+        entity_id,
+        self_val: &self_val,
+    };
+
+    // Each chunk handles a disjoint set of selectors and returns Ok(None) for
+    // the rest; chunks run sequentially so only the matched chunk's frame is
+    // ever live at a recursion point inside it (e.g. signal_condition).
+    if let Some(v) = obj_prim_core(&cx, sel, &mut args)? {
+        return Ok(v);
+    }
+    if let Some(v) = obj_prim_indexed(&cx, sel, &mut args)? {
+        return Ok(v);
+    }
+    if let Some(v) = obj_prim_conditions(&cx, sel, &mut args, env)? {
+        return Ok(v);
+    }
+    if let Some(v) = obj_prim_history(&cx, sel, &mut args)? {
+        return Ok(v);
+    }
+    if let Some(v) = obj_prim_timers(&cx, sel, &mut args)? {
+        return Ok(v);
+    }
+    if let Some(v) = obj_prim_tx(&cx, sel, &mut args)? {
+        return Ok(v);
+    }
+    if let Some(v) = obj_prim_futures(&cx, sel, &mut args)? {
+        return Ok(v);
+    }
+    Err(EvalError::MessageNotUnderstood {
+        receiver_kind: "Object",
+        selector: sel.clone(),
+    })
+}
+
+/// `=`, `~=`, `printString`, `respondsTo:`.
+#[inline(never)]
+fn obj_prim_core(
+    cx: &ObjPrim,
+    sel: &Arc<str>,
+    args: &mut Vec<Value>,
+) -> Result<Option<Value>, EvalError> {
+    Ok(Some(match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(self_val == force_value(args.remove(0))?))
+            Value::Bool(*cx.self_val == force_value(args.remove(0))?)
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(self_val != force_value(args.remove(0))?))
+            Value::Bool(*cx.self_val != force_value(args.remove(0))?)
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
-            let s: Arc<str> = Arc::from(format!("a {}", obj.class.name).as_str());
+            let s: Arc<str> = Arc::from(format!("a {}", cx.obj.class.name).as_str());
             println!("{:?}", s);
-            Ok(Value::Str(s))
+            Value::Str(s)
         }
         "respondsTo:" => {
             expect_arity(sel, 1, args.len())?;
             match args.remove(0) {
-                Value::Symbol(s) => Ok(Value::Bool(obj.class.lookup(&s).is_some())),
-                _ => Ok(Value::Bool(false)),
+                Value::Symbol(s) => Value::Bool(cx.obj.class.lookup(&s).is_some()),
+                _ => Value::Bool(false),
             }
         }
+        _ => return Ok(None),
+    }))
+}
+
+/// Indexed-slot primitives: `_primAt:`, `_primAt:put:`, `_primSize`, `_primAsString`.
+#[inline(never)]
+fn obj_prim_indexed(
+    cx: &ObjPrim,
+    sel: &Arc<str>,
+    args: &mut Vec<Value>,
+) -> Result<Option<Value>, EvalError> {
+    use crate::object::IndexedStorage;
+    let obj = cx.obj;
+    let entity_id = cx.entity_id;
+    let ev = cx.ev;
+    Ok(Some(match sel.as_ref() {
         "_primAt:" => {
             expect_arity(sel, 1, args.len())?;
             let n = as_int(args.remove(0), sel)?;
@@ -1273,7 +1368,7 @@ pub(crate) fn dispatch_object_primitive(
                             guard.len()
                         )));
                     }
-                    Ok(guard[n as usize].clone())
+                    guard[n as usize].clone()
                 }
                 IndexedStorage::Byte(bytes) => {
                     let guard = bytes.lock();
@@ -1283,7 +1378,7 @@ pub(crate) fn dispatch_object_primitive(
                             guard.len()
                         )));
                     }
-                    Ok(Value::Int(guard[n as usize] as i64))
+                    Value::Int(guard[n as usize] as i64)
                 }
                 IndexedStorage::Float64(floats) => {
                     let guard = floats.lock();
@@ -1293,7 +1388,7 @@ pub(crate) fn dispatch_object_primitive(
                             guard.len()
                         )));
                     }
-                    Ok(Value::Float(guard[n as usize]))
+                    Value::Float(guard[n as usize])
                 }
             }
         }
@@ -1318,7 +1413,7 @@ pub(crate) fn dispatch_object_primitive(
                     if let Some(eid) = entity_id {
                         crate::store_bridge::buffer_indexed_slot(ev, eid, n as usize, &v);
                     }
-                    Ok(v)
+                    v
                 }
                 IndexedStorage::Byte(bytes) => {
                     let b = match &v {
@@ -1351,7 +1446,7 @@ pub(crate) fn dispatch_object_primitive(
                             &Value::Int(b as i64),
                         );
                     }
-                    Ok(v)
+                    v
                 }
                 IndexedStorage::Float64(floats) => {
                     let f = match &v {
@@ -1380,7 +1475,7 @@ pub(crate) fn dispatch_object_primitive(
                             &Value::Float(f),
                         );
                     }
-                    Ok(v)
+                    v
                 }
             }
         }
@@ -1394,7 +1489,7 @@ pub(crate) fn dispatch_object_primitive(
                 IndexedStorage::Byte(bytes) => bytes.lock().len(),
                 IndexedStorage::Float64(floats) => floats.lock().len(),
             };
-            Ok(Value::Int(len as i64))
+            Value::Int(len as i64)
         }
         "_primAsString" => {
             expect_arity(sel, 0, args.len())?;
@@ -1403,20 +1498,38 @@ pub(crate) fn dispatch_object_primitive(
             })? {
                 IndexedStorage::Byte(bytes) => {
                     let s = String::from_utf8_lossy(&bytes.lock()).into_owned();
-                    Ok(Value::Str(Arc::from(s.as_str())))
+                    Value::Str(Arc::from(s.as_str()))
                 }
-                _ => Err(EvalError::TypeError(format!(
-                    "{sel}: requires Byte indexed storage"
-                ))),
+                _ => {
+                    return Err(EvalError::TypeError(format!(
+                        "{sel}: requires Byte indexed storage"
+                    )));
+                }
             }
         }
+        _ => return Ok(None),
+    }))
+}
+
+/// Condition system: `error:`, `_primSignalCondition:`, `_primResume:`,
+/// `_primReturn:`, `_primRetry`, and the `_primHCRun:` fallback. This chunk holds
+/// the signal path; keeping it small bounds the Rust stack at the handler eval.
+#[inline(never)]
+fn obj_prim_conditions(
+    cx: &ObjPrim,
+    sel: &Arc<str>,
+    args: &mut Vec<Value>,
+    env: &mut Env,
+) -> Result<Option<Value>, EvalError> {
+    let ev = cx.ev;
+    Ok(Some(match sel.as_ref() {
         "error:" => {
             expect_arity(sel, 1, args.len())?;
             let msg = match force_value(args.remove(0))? {
                 Value::Str(s) => s,
                 other => Arc::from(format!("error: argument was {}", other.kind()).as_str()),
             };
-            signal_condition(ev, make_error_value(&ev.registry, &msg), env)
+            signal_condition(ev, make_error_value(&ev.registry, &msg), env)?
         }
         "_primSignalCondition:" => {
             expect_arity(sel, 1, args.len())?;
@@ -1426,21 +1539,19 @@ pub(crate) fn dispatch_object_primitive(
                     "_primSignalCondition: requires a Condition instance".into(),
                 ));
             }
-            signal_condition(ev, condition, env)
+            signal_condition(ev, condition, env)?
         }
         "_primResume:" => {
             expect_arity(sel, 1, args.len())?;
-            let v = args.remove(0);
-            Err(EvalError::Resume(v))
+            return Err(EvalError::Resume(args.remove(0)));
         }
         "_primReturn:" => {
             expect_arity(sel, 1, args.len())?;
-            let v = args.remove(0);
-            Err(EvalError::ReturnFromBlock(v))
+            return Err(EvalError::ReturnFromBlock(args.remove(0)));
         }
         "_primRetry" => {
             expect_arity(sel, 0, args.len())?;
-            Err(EvalError::Retry)
+            return Err(EvalError::Retry);
         }
         "_primHCRun:" => {
             // Fallback path only. The iterative evaluator intercepts `_primHCRun:`
@@ -1450,7 +1561,7 @@ pub(crate) fn dispatch_object_primitive(
             // `builtins::dispatch` caller.
             expect_arity(sel, 1, args.len())?;
             let body = as_block(args.remove(0), sel)?;
-            let handler_pairs = extract_handler_pairs(&handle)?;
+            let handler_pairs = extract_handler_pairs(cx.handle)?;
 
             // Push handler pairs onto handler_chain.
             let chain_start_len = ev.handler_chain.borrow().len();
@@ -1472,8 +1583,22 @@ pub(crate) fn dispatch_object_primitive(
                 }
             };
             ev.handler_chain.borrow_mut().truncate(chain_start_len);
-            result
+            result?
         }
+        _ => return Ok(None),
+    }))
+}
+
+/// Temporal queries: `historyOf:`, `historyOf:from:to:`.
+#[inline(never)]
+fn obj_prim_history(
+    cx: &ObjPrim,
+    sel: &Arc<str>,
+    args: &mut Vec<Value>,
+) -> Result<Option<Value>, EvalError> {
+    let ev = cx.ev;
+    let entity_id = cx.entity_id;
+    Ok(Some(match sel.as_ref() {
         "historyOf:" => {
             expect_arity(sel, 1, args.len())?;
             let eid = entity_id.ok_or_else(|| {
@@ -1498,7 +1623,7 @@ pub(crate) fn dispatch_object_primitive(
                     &format!("historyOf: store error: {e:?}"),
                 ))
             })?;
-            history_facts_to_array(ev, &facts)
+            history_facts_to_array(ev, &facts)?
         }
         "historyOf:from:to:" => {
             expect_arity(sel, 3, args.len())?;
@@ -1540,8 +1665,21 @@ pub(crate) fn dispatch_object_primitive(
                     start_ms <= to_ms && end_ms >= from_ms
                 })
                 .collect();
-            history_facts_to_array(ev, &facts)
+            history_facts_to_array(ev, &facts)?
         }
+        _ => return Ok(None),
+    }))
+}
+
+/// Timer primitives: `_primCancelTimer:`, `_primTimerPending:`.
+#[inline(never)]
+fn obj_prim_timers(
+    cx: &ObjPrim,
+    sel: &Arc<str>,
+    args: &mut Vec<Value>,
+) -> Result<Option<Value>, EvalError> {
+    let ev = cx.ev;
+    Ok(Some(match sel.as_ref() {
         "_primCancelTimer:" => {
             // Requires: args[0] is a Value::Handle returned by _primScheduleTimer:block:.
             // Ensures: the timer callback will not be called if it has not already fired.
@@ -1550,12 +1688,14 @@ pub(crate) fn dispatch_object_primitive(
             match force_value(args.remove(0))? {
                 Value::Handle(h) => {
                     ev.os.cancel_timer(&h);
-                    Ok(Value::Nil)
+                    Value::Nil
                 }
-                other => Err(EvalError::TypeError(format!(
-                    "_primCancelTimer: argument must be a Handle, got {}",
-                    other.kind()
-                ))),
+                other => {
+                    return Err(EvalError::TypeError(format!(
+                        "_primCancelTimer: argument must be a Handle, got {}",
+                        other.kind()
+                    )));
+                }
             }
         }
         "_primTimerPending:" => {
@@ -1563,15 +1703,28 @@ pub(crate) fn dispatch_object_primitive(
             // Ensures: returns Value::Bool(true) iff the timer has not fired and is not cancelled.
             expect_arity(sel, 1, args.len())?;
             match force_value(args.remove(0))? {
-                Value::Handle(h) => Ok(Value::Bool(ev.os.timer_pending(&h))),
-                other => Err(EvalError::TypeError(format!(
-                    "_primTimerPending: argument must be a Handle, got {}",
-                    other.kind()
-                ))),
+                Value::Handle(h) => Value::Bool(ev.os.timer_pending(&h)),
+                other => {
+                    return Err(EvalError::TypeError(format!(
+                        "_primTimerPending: argument must be a Handle, got {}",
+                        other.kind()
+                    )));
+                }
             }
         }
+        _ => return Ok(None),
+    }))
+}
 
-        // ── Multi-entity transactions (C31) ────────────────────────────────────
+/// Multi-entity transaction primitives (C31).
+#[inline(never)]
+fn obj_prim_tx(
+    cx: &ObjPrim,
+    sel: &Arc<str>,
+    args: &mut Vec<Value>,
+) -> Result<Option<Value>, EvalError> {
+    let ev = cx.ev;
+    Ok(Some(match sel.as_ref() {
         "_primBeginSharedTx" => {
             // Begin a transaction level. If no transaction is active, create a
             // Root under a fresh shared TxId; otherwise create a Child of the
@@ -1602,7 +1755,7 @@ pub(crate) fn dispatch_object_primitive(
                 }
             };
             *ev.current_tx_ctx.borrow_mut() = Some(new_ctx.clone());
-            Ok(Value::Handle(new_ctx))
+            Value::Handle(new_ctx)
         }
         "_primCommitSharedTx:" => {
             // Finalize a transaction level. Root: commit the context buffer to the
@@ -1627,7 +1780,7 @@ pub(crate) fn dispatch_object_primitive(
                     *ev.current_tx_ctx.borrow_mut() = Some(c.outer.clone());
                 }
             }
-            Ok(Value::Nil)
+            Value::Nil
         }
         "_primRollbackSharedTx:" => {
             // Abort a transaction level. Root: drop the context buffer (its ops
@@ -1645,7 +1798,7 @@ pub(crate) fn dispatch_object_primitive(
                     *ev.current_tx_ctx.borrow_mut() = Some(c.outer.clone());
                 }
             }
-            Ok(Value::Nil)
+            Value::Nil
         }
         "_primEnrolledParticipants:" => {
             // Return this level's participants as a Cons list (or nil). A Cons is a
@@ -1661,7 +1814,7 @@ pub(crate) fn dispatch_object_primitive(
                 .cloned()
                 .map(Value::Instance)
                 .collect();
-            build_cons_list(ev, parts)
+            build_cons_list(ev, parts)?
         }
         "_primExitTxMode:" => {
             // Participant-side finalize of its current transaction frame, driven by
@@ -1677,7 +1830,7 @@ pub(crate) fn dispatch_object_primitive(
                     )));
                 }
             };
-            let d = match &handle.0.kind {
+            let d = match &cx.handle.0.kind {
                 InstanceKind::Entity(d) => d.as_ref(),
                 _ => {
                     return Err(EvalError::TypeError(
@@ -1686,7 +1839,7 @@ pub(crate) fn dispatch_object_primitive(
                 }
             };
             if !d.in_tx() {
-                return Ok(Value::Nil); // defensive: nothing to finalize
+                return Ok(Some(Value::Nil)); // defensive: nothing to finalize
             }
             let ctx = ev.current_tx_ctx.borrow().clone();
             match outcome.as_ref() {
@@ -1707,7 +1860,11 @@ pub(crate) fn dispatch_object_primitive(
                             // Lock passed up: become a participant of the parent so
                             // its later commit/rollback reaches this entity.
                             if let Some(TxContext::Child(ch)) = ctx.as_deref() {
-                                ch.outer.participants().lock().unwrap().push(handle.clone());
+                                ch.outer
+                                    .participants()
+                                    .lock()
+                                    .unwrap()
+                                    .push(cx.handle.clone());
                             }
                         }
                         FrameCommitOutcome::MergedIntoAncestor => {}
@@ -1720,18 +1877,24 @@ pub(crate) fn dispatch_object_primitive(
                     )));
                 }
             }
-            Ok(Value::Nil)
+            Value::Nil
         }
+        _ => return Ok(None),
+    }))
+}
 
-        // ── Explicit Future reification (C31) ──────────────────────────────────
-        // Reify the implicit `Value::Future` so Smol code can create a future,
-        // pass it around, and resolve/reject it later — used by `Transaction` to
-        // hold the still-pending transaction result. The handle is a plain
-        // `Value::Future`, so it is `await`-able and `then:`-able exactly like an
-        // implicit future.
+/// Explicit Future reification (C31): `_primNewFutureHandle`,
+/// `_primResolveFuture:value:`, `_primRejectFuture:error:`.
+#[inline(never)]
+fn obj_prim_futures(
+    _cx: &ObjPrim,
+    sel: &Arc<str>,
+    args: &mut Vec<Value>,
+) -> Result<Option<Value>, EvalError> {
+    Ok(Some(match sel.as_ref() {
         "_primNewFutureHandle" => {
             expect_arity(sel, 0, args.len())?;
-            Ok(Value::Future(FutureHandle::new()))
+            Value::Future(FutureHandle::new())
         }
         "_primResolveFuture:value:" => {
             expect_arity(sel, 2, args.len())?;
@@ -1740,12 +1903,14 @@ pub(crate) fn dispatch_object_primitive(
             match h {
                 Value::Future(fh) => {
                     fh.resolve_ok(v);
-                    Ok(Value::Nil)
+                    Value::Nil
                 }
-                other => Err(EvalError::TypeError(format!(
-                    "_primResolveFuture:value: expects a future handle, got {}",
-                    other.kind()
-                ))),
+                other => {
+                    return Err(EvalError::TypeError(format!(
+                        "_primResolveFuture:value: expects a future handle, got {}",
+                        other.kind()
+                    )));
+                }
             }
         }
         "_primRejectFuture:error:" => {
@@ -1755,20 +1920,18 @@ pub(crate) fn dispatch_object_primitive(
             match h {
                 Value::Future(fh) => {
                     fh.resolve_err(EvalError::Signal(e));
-                    Ok(Value::Nil)
+                    Value::Nil
                 }
-                other => Err(EvalError::TypeError(format!(
-                    "_primRejectFuture:error: expects a future handle, got {}",
-                    other.kind()
-                ))),
+                other => {
+                    return Err(EvalError::TypeError(format!(
+                        "_primRejectFuture:error: expects a future handle, got {}",
+                        other.kind()
+                    )));
+                }
             }
         }
-
-        _ => Err(EvalError::MessageNotUnderstood {
-            receiver_kind: "Object",
-            selector: sel.clone(),
-        }),
-    }
+        _ => return Ok(None),
+    }))
 }
 
 /// Extract a HandlerContext's handler pairs from its `pairs` ivar.
@@ -1855,6 +2018,11 @@ pub(crate) fn signal_condition(
     condition: Value,
     env: &mut Env,
 ) -> Result<Value, EvalError> {
+    #[cfg(feature = "step_probe")]
+    {
+        let sp_probe = 0u8;
+        crate::eval_iterative::probe::sample_signal_condition(&sp_probe as *const u8 as usize);
+    }
     let cond_class = match &condition {
         Value::Instance(h) => h.0.class.clone(),
         _ => return Err(EvalError::Signal(condition)),

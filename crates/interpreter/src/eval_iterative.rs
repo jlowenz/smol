@@ -42,6 +42,21 @@ pub mod probe {
     /// `step_loop → builtins → eval_block → step_loop` recursion. This is the
     /// per-nesting-level growth a flattened evaluator must drive toward zero.
     static MAX_LEVEL_DELTA: AtomicUsize = AtomicUsize::new(0);
+    /// Max stack consumed from the enclosing `step_loop` entry down to a
+    /// `signal_condition` entry — i.e. everything above the signal handler eval,
+    /// dominated by the `builtins::dispatch` / `dispatch_object_primitive` chain.
+    static MAX_SIGCOND_DELTA: AtomicUsize = AtomicUsize::new(0);
+
+    /// Sample the stack pointer at a `signal_condition` entry (temporary probe to
+    /// attribute the per-level delta to the dispatch chain). `sp` is the address
+    /// of a local in `signal_condition`'s frame.
+    pub fn sample_signal_condition(sp: usize) {
+        ENTRY_SPS.with(|s| {
+            if let Some(&parent) = s.borrow().last() {
+                MAX_SIGCOND_DELTA.fetch_max(parent.saturating_sub(sp), Ordering::Relaxed);
+            }
+        });
+    }
 
     /// RAII guard: increments the per-thread `step_loop` depth on entry,
     /// updates the global max depth, records the stack-pointer high/low water
@@ -94,6 +109,7 @@ pub mod probe {
         MAX_SP.store(0, Ordering::Relaxed);
         MIN_SP.store(usize::MAX, Ordering::Relaxed);
         MAX_LEVEL_DELTA.store(0, Ordering::Relaxed);
+        MAX_SIGCOND_DELTA.store(0, Ordering::Relaxed);
         ENTRY_SPS.with(|s| s.borrow_mut().clear());
     }
 
@@ -109,6 +125,12 @@ pub mod probe {
     #[cfg(test)]
     pub fn level_delta() -> usize {
         MAX_LEVEL_DELTA.load(Ordering::Relaxed)
+    }
+
+    /// Max stack from a `step_loop` entry down to a `signal_condition` entry.
+    #[cfg(test)]
+    pub fn sigcond_delta() -> usize {
+        MAX_SIGCOND_DELTA.load(Ordering::Relaxed)
     }
 
     /// Total Rust stack span (bytes) between the shallowest and deepest

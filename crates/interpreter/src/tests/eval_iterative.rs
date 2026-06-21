@@ -19,9 +19,9 @@ outer run: [
 "#;
     let r = eval_probe(src);
     eprintln!(
-        "[step_probe] nested HC: max step_loop depth = {}, size_of::<Cont>() = {} bytes, \
-         stack span = {} bytes, max per-level delta = {} bytes",
-        r.max_depth, r.cont_size, r.stack_span, r.level_delta,
+        "[step_probe] nested HC: depth = {}, size_of::<Cont>() = {} B, span = {} B, \
+         per-level delta = {} B, step_loop→signal_condition delta = {} B",
+        r.max_depth, r.cont_size, r.stack_span, r.level_delta, r.sigcond_delta,
     );
     assert_eq!(r.value, Value::Str(Arc::from("inner")));
 }

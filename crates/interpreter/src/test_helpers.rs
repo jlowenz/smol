@@ -147,6 +147,8 @@ pub(crate) struct ProbeResult {
     pub stack_span: usize,
     /// Largest parent→child `step_loop` entry delta (bytes) — per-level growth.
     pub level_delta: usize,
+    /// Max stack from a `step_loop` entry down to a `signal_condition` entry.
+    pub sigcond_delta: usize,
 }
 
 #[cfg(feature = "step_probe")]
@@ -171,6 +173,7 @@ pub(crate) fn eval_probe(src: &str) -> ProbeResult {
             cont_size: probe::cont_size(),
             stack_span: probe::stack_span(),
             level_delta: probe::level_delta(),
+            sigcond_delta: probe::sigcond_delta(),
         })
         .unwrap();
     });
