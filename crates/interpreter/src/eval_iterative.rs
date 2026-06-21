@@ -378,6 +378,19 @@ pub(crate) enum Cont {
         stop: i64,
         step: i64,
     },
+
+    /// Sits below a signal handler's block frame (flattened `_primSignalCondition:`
+    /// / `error:`). The handler runs on the heap `Cont` stack with itself and all
+    /// inner handlers removed from `handler_chain` (Common-Lisp handler-scoping);
+    /// `removed` holds those entries, re-appended whenever the guard is left.
+    ///
+    /// Success / `resume:`: the handler's value becomes the signal expression's
+    ///   value — the continuation below resumes with it (non-unwinding handler).
+    /// `return:` / `retry` / re-signal: propagate (to the enclosing `HCRunGuard`
+    ///   or an outer handler) after the chain is restored.
+    SignalGuard {
+        removed: Vec<crate::eval::HandlerPair>,
+    },
 }
 
 /// Outcome of a `^`-return unwind scan.
@@ -437,6 +450,11 @@ fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
             chain_start_len, ..
         } => {
             ev.handler_chain.borrow_mut().truncate(chain_start_len);
+            None
+        }
+        // Discarding a signal boundary re-enables the handlers it had disabled.
+        Cont::SignalGuard { removed } => {
+            ev.handler_chain.borrow_mut().extend(removed);
             None
         }
         _ => None,
@@ -614,6 +632,17 @@ fn handle_step_error(
                             ev.handler_chain.borrow_mut().truncate(chain_start_len);
                         }
                     },
+                    Cont::SignalGuard { removed } => {
+                        // Re-enable the handlers this signal had disabled.
+                        ev.handler_chain.borrow_mut().extend(removed);
+                        // `resume:` delivers a value to the signal point; return:/
+                        // retry/re-signal propagate to the enclosing HCRunGuard /
+                        // outer handler (keep scanning).
+                        if let EvalError::Resume(v) = &other {
+                            *acc = v.clone();
+                            return Ok(());
+                        }
+                    }
                     // Frames are torn down; all other continuations (ForceAcc,
                     // RestoreAcc, CollectArgs, …) are discarded during propagation.
                     other_cont => {
@@ -940,6 +969,13 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
             } => {
                 // Body completed normally; drop this HC's handlers, pass acc through.
                 ev.handler_chain.borrow_mut().truncate(chain_start_len);
+            }
+
+            // ── SignalGuard (handler completed normally) ──────────────────
+            Cont::SignalGuard { removed } => {
+                // Re-enable the disabled handlers; acc (handler result) becomes
+                // the signal expression's value and the continuation resumes.
+                ev.handler_chain.borrow_mut().extend(removed);
             }
 
             // ── ToDoStep (numeric loop iteration) ─────────────────────────
@@ -1696,6 +1732,49 @@ fn dispatch_super_to_stack(
     Ok(())
 }
 
+/// Flattened signal dispatch for `_primSignalCondition:` / `error:`.
+///
+/// Requires: `condition` is forced.
+/// Ensures: if a handler in `ev.handler_chain` matches, it runs on the heap
+///   `Cont` stack behind a `SignalGuard`, with itself and all inner handlers
+///   removed from the chain for its duration (Common-Lisp handler-scoping) so a
+///   re-signal defers to an outer handler. Its result becomes the signal
+///   expression's value (resume). If no handler matches, the unhandled policy is
+///   applied to `*acc` (Error → propagated `EvalError::Signal`). No recursive
+///   `step_loop` is entered.
+fn dispatch_signal(
+    ev: &Evaluator,
+    condition: Value,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+) -> Result<(), EvalError> {
+    let cond_class = match &condition {
+        Value::Instance(h) => h.0.class.clone(),
+        _ => return Err(EvalError::Signal(condition)),
+    };
+    let idx = ev
+        .handler_chain
+        .borrow()
+        .iter()
+        .rposition(|(hc, _)| Class::is_subclass_of(&cond_class, hc));
+    match idx {
+        Some(i) => {
+            let (handler_blk, removed) = {
+                let mut chain = ev.handler_chain.borrow_mut();
+                let removed = chain.split_off(i); // removed[0] = matched pair
+                (removed[0].1.clone(), removed)
+            };
+            stack.push(Cont::SignalGuard { removed });
+            push_block_frame(ev, &handler_blk, vec![condition], false, stack)?;
+            Ok(())
+        }
+        None => {
+            *acc = crate::builtins_iterative::apply_unhandled_policy(ev, condition)?;
+            Ok(())
+        }
+    }
+}
+
 fn dispatch_to_stack(
     ev: &Evaluator,
     receiver: Value,
@@ -1838,6 +1917,47 @@ fn dispatch_to_stack(
                 return Ok(());
             }
             _ => {}
+        }
+    }
+
+    // (1d) Signal dispatch flattened: run the matching handler on the heap `Cont`
+    // stack (SignalGuard) with Common-Lisp handler-scoping instead of recursing
+    // `step_loop` via `eval_block`. Covers the canonical `signal` →
+    // `self _primSignalCondition: self` path and object-receiver `error:`.
+    //
+    // Gated on an Instance receiver to preserve the primitive path exactly:
+    // `error:` on a primitive uses `dispatch_primitive_fallback` (a direct
+    // `EvalError::Signal` that bypasses the handler chain, with a different
+    // message). `_primSignalCondition:` is only ever sent to a condition instance.
+    if matches!(receiver, Value::Instance(_)) {
+        if selector.as_ref() == "_primSignalCondition:" {
+            if args.len() != 1 {
+                return Err(EvalError::ArityMismatch {
+                    expected: 1,
+                    got: args.len(),
+                });
+            }
+            let condition = force_value(args.into_iter().next().unwrap())?;
+            if !matches!(&condition, Value::Instance(_)) {
+                return Err(EvalError::TypeError(
+                    "_primSignalCondition: requires a Condition instance".into(),
+                ));
+            }
+            return dispatch_signal(ev, condition, stack, acc);
+        }
+        if selector.as_ref() == "error:" {
+            if args.len() != 1 {
+                return Err(EvalError::ArityMismatch {
+                    expected: 1,
+                    got: args.len(),
+                });
+            }
+            let msg = match force_value(args.into_iter().next().unwrap())? {
+                Value::Str(s) => s,
+                other => Arc::from(format!("error: argument was {}", other.kind()).as_str()),
+            };
+            let condition = crate::builtins_iterative::make_error_value(&ev.registry, &msg);
+            return dispatch_signal(ev, condition, stack, acc);
         }
     }
 

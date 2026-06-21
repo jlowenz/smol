@@ -2134,6 +2134,23 @@ hc run: ['ok'].
     assert_eq!(eval(src), Value::Str(Arc::from("ok")));
 }
 
+#[test]
+fn handler_resignal_defers_to_outer_handler_cl_scoping() {
+    // Common-Lisp handler-scoping: while a handler runs, it (and inner handlers)
+    // are disabled, so a handler that re-signals a condition it itself handles
+    // defers to the OUTER handler instead of re-matching itself (which would loop
+    // forever under the naive "handler stays active" rule).
+    let src = r#"
+| outer |
+outer := HandlerContext new on: Error do: [:e | 'outer caught'].
+outer run: [
+    (HandlerContext new on: Error do: [:e | Error signal: 'reraised'])
+        run: [Error signal: 'original']
+]
+"#;
+    assert_eq!(eval(src), Value::Str(Arc::from("outer caught")));
+}
+
 // Ignored pending the evaluator chunk (docs/chunk_31_5_plan.md): nested
 // synchronous HandlerContext run: overflows the 256 KB coroutine stack because
 // block-taking builtins (_primHCRun etc.) still recurse a full step_loop frame

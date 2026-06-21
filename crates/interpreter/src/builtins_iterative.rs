@@ -2029,29 +2029,43 @@ pub(crate) fn signal_condition(
         _ => return Err(EvalError::Signal(condition)),
     };
 
-    // Walk handler_chain in reverse (most-recently-pushed first).
-    let chain_snapshot = ev.handler_chain.borrow().clone();
-    let mut re_signaled = false;
-    for (handler_class, handler_block) in chain_snapshot.iter().rev() {
-        if crate::class::Class::is_subclass_of(&cond_class, handler_class) {
-            match ev.eval_block(handler_block, vec![condition.clone()], env) {
-                Ok(v) => return Ok(v),
-                Err(EvalError::Resume(v)) => return Ok(v),
-                Err(EvalError::ReturnFromBlock(v)) => return Err(EvalError::ReturnFromBlock(v)),
-                Err(EvalError::Retry) => return Err(EvalError::Retry),
-                Err(EvalError::Signal(_)) => {
-                    re_signaled = true;
-                    break;
-                }
-                Err(other) => return Err(other),
-            }
-        }
-    }
-    if re_signaled {
-        return Err(EvalError::Signal(condition));
+    // Innermost (highest-index) matching handler.
+    let idx = ev
+        .handler_chain
+        .borrow()
+        .iter()
+        .rposition(|(hc, _)| crate::class::Class::is_subclass_of(&cond_class, hc));
+    if let Some(i) = idx {
+        // Common-Lisp handler-scoping: run the handler with itself and all inner
+        // handlers disabled (only outer clusters active), so a re-signal from the
+        // handler defers to an outer handler rather than re-matching this one.
+        // Restore the disabled handlers afterward.
+        let (handler_block, removed) = {
+            let mut chain = ev.handler_chain.borrow_mut();
+            let removed = chain.split_off(i);
+            (removed[0].1.clone(), removed)
+        };
+        let outcome = ev.eval_block(&handler_block, vec![condition], env);
+        ev.handler_chain.borrow_mut().extend(removed);
+        // Normal return or `resume:` both deliver a value to the signal point;
+        // return:/retry/re-signal propagate.
+        return match outcome {
+            Ok(v) | Err(EvalError::Resume(v)) => Ok(v),
+            Err(e) => Err(e),
+        };
     }
 
-    // No handler matched — apply unhandled policy by condition class.
+    apply_unhandled_policy(ev, condition)
+}
+
+/// Apply the unhandled-condition policy by class: `Error` → raise
+/// `EvalError::Signal`; `Warning` → log per `LoggingPolicy` and answer nil;
+/// any other `Condition` → answer nil.
+pub(crate) fn apply_unhandled_policy(ev: &Evaluator, condition: Value) -> Result<Value, EvalError> {
+    let cond_class = match &condition {
+        Value::Instance(h) => h.0.class.clone(),
+        _ => return Err(EvalError::Signal(condition)),
+    };
     let kernel = ev.registry.kernel();
     let is_error = kernel
         .lookup_class("Error")
