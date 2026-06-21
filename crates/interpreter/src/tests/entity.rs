@@ -558,6 +558,130 @@ fn entity_stack_depth_probe() {
     assert_eq!(rx.recv().unwrap(), Value::Int(210));
 }
 
+// ── C31 S5: Transaction kernel class — end-to-end ─────────────────────────────
+
+/// Run `src` through the production coroutine path (kernel loaded on the test
+/// thread, program evaluated inside a `may` coroutine via `with_registry`), as
+/// `entity_stack_depth_probe` does. Required for `Transaction atomic:`, which
+/// spawns participant coroutines and blocks the coordinator on their replies.
+#[cfg(test)]
+fn run_in_coroutine(src: &str) -> Value {
+    crate::entity::init_coroutine_stack();
+    let base_ev = crate::eval::Evaluator::new();
+    let registry = base_ev.registry.clone();
+    let prog = crate::parser::Parser::parse(src).expect("parse");
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    may::go!(move || {
+        let ev = crate::eval::Evaluator::with_registry(registry);
+        let mut env = crate::env::Env::new();
+        ev.registry.populate_env(&mut env);
+        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        tx.send(v).unwrap();
+    });
+    rx.recv().unwrap()
+}
+
+#[test]
+fn hc_within_entity_method_runs() {
+    // Probe: does HandlerContext run: work when invoked from inside an entity's
+    // own method (current_entity_id = that entity), vs. top-level eval?
+    let src = r#"
+        Object subclass: #Coord instanceVariableNames: ''.
+        Coord >> tryHC [
+            | hc |
+            hc := HandlerContext new.
+            hc on: Error do: [:e | e resume: 7].
+            ^hc run: [ 42 ]
+        ]
+        | c |
+        c := Coord new.
+        c tryHC await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(42));
+}
+
+#[test]
+fn hc_then_signal_resolves_future_within_entity() {
+    // Isolates the Transaction machinery minus pvtCommit/_primBeginSharedTx:
+    // an HC inside an entity whose run: body registers a then: that signals
+    // OkToCommit; the handler resolves a future. Returns the future's value.
+    let src = r#"
+        Object subclass: #Coord2 instanceVariableNames: ''.
+        Coord2 >> tryTx [
+            | txf |
+            txf := Future new.
+            ((HandlerContext new
+                on: OkToCommit do: [:c | txf resolveWith: c value. c resume: nil])
+                on: Error do: [:e | txf rejectWith: e. e return: nil])
+              run: [ 42 then: [ (OkToCommit value: 99) signal ] ].
+            ^txf handle
+        ]
+        | c |
+        c := Coord2 new.
+        c tryTx await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(99));
+}
+
+#[test]
+fn atomic_no_participants_commits_and_resolves_result() {
+    // Minimal: no participant work. Exercises the HandlerContext + then: +
+    // OkToCommit + resume: machinery in isolation.
+    let src = r#"
+        | tr |
+        tr := (Transaction atomic: [:tx | 42]) await.
+        tr result await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(42));
+}
+
+#[test]
+fn atomic_transfer_commits_on_both_participants() {
+    // Two accounts; an atomic block moves 30 from a to b. After commit both live
+    // balances reflect the transfer.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+        Account >> withdraw: n [ balance := balance - n ]
+
+        | a b tr |
+        a := Account new.
+        b := Account new.
+        (a deposit: 100) await.
+        tr := (Transaction atomic: [:tx |
+            (a withdraw: 30) await.
+            (b deposit: 30) await ]) await.
+        tr result await.
+        (a balance await) + ((b balance await) * 1000)
+    "#;
+    // a = 70, b = 30  →  70 + 30*1000 = 30070
+    assert_eq!(run_in_coroutine(src), Value::Int(30070));
+}
+
+#[test]
+fn atomic_abort_rolls_back_writes() {
+    // The block writes then aborts; live balances must remain pre-transaction.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a tr |
+        a := Account new.
+        (a deposit: 100) await.
+        tr := (Transaction atomic: [:tx |
+            (a deposit: 50) await.
+            tx abort ]) await.
+        "result rejects on abort; swallow it, then check the rollback took effect"
+        [ tr result await ] on: Error do: [:e | nil].
+        a balance await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(100));
+}
+
 // ── C31 S2: transaction lock + shadow frames ──────────────────────────────────
 
 #[cfg(test)]
@@ -946,8 +1070,8 @@ mod tx_primitives {
     }
 
     #[test]
-    fn enrolled_participants_returns_array_of_entities() {
-        let ev = Evaluator::new(); // build_array needs the kernel Array class
+    fn enrolled_participants_returns_cons_list() {
+        let ev = Evaluator::new(); // build_cons_list needs the kernel Cons class
         let coord = cell_entity(&ev, 0);
         let root = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
         let ctx = match &root {
@@ -959,19 +1083,26 @@ mod tx_primitives {
         let p2 = cell_entity(&ev, 2);
         ctx.participants().lock().unwrap().push(p1.clone());
         ctx.participants().lock().unwrap().push(p2.clone());
-        let arr = call(&ev, &coord, "_primEnrolledParticipants:", vec![root]).unwrap();
-        match arr {
-            Value::Instance(h) => {
-                if let InstanceKind::Entity(d) = &h.0.kind
-                    && let Some(crate::object::IndexedStorage::Pointer(slots)) = &d.data.indexed
-                {
-                    assert_eq!(slots.lock().len(), 2);
-                } else {
-                    panic!("expected an Array entity");
-                }
-            }
-            _ => panic!("expected an Array"),
+        let list = call(&ev, &coord, "_primEnrolledParticipants:", vec![root]).unwrap();
+        // Walk the head/tail Cons chain and count the nodes.
+        let mut count = 0;
+        let mut node = list;
+        while let Value::Instance(h) = &node {
+            assert_eq!(h.0.class.name.as_ref(), "Cons");
+            let tail = h.ivar_storage().get_slot("tail").unwrap_or(Value::Nil);
+            count += 1;
+            node = tail;
         }
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn enrolled_participants_empty_is_nil() {
+        let ev = Evaluator::new();
+        let coord = cell_entity(&ev, 0);
+        let root = call(&ev, &coord, "_primBeginSharedTx", vec![]).unwrap();
+        let list = call(&ev, &coord, "_primEnrolledParticipants:", vec![root]).unwrap();
+        assert_eq!(list, Value::Nil);
     }
 
     #[test]

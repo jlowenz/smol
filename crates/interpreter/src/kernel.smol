@@ -407,6 +407,7 @@ Cons >> size [
 ]
 
 Nil >> isEmpty [ ^true ]
+Nil >> do: aBlock [ ^nil ]
 Nil >> inject: aValue into: aBlock [ ^aValue ]
 
 Cons >> inject: aValue into: aBlock [
@@ -642,23 +643,39 @@ Condition subclass: #Error
 "HandlerContext — non-unwinding handler registration (CL handler-bind analog).
 pairs is a Cons-of-Association linked list (or nil):
   Cons(head: cls -> blk, tail: rest)
-Newest pair is at the head. Using pure-Value Cons nodes avoids cross-entity reads
-in _primHCRun:, which executes as a self-send in the entity's own coroutine."
-Object subclass: #HandlerContext
+Newest pair is at the head.
+
+HandlerContext is a Value (synchronous dispatch): `run:` and the handlers it
+registers execute in the *caller's* coroutine, not a separate actor's. This is
+required — an entity HandlerContext would be enqueued/auto-enrolled when used
+inside a transaction, and its `pairs` write would land in a shadow frame while
+`_primHCRun:` reads the live slot, losing the handlers. Being a Value, `on:do:`
+is functional (returns a new HandlerContext with the pair prepended) since the
+instance is frozen after construction."
+Value subclass: #HandlerContext
     instanceVariableNames: 'pairs'
     classVariableNames: ''
     indexedSlots: #none.
 
 HandlerContext >> initialize       [ pairs := nil ]
-HandlerContext >> on: cls do: blk  [
-    pairs := Cons with: (cls -> blk) rest: pairs.
-    ^self
-]
-HandlerContext >> on: anArray run: body [
-    anArray do: [:assoc | self on: assoc key do: assoc value].
-    ^self run: body
-]
+HandlerContext >> pvtSetPairs: c   [ pairs := c ]
 HandlerContext >> pairs            [ ^pairs ]
+
+HandlerContext class >> pvtPairs: aCons [
+    ^self _primNewValue: [:hc | hc pvtSetPairs: aCons]
+]
+
+"Functional: returns a new HandlerContext with (cls -> blk) prepended."
+HandlerContext >> on: cls do: blk  [
+    ^HandlerContext pvtPairs: (Cons with: (cls -> blk) rest: pairs)
+]
+
+"Register all (cls -> blk) associations from anArray in one go, then run body.
+Folds with inject:into: (no in-place mutation, since self is frozen)."
+HandlerContext >> on: anArray run: body [
+    ^(anArray inject: self into: [:hc :assoc | hc on: assoc key do: assoc value]) run: body
+]
+
 HandlerContext >> run: body        [ ^self _primHCRun: body ]
 
 "Boolean hierarchy — True and False are singleton-style classes.
@@ -791,3 +808,118 @@ Object subclass: #World
 World class >> instancesOf: aClass [
     ^self _primInstancesOf: aClass
 ]
+
+"════════════════════════════════════════════════════════════════════════════
+ Multi-entity atomic transactions (C31)
+
+ `Transaction atomic: aBlock` runs aBlock as a single atomic unit, passing the
+ transaction as the block argument. Tagged work messages the block sends to other
+ entities cause those entities to auto-enroll (lock their mailbox + shadow their
+ writes). On success the coordinator tells every participant to apply its writes,
+ then commits the shared store transaction; on error (or `tx abort`) it tells them
+ to discard and rolls back.
+
+ `atomic:` returns immediately with a `TxResult` (the Transaction + a pending
+ result future). The block runs under a HandlerContext: when the block's work
+ future resolves, a `then:` continuation signals `OkToCommit`, whose handler runs
+ the commit and resolves the result; any `Error` (including `tx abort`) is caught
+ by the same HandlerContext, which rolls back and rejects the result. Because the
+ continuation carries the coordinator's entity id, `self pvtCommit`/`pvtRollback`
+ are sync self-sends — they do not enqueue tagged messages back to the coordinator
+ (which would wrongly enroll it in its own transaction).
+
+ Contract: the block must sequence (chain/await) the participant work it wants
+ included, so the future it yields resolves only after all participants have
+ enrolled. Async-participant error propagation (vs. synchronous block errors) is
+ not yet covered — see OQ-C31-1 / docs.
+ ════════════════════════════════════════════════════════════════════════════"
+
+"Explicit Future: reifies an implicit future handle so code can create a future,
+hand it around, and resolve/reject it later. `handle` is a plain future handle
+(awaitable like any implicit future); `syncValue` forces it."
+Value subclass: #Future
+    instanceVariableNames: 'handle'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Future class >> new [ ^self _primNewValue: [:f | f pvtInit] ]
+Future >> pvtInit          [ handle := self _primNewFutureHandle ]
+Future >> resolveWith: v   [ ^self _primResolveFuture: handle value: v ]
+Future >> rejectWith: e    [ ^self _primRejectFuture: handle error: e ]
+Future >> syncValue        [ ^handle await ]
+Future >> handle           [ ^handle ]
+
+"Internal condition: signaled by the commit continuation once the block's work
+has resolved, carrying the block's result. Caught by the transaction's
+HandlerContext to run the commit. Not an Error, so the Error handler ignores it."
+Condition subclass: #OkToCommit
+    instanceVariableNames: 'value'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+OkToCommit class >> value: v [ ^self _primNewValue: [:c | c pvtSetValue: v] ]
+OkToCommit >> pvtSetValue: v [ value := v ]
+OkToCommit >> value          [ ^value ]
+
+"Returned by `Transaction atomic:`. `result` is a future that resolves with the
+block's value on commit, or rejects on rollback."
+Value subclass: #TxResult
+    instanceVariableNames: 'transaction result'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+TxResult class >> transaction: t result: r [
+    ^self _primNewValue: [:x | x pvtSetTransaction: t result: r]
+]
+TxResult >> pvtSetTransaction: t result: r [ transaction := t. result := r ]
+TxResult >> transaction [ ^transaction ]
+TxResult >> result      [ ^result ]
+TxResult >> status      [ ^transaction status ]
+
+"Participant-side trampoline: the coordinator sends pvtExitTx: to finalize each
+participant's current transaction frame (#commit applies shadow writes to live
+slots and hands the durable buffer up; #rollback discards both)."
+Object >> pvtExitTx: outcome [ ^self _primExitTxMode: outcome ]
+
+Object subclass: #Transaction
+    instanceVariableNames: 'handle status'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Transaction class >> atomic: aBlock [
+    ^self new pvtRunAtomic: aBlock
+]
+
+Transaction >> initialize  [ status := #pending ]
+Transaction >> status      [ ^status ]
+Transaction >> isCommitted [ ^status = #committed ]
+Transaction >> isAborted   [ ^status = #aborted ]
+
+Transaction >> pvtRunAtomic: aBlock [
+    | txf |
+    txf := Future new.
+    handle := self _primBeginSharedTx.
+    ((HandlerContext new
+        on: OkToCommit do: [:c | self pvtCommit. txf resolveWith: c value. c resume: nil])
+        on: Error do: [:e | self pvtRollback. txf rejectWith: e. e return: nil])
+      run: [ | f |
+        f := aBlock value: self.
+        f then: [ (OkToCommit value: f await) signal ] ].
+    ^TxResult transaction: self result: txf handle
+]
+
+Transaction >> pvtCommit [
+    (self _primEnrolledParticipants: handle) do: [:p | (p pvtExitTx: #commit) await].
+    self _primCommitSharedTx: handle.
+    status := #committed
+]
+
+Transaction >> pvtRollback [
+    (self _primEnrolledParticipants: handle) do: [:p | (p pvtExitTx: #rollback) await].
+    self _primRollbackSharedTx: handle.
+    status := #aborted
+]
+
+"Abort from within the block: signals an Error caught by the HandlerContext,
+which rolls back and rejects the result future."
+Transaction >> abort [ self error: 'transaction aborted' ]

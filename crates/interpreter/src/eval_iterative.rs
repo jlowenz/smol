@@ -153,6 +153,16 @@ pub(crate) enum Cont {
         body_blk: Arc<crate::value::Block>,
     },
 
+    /// Sits below a `then:` receiver-block frame. After the receiver block
+    /// evaluates, inspects its result: a `Future` is handed to the async `then:`
+    /// path (spawns a continuation coroutine); any other value runs the
+    /// continuation block on the step-loop stack. This keeps the synchronous
+    /// `then:` arms off the Rust call stack (no recursive `eval_block`).
+    ThenCheck {
+        cont_blk: Arc<crate::value::Block>,
+        env: Env,
+    },
+
     /// Sits below the `on:do:` handler block frame, inspecting the handler's outcome.
     ///
     /// Success path: fires normally → `acc` = handler result, pass through.
@@ -464,6 +474,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                     ));
                 }
                 Expr::Send { receiver, message } => {
+                    // eprintln!("Send: {:?} <- {:?}", receiver, message);
                     if matches!(receiver.as_ref(), Expr::Super) {
                         match message {
                             Message::Unary(sel) => {
@@ -663,6 +674,29 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 let body_result = acc.clone();
                 stack.push(Cont::RestoreAcc { value: body_result });
                 push_block_frame(ev, &ensure_blk, vec![], false, &mut stack)?;
+            }
+
+            // ── ThenCheck (then: receiver-block completed) ────────────────
+            Cont::ThenCheck { cont_blk, mut env } => {
+                let recv_result = std::mem::replace(&mut acc, Value::Nil);
+                match recv_result {
+                    // Receiver yielded a future: hand off to the async `then:`
+                    // path, which spawns a continuation coroutine (fresh stack).
+                    Value::Future(_) => {
+                        acc = crate::builtins::dispatch(
+                            ev,
+                            recv_result,
+                            Arc::from("then:"),
+                            vec![Value::Block(cont_blk)],
+                            &mut env,
+                        )?;
+                    }
+                    // Non-future: run the continuation on the step-loop stack;
+                    // its result becomes the `then:` result.
+                    _ => {
+                        push_block_frame(ev, &cont_blk, vec![], false, &mut stack)?;
+                    }
+                }
             }
 
             // ── OnDoCatch (success path) ──────────────────────────────────
@@ -1302,8 +1336,45 @@ fn dispatch_to_stack(
 ) -> Result<(), EvalError> {
     // `then:` must see the raw receiver (including Futures) so that
     // `Future then: [blk]` chains asynchronously without eager resolution.
+    //
+    // The synchronous arms (resolved-value receiver, or block receiver that
+    // yields a non-future) run the continuation on the step-loop `Cont` stack
+    // rather than via a recursive `eval_block`, so deep `then:` chains do not
+    // grow the Rust coroutine stack. The genuine-Future arm spawns a
+    // continuation coroutine (fresh stack), delegated to the builtins handler.
     if selector.as_ref() == "then:" {
-        *acc = crate::builtins::dispatch(ev, receiver, selector, args, env)?;
+        if args.len() != 1 {
+            return Err(EvalError::ArityMismatch {
+                expected: 1,
+                got: args.len(),
+            });
+        }
+        let cont_blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+        match receiver {
+            // Genuine future: async spawn (no Rust stack growth).
+            Value::Future(_) => {
+                *acc = crate::builtins::dispatch(
+                    ev,
+                    receiver,
+                    selector,
+                    vec![Value::Block(cont_blk)],
+                    env,
+                )?;
+            }
+            // Block receiver: evaluate it on the step-loop stack (unforced, so a
+            // future result is visible), then `ThenCheck` decides.
+            Value::Block(ref blk) => {
+                stack.push(Cont::ThenCheck {
+                    cont_blk,
+                    env: env.clone(),
+                });
+                push_block_frame(ev, blk, vec![], false, stack)?;
+            }
+            // Already-resolved value: run the continuation on the step-loop stack.
+            _ => {
+                push_block_frame(ev, &cont_blk, vec![], false, stack)?;
+            }
+        }
         return Ok(());
     }
 

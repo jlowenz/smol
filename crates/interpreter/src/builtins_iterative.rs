@@ -11,8 +11,8 @@ use parking_lot::RwLock;
 use crate::class::{Class, IndexedSlotKind};
 use crate::entity::FrameCommitOutcome;
 use crate::entity::{
-    EntityId, InstanceHandle, InstanceKind, InstanceState, send_to_entity, spawn_class_entity,
-    spawn_entity_bare,
+    EntityId, FutureHandle, InstanceHandle, InstanceKind, InstanceState, send_to_entity,
+    spawn_class_entity, spawn_entity_bare,
 };
 use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
@@ -1717,7 +1717,9 @@ pub(crate) fn dispatch_object_primitive(
             Ok(Value::Nil)
         }
         "_primEnrolledParticipants:" => {
-            // Return this transaction level's participants as an Array of entities.
+            // Return this level's participants as a Cons list (or nil). A Cons is a
+            // Value (synchronous dispatch), so the coordinator iterates it in its
+            // own coroutine and the pvtExitTx: sends it makes are tagged.
             expect_arity(sel, 1, args.len())?;
             let ctx = tx_ctx_from_handle(force_value(args.remove(0))?)?;
             let parts: Vec<Value> = ctx
@@ -1728,7 +1730,7 @@ pub(crate) fn dispatch_object_primitive(
                 .cloned()
                 .map(Value::Instance)
                 .collect();
-            build_array(ev, parts)
+            build_cons_list(ev, parts)
         }
         "_primExitTxMode:" => {
             // Participant-side finalize of its current transaction frame, driven by
@@ -1788,6 +1790,47 @@ pub(crate) fn dispatch_object_primitive(
                 }
             }
             Ok(Value::Nil)
+        }
+
+        // ── Explicit Future reification (C31) ──────────────────────────────────
+        // Reify the implicit `Value::Future` so Smol code can create a future,
+        // pass it around, and resolve/reject it later — used by `Transaction` to
+        // hold the still-pending transaction result. The handle is a plain
+        // `Value::Future`, so it is `await`-able and `then:`-able exactly like an
+        // implicit future.
+        "_primNewFutureHandle" => {
+            expect_arity(sel, 0, args.len())?;
+            Ok(Value::Future(FutureHandle::new()))
+        }
+        "_primResolveFuture:value:" => {
+            expect_arity(sel, 2, args.len())?;
+            let h = args.remove(0);
+            let v = force_value(args.remove(0))?;
+            match h {
+                Value::Future(fh) => {
+                    fh.resolve_ok(v);
+                    Ok(Value::Nil)
+                }
+                other => Err(EvalError::TypeError(format!(
+                    "_primResolveFuture:value: expects a future handle, got {}",
+                    other.kind()
+                ))),
+            }
+        }
+        "_primRejectFuture:error:" => {
+            expect_arity(sel, 2, args.len())?;
+            let h = args.remove(0);
+            let e = force_value(args.remove(0))?;
+            match h {
+                Value::Future(fh) => {
+                    fh.resolve_err(EvalError::Signal(e));
+                    Ok(Value::Nil)
+                }
+                other => Err(EvalError::TypeError(format!(
+                    "_primRejectFuture:error: expects a future handle, got {}",
+                    other.kind()
+                ))),
+            }
         }
 
         _ => Err(EvalError::MessageNotUnderstood {
@@ -1998,6 +2041,35 @@ fn build_array(ev: &Evaluator, values: Vec<Value>) -> Result<Value, EvalError> {
     }
 
     Ok(Value::Instance(arr))
+}
+
+/// Build a `Cons` linked list (head-first) from `items`, or `Value::Nil` if empty.
+///
+/// Returns a Value-object chain (synchronous dispatch), so a caller can iterate
+/// it with `do:` in its own coroutine — used for transaction participant lists,
+/// where the iterating coordinator must send tagged messages from its own
+/// coroutine (an `Array` entity's `do:` would run in the array's coroutine, where
+/// `current_tx_ctx` is unset and the sends would be untagged).
+fn build_cons_list(ev: &Evaluator, items: Vec<Value>) -> Result<Value, EvalError> {
+    let cons_class = ev
+        .registry
+        .kernel()
+        .lookup_class("Cons")
+        .ok_or_else(|| EvalError::TypeError("Cons not in kernel".into()))?
+        .0
+        .class
+        .clone();
+    let mut list = Value::Nil;
+    for item in items.into_iter().rev() {
+        let obj = Arc::new(Object::new(cons_class.clone()));
+        obj.set_slot(Arc::from("head"), item);
+        obj.set_slot(Arc::from("tail"), list);
+        list = Value::Instance(InstanceHandle(Arc::new(InstanceState {
+            class: cons_class.clone(),
+            kind: InstanceKind::ValueObject(obj),
+        })));
+    }
+    Ok(list)
 }
 
 /// Convert a slice of `StoredFact` to an `Array` of `Association(ts_ms → value)`.

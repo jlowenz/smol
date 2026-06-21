@@ -84,6 +84,14 @@ pub struct ContinuationContext {
     /// Active transaction context, so a `then:` continuation's outgoing entity
     /// sends are tagged with the same transaction as the code that scheduled it.
     pub(crate) current_tx_ctx: Option<Arc<crate::shared_tx::TxContext>>,
+    /// The entity whose coroutine created this continuation. A `then:` block is
+    /// created inside that entity, so the floating continuation acts as it: this
+    /// makes self-sends in the continuation dispatch synchronously (the sync
+    /// self-send path keys on `current_entity_id`), rather than enqueuing tagged
+    /// messages back to the entity (which would, e.g., wrongly auto-enroll a
+    /// transaction coordinator into its own transaction when commit runs in a
+    /// spawned `then:` continuation).
+    pub(crate) current_entity_id: Option<EntityId>,
 }
 
 impl ContinuationContext {
@@ -103,7 +111,7 @@ impl ContinuationContext {
             method_stack: RefCell::new(Vec::new()),
             method_depth: Cell::new(0),
             current_block_home: Cell::new(None),
-            current_entity_id: Cell::new(None),
+            current_entity_id: Cell::new(self.current_entity_id),
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
             current_tx_ctx: RefCell::new(self.current_tx_ctx),
@@ -706,6 +714,7 @@ impl Evaluator {
             handler_chain: self.handler_chain.borrow().clone(),
             active_namespace: self.active_namespace.borrow().clone(),
             current_tx_ctx: self.current_tx_ctx.borrow().clone(),
+            current_entity_id: self.current_entity_id.get(),
         }
     }
 
