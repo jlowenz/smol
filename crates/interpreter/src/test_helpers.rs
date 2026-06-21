@@ -145,6 +145,8 @@ pub(crate) struct ProbeResult {
     pub cont_size: usize,
     /// Total Rust stack span (bytes) across all `step_loop` entries.
     pub stack_span: usize,
+    /// Largest parent→child `step_loop` entry delta (bytes) — per-level growth.
+    pub level_delta: usize,
 }
 
 #[cfg(feature = "step_probe")]
@@ -168,6 +170,7 @@ pub(crate) fn eval_probe(src: &str) -> ProbeResult {
             max_depth: probe::max_depth(),
             cont_size: probe::cont_size(),
             stack_span: probe::stack_span(),
+            level_delta: probe::level_delta(),
         })
         .unwrap();
     });

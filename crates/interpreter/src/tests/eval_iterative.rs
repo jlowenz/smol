@@ -18,15 +18,10 @@ outer run: [
 ]
 "#;
     let r = eval_probe(src);
-    let per_level = if r.max_depth > 1 {
-        r.stack_span / (r.max_depth - 1)
-    } else {
-        0
-    };
     eprintln!(
         "[step_probe] nested HC: max step_loop depth = {}, size_of::<Cont>() = {} bytes, \
-         stack span = {} bytes (~{} bytes/level)",
-        r.max_depth, r.cont_size, r.stack_span, per_level,
+         stack span = {} bytes, max per-level delta = {} bytes",
+        r.max_depth, r.cont_size, r.stack_span, r.level_delta,
     );
     assert_eq!(r.value, Value::Str(Arc::from("inner")));
 }

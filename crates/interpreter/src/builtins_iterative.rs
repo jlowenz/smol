@@ -1443,83 +1443,14 @@ pub(crate) fn dispatch_object_primitive(
             Err(EvalError::Retry)
         }
         "_primHCRun:" => {
-            // Run a block with this HandlerContext's handler pairs registered.
-            //
-            // Requires: args[0] is a Block; self's `pairs` ivar is an OrderedCollection
-            //   of Associations (key = condition class, value = handler block).
-            // Ensures: handler pairs are pushed onto ev.handler_chain for the duration of
-            //   body execution and popped when body completes (success, error, or retry).
+            // Fallback path only. The iterative evaluator intercepts `_primHCRun:`
+            // in `dispatch_to_stack` and runs the body on the heap `Cont` stack
+            // (no recursive `step_loop`); see `eval_iterative::dispatch_to_stack`.
+            // This arm preserves the recursive behavior for any direct
+            // `builtins::dispatch` caller.
             expect_arity(sel, 1, args.len())?;
             let body = as_block(args.remove(0), sel)?;
-
-            // Extract pairs from self's `pairs` ivar.
-            // HandlerContext is a Value subclass (ValueObject); Entity arm is kept as
-            // a defensive fallback only.
-            let pairs_val = match &handle.0.kind {
-                InstanceKind::ValueObject(o) => o.get_slot("pairs").unwrap_or(Value::Nil),
-                InstanceKind::Entity(d) => d.data.get_slot("pairs").unwrap_or(Value::Nil),
-                InstanceKind::ClassEntity(_) => {
-                    return Err(EvalError::TypeError(
-                        "_primHCRun: requires a HandlerContext instance".into(),
-                    ));
-                }
-            };
-
-            // Walk the Cons-of-Association linked list:
-            //   Cons(head: cls -> blk, tail: rest)
-            // Newest pair is at the head; we collect then reverse so that
-            // handler_chain is ordered oldest-first, making the reverse walk in
-            // signal_condition match newest (innermost) first.
-            let mut handler_pairs: Vec<(Arc<Class>, Arc<crate::value::Block>)> = Vec::new();
-            let mut node = force_value(pairs_val)?;
-            while let Value::Instance(node_h) = node {
-                let node_obj = match &node_h.0.kind {
-                    InstanceKind::ValueObject(o) => o.clone(),
-                    InstanceKind::Entity(d) => d.data.clone(),
-                    InstanceKind::ClassEntity(_) => break,
-                };
-                // head is an Association(key=cls, value=blk); tail is rest.
-                let head_val = force_value(node_obj.get_slot("head").unwrap_or(Value::Nil))?;
-                let tail = force_value(node_obj.get_slot("tail").unwrap_or(Value::Nil))?;
-
-                let assoc_h = match head_val {
-                    Value::Instance(h) => h,
-                    _ => {
-                        node = tail;
-                        continue;
-                    }
-                };
-                let assoc_obj = match &assoc_h.0.kind {
-                    InstanceKind::ValueObject(o) => o.clone(),
-                    InstanceKind::Entity(d) => d.data.clone(),
-                    InstanceKind::ClassEntity(_) => {
-                        node = tail;
-                        continue;
-                    }
-                };
-                let cls_val = force_value(assoc_obj.get_slot("key").unwrap_or(Value::Nil))?;
-                let blk_val = force_value(assoc_obj.get_slot("value").unwrap_or(Value::Nil))?;
-
-                let cls = match cls_val {
-                    Value::Instance(ch) => ch.0.class.clone(),
-                    _ => {
-                        node = tail;
-                        continue;
-                    }
-                };
-                let blk = match blk_val {
-                    Value::Block(b) => b,
-                    _ => {
-                        node = tail;
-                        continue;
-                    }
-                };
-                handler_pairs.push((cls, blk));
-                node = tail;
-            }
-            // Reverse so oldest pair is pushed first; signal_condition's reverse
-            // walk then matches the most-recently-registered handler first.
-            handler_pairs.reverse();
+            let handler_pairs = extract_handler_pairs(&handle)?;
 
             // Push handler pairs onto handler_chain.
             let chain_start_len = ev.handler_chain.borrow().len();
@@ -1838,6 +1769,79 @@ pub(crate) fn dispatch_object_primitive(
             selector: sel.clone(),
         }),
     }
+}
+
+/// Extract a HandlerContext's handler pairs from its `pairs` ivar.
+///
+/// Requires: `handle` is a HandlerContext instance whose `pairs` ivar is a
+///   Cons-of-Association linked list `Cons(head: cls -> blk, tail: rest)`, newest
+///   at the head.
+/// Ensures: returns `(condition class, handler block)` pairs ordered oldest-first,
+///   ready to push onto `ev.handler_chain` so that `signal_condition`'s reverse
+///   walk matches the most-recently-registered handler first.
+pub(crate) fn extract_handler_pairs(
+    handle: &InstanceHandle,
+) -> Result<Vec<crate::eval::HandlerPair>, EvalError> {
+    let pairs_val = match &handle.0.kind {
+        InstanceKind::ValueObject(o) => o.get_slot("pairs").unwrap_or(Value::Nil),
+        InstanceKind::Entity(d) => d.data.get_slot("pairs").unwrap_or(Value::Nil),
+        InstanceKind::ClassEntity(_) => {
+            return Err(EvalError::TypeError(
+                "_primHCRun: requires a HandlerContext instance".into(),
+            ));
+        }
+    };
+
+    let mut handler_pairs: Vec<crate::eval::HandlerPair> = Vec::new();
+    let mut node = force_value(pairs_val)?;
+    while let Value::Instance(node_h) = node {
+        let node_obj = match &node_h.0.kind {
+            InstanceKind::ValueObject(o) => o.clone(),
+            InstanceKind::Entity(d) => d.data.clone(),
+            InstanceKind::ClassEntity(_) => break,
+        };
+        // head is an Association(key=cls, value=blk); tail is rest.
+        let head_val = force_value(node_obj.get_slot("head").unwrap_or(Value::Nil))?;
+        let tail = force_value(node_obj.get_slot("tail").unwrap_or(Value::Nil))?;
+
+        let assoc_h = match head_val {
+            Value::Instance(h) => h,
+            _ => {
+                node = tail;
+                continue;
+            }
+        };
+        let assoc_obj = match &assoc_h.0.kind {
+            InstanceKind::ValueObject(o) => o.clone(),
+            InstanceKind::Entity(d) => d.data.clone(),
+            InstanceKind::ClassEntity(_) => {
+                node = tail;
+                continue;
+            }
+        };
+        let cls_val = force_value(assoc_obj.get_slot("key").unwrap_or(Value::Nil))?;
+        let blk_val = force_value(assoc_obj.get_slot("value").unwrap_or(Value::Nil))?;
+
+        let cls = match cls_val {
+            Value::Instance(ch) => ch.0.class.clone(),
+            _ => {
+                node = tail;
+                continue;
+            }
+        };
+        let blk = match blk_val {
+            Value::Block(b) => b,
+            _ => {
+                node = tail;
+                continue;
+            }
+        };
+        handler_pairs.push((cls, blk));
+        node = tail;
+    }
+    // Reverse so oldest pair is pushed first.
+    handler_pairs.reverse();
+    Ok(handler_pairs)
 }
 
 /// Core signal dispatch: walk the handler_chain, then apply unhandled policy.

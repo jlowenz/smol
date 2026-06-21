@@ -24,22 +24,29 @@ const YIELD_INTERVAL: u32 = 1024;
 /// unless the `step_probe` feature is enabled.
 #[cfg(feature = "step_probe")]
 pub mod probe {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     thread_local! {
         static DEPTH: Cell<usize> = const { Cell::new(0) };
+        /// Stack-pointer of each currently-active `step_loop` entry, parent-first.
+        static ENTRY_SPS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     }
     static MAX_DEPTH: AtomicUsize = AtomicUsize::new(0);
     /// Shallowest (largest-address) stack pointer sampled at a `step_loop` entry.
     static MAX_SP: AtomicUsize = AtomicUsize::new(0);
     /// Deepest (smallest-address) stack pointer sampled at a `step_loop` entry.
     static MIN_SP: AtomicUsize = AtomicUsize::new(usize::MAX);
+    /// Largest Rust-stack delta between a `step_loop` entry and its *parent*
+    /// `step_loop` entry — i.e. the stack consumed by one full
+    /// `step_loop → builtins → eval_block → step_loop` recursion. This is the
+    /// per-nesting-level growth a flattened evaluator must drive toward zero.
+    static MAX_LEVEL_DELTA: AtomicUsize = AtomicUsize::new(0);
 
     /// RAII guard: increments the per-thread `step_loop` depth on entry,
-    /// updates the global max depth, and records the stack-pointer high/low
-    /// water marks so the actual Rust stack consumed per recursion level can be
-    /// derived. Decrements the depth on drop.
+    /// updates the global max depth, records the stack-pointer high/low water
+    /// marks, and tracks the max parent→child entry delta. Restores depth and
+    /// the entry-SP stack on drop.
     pub(super) struct DepthGuard;
 
     impl DepthGuard {
@@ -55,6 +62,15 @@ pub mod probe {
             MAX_DEPTH.fetch_max(d, Ordering::Relaxed);
             MAX_SP.fetch_max(sp, Ordering::Relaxed);
             MIN_SP.fetch_min(sp, Ordering::Relaxed);
+            ENTRY_SPS.with(|s| {
+                let mut s = s.borrow_mut();
+                if let Some(&parent) = s.last() {
+                    // Parent entered shallower (larger address); child is deeper.
+                    let delta = parent.saturating_sub(sp);
+                    MAX_LEVEL_DELTA.fetch_max(delta, Ordering::Relaxed);
+                }
+                s.push(sp);
+            });
             DepthGuard
         }
     }
@@ -62,6 +78,9 @@ pub mod probe {
     impl Drop for DepthGuard {
         fn drop(&mut self) {
             DEPTH.with(|c| c.set(c.get() - 1));
+            ENTRY_SPS.with(|s| {
+                s.borrow_mut().pop();
+            });
         }
     }
 
@@ -74,12 +93,22 @@ pub mod probe {
         MAX_DEPTH.store(0, Ordering::Relaxed);
         MAX_SP.store(0, Ordering::Relaxed);
         MIN_SP.store(usize::MAX, Ordering::Relaxed);
+        MAX_LEVEL_DELTA.store(0, Ordering::Relaxed);
+        ENTRY_SPS.with(|s| s.borrow_mut().clear());
     }
 
     /// The maximum `step_loop` recursion depth observed since the last `reset`.
     #[cfg(test)]
     pub fn max_depth() -> usize {
         MAX_DEPTH.load(Ordering::Relaxed)
+    }
+
+    /// Largest Rust-stack delta (bytes) between a `step_loop` entry and its
+    /// parent entry — the per-nesting-level growth. Unlike `stack_span` this is
+    /// not averaged: it is the true cost of one recursion step.
+    #[cfg(test)]
+    pub fn level_delta() -> usize {
+        MAX_LEVEL_DELTA.load(Ordering::Relaxed)
     }
 
     /// Total Rust stack span (bytes) between the shallowest and deepest
@@ -281,6 +310,23 @@ pub(crate) enum Cont {
         return_val: Value,
         target_depth: usize,
     },
+
+    /// Marks the bottom of a `_primHCRun:` body on the stack.
+    ///
+    /// This HandlerContext's handler pairs were pushed onto `ev.handler_chain`,
+    /// extending it past `chain_start_len`. The guard truncates the chain back to
+    /// `chain_start_len` on every exit path and drives the `retry` loop — the
+    /// flattened equivalent of the recursive `_primHCRun:` builtin, so nested
+    /// synchronous `run:` does not grow the Rust stack.
+    ///
+    /// Success path: fires when the body completes; truncates chain, passes `acc`.
+    /// `Retry`: `handle_step_error` re-runs `body_blk` with the chain unchanged.
+    /// `ReturnFromBlock(v)`: `handle_step_error` truncates the chain, yields `v`.
+    /// Other errors / `^`-return: chain truncated as the guard is discarded.
+    HCRunGuard {
+        chain_start_len: usize,
+        body_blk: Arc<crate::value::Block>,
+    },
 }
 
 /// Outcome of a `^`-return unwind scan.
@@ -333,6 +379,14 @@ fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
         } => {
             ev.current_block_home.set(saved_block_home);
             Some(0)
+        }
+        // Not a frame, but discarding an HCRun boundary (on `^`-return unwind or
+        // terminal cleanup) must still restore the handler_chain.
+        Cont::HCRunGuard {
+            chain_start_len, ..
+        } => {
+            ev.handler_chain.borrow_mut().truncate(chain_start_len);
+            None
         }
         _ => None,
     }
@@ -483,6 +537,32 @@ fn handle_step_error(
                             }
                         }
                     }
+                    Cont::HCRunGuard {
+                        chain_start_len,
+                        body_blk,
+                    } => match &other {
+                        // Retry re-runs the body with this HC's handlers still
+                        // registered (chain unchanged), mirroring the recursive loop.
+                        EvalError::Retry => {
+                            stack.push(Cont::HCRunGuard {
+                                chain_start_len,
+                                body_blk: body_blk.clone(),
+                            });
+                            push_block_frame(ev, &body_blk, vec![], false, stack)?;
+                            return Ok(());
+                        }
+                        // A value returned from run:; truncate chain, deliver it.
+                        EvalError::ReturnFromBlock(v) => {
+                            ev.handler_chain.borrow_mut().truncate(chain_start_len);
+                            *acc = v.clone();
+                            return Ok(());
+                        }
+                        // Any other error escapes this boundary: drop the HC's
+                        // handlers, then keep propagating.
+                        _ => {
+                            ev.handler_chain.borrow_mut().truncate(chain_start_len);
+                        }
+                    },
                     // Frames are torn down; all other continuations (ForceAcc,
                     // RestoreAcc, CollectArgs, …) are discarded during propagation.
                     other_cont => {
@@ -496,9 +576,155 @@ fn handle_step_error(
     }
 }
 
+/// Handle a `Cont::EvalExpr`: evaluate `expr`, updating `acc` or pushing
+/// follow-up continuations onto `stack`.
+///
+/// Extracted from `step_loop`'s match as `#[inline(never)]` so this arm's
+/// (large) locals live in this frame — created and freed within one loop
+/// iteration — rather than being summed into `step_loop`'s per-call frame.
+#[inline(never)]
+fn handle_eval_expr(
+    ev: &Evaluator,
+    expr: Expr,
+    mut env: Env,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+) -> Result<(), EvalError> {
+    match expr {
+        Expr::Lit(lit) => {
+            *acc = eval_literal(&lit);
+        }
+        Expr::Var(name) => {
+            *acc = ev
+                .lookup_var(&name, &env)
+                .ok_or_else(|| EvalError::UndefinedVariable(name.clone()))?;
+        }
+        Expr::Block {
+            params,
+            locals,
+            body,
+        } => {
+            let home_depth = ev
+                .current_block_home
+                .get()
+                .unwrap_or_else(|| ev.method_depth.get());
+            let home_self = {
+                let ms = ev.method_stack.borrow();
+                ms.iter().rev().find_map(|b| match b {
+                    SelfBinding::Instance { handle, .. } => Some(handle.clone()),
+                    _ => None,
+                })
+            };
+            *acc = Value::Block(Arc::new(crate::value::Block {
+                params,
+                locals,
+                body,
+                env: env.clone(),
+                home_depth,
+                home_entity: ev.current_entity_id.get(),
+                home_self,
+            }));
+        }
+        Expr::NamespaceRef {
+            namespace_path,
+            name,
+        } => {
+            *acc = ev.eval_namespace_ref(&namespace_path, &name, &mut env)?;
+        }
+        Expr::Super => {
+            return Err(EvalError::TypeError(
+                "super may only appear as a message receiver".into(),
+            ));
+        }
+        Expr::Send { receiver, message } => {
+            if matches!(receiver.as_ref(), Expr::Super) {
+                match message {
+                    Message::Unary(sel) => {
+                        if let Err(e) =
+                            dispatch_super_to_stack(ev, sel, vec![], &mut env, stack, acc)
+                        {
+                            handle_step_error(e, ev, stack, acc)?;
+                        }
+                    }
+                    Message::Binary { op, arg } => {
+                        stack.push(Cont::SuperCollectArgs {
+                            selector: op,
+                            done: vec![],
+                            pending: VecDeque::new(),
+                            env: env.clone(),
+                        });
+                        stack.push(Cont::EvalExpr { expr: *arg, env });
+                    }
+                    Message::Keyword { parts } => {
+                        let selector: Arc<str> = parts
+                            .iter()
+                            .map(|(k, _)| k.as_ref())
+                            .collect::<String>()
+                            .into();
+                        let mut exprs: VecDeque<Expr> = parts.into_iter().map(|(_, e)| e).collect();
+                        let first = exprs.pop_front().expect("keyword message has no parts");
+                        stack.push(Cont::SuperCollectArgs {
+                            selector,
+                            done: vec![],
+                            pending: exprs,
+                            env: env.clone(),
+                        });
+                        stack.push(Cont::EvalExpr { expr: first, env });
+                    }
+                }
+            } else {
+                // Push AfterReceiver first (below in stack), then receiver eval.
+                stack.push(Cont::AfterReceiver {
+                    message,
+                    env: env.clone(),
+                });
+                stack.push(Cont::EvalExpr {
+                    expr: *receiver,
+                    env,
+                });
+            }
+        }
+        Expr::Cascade { receiver, messages } => {
+            stack.push(Cont::CascadeStep {
+                receiver: None,
+                pending: messages.into_iter().collect(),
+                env: env.clone(),
+            });
+            stack.push(Cont::EvalExpr {
+                expr: *receiver,
+                env,
+            });
+        }
+        Expr::ArrayLiteral(elements) => {
+            *acc = eval_array_literal_iterative(ev, &elements, &mut env)?;
+        }
+        Expr::DynamicArray(elements) => {
+            let array_handle = ev
+                .registry
+                .kernel()
+                .lookup_class("Array")
+                .ok_or_else(|| EvalError::UndefinedVariable(Arc::from("Array")))?;
+            if elements.is_empty() {
+                *acc = build_array(array_handle.0.class.clone(), vec![]);
+            } else {
+                let mut exprs: VecDeque<Expr> = elements.into_iter().collect();
+                let first = exprs.pop_front().unwrap();
+                stack.push(Cont::DynArrayElem {
+                    array_class: array_handle,
+                    done: vec![],
+                    pending: exprs,
+                    env: env.clone(),
+                });
+                stack.push(Cont::EvalExpr { expr: first, env });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Drive the iterative evaluator to completion starting from `initial_cont`.
 ///
-/// Requires: any `CallFrame` in `initial_cont` has already had its env
+/// Requires: any frame in `initial_cont` has already had its env
 ///   frame pushed and, for method frames, its self binding pushed to
 ///   `ev.method_stack`.
 /// Ensures: returns the value accumulated when the continuation stack
@@ -523,143 +749,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
 
         match cont {
             // ── Leaf expressions ─────────────────────────────────────────
-            Cont::EvalExpr { expr, mut env } => match expr {
-                Expr::Lit(lit) => {
-                    acc = eval_literal(&lit);
-                }
-                Expr::Var(name) => {
-                    acc = ev
-                        .lookup_var(&name, &env)
-                        .ok_or_else(|| EvalError::UndefinedVariable(name.clone()))?;
-                }
-                Expr::Block {
-                    params,
-                    locals,
-                    body,
-                } => {
-                    let home_depth = ev
-                        .current_block_home
-                        .get()
-                        .unwrap_or_else(|| ev.method_depth.get());
-                    let home_self = {
-                        let ms = ev.method_stack.borrow();
-                        ms.iter().rev().find_map(|b| match b {
-                            SelfBinding::Instance { handle, .. } => Some(handle.clone()),
-                            _ => None,
-                        })
-                    };
-                    acc = Value::Block(Arc::new(crate::value::Block {
-                        params,
-                        locals,
-                        body,
-                        env: env.clone(),
-                        home_depth,
-                        home_entity: ev.current_entity_id.get(),
-                        home_self,
-                    }));
-                }
-                Expr::NamespaceRef {
-                    namespace_path,
-                    name,
-                } => {
-                    acc = ev.eval_namespace_ref(&namespace_path, &name, &mut env)?;
-                }
-                Expr::Super => {
-                    return Err(EvalError::TypeError(
-                        "super may only appear as a message receiver".into(),
-                    ));
-                }
-                Expr::Send { receiver, message } => {
-                    // eprintln!("Send: {:?} <- {:?}", receiver, message);
-                    if matches!(receiver.as_ref(), Expr::Super) {
-                        match message {
-                            Message::Unary(sel) => {
-                                if let Err(e) = dispatch_super_to_stack(
-                                    ev,
-                                    sel,
-                                    vec![],
-                                    &mut env,
-                                    &mut stack,
-                                    &mut acc,
-                                ) {
-                                    handle_step_error(e, ev, &mut stack, &mut acc)?;
-                                }
-                            }
-                            Message::Binary { op, arg } => {
-                                stack.push(Cont::SuperCollectArgs {
-                                    selector: op,
-                                    done: vec![],
-                                    pending: VecDeque::new(),
-                                    env: env.clone(),
-                                });
-                                stack.push(Cont::EvalExpr { expr: *arg, env });
-                            }
-                            Message::Keyword { parts } => {
-                                let selector: Arc<str> = parts
-                                    .iter()
-                                    .map(|(k, _)| k.as_ref())
-                                    .collect::<String>()
-                                    .into();
-                                let mut exprs: VecDeque<Expr> =
-                                    parts.into_iter().map(|(_, e)| e).collect();
-                                let first =
-                                    exprs.pop_front().expect("keyword message has no parts");
-                                stack.push(Cont::SuperCollectArgs {
-                                    selector,
-                                    done: vec![],
-                                    pending: exprs,
-                                    env: env.clone(),
-                                });
-                                stack.push(Cont::EvalExpr { expr: first, env });
-                            }
-                        }
-                    } else {
-                        // Push AfterReceiver first (below in stack), then receiver eval.
-                        stack.push(Cont::AfterReceiver {
-                            message,
-                            env: env.clone(),
-                        });
-                        stack.push(Cont::EvalExpr {
-                            expr: *receiver,
-                            env,
-                        });
-                    }
-                }
-                Expr::Cascade { receiver, messages } => {
-                    stack.push(Cont::CascadeStep {
-                        receiver: None,
-                        pending: messages.into_iter().collect(),
-                        env: env.clone(),
-                    });
-                    stack.push(Cont::EvalExpr {
-                        expr: *receiver,
-                        env,
-                    });
-                }
-                Expr::ArrayLiteral(elements) => {
-                    acc = eval_array_literal_iterative(ev, &elements, &mut env)?;
-                }
-                Expr::DynamicArray(elements) => {
-                    let array_handle = ev
-                        .registry
-                        .kernel()
-                        .lookup_class("Array")
-                        .ok_or_else(|| EvalError::UndefinedVariable(Arc::from("Array")))?;
-                    if elements.is_empty() {
-                        acc = build_array(array_handle.0.class.clone(), vec![]);
-                    } else {
-                        let mut exprs: VecDeque<Expr> = elements.into_iter().collect();
-                        let first = exprs.pop_front().unwrap();
-                        stack.push(Cont::DynArrayElem {
-                            array_class: array_handle,
-                            done: vec![],
-                            pending: exprs,
-                            env: env.clone(),
-                        });
-                        stack.push(Cont::EvalExpr { expr: first, env });
-                    }
-                }
-            },
+            Cont::EvalExpr { expr, env } => handle_eval_expr(ev, expr, env, &mut stack, &mut acc)?,
 
             // ── Assignment ───────────────────────────────────────────────
             Cont::Assign { name, mut env } => {
@@ -685,86 +775,50 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
             // ── MethodFrame dispatch ──────────────────────────────────────
             Cont::MethodFrame {
                 depth,
-                mut pending,
-                mut env,
+                pending,
+                env,
                 implicit_self,
                 saved_block_home,
             } => {
-                if pending.is_empty() {
-                    // Frame exhausted — pop self binding, restore home, pop env.
-                    ev.pop_self();
-                    ev.current_block_home.set(saved_block_home);
-                    env.pop_frame();
-                    // Methods answer `self` absent an explicit `^`.
-                    acc = implicit_self;
-                } else {
-                    let stmt = pending.pop_front().unwrap();
-                    // Push the frame back first (continuing frame is below new work).
-                    stack.push(Cont::MethodFrame {
-                        depth,
-                        pending,
-                        env: env.clone(),
-                        implicit_self,
-                        saved_block_home,
-                    });
-                    dispatch_stmt(ev, stmt, &env, depth, &mut stack, &mut acc)?;
-                }
+                handle_method_frame(
+                    ev,
+                    depth,
+                    pending,
+                    env,
+                    implicit_self,
+                    saved_block_home,
+                    &mut stack,
+                    &mut acc,
+                )?;
             }
 
             // ── BlockFrame dispatch ───────────────────────────────────────
             Cont::BlockFrame {
-                mut pending,
-                mut env,
+                pending,
+                env,
                 saved_block_home,
                 block_home_self,
                 sync,
             } => {
-                if pending.is_empty() {
-                    // Frame exhausted — pop synthetic self (if any), restore home, pop env.
-                    if block_home_self.is_some() {
-                        ev.pop_self();
-                    }
-                    ev.current_block_home.set(saved_block_home);
-                    env.pop_frame();
-                    // acc stays as the last expression result.
-                } else {
-                    let stmt = pending.pop_front().unwrap();
-                    stack.push(Cont::BlockFrame {
-                        pending,
-                        env: env.clone(),
-                        saved_block_home,
-                        block_home_self,
-                        sync,
-                    });
-                    // For sync frames, force the statement result before the frame resumes.
-                    if sync {
-                        stack.push(Cont::ForceAcc);
-                    }
-                    // Blocks match `^`-returns against `current_block_home` (always
-                    // set during a block), so the frame depth here is irrelevant.
-                    dispatch_stmt(ev, stmt, &env, 0, &mut stack, &mut acc)?;
-                }
+                handle_block_frame(
+                    ev,
+                    pending,
+                    env,
+                    saved_block_home,
+                    block_home_self,
+                    sync,
+                    &mut stack,
+                    &mut acc,
+                )?;
             }
 
             // ── ProgramFrame dispatch ─────────────────────────────────────
             Cont::ProgramFrame {
-                mut pending,
+                pending,
                 env,
                 saved_block_home,
             } => {
-                if pending.is_empty() {
-                    // Top-level frame: restore home only (no self binding, no owned env).
-                    ev.current_block_home.set(saved_block_home);
-                    // acc stays as the last expression result.
-                } else {
-                    let stmt = pending.pop_front().unwrap();
-                    stack.push(Cont::ProgramFrame {
-                        pending,
-                        env: env.clone(),
-                        saved_block_home,
-                    });
-                    dispatch_stmt(ev, stmt, &env, 0, &mut stack, &mut acc)?;
-                }
+                handle_program_frame(ev, pending, env, saved_block_home, &mut stack, &mut acc)?;
             }
 
             // ── ForceAcc ──────────────────────────────────────────────────
@@ -829,6 +883,14 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 // Handler completed normally; acc = handler result, pass through.
             }
 
+            // ── HCRunGuard (success path) ─────────────────────────────────
+            Cont::HCRunGuard {
+                chain_start_len, ..
+            } => {
+                // Body completed normally; drop this HC's handlers, pass acc through.
+                ev.handler_chain.borrow_mut().truncate(chain_start_len);
+            }
+
             // ── ContinueUnwind ────────────────────────────────────────────
             Cont::ContinueUnwind {
                 return_val,
@@ -849,174 +911,57 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
             }
 
             // ── AfterReceiver ─────────────────────────────────────────────
-            Cont::AfterReceiver { message, mut env } => {
-                let receiver = acc.clone();
-                match message {
-                    Message::Unary(sel) => {
-                        if let Err(e) = dispatch_to_stack(
-                            ev,
-                            receiver,
-                            sel,
-                            vec![],
-                            &mut env,
-                            &mut stack,
-                            &mut acc,
-                        ) {
-                            handle_step_error(e, ev, &mut stack, &mut acc)?;
-                        }
-                    }
-                    Message::Binary { op, arg } => {
-                        stack.push(Cont::CollectArgs {
-                            receiver,
-                            selector: op,
-                            done: vec![],
-                            pending: VecDeque::new(), // first arg already being pushed
-                            env: env.clone(),
-                        });
-                        stack.push(Cont::EvalExpr { expr: *arg, env });
-                    }
-                    Message::Keyword { parts } => {
-                        let selector: Arc<str> = parts
-                            .iter()
-                            .map(|(k, _)| k.as_ref())
-                            .collect::<String>()
-                            .into();
-                        let mut exprs: VecDeque<Expr> = parts.into_iter().map(|(_, e)| e).collect();
-                        let first = exprs.pop_front().expect("keyword message has no parts");
-                        stack.push(Cont::CollectArgs {
-                            receiver,
-                            selector,
-                            done: vec![],
-                            pending: exprs,
-                            env: env.clone(),
-                        });
-                        stack.push(Cont::EvalExpr { expr: first, env });
-                    }
-                }
+            Cont::AfterReceiver { message, env } => {
+                handle_after_receiver(ev, message, env, &mut stack, &mut acc)?;
             }
 
             // ── CollectArgs ───────────────────────────────────────────────
             Cont::CollectArgs {
                 receiver,
                 selector,
-                mut done,
-                mut pending,
-                mut env,
+                done,
+                pending,
+                env,
             } => {
-                done.push(acc.clone());
-                if let Some(next) = pending.pop_front() {
-                    stack.push(Cont::CollectArgs {
-                        receiver,
-                        selector,
-                        done,
-                        pending,
-                        env: env.clone(),
-                    });
-                    stack.push(Cont::EvalExpr { expr: next, env });
-                } else {
-                    reductions += 1;
-                    if reductions >= YIELD_INTERVAL {
-                        reductions = 0;
-                        may::coroutine::yield_now();
-                    }
-                    if let Err(e) = dispatch_to_stack(
-                        ev, receiver, selector, done, &mut env, &mut stack, &mut acc,
-                    ) {
-                        handle_step_error(e, ev, &mut stack, &mut acc)?;
-                    }
-                }
+                handle_collect_args(
+                    ev,
+                    receiver,
+                    selector,
+                    done,
+                    pending,
+                    env,
+                    &mut stack,
+                    &mut acc,
+                    &mut reductions,
+                )?;
             }
 
             // ── SuperCollectArgs ──────────────────────────────────────────
             Cont::SuperCollectArgs {
                 selector,
-                mut done,
-                mut pending,
-                mut env,
+                done,
+                pending,
+                env,
             } => {
-                done.push(acc.clone());
-                if let Some(next) = pending.pop_front() {
-                    stack.push(Cont::SuperCollectArgs {
-                        selector,
-                        done,
-                        pending,
-                        env: env.clone(),
-                    });
-                    stack.push(Cont::EvalExpr { expr: next, env });
-                } else {
-                    reductions += 1;
-                    if reductions >= YIELD_INTERVAL {
-                        reductions = 0;
-                        may::coroutine::yield_now();
-                    }
-                    if let Err(e) =
-                        dispatch_super_to_stack(ev, selector, done, &mut env, &mut stack, &mut acc)
-                    {
-                        handle_step_error(e, ev, &mut stack, &mut acc)?;
-                    }
-                }
+                handle_super_collect_args(
+                    ev,
+                    selector,
+                    done,
+                    pending,
+                    env,
+                    &mut stack,
+                    &mut acc,
+                    &mut reductions,
+                )?;
             }
 
             // ── CascadeStep ───────────────────────────────────────────────
             Cont::CascadeStep {
                 receiver,
-                mut pending,
-                mut env,
+                pending,
+                env,
             } => {
-                // On first fire, acc = evaluated receiver; on subsequent fires, acc = send result.
-                let recv = receiver.unwrap_or_else(|| acc.clone());
-                if let Some(msg) = pending.pop_front() {
-                    // Send this message to recv, then continue with remaining pending.
-                    stack.push(Cont::CascadeStep {
-                        receiver: Some(recv.clone()),
-                        pending,
-                        env: env.clone(),
-                    });
-                    match msg {
-                        Message::Unary(sel) => {
-                            if let Err(e) = dispatch_to_stack(
-                                ev,
-                                recv,
-                                sel,
-                                vec![],
-                                &mut env,
-                                &mut stack,
-                                &mut acc,
-                            ) {
-                                handle_step_error(e, ev, &mut stack, &mut acc)?;
-                            }
-                        }
-                        Message::Binary { op, arg } => {
-                            stack.push(Cont::CollectArgs {
-                                receiver: recv,
-                                selector: op,
-                                done: vec![],
-                                pending: VecDeque::new(),
-                                env: env.clone(),
-                            });
-                            stack.push(Cont::EvalExpr { expr: *arg, env });
-                        }
-                        Message::Keyword { parts } => {
-                            let selector: Arc<str> = parts
-                                .iter()
-                                .map(|(k, _)| k.as_ref())
-                                .collect::<String>()
-                                .into();
-                            let mut exprs: VecDeque<Expr> =
-                                parts.into_iter().map(|(_, e)| e).collect();
-                            let first = exprs.pop_front().expect("keyword message has no parts");
-                            stack.push(Cont::CollectArgs {
-                                receiver: recv,
-                                selector,
-                                done: vec![],
-                                pending: exprs,
-                                env: env.clone(),
-                            });
-                            stack.push(Cont::EvalExpr { expr: first, env });
-                        }
-                    }
-                }
-                // else: pending empty — acc already holds last send result, nothing to push
+                handle_cascade_step(ev, receiver, pending, env, &mut stack, &mut acc)?;
             }
 
             // ── DynArrayElem ──────────────────────────────────────────────
@@ -1040,6 +985,292 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 }
             }
         }
+    }
+}
+
+/// `Cont::MethodFrame` handler — see the variant docs. Extracted `#[inline(never)]`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn handle_method_frame(
+    ev: &Evaluator,
+    depth: usize,
+    mut pending: VecDeque<Stmt>,
+    mut env: Env,
+    implicit_self: Value,
+    saved_block_home: Option<usize>,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+) -> Result<(), EvalError> {
+    if pending.is_empty() {
+        // Frame exhausted — pop self binding, restore home, pop env.
+        ev.pop_self();
+        ev.current_block_home.set(saved_block_home);
+        env.pop_frame();
+        // Methods answer `self` absent an explicit `^`.
+        *acc = implicit_self;
+    } else {
+        let stmt = pending.pop_front().unwrap();
+        // Push the frame back first (continuing frame is below new work).
+        stack.push(Cont::MethodFrame {
+            depth,
+            pending,
+            env: env.clone(),
+            implicit_self,
+            saved_block_home,
+        });
+        dispatch_stmt(ev, stmt, &env, depth, stack, acc)?;
+    }
+    Ok(())
+}
+
+/// `Cont::BlockFrame` handler — see the variant docs. Extracted `#[inline(never)]`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn handle_block_frame(
+    ev: &Evaluator,
+    mut pending: VecDeque<Stmt>,
+    mut env: Env,
+    saved_block_home: Option<usize>,
+    block_home_self: Option<InstanceHandle>,
+    sync: bool,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+) -> Result<(), EvalError> {
+    if pending.is_empty() {
+        // Frame exhausted — pop synthetic self (if any), restore home, pop env.
+        if block_home_self.is_some() {
+            ev.pop_self();
+        }
+        ev.current_block_home.set(saved_block_home);
+        env.pop_frame();
+        // acc stays as the last expression result.
+    } else {
+        let stmt = pending.pop_front().unwrap();
+        stack.push(Cont::BlockFrame {
+            pending,
+            env: env.clone(),
+            saved_block_home,
+            block_home_self,
+            sync,
+        });
+        // For sync frames, force the statement result before the frame resumes.
+        if sync {
+            stack.push(Cont::ForceAcc);
+        }
+        // Blocks match `^`-returns against `current_block_home` (always set during a
+        // block), so the frame depth here is irrelevant.
+        dispatch_stmt(ev, stmt, &env, 0, stack, acc)?;
+    }
+    Ok(())
+}
+
+/// `Cont::ProgramFrame` handler — see the variant docs. Extracted `#[inline(never)]`.
+#[inline(never)]
+fn handle_program_frame(
+    ev: &Evaluator,
+    mut pending: VecDeque<Stmt>,
+    env: Env,
+    saved_block_home: Option<usize>,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+) -> Result<(), EvalError> {
+    if pending.is_empty() {
+        // Top-level frame: restore home only (no self binding, no owned env).
+        ev.current_block_home.set(saved_block_home);
+        // acc stays as the last expression result.
+    } else {
+        let stmt = pending.pop_front().unwrap();
+        stack.push(Cont::ProgramFrame {
+            pending,
+            env: env.clone(),
+            saved_block_home,
+        });
+        dispatch_stmt(ev, stmt, &env, 0, stack, acc)?;
+    }
+    Ok(())
+}
+
+/// `Cont::AfterReceiver` handler: receiver is in `acc`; dispatch the message
+/// (unary) or begin argument collection (binary/keyword). Extracted `#[inline(never)]`.
+#[inline(never)]
+fn handle_after_receiver(
+    ev: &Evaluator,
+    message: Message,
+    mut env: Env,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+) -> Result<(), EvalError> {
+    let receiver = acc.clone();
+    match message {
+        Message::Unary(sel) => {
+            if let Err(e) = dispatch_to_stack(ev, receiver, sel, vec![], &mut env, stack, acc) {
+                handle_step_error(e, ev, stack, acc)?;
+            }
+        }
+        Message::Binary { op, arg } => {
+            stack.push(Cont::CollectArgs {
+                receiver,
+                selector: op,
+                done: vec![],
+                pending: VecDeque::new(), // first arg already being pushed
+                env: env.clone(),
+            });
+            stack.push(Cont::EvalExpr { expr: *arg, env });
+        }
+        Message::Keyword { parts } => {
+            let selector: Arc<str> = parts
+                .iter()
+                .map(|(k, _)| k.as_ref())
+                .collect::<String>()
+                .into();
+            let mut exprs: VecDeque<Expr> = parts.into_iter().map(|(_, e)| e).collect();
+            let first = exprs.pop_front().expect("keyword message has no parts");
+            stack.push(Cont::CollectArgs {
+                receiver,
+                selector,
+                done: vec![],
+                pending: exprs,
+                env: env.clone(),
+            });
+            stack.push(Cont::EvalExpr { expr: first, env });
+        }
+    }
+    Ok(())
+}
+
+/// `Cont::CollectArgs` handler: append `acc` to `done`, evaluate the next
+/// argument, or dispatch once arguments are exhausted. Extracted `#[inline(never)]`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn handle_collect_args(
+    ev: &Evaluator,
+    receiver: Value,
+    selector: Arc<str>,
+    mut done: Vec<Value>,
+    mut pending: VecDeque<Expr>,
+    mut env: Env,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+    reductions: &mut u32,
+) -> Result<(), EvalError> {
+    done.push(acc.clone());
+    if let Some(next) = pending.pop_front() {
+        stack.push(Cont::CollectArgs {
+            receiver,
+            selector,
+            done,
+            pending,
+            env: env.clone(),
+        });
+        stack.push(Cont::EvalExpr { expr: next, env });
+    } else {
+        bump_reductions(reductions);
+        if let Err(e) = dispatch_to_stack(ev, receiver, selector, done, &mut env, stack, acc) {
+            handle_step_error(e, ev, stack, acc)?;
+        }
+    }
+    Ok(())
+}
+
+/// `Cont::SuperCollectArgs` handler — like `handle_collect_args` but dispatches
+/// to the superclass (`self` receiver). Extracted `#[inline(never)]`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn handle_super_collect_args(
+    ev: &Evaluator,
+    selector: Arc<str>,
+    mut done: Vec<Value>,
+    mut pending: VecDeque<Expr>,
+    mut env: Env,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+    reductions: &mut u32,
+) -> Result<(), EvalError> {
+    done.push(acc.clone());
+    if let Some(next) = pending.pop_front() {
+        stack.push(Cont::SuperCollectArgs {
+            selector,
+            done,
+            pending,
+            env: env.clone(),
+        });
+        stack.push(Cont::EvalExpr { expr: next, env });
+    } else {
+        bump_reductions(reductions);
+        if let Err(e) = dispatch_super_to_stack(ev, selector, done, &mut env, stack, acc) {
+            handle_step_error(e, ev, stack, acc)?;
+        }
+    }
+    Ok(())
+}
+
+/// `Cont::CascadeStep` handler: send the next cascaded message to the shared
+/// receiver, then continue with the remaining messages. Extracted `#[inline(never)]`.
+#[inline(never)]
+fn handle_cascade_step(
+    ev: &Evaluator,
+    receiver: Option<Value>,
+    mut pending: VecDeque<Message>,
+    mut env: Env,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+) -> Result<(), EvalError> {
+    // On first fire, acc = evaluated receiver; on subsequent fires, acc = send result.
+    let recv = receiver.unwrap_or_else(|| acc.clone());
+    if let Some(msg) = pending.pop_front() {
+        // Send this message to recv, then continue with remaining pending.
+        stack.push(Cont::CascadeStep {
+            receiver: Some(recv.clone()),
+            pending,
+            env: env.clone(),
+        });
+        match msg {
+            Message::Unary(sel) => {
+                if let Err(e) = dispatch_to_stack(ev, recv, sel, vec![], &mut env, stack, acc) {
+                    handle_step_error(e, ev, stack, acc)?;
+                }
+            }
+            Message::Binary { op, arg } => {
+                stack.push(Cont::CollectArgs {
+                    receiver: recv,
+                    selector: op,
+                    done: vec![],
+                    pending: VecDeque::new(),
+                    env: env.clone(),
+                });
+                stack.push(Cont::EvalExpr { expr: *arg, env });
+            }
+            Message::Keyword { parts } => {
+                let selector: Arc<str> = parts
+                    .iter()
+                    .map(|(k, _)| k.as_ref())
+                    .collect::<String>()
+                    .into();
+                let mut exprs: VecDeque<Expr> = parts.into_iter().map(|(_, e)| e).collect();
+                let first = exprs.pop_front().expect("keyword message has no parts");
+                stack.push(Cont::CollectArgs {
+                    receiver: recv,
+                    selector,
+                    done: vec![],
+                    pending: exprs,
+                    env: env.clone(),
+                });
+                stack.push(Cont::EvalExpr { expr: first, env });
+            }
+        }
+    }
+    // else: pending empty — acc already holds last send result, nothing to push.
+    Ok(())
+}
+
+/// Increment the cooperative-scheduling reduction counter, yielding to the
+/// `may` scheduler once `YIELD_INTERVAL` is reached.
+#[inline]
+fn bump_reductions(reductions: &mut u32) {
+    *reductions += 1;
+    if *reductions >= YIELD_INTERVAL {
+        *reductions = 0;
+        may::coroutine::yield_now();
     }
 }
 
@@ -1452,6 +1683,36 @@ fn dispatch_to_stack(
     if let Some(found) = lookup_user_method(ev, &receiver, &selector) {
         drain_tail_frames(ev, stack);
         push_method_call_frame(ev, found, args, env, stack)?;
+        return Ok(());
+    }
+
+    // (1b) `_primHCRun:` flattened: register this HandlerContext's handler pairs
+    // on the handler_chain and run the body on the heap `Cont` stack (via
+    // HCRunGuard) instead of recursing `step_loop` through `eval_block`. This is
+    // what makes nested synchronous `run:` O(1) in Rust stack.
+    if selector.as_ref() == "_primHCRun:"
+        && let Value::Instance(ref handle) = receiver
+    {
+        if args.len() != 1 {
+            return Err(EvalError::ArityMismatch {
+                expected: 1,
+                got: args.len(),
+            });
+        }
+        let body = as_block(args.into_iter().next().unwrap(), &selector)?;
+        let pairs = crate::builtins_iterative::extract_handler_pairs(handle)?;
+        let chain_start_len = ev.handler_chain.borrow().len();
+        {
+            let mut chain = ev.handler_chain.borrow_mut();
+            for (cls, blk) in &pairs {
+                chain.push((cls.clone(), blk.clone()));
+            }
+        }
+        stack.push(Cont::HCRunGuard {
+            chain_start_len,
+            body_blk: body.clone(),
+        });
+        push_block_frame(ev, &body, vec![], false, stack)?;
         return Ok(());
     }
 

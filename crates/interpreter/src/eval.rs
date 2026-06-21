@@ -165,8 +165,11 @@ pub struct Evaluator {
     /// `(condition_class, handler_block)` pair. `_primSignalCondition:` walks this
     /// in reverse (most-recently-pushed first) before raising `EvalError::Signal`.
     /// Pushed/popped by `_primHCRun:`; always empty outside a `HandlerContext run:`.
-    pub handler_chain: RefCell<Vec<(Arc<crate::class::Class>, Arc<crate::value::Block>)>>,
+    pub handler_chain: RefCell<Vec<HandlerPair>>,
 }
+
+/// A `HandlerContext` handler registration: `(condition class, handler block)`.
+pub(crate) type HandlerPair = (Arc<crate::class::Class>, Arc<crate::value::Block>);
 
 impl Default for Evaluator {
     fn default() -> Self {
