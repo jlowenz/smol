@@ -398,6 +398,15 @@ pub(crate) enum Cont {
     /// the result. A `^`-return / error from the init block abandons the instance
     /// (no freeze), matching the recursive builtin.
     NewValueGuard { inst: InstanceHandle },
+
+    /// Sits below a `Namespace do:` block. The active namespace was swapped to the
+    /// receiver for the block's duration; this guard restores `saved_ns` on every
+    /// exit path (success, error, `^`-return) — the flattened equivalent of
+    /// `Evaluator::with_namespace`, so nested `Namespace do:` doesn't grow the
+    /// Rust stack. The block's value passes through as the result.
+    NamespaceGuard {
+        saved_ns: Arc<crate::namespace::Namespace>,
+    },
 }
 
 /// Outcome of a `^`-return unwind scan.
@@ -462,6 +471,11 @@ fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
         // Discarding a signal boundary re-enables the handlers it had disabled.
         Cont::SignalGuard { removed } => {
             ev.handler_chain.borrow_mut().extend(removed);
+            None
+        }
+        // Discarding a `Namespace do:` boundary restores the active namespace.
+        Cont::NamespaceGuard { saved_ns } => {
+            *ev.active_namespace.borrow_mut() = saved_ns;
             None
         }
         _ => None,
@@ -990,6 +1004,12 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 // Init block finished; freeze the instance and answer it.
                 crate::builtins_iterative::freeze_value_instance(&inst);
                 acc = Value::Instance(inst);
+            }
+
+            // ── NamespaceGuard (Namespace do: block completed) ────────────
+            Cont::NamespaceGuard { saved_ns } => {
+                // Restore the active namespace; acc (block result) passes through.
+                *ev.active_namespace.borrow_mut() = saved_ns;
             }
 
             // ── ToDoStep (numeric loop iteration) ─────────────────────────
@@ -2055,6 +2075,26 @@ fn dispatch_to_stack(
             push_class_method_frame(ev, handle.clone(), def_class, method, args, env, stack)?;
             return Ok(());
         }
+    }
+
+    // (1g) `Namespace do:` flattened: swap the active namespace and run the block
+    // on the heap `Cont` stack (NamespaceGuard restores it on every exit path)
+    // instead of recursing `step_loop` via `with_namespace` → `eval_block`.
+    if let Value::Namespace(ref ns) = receiver
+        && selector.as_ref() == "do:"
+    {
+        if args.len() != 1 {
+            return Err(EvalError::ArityMismatch {
+                expected: 1,
+                got: args.len(),
+            });
+        }
+        let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+        let saved_ns = ev.active_namespace.borrow().clone();
+        *ev.active_namespace.borrow_mut() = ns.clone();
+        stack.push(Cont::NamespaceGuard { saved_ns });
+        push_block_frame(ev, &blk, vec![], false, stack)?;
+        return Ok(());
     }
 
     // (2-5) Block dispatch.

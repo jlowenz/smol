@@ -60,6 +60,63 @@ fn step_probe_nested_loops() {
     );
 }
 
+/// C31.5: nested synchronous `then:` must NOT grow the Rust stack — the
+/// receiver block (`ThenCheck`) and the continuation both run via
+/// `push_block_frame` on the same `step_loop`; only a genuine `Future` receiver
+/// spawns an async continuation. Deep block-`then:` chains stay depth ≈ 1.
+#[cfg(feature = "step_probe")]
+#[test]
+fn step_probe_nested_then() {
+    use crate::test_helpers::eval_probe;
+    // Right-nested then:: each continuation block itself evaluates another
+    // `[..] then: [..]`. All synchronous (Int results), so no parking/migration.
+    let src = r#"
+[1] then: [
+  [2] then: [
+    [3] then: [
+      [4] then: [
+        [5] then: [ 6 ]]]]]
+"#;
+    let r = eval_probe(src);
+    eprintln!(
+        "[step_probe] nested then (5-deep): depth = {}, per-level delta = {} B",
+        r.max_depth, r.level_delta,
+    );
+    assert_eq!(r.value, Value::Int(6));
+    assert!(
+        r.max_depth <= 2,
+        "nested then: should not grow step_loop depth with nesting, got {}",
+        r.max_depth
+    );
+}
+
+/// C31.5: nested `Namespace do:` must NOT grow the Rust stack — the block runs on
+/// the heap `Cont` stack behind a `NamespaceGuard` (the flattened equivalent of
+/// `with_namespace`), so depth stays ≈ 1 regardless of nesting.
+#[cfg(feature = "step_probe")]
+#[test]
+fn step_probe_nested_namespace_do() {
+    use crate::test_helpers::eval_probe;
+    let src = r#"
+Kernel do: [
+  Kernel do: [
+    Kernel do: [
+      Kernel do: [
+        Kernel do: [ 42 ]]]]]
+"#;
+    let r = eval_probe(src);
+    eprintln!(
+        "[step_probe] nested namespace do (5-deep): depth = {}, per-level delta = {} B",
+        r.max_depth, r.level_delta,
+    );
+    assert_eq!(r.value, Value::Int(42));
+    assert!(
+        r.max_depth <= 2,
+        "nested Namespace do: should not grow step_loop depth, got {}",
+        r.max_depth
+    );
+}
+
 #[test]
 fn s1_literal_return() {
     let v = eval("^42");
