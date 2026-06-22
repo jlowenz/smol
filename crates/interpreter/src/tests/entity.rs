@@ -682,6 +682,38 @@ fn atomic_abort_rolls_back_writes() {
     assert_eq!(run_in_coroutine(src), Value::Int(100));
 }
 
+// S5b gap (C31): nested `atomic:` does not yet work. The inner `Transaction
+// atomic:` send is tagged with the outer tx context, so the inner coordinator
+// (the `Transaction` class entity, and its instance) auto-enrolls as a
+// participant of the OUTER transaction (entity.rs run_entity_loop). The outer
+// `pvtCommit` then sends `pvtExitTx:` to the class → MessageNotUnderstood. Fixing
+// this needs a design decision (exclude coordinators/classes from tagged
+// auto-enrollment); tracked as S5b. The C31.5 prerequisite handled a coordinator
+// enrolling in its OWN tx; this is the distinct nested facet.
+#[test]
+#[ignore = "C31 S5b: nested atomic coordinator auto-enrolls in outer tx (design pending)"]
+fn atomic_nested_inner_commit_absorbs_into_outer() {
+    // S5b: an inner `atomic:` runs as a Child of the outer; on inner commit its
+    // buffer absorbs into the outer, and the outer commit writes both. a ends at
+    // 100 + 10 (outer) + 5 (inner) = 115.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a tr |
+        a := Account new.
+        (a deposit: 100) await.
+        tr := (Transaction atomic: [:tx |
+            (a deposit: 10) await.
+            ((Transaction atomic: [:tx2 | (a deposit: 5) await ]) await result await) ]) await.
+        tr result await.
+        a balance await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(115));
+}
+
 // ── C31 S2: transaction lock + shadow frames ──────────────────────────────────
 
 #[cfg(test)]
