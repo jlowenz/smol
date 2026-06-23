@@ -280,3 +280,50 @@ could not represent this. Lock + shadow are one per-entity stack of context-tagg
 locks; siblings serialize on a shared entity. Admission and the deadlock graph key
 on `TxCtxId` + ancestry, not root `TxId`. No `savepoint()`/`rollback_to()`/
 `TentativeOp::Savepoint`; the WAL and backend `apply` are untouched.
+
+---
+
+## Resume state (2026-06-22) — C31.5 done; resume at C31 S6 then S5b
+
+**C31.5 (complete the iterative evaluator) is COMPLETE** (commits 9f6c8c7..b87443c).
+All synchronous nesting now runs on the heap `Cont` stack — methods, class
+methods, `value`/`on:do:`/`ensure:`/`then:`, `HandlerContext run:`, signals
+(CL handler-scoping), `_primNewValue:`, all iteration (`to:do:`), and
+`Namespace do:`. Per-entity release stack lowered 256 KB → 64 KB (debug stays
+256 KB via `cfg(debug_assertions)`). Debug-only `step_probe` Cargo feature
+(`probe::ProbeState` on `Evaluator`) measures `step_loop` depth/per-level deltas.
+The 3 nested-HC tests are un-ignored. Full debug suite: 690 pass, 1 ignored
+(the S5b gap below).
+
+**C31 status:** S0–S5 committed earlier (triple-store additions, `TxContext`,
+frame stack, tagged envelopes, 7 primitives, `Transaction`/`TxResult` kernel
+classes). Happy paths green: `atomic_no_participants_*`, `atomic_transfer_*`,
+`atomic_abort_*` (tests/entity.rs), plus S2 `tx_frames` unit tests.
+
+### Plan: do S6 (single-level) first, then S5b (nested), then S5c (deadlock)
+
+**S6 single-level matrix — WRITE THESE (tests/entity.rs, `run_in_coroutine`):**
+- shadow correctness: a mid-block read returns the shadow value, not the stale slot.
+- mailbox lock: an external (untagged) message is delivered only after commit.
+- shared TxId: both participants' facts appear under one TxId.
+(Happy/abort already covered.)
+
+**S5b nested `atomic:` — KNOWN BUG (ignored test
+`atomic_nested_inner_commit_absorbs_into_outer`):** the inner `Transaction
+atomic:` send is tagged with the OUTER tx context, so the inner coordinator (the
+`Transaction` class entity AND the instance created by `self new`) auto-enrolls as
+an outer participant in `run_entity_loop` (entity.rs ~line 678). Outer
+`pvtCommit` then sends `pvtExitTx:` to the class → `MessageNotUnderstood`.
+Design decision needed: exclude transaction coordinators / class entities from
+tagged auto-enrollment, while still letting the inner coordinator SEE the outer
+`current_tx_ctx` so `_primBeginSharedTx` builds a `Child`. (C31.5's prerequisite
+fixed a coordinator enrolling in its OWN tx; this nested facet is distinct.)
+Then add: nested inner-rollback, parallel children, sibling serialization tests.
+
+**S5c deadlock detection — NOT STARTED.** Needs kernel-side `pvtCheckDeadlock`,
+`Deadlock` condition, `participates-in (TxCtxId)` facts, `Timer`-based, graph keyed
+on `TxCtxId` (not root TxId). See §S5c above.
+
+**Workflow reminders:** `cargo fmt` + `cargo clippy --all-targets` before commit
+(hook enforces); tx tests run via `run_in_coroutine` (needs a may coroutine for
+the coordinator to block on participant replies).
