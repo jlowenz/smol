@@ -640,6 +640,13 @@ Condition subclass: #Error
     classVariableNames: ''
     indexedSlots: #none.
 
+"Signaled when resolveWith:/rejectWith: is sent to an already-settled Future.
+Carries an #ignore restart so a handler can choose to keep the first resolution."
+Error subclass: #FutureAlreadyResolved
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
 "HandlerContext — non-unwinding handler registration (CL handler-bind analog).
 pairs is a Cons-of-Association linked list (or nil):
   Cons(head: cls -> blk, tail: rest)
@@ -834,9 +841,13 @@ World class >> instancesOf: aClass [
  not yet covered — see OQ-C31-1 / docs.
  ════════════════════════════════════════════════════════════════════════════"
 
-"Explicit Future: reifies an implicit future handle so code can create a future,
-hand it around, and resolve/reject it later. `handle` is a plain future handle
-(awaitable like any implicit future); `syncValue` forces it."
+"Explicit Future: reifies an implicit future so code can create one, hand it
+around, and resolve/reject it later. The wrapping is an implementation detail —
+clients use `await` (blocks until resolved, like any implicit future) and
+`resolveWith:`/`rejectWith:`; the internal handle is never exposed. A Future is a
+Value and so is freely shareable across entities/threads; resolution is
+single-winner — the first `resolveWith:`/`rejectWith:` wins and any later attempt
+signals an error."
 Value subclass: #Future
     instanceVariableNames: 'handle'
     classVariableNames: ''
@@ -844,10 +855,19 @@ Value subclass: #Future
 
 Future class >> new [ ^self _primNewValue: [:f | f pvtInit] ]
 Future >> pvtInit          [ handle := self _primNewFutureHandle ]
-Future >> resolveWith: v   [ ^self _primResolveFuture: handle value: v ]
-Future >> rejectWith: e    [ ^self _primRejectFuture: handle error: e ]
-Future >> syncValue        [ ^handle await ]
-Future >> handle           [ ^handle ]
+Future >> await            [ ^handle await ]
+Future >> then: aBlock     [ ^handle then: aBlock ]
+Future >> resolveWith: v   [ ^self pvtSettle: (self _primResolveFuture: handle value: v) ]
+Future >> rejectWith: e    [ ^self pvtSettle: (self _primRejectFuture: handle error: e) ]
+
+"Single-winner guard: if the prim reports the future was already settled, signal a
+typed, restartable condition. Handlers may `invokeRestart: #ignore` to keep the
+existing resolution (the late attempt becomes a no-op returning nil)."
+Future >> pvtSettle: won [
+    won ifTrue: [ ^self ].
+    ^((FutureAlreadyResolved withMessage: 'future already resolved')
+        addRestart: #ignore block: [ nil ]) signal
+]
 
 "Internal condition: signaled by the commit continuation once the block's work
 has resolved, carrying the block's result. Caught by the transaction's
@@ -905,7 +925,7 @@ Transaction >> pvtRunAtomic: aBlock [
       run: [ | f |
         f := aBlock value: self.
         f then: [ (OkToCommit value: f await) signal ] ].
-    ^TxResult transaction: self result: txf handle
+    ^TxResult transaction: self result: txf
 ]
 
 Transaction >> pvtCommit [

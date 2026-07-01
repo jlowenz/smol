@@ -1826,7 +1826,13 @@ fn dispatch_to_stack(
     // rather than via a recursive `eval_block`, so deep `then:` chains do not
     // grow the Rust coroutine stack. The genuine-Future arm spawns a
     // continuation coroutine (fresh stack), delegated to the builtins handler.
-    if selector.as_ref() == "then:" {
+    //
+    // This early interception (before `force_value` below) exists *only* to avoid
+    // eagerly forcing a raw `Value::Future` receiver — chaining is the whole point.
+    // A `Value::Instance` (e.g. the explicit `Future`) is never force-blocked, so it
+    // falls through to ordinary user-method lookup, letting `Future >> then:`
+    // delegate to its handle. That keeps `then:` symmetric with `await`.
+    if selector.as_ref() == "then:" && !matches!(&receiver, Value::Instance(_)) {
         if args.len() != 1 {
             return Err(EvalError::ArityMismatch {
                 expected: 1,

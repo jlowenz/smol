@@ -614,7 +614,7 @@ fn hc_then_signal_resolves_future_within_entity() {
                 on: OkToCommit do: [:c | txf resolveWith: c value. c resume: nil])
                 on: Error do: [:e | txf rejectWith: e. e return: nil])
               run: [ 42 then: [ (OkToCommit value: 99) signal ] ].
-            ^txf handle
+            ^txf await
         ]
         | c |
         c := Coord2 new.
@@ -680,6 +680,139 @@ fn atomic_abort_rolls_back_writes() {
         a balance await
     "#;
     assert_eq!(run_in_coroutine(src), Value::Int(100));
+}
+
+#[test]
+fn atomic_shadow_read_returns_speculative_value_mid_block() {
+    // Shadow correctness: a mid-block read after a write returns the shadow
+    // (speculative) value, not the stale live slot. The atomic block's value IS
+    // the mid-block read, and `result` resolves to it. Pre-tx slot = 100; after
+    // `deposit: 50` the in-tx read returns 150 (the live slot stays 100 until
+    // commit). A broken shadow would surface the live slot → 100, so 150
+    // distinguishes read-your-writes from a stale-slot read.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a tr |
+        a := Account new.
+        (a deposit: 100) await.
+        tr := (Transaction atomic: [:tx |
+            (a deposit: 50) await.
+            a balance await ]) await.
+        tr result await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(150));
+}
+
+#[test]
+fn atomic_mailbox_lock_defers_external_message_until_commit() {
+    // Mailbox lock: an external (untagged) message issued while a participant is
+    // locked by the transaction is delivered only after commit. Determinism is
+    // forced with two gates: `g1` confirms the tx has locked `a` before the
+    // external read is enqueued; `g2` keeps the tx from committing until that
+    // untagged read is already in `a`'s mailbox. So the read is provably enqueued
+    // *during* the lock. The tx writes again (deposit: 25) AFTER the gate, so the
+    // committed balance (175) differs from the mid-tx shadow (150). With the lock
+    // honoured the read parks and is admitted only after commit, observing 175. A
+    // broken lock would admit it mid-tx and observe the speculative shadow (150),
+    // so 175 specifically proves the read was deferred until commit.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a g1 g2 trf seen |
+        a := Account new.
+        (a deposit: 100) await.
+        g1 := Future new.
+        g2 := Future new.
+        trf := Transaction atomic: [:tx |
+            (a deposit: 50) await.
+            g1 resolveWith: true.
+            g2 await.
+            (a deposit: 25) await ].
+        g1 await.
+        seen := a balance.
+        g2 resolveWith: true.
+        (trf await) result await.
+        seen await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(175));
+}
+
+#[test]
+fn atomic_transfer_commits_both_participants_under_one_tx_id() {
+    // Shared TxId: a transfer touching two participants commits both entities'
+    // facts under a single TxId. We subscribe (System ctx, wildcard pattern) to
+    // capture every committed change, then assert there is a TxId whose `balance`
+    // changes span both distinct participant subjects — i.e. the shared-tx commit
+    // wrote both under one id, not two per-entity ids.
+    use triple_store::exec_context::ExecContext;
+    use triple_store::pattern::{Match, MatchAsserter, Pattern};
+
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+        Account >> withdraw: n [ balance := balance - n ]
+
+        | a b tr |
+        a := Account new.
+        b := Account new.
+        (a deposit: 100) await.
+        tr := (Transaction atomic: [:tx |
+            (a withdraw: 30) await.
+            (b deposit: 30) await ]) await.
+        tr result await
+    "#;
+
+    crate::entity::init_coroutine_stack();
+    let base_ev = crate::eval::Evaluator::new();
+    let registry = base_ev.registry.clone();
+    let store = registry.store.clone_handle();
+    let sub = store.subscribe(
+        ExecContext::System,
+        Pattern {
+            subject: Match::Any,
+            predicate: Match::Any,
+            object: Match::Any,
+            asserter: MatchAsserter::Any,
+        },
+    );
+    let prog = crate::parser::Parser::parse(src).expect("parse");
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    may::go!(move || {
+        let ev = crate::eval::Evaluator::with_registry(registry);
+        let mut env = crate::env::Env::new();
+        ev.registry.populate_env(&mut env);
+        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        tx.send(v).unwrap();
+    });
+    rx.recv().unwrap();
+
+    // Drain committed changes; group `balance` subjects by TxId.
+    use std::collections::HashMap;
+    let mut by_tx: HashMap<
+        triple_store::id::TxId,
+        std::collections::HashSet<triple_store::id::EntityId>,
+    > = HashMap::new();
+    while let Ok(Some(ev)) = sub.try_recv() {
+        if store.resolve(ev.predicate).as_deref() != Some("balance") {
+            continue;
+        }
+        by_tx.entry(ev.tx_id).or_default().insert(ev.subject);
+    }
+
+    let shared = by_tx.values().any(|subjects| subjects.len() >= 2);
+    assert!(
+        shared,
+        "expected one TxId to cover both participants' balance facts; got {by_tx:?}"
+    );
 }
 
 // S5b gap (C31): nested `atomic:` does not yet work. The inner `Transaction

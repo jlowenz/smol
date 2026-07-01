@@ -121,6 +121,37 @@ impl FutureHandle {
         self.0.resolved.notify_all();
     }
 
+    /// Race-safe single-winner resolution: resolve successfully with `v` iff the
+    /// future is not yet resolved. Intended for the explicit `Future` Value, which
+    /// is freely shareable and may have resolve/reject raced from many threads.
+    ///
+    /// Ensures: returns `true` iff this call set the result (the winner); `false`
+    ///   if the future was already resolved (the existing result is left intact).
+    ///   The check-and-set is atomic under `inner`.
+    pub fn try_resolve_ok(&self, v: Value) -> bool {
+        let mut guard = self.0.inner.lock().unwrap();
+        if guard.result.is_some() {
+            return false;
+        }
+        guard.result = Some(Ok(v));
+        self.0.resolved.notify_all();
+        true
+    }
+
+    /// Race-safe single-winner rejection; see [`FutureHandle::try_resolve_ok`].
+    ///
+    /// Ensures: returns `true` iff this call set the error (the winner); `false`
+    ///   if the future was already resolved.
+    pub fn try_resolve_err(&self, e: EvalError) -> bool {
+        let mut guard = self.0.inner.lock().unwrap();
+        if guard.result.is_some() {
+            return false;
+        }
+        guard.result = Some(Err(e));
+        self.0.resolved.notify_all();
+        true
+    }
+
     /// Returns `true` if this future has already been resolved.
     pub fn is_resolved(&self) -> bool {
         self.0.inner.lock().unwrap().result.is_some()

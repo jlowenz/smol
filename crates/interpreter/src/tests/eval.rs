@@ -2433,20 +2433,21 @@ fn future_resolve_then_sync_value() {
         | f |
         f := Future new.
         f resolveWith: 42.
-        f syncValue
+        f await
     "#;
     assert_eq!(eval(src), Value::Int(42));
 }
 
 #[test]
 fn future_then_runs_after_resolution() {
-    // A continuation registered with then: on the explicit future's handle runs
-    // once the handle resolves, observing the resolved value.
+    // A continuation registered with then: on the explicit future runs once the
+    // future resolves, observing the resolved value. then: is seamless on Future
+    // (delegates to the underlying handle) — no implementation leak.
     let src = r#"
         | f |
         f := Future new.
         f resolveWith: 10.
-        (f handle then: [ f syncValue + 1 ]) await
+        (f then: [ f await + 1 ]) await
     "#;
     assert_eq!(eval(src), Value::Int(11));
 }
@@ -2464,10 +2465,39 @@ fn signal_in_then_continuation_caught_by_enclosing_hc() {
         f := Future new.
         f resolveWith: 7.
         cont := (HandlerContext new on: Error do: [:e | e resume: 99])
-            run: [ f handle then: [ (Error signal: 'from continuation') + 1 ] ].
+            run: [ f then: [ (Error signal: 'from continuation') + 1 ] ].
         cont await
     "#;
     // If the HC handler is captured into the then: continuation via fork_context,
     // it resumes the signal with 99, so the continuation computes 99 + 1 = 100.
     assert_eq!(eval(src), Value::Int(100));
+}
+
+#[test]
+fn future_double_resolve_signals_already_resolved_and_keeps_first_value() {
+    // Single-winner resolution: the first resolveWith: wins; a later attempt
+    // signals the typed, restartable FutureAlreadyResolved condition. A handler
+    // that invokes the #ignore restart keeps the original value (the late attempt
+    // is a no-op), so the future still resolves to 1.
+    let src = r#"
+        | f |
+        f := Future new.
+        f resolveWith: 1.
+        [ f resolveWith: 2 ] on: FutureAlreadyResolved do: [:e | e invokeRestart: #ignore].
+        f await
+    "#;
+    assert_eq!(eval(src), Value::Int(1));
+}
+
+#[test]
+fn future_double_resolve_condition_is_catchable_as_error() {
+    // FutureAlreadyResolved is an Error subclass, so an Error handler also catches
+    // it; returning from the handler yields its value (here #handled).
+    let src = r#"
+        | f |
+        f := Future new.
+        f resolveWith: 1.
+        [ f resolveWith: 2. #unreached ] on: Error do: [:e | e return: #handled]
+    "#;
+    assert_eq!(eval(src), Value::Symbol(Arc::from("handled")));
 }

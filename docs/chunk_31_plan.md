@@ -327,3 +327,79 @@ on `TxCtxId` (not root TxId). See §S5c above.
 **Workflow reminders:** `cargo fmt` + `cargo clippy --all-targets` before commit
 (hook enforces); tx tests run via `run_in_coroutine` (needs a may coroutine for
 the coordinator to block on participant replies).
+
+---
+
+## Resume state (2026-06-23) — S6 DONE (uncommitted); Future seamless-interface UNRESOLVED
+
+**Nothing committed this session.** Working tree has all the changes below. Suite:
+695 pass / 1 ignored (S5b). `cargo fmt` + clippy clean.
+
+### S6 single-level matrix — DONE (3 new tests, tests/entity.rs)
+- `atomic_shadow_read_returns_speculative_value_mid_block` — read-your-writes shadow (150 vs stale 100).
+- `atomic_mailbox_lock_defers_external_message_until_commit` — two `Future` gates force
+  determinism; a post-gate `deposit: 25` makes committed (175) ≠ mid-tx shadow (150),
+  so it actually proves deferral (a broken lock would read the 150 shadow).
+- `atomic_transfer_commits_both_participants_under_one_tx_id` — subscribes (System ctx,
+  wildcard `Pattern`) and asserts one `TxId` spans both participant subjects. Inlines its
+  own coroutine runner (not `run_in_coroutine`) to hold the `Subscription`.
+
+### Future seamless-interface work — PARTIALLY DONE, DESIGN NOT SETTLED (user wants to revisit)
+Goal (user): the explicit `Future` must be **seamless — behave exactly like an implicit
+`Value::Future`**: clients never touch `handle`; awaiting/forcing it transparently yields
+the resolved value ("magically be the receiver of the resolved value").
+
+Done so far (committed to working tree, but design is being reconsidered):
+- Removed `Future >> handle` and `Future >> syncValue`. Added `Future >> await [^handle await]`,
+  `Future >> then: aBlock [^handle then: aBlock]`.
+- `eval_iterative.rs`: `then:` interception now skipped for `Value::Instance` receivers
+  (`&& !matches!(&receiver, Value::Instance(_))`) so `Future >> then:` is reachable via
+  user-method lookup. Rationale: `then:` is intercepted *before* `force_value` only to avoid
+  eagerly forcing a raw `Value::Future`; a ValueObject is never force-blocked so it can route
+  normally. `await` needed NO Rust change (lookup_user_method runs before the `dispatch()`
+  await interceptor).
+- Single-winner resolution: `FutureHandle::try_resolve_ok/try_resolve_err` (atomic
+  check-and-set under the existing mutex) in entity.rs; prims `_primResolveFuture:value:` /
+  `_primRejectFuture:error:` now return `Value::Bool(won)`.
+- Typed restartable condition: `Error subclass: #FutureAlreadyResolved` (kernel.smol) with an
+  `#ignore` restart; `resolveWith:`/`rejectWith:` funnel through `Future >> pvtSettle: won`.
+- `TxResult` now stores the `Future` itself (`result: txf`, was `txf handle`).
+- Tests migrated off `handle`/`syncValue`: eval.rs `future_resolve_then_sync_value`,
+  `future_then_runs_after_resolution`, `signal_in_then_continuation_caught_by_enclosing_hc`;
+  added `future_double_resolve_signals_already_resolved_and_keeps_first_value` and
+  `future_double_resolve_condition_is_catchable_as_error`.
+
+**OPEN — two user objections still unresolved (resume here):**
+1. **WRONG edit at `tests/entity.rs` `hc_then_signal_resolves_future_within_entity` (~L617):**
+   I changed `^txf handle` → `^txf await`. User: awaiting when the caller didn't ask is
+   semantically different from *returning the future/handle*. Must revert to returning the
+   future (`^txf`) — but that only yields the right value once objection 2 is fixed.
+2. **Explicit `Future` is STILL not seamless:** a returned `Future` instance is NOT
+   transparently resolved when it becomes the value of an (implicit) future that gets
+   awaited. Implicit futures get this via `force_value` unwrapping `Value::Future`; the
+   ValueObject wrapper does not.
+
+**Core tension blocking a quick fix (document for next session):** making `force_value`
+unwrap a `Future` *instance* would also force the **receiver** of `resolveWith:`/`rejectWith:`
+(because `dispatch_to_stack` force-resolves receivers before user-method lookup, eval_iterative.rs
+~L1868) → deadlock on an unresolved future. This is the same reason raw `Value::Future` needs
+`then:`/resolve verbs intercepted *before* force.
+
+**Leading candidate design (NOT yet agreed — discuss with user):** make the explicit `Future`
+literally *be* a `Value::Future` (raw handle), not a ValueObject wrapper:
+- `Future class >> new [ ^self _primNewFutureHandle ]` returns `Value::Future`.
+- Then it is transparently forced everywhere for free (no `force_value` coupling) → fully
+  seamless, identical to implicit futures. `await`/`then:` already work.
+- `resolveWith:`/`rejectWith:` must become **receiver-non-forcing** selectors: either (a) skip
+  `force_value` for these selectors when receiver is `Value::Future` and add a `Future` class
+  mapping in `lookup_user_method` (currently `_ => None` for `Value::Future`, builtins L334) +
+  `value_to_class_handle(Value::Future)`; or (b) intercept them in Rust like `then:` and signal
+  `FutureAlreadyResolved` from Rust.
+- Feasibility already checked: `lookup_user_method` (builtins_iterative.rs:266) returns `None`
+  for `Value::Future` today; would need a `Value::Future => Future class` arm. `then:` is
+  intercepted in `dispatch_to_stack` before force; the same hook can carve out resolve/reject.
+- Trade-off: 2 more receiver-non-forcing selectors; `Future` becomes a class whose "instances"
+  are `Value::Future`. Cleanest match to "seamless like an implicit future".
+
+After the Future design is settled: revert objection-1 edit, re-verify suite, then **commit S6 +
+Future work together**, then proceed to **S5b** (nested-atomic auto-enroll bug), then **S5c**.

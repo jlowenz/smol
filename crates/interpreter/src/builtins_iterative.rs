@@ -1929,10 +1929,7 @@ fn obj_prim_futures(
             let h = args.remove(0);
             let v = force_value(args.remove(0))?;
             match h {
-                Value::Future(fh) => {
-                    fh.resolve_ok(v);
-                    Value::Nil
-                }
+                Value::Future(fh) => Value::Bool(fh.try_resolve_ok(v)),
                 other => {
                     return Err(EvalError::TypeError(format!(
                         "_primResolveFuture:value: expects a future handle, got {}",
@@ -1946,10 +1943,7 @@ fn obj_prim_futures(
             let h = args.remove(0);
             let e = force_value(args.remove(0))?;
             match h {
-                Value::Future(fh) => {
-                    fh.resolve_err(EvalError::Signal(e));
-                    Value::Nil
-                }
+                Value::Future(fh) => Value::Bool(fh.try_resolve_err(EvalError::Signal(e))),
                 other => {
                     return Err(EvalError::TypeError(format!(
                         "_primRejectFuture:error: expects a future handle, got {}",
