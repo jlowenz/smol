@@ -667,6 +667,31 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
     let ev = Evaluator::with_registry(registry);
     ev.current_entity_id.set(Some(data.id));
 
+    // C31 S5b: a transaction coordinator (any entity that is-a `Transaction` —
+    // the class entity itself, whose `state.class` is `Transaction` under the
+    // current no-metaclass representation, or a `Transaction` instance/subclass)
+    // must NOT auto-enroll as a participant when it receives a tagged message.
+    // The inner `atomic:` send is tagged with the outer tx, so without this the
+    // coordinator would join the outer participant list and later be sent
+    // `pvtExitTx:`, which it does not understand. Tag *propagation* still happens
+    // (below), so the inner coordinator still sees the outer ctx and builds a
+    // Child. We key on Transaction *identity* rather than a flag so that ordinary
+    // classes-as-data can still participate; a trait would be the cleaner tag once
+    // traits exist. NOTE: this reflexive-subclass match depends on class entities
+    // sharing their class (no metaclass); revisit when the metaclass hierarchy is
+    // designed.
+    //
+    // Computed per tagged message rather than once at startup: the `Transaction`
+    // class entity's loop begins *during* kernel load, before `Transaction` is
+    // registered in the namespace, so a startup lookup would cache `false`.
+    let class_state = state.class.clone();
+    let is_tx_coordinator = || {
+        ev.registry
+            .kernel()
+            .lookup_class("Transaction")
+            .is_some_and(|tc| Class::is_subclass_of(&class_state, &tc.0.class))
+    };
+
     let mut env = global_env;
 
     loop {
@@ -712,6 +737,7 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
         // level reuse the existing frame.
         let tx_tag = envelope.tx_tag.clone();
         if let Some(ctx) = &tx_tag
+            && !is_tx_coordinator()
             && data.tx_holder() != Some(ctx.ctx_id())
         {
             data.tx_push_frame(ctx.ctx_id(), ctx.tx_id());

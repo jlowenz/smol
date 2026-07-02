@@ -817,16 +817,12 @@ fn atomic_transfer_commits_both_participants_under_one_tx_id() {
     );
 }
 
-// S5b gap (C31): nested `atomic:` does not yet work. The inner `Transaction
-// atomic:` send is tagged with the outer tx context, so the inner coordinator
-// (the `Transaction` class entity, and its instance) auto-enrolls as a
-// participant of the OUTER transaction (entity.rs run_entity_loop). The outer
-// `pvtCommit` then sends `pvtExitTx:` to the class → MessageNotUnderstood. Fixing
-// this needs a design decision (exclude coordinators/classes from tagged
-// auto-enrollment); tracked as S5b. The C31.5 prerequisite handled a coordinator
-// enrolling in its OWN tx; this is the distinct nested facet.
+// S5b (C31): nested `atomic:`. The inner `Transaction atomic:` send is tagged
+// with the outer tx context. Fixed by excluding transaction coordinators (any
+// entity that is-a `Transaction`) from tagged auto-enrollment in
+// `run_entity_loop`; tag propagation still occurs so the inner coordinator builds
+// a Child of the outer tx.
 #[test]
-#[ignore = "C31 S5b: nested atomic coordinator auto-enrolls in outer tx (design pending)"]
 fn atomic_nested_inner_commit_absorbs_into_outer() {
     // S5b: an inner `atomic:` runs as a Child of the outer; on inner commit its
     // buffer absorbs into the outer, and the outer commit writes both. a ends at
@@ -847,6 +843,99 @@ fn atomic_nested_inner_commit_absorbs_into_outer() {
         a balance await
     "#;
     assert_eq!(run_in_coroutine(src), Value::Int(115));
+}
+
+#[test]
+fn atomic_nested_inner_rollback_keeps_outer_write() {
+    // S5b: an inner `atomic:` aborts; its Child buffer is discarded while the
+    // outer transaction still commits its own write. The outer block catches the
+    // inner rejection and continues. a ends at 100 + 10 (outer); the inner +5 is
+    // rolled back.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a tr |
+        a := Account new.
+        (a deposit: 100) await.
+        tr := (Transaction atomic: [:tx |
+            (a deposit: 10) await.
+            [ (Transaction atomic: [:tx2 | (a deposit: 5) await. tx2 abort ]) await result await ]
+                on: Error do: [:e | nil] ]) await.
+        tr result await.
+        a balance await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(110));
+}
+
+#[test]
+fn atomic_sibling_children_have_independent_buffers() {
+    // S5b: two sibling inner `atomic:` blocks under one outer touch different
+    // accounts. The first commits (absorbs into the outer), the second aborts.
+    // The aborting sibling does not disturb the committed one: a = 100 + 5,
+    // b = 100 (unchanged). Encoded as a*1000 + b = 105100.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a b tr |
+        a := Account new.
+        b := Account new.
+        (a deposit: 100) await.
+        (b deposit: 100) await.
+        tr := (Transaction atomic: [:tx |
+            (Transaction atomic: [:t1 | (a deposit: 5) await ]) await result await.
+            [ (Transaction atomic: [:t2 | (b deposit: 7) await. t2 abort ]) await result await ]
+                on: Error do: [:e | nil] ]) await.
+        tr result await.
+        (a balance await * 1000) + b balance await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(105100));
+}
+
+#[test]
+fn atomic_sibling_children_serialize_on_shared_entity() {
+    // S5b: two sibling children of one outer both do a read-modify-write on the
+    // SAME account. Gated futures make the interleaving deterministic without any
+    // timing assumption: child1 acquires a's tx lock (its deposit enrolls+locks a
+    // to its ctx), signals g1, then parks on g2. Only after g1 does the outer
+    // launch child2, whose deposit message parks in a's mailbox (its sibling ctx
+    // is not a descendant of child1's) until child1 exits. Releasing g2 lets
+    // child1 commit/absorb; child2 then proceeds and reads child1's value.
+    //
+    // Serialized-correct result: 100 + 5 + 7 = 112 (child2 reads child1's absorbed
+    // write via the shared outer tx). A broken lock would let child2 read the stale
+    // 100 and lose child1's update.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a g1 g2 tr |
+        a := Account new.
+        (a deposit: 100) await.
+        g1 := Future new.
+        g2 := Future new.
+        tr := (Transaction atomic: [:tx |
+            | r1 r2 |
+            r1 := Transaction atomic: [:t1 |
+                (a deposit: 5) await.
+                g1 resolveWith: true.
+                g2 await ].
+            g1 await.
+            r2 := Transaction atomic: [:t2 | (a deposit: 7) await ].
+            g2 resolveWith: true.
+            r1 result await.
+            r2 result await ]) await.
+        tr result await.
+        a balance await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(112));
 }
 
 // ── C31 S2: transaction lock + shadow frames ──────────────────────────────────
