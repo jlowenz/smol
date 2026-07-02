@@ -875,7 +875,30 @@ fn dispatch_envelope(
     if let Some((method, def_class)) = handle.0.class.lookup(selector) {
         return ev.invoke_method(handle.clone(), def_class, method, args, env);
     }
-    crate::builtins::dispatch_object_primitive(ev, handle, selector, args, env)
+    // On a primitive miss, route through `doesNotUnderstand:` (reified-message
+    // forwarding) if the class defines one. This is the entity/actor counterpart
+    // of the synchronous DNU hook in `dispatch_to_stack`: an incoming mailbox
+    // message the entity does not understand is reified and handled in Smol. The
+    // default `Object >> doesNotUnderstand:` signals a `MessageNotUnderstood`
+    // condition, so an unhandled miss still surfaces as an error.
+    let dnu = handle.0.class.lookup("doesNotUnderstand:");
+    if dnu.is_none() {
+        return crate::builtins::dispatch_object_primitive(ev, handle, selector, args, env);
+    }
+    match crate::builtins::dispatch_object_primitive(
+        ev,
+        handle.clone(),
+        selector,
+        args.clone(),
+        env,
+    ) {
+        Err(crate::eval::EvalError::MessageNotUnderstood { .. }) => {
+            let (dnu_method, dnu_class) = dnu.expect("dnu is Some");
+            let msg = crate::builtins::build_message(ev, selector.clone(), args)?;
+            ev.invoke_method(handle, dnu_class, dnu_method, vec![msg], env)
+        }
+        other => other,
+    }
 }
 
 fn dispatch_class_envelope(

@@ -614,11 +614,13 @@ fn hc_then_signal_resolves_future_within_entity() {
                 on: OkToCommit do: [:c | txf resolveWith: c value. c resume: nil])
                 on: Error do: [:e | txf rejectWith: e. e return: nil])
               run: [ 42 then: [ (OkToCommit value: 99) signal ] ].
-            ^txf await
+            ^txf
         ]
         | c |
         c := Coord2 new.
-        c tryTx await
+        "c tryTx yields an implicit future resolving to the Future txf; awaiting
+         once unwraps the entity send, awaiting again resolves the Future itself."
+        c tryTx await await
     "#;
     assert_eq!(run_in_coroutine(src), Value::Int(99));
 }

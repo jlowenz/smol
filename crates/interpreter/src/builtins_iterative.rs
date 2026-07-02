@@ -385,6 +385,28 @@ pub(crate) fn as_block(v: Value, selector: &Arc<str>) -> Result<Arc<Block>, Eval
     }
 }
 
+/// Collect a nil-terminated `Cons` list into a `Vec`, head-to-tail.
+///
+/// Used by `perform:withArguments:` to unpack the argument list. The spine is
+/// forced (to distinguish `Cons` from the terminating `nil`), but each `head`
+/// element is left unforced so a `Value::Future` argument stays transparent.
+///
+/// Requires: `list` is `Value::Nil` or a chain of `Cons` ValueObjects.
+/// Ensures: returns elements in list order; a non-Cons node terminates the walk.
+pub(crate) fn cons_to_vec(list: Value) -> Result<Vec<Value>, EvalError> {
+    let mut out = Vec::new();
+    let mut node = force_value(list)?;
+    while let Value::Instance(h) = node {
+        let obj = match &h.0.kind {
+            InstanceKind::ValueObject(o) => o.clone(),
+            _ => break,
+        };
+        out.push(obj.get_slot("head").unwrap_or(Value::Nil));
+        node = force_value(obj.get_slot("tail").unwrap_or(Value::Nil))?;
+    }
+    Ok(out)
+}
+
 fn bigint_from_value(v: Value, sel: &Arc<str>) -> Result<BigInt, EvalError> {
     match force_value(v)? {
         Value::Int(n) => Ok(BigInt::from(n)),
@@ -540,6 +562,63 @@ pub(crate) fn freeze_value_instance(inst: &InstanceHandle) {
     if let InstanceKind::ValueObject(obj) = &inst.0.kind {
         obj.freeze();
     }
+}
+
+/// Build a nil-terminated `Cons` list (a frozen `Value`) from `items`, in order.
+///
+/// Mirrors Array-literal construction (eval.rs): the interpreter instantiates a
+/// Smol-declared value class directly. Used to reify `Message` arguments.
+///
+/// Requires: the kernel defines `Cons` with ivars `head`/`tail`.
+/// Ensures: returns `Value::Nil` for an empty `items`, else a frozen `Cons` chain.
+pub(crate) fn build_cons(ev: &Evaluator, items: Vec<Value>) -> Result<Value, EvalError> {
+    let cons_cls = ev
+        .registry
+        .kernel()
+        .lookup_class("Cons")
+        .ok_or_else(|| EvalError::UndefinedVariable(Arc::from("Cons")))?
+        .0
+        .class
+        .clone();
+    let mut list = Value::Nil;
+    for item in items.into_iter().rev() {
+        let inst = make_value_instance(cons_cls.clone(), None);
+        if let InstanceKind::ValueObject(obj) = &inst.0.kind {
+            obj.set_slot(Arc::from("head"), item);
+            obj.set_slot(Arc::from("tail"), list);
+            obj.freeze();
+        }
+        list = Value::Instance(inst);
+    }
+    Ok(list)
+}
+
+/// Reify a failed send as a frozen `Message` value (`selector` + `arguments`),
+/// for the `doesNotUnderstand:` hook.
+///
+/// Requires: the kernel defines `Message` with ivars `selector`/`arguments`.
+/// Ensures: `selector` is a Symbol; `arguments` is a `Cons` list (nil if empty).
+pub(crate) fn build_message(
+    ev: &Evaluator,
+    selector: Arc<str>,
+    args: Vec<Value>,
+) -> Result<Value, EvalError> {
+    let arg_list = build_cons(ev, args)?;
+    let msg_cls = ev
+        .registry
+        .kernel()
+        .lookup_class("Message")
+        .ok_or_else(|| EvalError::UndefinedVariable(Arc::from("Message")))?
+        .0
+        .class
+        .clone();
+    let inst = make_value_instance(msg_cls, None);
+    if let InstanceKind::ValueObject(obj) = &inst.0.kind {
+        obj.set_slot(Arc::from("selector"), Value::Symbol(selector));
+        obj.set_slot(Arc::from("arguments"), arg_list);
+        obj.freeze();
+    }
+    Ok(Value::Instance(inst))
 }
 
 /// Fallback dispatch for primitive value types (Int, Float, Bool, Nil, Str,

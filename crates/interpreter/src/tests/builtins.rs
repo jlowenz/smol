@@ -663,20 +663,18 @@ fn mnu_for_unknown_float_selector() {
     ));
 }
 
+// C33: Bool/Nil route through user-method lookup, so an unknown selector now
+// reaches the default `Object>>doesNotUnderstand:`, which signals a
+// MessageNotUnderstood condition (iterative path only; the recursive kernel has
+// no DNU). Str/Symbol/Float/LargeInt still surface the raw error on both paths.
 #[test]
 fn mnu_for_unknown_bool_selector() {
-    assert!(matches!(
-        eval_err_diff("true unknownMsg"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(&eval_err("true unknownMsg"), "does not understand");
 }
 
 #[test]
 fn mnu_for_unknown_nil_selector() {
-    assert!(matches!(
-        eval_err_diff("nil unknownMsg"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(&eval_err("nil unknownMsg"), "does not understand");
 }
 
 #[test]
@@ -849,36 +847,27 @@ fn string_at_out_of_bounds() {
 // non-Bool result, which produces MessageNotUnderstood rather than TypeError.
 // This is the correct Smalltalk semantics: `1 ifFalse: [...]` is MNU.
 
+// C33: `1 ifFalse:`/`1 ifTrue:` — Int routes through user-method lookup, so the
+// non-Bool condition now signals MessageNotUnderstood via the default DNU
+// (iterative path). See note above.
 #[test]
 fn block_while_true_colon_non_bool_condition_errors() {
-    assert!(matches!(
-        eval_err_diff("[1] whileTrue: []"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(&eval_err("[1] whileTrue: []"), "does not understand");
 }
 
 #[test]
 fn block_while_false_colon_non_bool_condition_errors() {
-    assert!(matches!(
-        eval_err_diff("[1] whileFalse: []"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(&eval_err("[1] whileFalse: []"), "does not understand");
 }
 
 #[test]
 fn block_while_true_no_arg_non_bool_errors() {
-    assert!(matches!(
-        eval_err_diff("[1] whileTrue"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(&eval_err("[1] whileTrue"), "does not understand");
 }
 
 #[test]
 fn block_while_false_no_arg_non_bool_errors() {
-    assert!(matches!(
-        eval_err_diff("[1] whileFalse"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(&eval_err("[1] whileFalse"), "does not understand");
 }
 
 // ── _primAt:put: edge cases ───────────────────────────────────────────────
@@ -1001,16 +990,15 @@ fn as_block_type_error() {
     // is not type-checked eagerly; errors surface as MNU when `aBlock value` is sent
     // to a non-Block. The condition must evaluate to false so that `aBlock value` is
     // actually reached; otherwise the method exits before calling the body.
+    // 'notABlock' is a Str, which does not route through user-method lookup, so
+    // it still surfaces the raw MNU error on both paths.
     assert!(matches!(
         eval_err_diff("[true] whileTrue: 'notABlock'"),
         crate::eval::EvalError::MessageNotUnderstood { .. }
     ));
     // Use [false] so the condition is false on the first check, meaning aBlock value
-    // (Int 42) is reached and produces MNU.
-    assert!(matches!(
-        eval_err_diff("[false] whileFalse: 42"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    // (Int 42) is reached. Int routes through DNU (C33), so this signals.
+    assert_signal_contains(&eval_err("[false] whileFalse: 42"), "does not understand");
 }
 
 #[test]
@@ -1121,10 +1109,9 @@ Foo new test
 
 #[test]
 fn block_mnu() {
-    assert!(matches!(
-        eval_err_diff("[] unknownBlockMsg"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    // Block routes through user-method lookup, so an unknown selector signals via
+    // the default DNU (C33, iterative path).
+    assert_signal_contains(&eval_err("[] unknownBlockMsg"), "does not understand");
 }
 
 // ── Object primitive paths ────────────────────────────────────────────────
@@ -1159,14 +1146,13 @@ Foo new respondsTo: 42
 
 #[test]
 fn object_mnu() {
+    // An entity that does not understand a message routes through the default
+    // Object>>doesNotUnderstand:, which signals MessageNotUnderstood (C33).
     let src = r#"
 Object subclass: #Foo instanceVariableNames: ''.
 Foo new completelyUnknownMessage
 "#;
-    assert!(matches!(
-        eval_err_diff(src),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(&eval_err(src), "does not understand");
 }
 
 #[test]

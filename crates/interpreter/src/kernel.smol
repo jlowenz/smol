@@ -329,6 +329,15 @@ Object >> isEmpty [ ^false ]
 Object >> class [ ^self _primClass ]
 Object >> isKindOf: aClass [ ^self _primIsKindOf: aClass ]
 
+"Default handling of a send that failed normal lookup: signal a
+MessageNotUnderstood condition carrying the reified message. Override in a
+subclass to intercept/forward arbitrary messages (proxies, transparent futures).
+The interpreter invokes this via the DNU hook in dispatch_to_stack /
+dispatch_envelope; see docs/chunk_33_plan.md."
+Object >> doesNotUnderstand: aMessage [
+    ^(MessageNotUnderstood receiver: self message: aMessage) signal
+]
+
 Object class >> new [
     ^[self _primNew initialize] syncValue
 ]
@@ -413,6 +422,20 @@ Nil >> inject: aValue into: aBlock [ ^aValue ]
 Cons >> inject: aValue into: aBlock [
     ^tail inject: (aBlock value: aValue value: head) into: aBlock
 ]
+
+"Message — a reified send: the selector and arguments of a message that failed
+ normal lookup, handed to `doesNotUnderstand:`. Constructed by the interpreter at
+ the DNU site (see build_message in eval_iterative.rs); `arguments` is a Cons list
+ (nil for a unary/0-arg send). A Value so it is immutable and freely shareable."
+Value subclass: #Message
+    instanceVariableNames: 'selector arguments'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Message >> selector       [ ^selector ]
+Message >> arguments      [ ^arguments ]
+Message >> argumentCount  [ ^arguments isNil ifTrue: [0] ifFalse: [arguments size] ]
+Message >> sendTo: anObject [ ^anObject perform: selector withArguments: arguments ]
 
 "Dictionary — open-addressing hash map over a flat Array of Association slots.
  Initial capacity 8; rehashes at 75% load by doubling."
@@ -647,6 +670,27 @@ Error subclass: #FutureAlreadyResolved
     classVariableNames: ''
     indexedSlots: #none.
 
+"Signaled by the default Object>>doesNotUnderstand: when a send fails normal
+lookup. Carries the receiver and the reified failed Message. A handler may
+`resume:` (or `return:`) a value to substitute for the failed send's result."
+Error subclass: #MessageNotUnderstood
+    instanceVariableNames: 'receiver failedMessage'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+MessageNotUnderstood class >> receiver: r message: m [
+    ^self _primNewValue: [:c | c pvtSetReceiver: r message: m]
+]
+
+MessageNotUnderstood >> pvtSetReceiver: r message: m [
+    receiver := r.
+    failedMessage := m.
+    self pvtSetMessage: 'does not understand #', m selector asString
+]
+
+MessageNotUnderstood >> receiver      [ ^receiver ]
+MessageNotUnderstood >> failedMessage [ ^failedMessage ]
+
 "HandlerContext — non-unwinding handler registration (CL handler-bind analog).
 pairs is a Cons-of-Association linked list (or nil):
   Cons(head: cls -> blk, tail: rest)
@@ -859,6 +903,13 @@ Future >> await            [ ^handle await ]
 Future >> then: aBlock     [ ^handle then: aBlock ]
 Future >> resolveWith: v   [ ^self pvtSettle: (self _primResolveFuture: handle value: v) ]
 Future >> rejectWith: e    [ ^self pvtSettle: (self _primRejectFuture: handle error: e) ]
+
+"Seamless forwarding: any message an explicit Future does not itself understand
+implicitly awaits resolution and is re-sent to the resolved value — so an
+explicit Future behaves like an implicit one (which the evaluator force-resolves
+at every use point). await/then:/resolveWith:/rejectWith: act on the wrapper and
+are handled above; everything else forwards here."
+Future >> doesNotUnderstand: aMessage [ ^aMessage sendTo: handle await ]
 
 "Single-winner guard: if the prim reports the future was already settled, signal a
 typed, restartable condition. Handlers may `invokeRestart: #ignore` to keep the

@@ -1873,6 +1873,37 @@ fn dispatch_to_stack(
     // — other coroutines (entities) run while this one waits for resolution.
     let receiver = force_value(receiver)?;
 
+    // (0) `perform:` / `perform:withArguments:` — reflective send. Re-dispatch the
+    // target selector on the *same* Cont stack so forwarding stays O(1) in Rust
+    // stack (no `step_loop`/`eval_block` recursion). Placed after the receiver
+    // force (so a Future receiver forwards to its resolved value) and before user
+    // lookup so it is authoritative. Arity of the target selector is validated by
+    // the re-dispatch itself.
+    if selector.as_ref() == "perform:" || selector.as_ref() == "perform:withArguments:" {
+        let is_with_args = selector.as_ref() == "perform:withArguments:";
+        let expected = if is_with_args { 2 } else { 1 };
+        if args.len() != expected {
+            return Err(EvalError::ArityMismatch {
+                expected,
+                got: args.len(),
+            });
+        }
+        let target_sel = match force_value(args.remove(0))? {
+            Value::Symbol(s) => s,
+            _ => {
+                return Err(EvalError::TypeError(
+                    "perform:: selector must be a Symbol".into(),
+                ));
+            }
+        };
+        let target_args = if is_with_args {
+            crate::builtins_iterative::cons_to_vec(args.remove(0))?
+        } else {
+            vec![]
+        };
+        return dispatch_to_stack(ev, receiver, target_sel, target_args, env, stack, acc);
+    }
+
     // (1) User-defined method lookup (covers Bool, Block, Int, Nil, ValueObject, entity self-send).
     if let Some(found) = lookup_user_method(ev, &receiver, &selector) {
         drain_tail_frames(ev, stack);
@@ -2251,9 +2282,33 @@ fn dispatch_to_stack(
         _ => {}
     }
 
-    // (7) All other selectors fall through to builtins.
-    *acc = crate::builtins::dispatch(ev, receiver, selector, args, env)?;
-    Ok(())
+    // (7) All other selectors fall through to builtins. On a
+    // `MessageNotUnderstood` miss, give the receiver a chance to handle the send
+    // via `doesNotUnderstand:` (reified-message forwarding): reify the failed
+    // send as a `Message` and invoke the method on the same Cont stack (no Rust
+    // recursion). The default `Object >> doesNotUnderstand:` signals a
+    // `MessageNotUnderstood` condition, so an unhandled miss still surfaces as an
+    // error. Only receivers that route through `lookup_user_method`
+    // (ValueObject/Entity/Int/Bool/Nil/Block) get the hook; primitive types that
+    // return `None` there (Str/Symbol/Float/LargeInt) re-raise the raw miss.
+    match crate::builtins::dispatch(ev, receiver.clone(), selector.clone(), args.clone(), env) {
+        Ok(v) => {
+            *acc = v;
+            Ok(())
+        }
+        Err(e @ EvalError::MessageNotUnderstood { .. }) => {
+            let dnu: Arc<str> = Arc::from("doesNotUnderstand:");
+            if let Some(found) = lookup_user_method(ev, &receiver, &dnu) {
+                let msg = crate::builtins_iterative::build_message(ev, selector, args)?;
+                drain_tail_frames(ev, stack);
+                push_method_call_frame(ev, found, vec![msg], env, stack)?;
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Build and push a `CallFrame` for a user-defined method call.

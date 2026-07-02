@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_helpers::{assert_signal_contains, eval, eval_diff, eval_err_diff};
+use crate::test_helpers::{assert_signal_contains, eval, eval_diff, eval_err, eval_err_diff};
 
 #[test]
 fn integer_arithmetic() {
@@ -97,10 +97,10 @@ fn undefined_variable_error() {
 
 #[test]
 fn message_not_understood() {
-    matches!(
-        eval_err_diff("42 unknownMsg"),
-        EvalError::MessageNotUnderstood { .. }
-    );
+    // C33: Int routes through user-method lookup, so an unknown selector reaches
+    // the default Object>>doesNotUnderstand:, signaling MessageNotUnderstood
+    // (iterative path). (The previous `matches!` here asserted nothing.)
+    assert_signal_contains(&eval_err("42 unknownMsg"), "does not understand");
 }
 
 #[test]
@@ -2500,4 +2500,180 @@ fn future_double_resolve_condition_is_catchable_as_error() {
         [ f resolveWith: 2. #unreached ] on: Error do: [:e | e return: #handled]
     "#;
     assert_eq!(eval(src), Value::Symbol(Arc::from("handled")));
+}
+
+// ---- C33: perform: / doesNotUnderstand: / reified Message ----
+
+#[test]
+fn perform_unary_selector() {
+    let src = r#"
+        Object subclass: #Greeter instanceVariableNames: ''.
+        Greeter >> greeting [ ^#hello ].
+        Greeter new perform: #greeting
+    "#;
+    assert_eq!(eval(src), Value::Symbol(Arc::from("hello")));
+}
+
+#[test]
+fn perform_binary_selector_with_arguments() {
+    // Binary send via perform:withArguments: on a primitive Int receiver.
+    let src = r#"
+        3 perform: #'+' withArguments: (Cons singleton: 4)
+    "#;
+    assert_eq!(eval(src), Value::Int(7));
+}
+
+#[test]
+fn perform_keyword_selector_with_arguments() {
+    let src = r#"
+        Object subclass: #Adder instanceVariableNames: ''.
+        Adder >> add: a to: b [ ^a + b ].
+        Adder new perform: #add:to: withArguments: (Cons with: 10 rest: (Cons singleton: 5))
+    "#;
+    assert_eq!(eval(src), Value::Int(15));
+}
+
+#[test]
+fn perform_non_symbol_selector_is_type_error() {
+    let err = eval_err("3 perform: 42");
+    assert!(matches!(err, EvalError::TypeError(_)));
+}
+
+#[test]
+fn perform_unknown_selector_triggers_dnu() {
+    // perform: of a selector the receiver does not understand routes through the
+    // receiver's doesNotUnderstand: hook, just like a direct send.
+    let src = r#"
+        Object subclass: #Sink instanceVariableNames: ''.
+        Sink >> doesNotUnderstand: aMessage [ ^#caught ].
+        Sink new perform: #whatever
+    "#;
+    assert_eq!(eval(src), Value::Symbol(Arc::from("caught")));
+}
+
+#[test]
+fn dnu_intercepts_unknown_message() {
+    let src = r#"
+        Object subclass: #Sink instanceVariableNames: ''.
+        Sink >> doesNotUnderstand: aMessage [ ^#intercepted ].
+        Sink new fooBar
+    "#;
+    assert_eq!(eval(src), Value::Symbol(Arc::from("intercepted")));
+}
+
+#[test]
+fn dnu_reifies_selector_and_arguments() {
+    // The reified Message exposes selector, arguments (Cons), and argumentCount.
+    let sel = eval(
+        r#"
+        Object subclass: #Probe instanceVariableNames: ''.
+        Probe >> doesNotUnderstand: aMessage [ ^aMessage selector ].
+        Probe new frobnicate: 99 with: 7
+    "#,
+    );
+    assert_eq!(sel, Value::Symbol(Arc::from("frobnicate:with:")));
+    let count = eval(
+        r#"
+        Object subclass: #Probe instanceVariableNames: ''.
+        Probe >> doesNotUnderstand: aMessage [ ^aMessage argumentCount ].
+        Probe new frobnicate: 99 with: 7
+    "#,
+    );
+    assert_eq!(count, Value::Int(2));
+    let first = eval(
+        r#"
+        Object subclass: #Probe instanceVariableNames: ''.
+        Probe >> doesNotUnderstand: aMessage [ ^aMessage arguments head ].
+        Probe new frobnicate: 99 with: 7
+    "#,
+    );
+    assert_eq!(first, Value::Int(99));
+}
+
+#[test]
+fn dnu_forwards_via_send_to() {
+    // Message>>sendTo: re-sends the reified message to another receiver.
+    let src = r#"
+        Object subclass: #Target instanceVariableNames: ''.
+        Target >> double: n [ ^n * 2 ].
+        Object subclass: #Proxy instanceVariableNames: 'target'.
+        Proxy >> setTarget: t [ target := t ].
+        Proxy >> doesNotUnderstand: aMessage [ ^aMessage sendTo: target ].
+        | p |
+        p := Proxy new.
+        p setTarget: Target new.
+        p double: 21
+    "#;
+    assert_eq!(eval(src), Value::Int(42));
+}
+
+#[test]
+fn dnu_unary_message_has_empty_arguments() {
+    let src = r#"
+        Object subclass: #Probe instanceVariableNames: ''.
+        Probe >> doesNotUnderstand: aMessage [ ^aMessage argumentCount ].
+        Probe new noArgs
+    "#;
+    assert_eq!(eval(src), Value::Int(0));
+}
+
+#[test]
+fn default_dnu_signals_message_not_understood_catchable() {
+    // No override: the default Object>>doesNotUnderstand: signals a
+    // MessageNotUnderstood condition, which an on:do: handler can catch.
+    let src = r#"
+        [ 5 mystery. #unreached ] on: MessageNotUnderstood do: [:e | #caught]
+    "#;
+    assert_eq!(eval(src), Value::Symbol(Arc::from("caught")));
+}
+
+#[test]
+fn default_dnu_condition_carries_receiver_and_message() {
+    let sel = eval(
+        r#"
+        [ 5 frob: 1 ] on: MessageNotUnderstood do: [:e | e failedMessage selector]
+    "#,
+    );
+    assert_eq!(sel, Value::Symbol(Arc::from("frob:")));
+    let recv = eval(
+        r#"
+        [ 5 frob: 1 ] on: MessageNotUnderstood do: [:e | e receiver]
+    "#,
+    );
+    assert_eq!(recv, Value::Int(5));
+}
+
+#[test]
+fn future_forwards_unknown_message_to_resolved_value() {
+    // Seamless forwarding: sending a message the Future does not itself understand
+    // implicitly awaits and forwards to the resolved value (via doesNotUnderstand:).
+    let src = r#"
+        | f |
+        f := Future new.
+        f resolveWith: 20.
+        f + 22
+    "#;
+    assert_eq!(eval(src), Value::Int(42));
+}
+
+#[test]
+fn future_forwards_keyword_message_to_resolved_value() {
+    let src = r#"
+        | f |
+        f := Future new.
+        f resolveWith: 10.
+        f max: 25
+    "#;
+    assert_eq!(eval(src), Value::Int(25));
+}
+
+#[test]
+fn default_dnu_resume_substitutes_send_result() {
+    // Resuming the condition makes the failed send evaluate to the resumed value.
+    let src = r#"
+        | r |
+        r := [ 5 mystery ] on: MessageNotUnderstood do: [:e | e resume: 99].
+        r
+    "#;
+    assert_eq!(eval(src), Value::Int(99));
 }
