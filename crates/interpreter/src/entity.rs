@@ -1,5 +1,6 @@
 use may::sync::{Condvar, Mutex};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -10,7 +11,7 @@ use crate::class_registry::ClassRegistry;
 use crate::env::Env;
 use crate::eval::EvalError;
 use crate::object::Object;
-use crate::shared_tx::{TxCtxId, TxFrame};
+use crate::shared_tx::{TxContext, TxCtxId, TxFrame};
 use crate::value::{Block, Value};
 use triple_store::exec_context::ExecContext;
 use triple_store::id::TxId;
@@ -51,6 +52,19 @@ static NEXT_ENTITY_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn next_entity_id() -> EntityId {
     EntityId(NEXT_ENTITY_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+/// C31 S5c: how long (ms) an entity may stay blocked on an inadmissible mailbox
+/// before the interpreter runs wait-for cycle detection. Conservative default so
+/// ordinary slow work is not aborted; tests lower it for a fast check.
+static DEADLOCK_TIMEOUT_MS: AtomicU64 = AtomicU64::new(500);
+
+pub(crate) fn set_deadlock_timeout_ms(ms: u64) {
+    DEADLOCK_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+}
+
+pub(crate) fn deadlock_timeout_ms() -> u64 {
+    DEADLOCK_TIMEOUT_MS.load(Ordering::Relaxed)
 }
 
 // ── FutureHandle ──────────────────────────────────────────────────────────────
@@ -654,6 +668,206 @@ pub(crate) fn admissible_index(mb: &VecDeque<Envelope>, holder: Option<TxCtxId>)
     }
 }
 
+/// C31 S5c: schedule a repeating deadlock check while an entity stays blocked.
+///
+/// One-shot OS timers can't cover a *silent* deadlock (no condvar wakes to
+/// re-arm on), so the check re-schedules itself after each run. The chain is
+/// gated by `active`: the blocked entity's loop clears it the instant it admits a
+/// message (or shuts down), so the next callback stops. The detection body runs
+/// in a `may` coroutine (it takes coroutine-aware mailbox locks).
+fn arm_deadlock_check(
+    os: Arc<dyn crate::os_interface::OsInterface>,
+    anchor: Arc<InstanceState>,
+    reg: Arc<ClassRegistry>,
+    active: Arc<std::sync::atomic::AtomicBool>,
+    ms: u64,
+) {
+    let os_next = os.clone();
+    let cb: Box<dyn FnOnce() + Send> = Box::new(move || {
+        if !active.load(Ordering::Relaxed) {
+            return;
+        }
+        may::go!(move || {
+            if !active.load(Ordering::Relaxed) {
+                return;
+            }
+            detect_and_resolve_deadlock(&anchor, &reg);
+            if active.load(Ordering::Relaxed) {
+                arm_deadlock_check(os_next, anchor, reg, active, ms);
+            }
+        });
+    });
+    os.schedule_timer(ms, cb);
+}
+
+/// C31 S5c: detect a transaction deadlock (a cycle in the wait-for graph) and, if
+/// found, break it by aborting one victim.
+///
+/// The graph is built by traversing *transactions*, not by scanning the entity
+/// registry (see [[project_tx_design]]). It is anchored on the blocked `anchor`
+/// entity whose check fired: the transactions parked in its mailbox
+/// (`envelope.tx_tag` is an `Arc<TxContext>`) seed a worklist, and each
+/// transaction's `participants()` — the entities it holds — are inspected for
+/// their own parked waiters, enqueuing those transactions in turn. So only the
+/// transactions and entities in the wait-for component are visited.
+///
+/// An entity locked to holder ctx `H` with a parked message tagged ctx `W` (i.e.
+/// `W` is *not* admissible under `H`) contributes an edge `W → H`. Nodes are
+/// `TxCtxId`s, so sibling children can deadlock. The holder tx of `anchor` is
+/// discovered as a waiter parked on some other transaction's participant, so a
+/// cycle through it still closes.
+///
+/// On detecting a cycle, one member's parked message is rejected with a `Deadlock`
+/// condition and removed from its entity's mailbox; the victim coordinator's
+/// `await` then raises `Deadlock`, its `on: Error do:` handler rolls back and
+/// releases its locks, and the rest of the cycle proceeds.
+///
+/// Ensures: returns `true` iff a cycle was found and a victim was aborted. Locks
+/// at most one entity mailbox at a time, so the detector cannot itself deadlock.
+pub(crate) fn detect_and_resolve_deadlock(
+    anchor: &Arc<InstanceState>,
+    registry: &ClassRegistry,
+) -> bool {
+    // waiter ctx → the holder ctxs it is blocked behind.
+    let mut edges: HashMap<TxCtxId, HashSet<TxCtxId>> = HashMap::new();
+    // waiter ctx → an entity where its message is parked (for victim rejection).
+    let mut target_entity: HashMap<TxCtxId, Arc<InstanceState>> = HashMap::new();
+    // Transactions still to inspect; `visited` dedupes by ctx_id.
+    let mut worklist: Vec<Arc<TxContext>> = Vec::new();
+    let mut visited: HashSet<TxCtxId> = HashSet::new();
+
+    // Seed from the anchor's own parked waiters.
+    collect_entity_edges(anchor, &mut edges, &mut target_entity, &mut worklist);
+
+    while let Some(tx) = worklist.pop() {
+        if !visited.insert(tx.ctx_id()) {
+            continue;
+        }
+        let participants: Vec<Arc<InstanceState>> = tx
+            .participants()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| h.0.clone())
+            .collect();
+        for st in &participants {
+            collect_entity_edges(st, &mut edges, &mut target_entity, &mut worklist);
+        }
+    }
+
+    let Some(victim) = find_cycle_victim(&edges) else {
+        return false;
+    };
+    match target_entity.get(&victim) {
+        Some(st) => reject_parked_message_for_ctx(st, victim, registry),
+        None => false,
+    }
+}
+
+/// Add the wait-for edges contributed by one entity `st`: for each message parked
+/// in its mailbox (tagged with a transaction that is *not* admissible under the
+/// entity's current holder), record `waiter → holder`, remember where the waiter's
+/// message is parked (for rejection), and enqueue the waiter transaction so its
+/// own participants are traversed. No-op for a value object or an entity not
+/// currently holding a lock.
+fn collect_entity_edges(
+    st: &Arc<InstanceState>,
+    edges: &mut HashMap<TxCtxId, HashSet<TxCtxId>>,
+    target_entity: &mut HashMap<TxCtxId, Arc<InstanceState>>,
+    worklist: &mut Vec<Arc<TxContext>>,
+) {
+    let data = match &st.kind {
+        InstanceKind::Entity(d) | InstanceKind::ClassEntity(d) => d.as_ref(),
+        InstanceKind::ValueObject(_) => return,
+    };
+    let Some(holder) = data.tx_holder() else {
+        return;
+    };
+    let mb = data.mailbox.lock().unwrap();
+    for env in mb.iter() {
+        if let Some(tag) = &env.tx_tag
+            && !tag.has_ancestor_or_self(holder)
+        {
+            let w = tag.ctx_id();
+            edges.entry(w).or_default().insert(holder);
+            target_entity.entry(w).or_insert_with(|| st.clone());
+            worklist.push(tag.clone());
+        }
+    }
+}
+
+/// Return a `TxCtxId` lying on a directed cycle of `edges`, or `None` if the graph
+/// is acyclic. Standard three-colour DFS; the node closing a back edge is on the
+/// cycle (and, being a graph key, is a waiter with a parked message to reject).
+/// Graphs here are tiny (one node per blocked tx context), so recursion is safe.
+fn find_cycle_victim(edges: &HashMap<TxCtxId, HashSet<TxCtxId>>) -> Option<TxCtxId> {
+    // 0 = white (unvisited), 1 = grey (on stack), 2 = black (done).
+    fn dfs(
+        node: TxCtxId,
+        edges: &HashMap<TxCtxId, HashSet<TxCtxId>>,
+        color: &mut HashMap<TxCtxId, u8>,
+    ) -> Option<TxCtxId> {
+        color.insert(node, 1);
+        if let Some(neighbors) = edges.get(&node) {
+            for &next in neighbors {
+                match color.get(&next).copied().unwrap_or(0) {
+                    0 => {
+                        if let Some(v) = dfs(next, edges, color) {
+                            return Some(v);
+                        }
+                    }
+                    1 => return Some(next), // back edge → `next` is on the cycle
+                    _ => {}
+                }
+            }
+        }
+        color.insert(node, 2);
+        None
+    }
+
+    let mut color: HashMap<TxCtxId, u8> = HashMap::new();
+    let starts: Vec<TxCtxId> = edges.keys().copied().collect();
+    for start in starts {
+        if color.get(&start).copied().unwrap_or(0) == 0
+            && let Some(v) = dfs(start, edges, &mut color)
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Reject and remove the message tagged with `victim_ctx` parked in `st`'s
+/// mailbox, resolving its reply with a `Deadlock` condition. Returns `true` iff a
+/// matching message was found (a concurrent change may have already cleared it).
+fn reject_parked_message_for_ctx(
+    st: &Arc<InstanceState>,
+    victim_ctx: TxCtxId,
+    registry: &ClassRegistry,
+) -> bool {
+    let data = match &st.kind {
+        InstanceKind::Entity(d) | InstanceKind::ClassEntity(d) => d.as_ref(),
+        InstanceKind::ValueObject(_) => return false,
+    };
+    let mut mb = data.mailbox.lock().unwrap();
+    let Some(pos) = mb
+        .iter()
+        .position(|e| e.tx_tag.as_ref().is_some_and(|t| t.ctx_id() == victim_ctx))
+    else {
+        return false;
+    };
+    let env = mb.remove(pos).expect("position is valid");
+    drop(mb);
+    let err = crate::builtins::make_condition_value(
+        registry,
+        "Deadlock",
+        "transaction deadlock detected",
+    );
+    env.reply.try_resolve_err(EvalError::Signal(err));
+    data.mailbox_ready.notify_all();
+    true
+}
+
 fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, global_env: Env) {
     use crate::builtins::make_error_value;
     use crate::eval::EvalError;
@@ -698,8 +912,18 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
         // Wait for an envelope (or shutdown signal).
         let envelope = {
             let mut mb = data.mailbox.lock().unwrap();
+            // C31 S5c: while blocked behind a lock (messages present but none
+            // admissible), run global wait-for cycle detection periodically. A
+            // genuine deadlock produces no notifications, so the check must
+            // re-arm itself rather than wait for a wake — a self-rescheduling
+            // timer chain gated by `dl_active`, which we clear the moment we
+            // admit a message (or shut down), stopping the chain.
+            let mut dl_active: Option<Arc<AtomicBool>> = None;
             loop {
                 if data.shutdown.load(Ordering::Acquire) {
+                    if let Some(a) = dl_active.take() {
+                        a.store(false, Ordering::Relaxed);
+                    }
                     let term_val = make_error_value(&ev.registry, "entity terminated");
                     for pending in mb.drain(..) {
                         pending
@@ -713,9 +937,23 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
                 // take envelopes from the holding context or a descendant.
                 let holder = data.tx_holder();
                 if let Some(i) = admissible_index(&mb, holder) {
+                    if let Some(a) = dl_active.take() {
+                        a.store(false, Ordering::Relaxed);
+                    }
                     break mb
                         .remove(i)
                         .expect("admissible_index returns a valid index");
+                }
+                if dl_active.is_none() && !mb.is_empty() {
+                    let active = Arc::new(AtomicBool::new(true));
+                    arm_deadlock_check(
+                        ev.os.clone(),
+                        state.clone(),
+                        ev.registry.clone(),
+                        active.clone(),
+                        deadlock_timeout_ms(),
+                    );
+                    dl_active = Some(active);
                 }
                 mb = data.mailbox_ready.wait(mb).unwrap();
             }

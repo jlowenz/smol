@@ -938,6 +938,80 @@ fn atomic_sibling_children_serialize_on_shared_entity() {
     assert_eq!(run_in_coroutine(src), Value::Int(112));
 }
 
+#[test]
+fn atomic_deadlock_is_detected_and_one_victim_aborts() {
+    // S5c: two independent root transactions cross-wait — T1 locks a then wants b;
+    // T2 locks b then wants a. Gated futures make the cycle deterministic: each
+    // signals after acquiring its first lock, then both are released together to
+    // grab the second (which parks, forming A->B->A). With a short deadlock
+    // timeout, the detector finds the cycle and aborts one victim; the survivor
+    // commits both its deposits. Whichever tx wins, it deposits 1 into each of a
+    // and b and the loser rolls back entirely, so a=101, b=101 either way.
+    // Encoded as a*1000 + b = 101101.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a b g1 g2 go tr1 tr2 |
+        Transaction deadlockTimeoutMs: 50.
+        a := Account new.
+        b := Account new.
+        (a deposit: 100) await.
+        (b deposit: 100) await.
+        g1 := Future new.
+        g2 := Future new.
+        go := Future new.
+        tr1 := Transaction atomic: [:t1 |
+            (a deposit: 1) await. g1 resolveWith: true. go await. (b deposit: 1) await ].
+        tr2 := Transaction atomic: [:t2 |
+            (b deposit: 1) await. g2 resolveWith: true. go await. (a deposit: 1) await ].
+        g1 await.
+        g2 await.
+        go resolveWith: true.
+        [ tr1 await result await ] on: Error do: [:e | nil].
+        [ tr2 await result await ] on: Error do: [:e | nil].
+        (a balance await * 1000) + b balance await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(101101));
+}
+
+#[test]
+fn atomic_deadlock_victim_raises_deadlock_condition() {
+    // S5c: the aborted victim's result future rejects specifically with a Deadlock
+    // condition (an Error subclass). Exactly one of the two rejects; catch Deadlock
+    // on each and count.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a b g1 g2 go tr1 tr2 c1 c2 |
+        Transaction deadlockTimeoutMs: 50.
+        a := Account new.
+        b := Account new.
+        (a deposit: 100) await.
+        (b deposit: 100) await.
+        g1 := Future new.
+        g2 := Future new.
+        go := Future new.
+        tr1 := Transaction atomic: [:t1 |
+            (a deposit: 1) await. g1 resolveWith: true. go await. (b deposit: 1) await ].
+        tr2 := Transaction atomic: [:t2 |
+            (b deposit: 1) await. g2 resolveWith: true. go await. (a deposit: 1) await ].
+        g1 await.
+        g2 await.
+        go resolveWith: true.
+        "Each on:do: returns 1 if that tx's result rejected with a Deadlock, else 0."
+        c1 := [ tr1 await result await. 0 ] on: Deadlock do: [:e | 1].
+        c2 := [ tr2 await result await. 0 ] on: Deadlock do: [:e | 1].
+        c1 + c2
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(1));
+}
+
 // ── C31 S2: transaction lock + shadow frames ──────────────────────────────────
 
 #[cfg(test)]

@@ -691,6 +691,15 @@ MessageNotUnderstood >> pvtSetReceiver: r message: m [
 MessageNotUnderstood >> receiver      [ ^receiver ]
 MessageNotUnderstood >> failedMessage [ ^failedMessage ]
 
+"Signaled (by the interpreter's deadlock detector, C31 S5c) inside a transaction
+coordinator whose participants are caught in a wait-for cycle. Being an Error, it
+is caught by the transaction's `on: Error do:` handler, which rolls back and
+releases the victim's locks so the rest of the cycle proceeds."
+Error subclass: #Deadlock
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
 "HandlerContext — non-unwinding handler registration (CL handler-bind analog).
 pairs is a Cons-of-Association linked list (or nil):
   Cons(head: cls -> blk, tail: rest)
@@ -957,6 +966,13 @@ Object subclass: #Transaction
     classVariableNames: ''
     indexedSlots: #none.
 
+"Deadlock-detection timeout (ms): how long an entity may stay blocked on a lock
+before the interpreter runs wait-for cycle detection (C31 S5c). Stored in the VM
+(see _primSetDeadlockTimeoutMs:); default 500 ms. Lowered in tests for a fast,
+deterministic check."
+Transaction class >> deadlockTimeoutMs        [ ^self _primDeadlockTimeoutMs ]
+Transaction class >> deadlockTimeoutMs: anInt [ ^self _primSetDeadlockTimeoutMs: anInt ]
+
 Transaction class >> atomic: aBlock [
     ^self new pvtRunAtomic: aBlock
 ]
@@ -970,12 +986,17 @@ Transaction >> pvtRunAtomic: aBlock [
     | txf |
     txf := Future new.
     handle := self _primBeginSharedTx.
-    ((HandlerContext new
+    "OkToCommit uses handler-bind (HandlerContext) so its handler can `resume:` the
+     commit point. Error is caught by an *outer* on:do: (unwinding) so it catches
+     both signalled conditions (`tx abort`) and raw errors surfaced by awaiting a
+     rejected reply — e.g. a Deadlock the detector injects into a parked send,
+     which escapes the HandlerContext boundary rather than walking its chain."
+    [ (HandlerContext new
         on: OkToCommit do: [:c | self pvtCommit. txf resolveWith: c value. c resume: nil])
-        on: Error do: [:e | self pvtRollback. txf rejectWith: e. e return: nil])
       run: [ | f |
         f := aBlock value: self.
-        f then: [ (OkToCommit value: f await) signal ] ].
+        f then: [ (OkToCommit value: f await) signal ] ] ]
+    on: Error do: [:e | self pvtRollback. txf rejectWith: e].
     ^TxResult transaction: self result: txf
 ]
 

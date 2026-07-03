@@ -52,6 +52,19 @@ pub fn dispatch(
         expect_arity(&selector, 0, args.len())?;
         return Ok(Value::Bool(!matches!(force_value(recv)?, Value::Nil)));
     }
+    // C31 S5c: deadlock-detection timeout (ms). Universal so `Transaction class`
+    // sends reach it regardless of class-side vs instance dispatch. Stored in a VM
+    // global read by the entity park loop.
+    if selector.as_ref() == "_primSetDeadlockTimeoutMs:" {
+        expect_arity(&selector, 1, args.len())?;
+        let ms = as_int(args.into_iter().next().unwrap(), &selector)?.max(0) as u64;
+        crate::entity::set_deadlock_timeout_ms(ms);
+        return Ok(recv);
+    }
+    if selector.as_ref() == "_primDeadlockTimeoutMs" {
+        expect_arity(&selector, 0, args.len())?;
+        return Ok(Value::Int(crate::entity::deadlock_timeout_ms() as i64));
+    }
     // `_primHash` is universal — handled here so all value kinds are covered.
     if selector.as_ref() == "_primHash" {
         expect_arity(&selector, 0, args.len())?;
@@ -524,14 +537,29 @@ pub(crate) fn make_error_value(
     registry: &crate::class_registry::ClassRegistry,
     message: &str,
 ) -> Value {
-    let Some(handle) = registry.kernel().lookup_class("Error") else {
+    make_condition_value(registry, "Error", message)
+}
+
+/// Build a condition instance of `class_name` (a `Condition` subclass) carrying
+/// `message`. Falls back to `Error`, then to a bare `Str`, if the class is
+/// missing. Used to construct typed conditions (e.g. `Deadlock`) from Rust.
+pub(crate) fn make_condition_value(
+    registry: &crate::class_registry::ClassRegistry,
+    class_name: &str,
+    message: &str,
+) -> Value {
+    let handle = registry
+        .kernel()
+        .lookup_class(class_name)
+        .or_else(|| registry.kernel().lookup_class("Error"));
+    let Some(handle) = handle else {
         return Value::Str(Arc::from(message));
     };
-    let error_class = handle.0.class.clone();
-    let obj = Arc::new(crate::object::Object::new(error_class.clone()));
+    let cond_class = handle.0.class.clone();
+    let obj = Arc::new(crate::object::Object::new(cond_class.clone()));
     obj.set_slot(Arc::from("message"), Value::Str(Arc::from(message)));
     Value::Instance(InstanceHandle(Arc::new(InstanceState {
-        class: error_class,
+        class: cond_class,
         kind: InstanceKind::ValueObject(obj),
     })))
 }
