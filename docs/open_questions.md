@@ -228,6 +228,33 @@ Example: large, complex, constructive solid geometry models and real-time raytra
 
 This concept is very ambiguous, but worth recording for future consideration.
 
+**Refinement (C32 planning, 2026-07-03) — broadcast vs. data-parallel.** A
+colleague asked whether we can *truly* broadcast a message (SIMD-style) to many
+entities at once. Splitting the idea into what the actor model permits:
+
+- **True simultaneous delivery is incompatible with the actor model as built.**
+  Each entity owns a mailbox + independent coroutine; delivery is a per-mailbox
+  enqueue processed when that entity's coroutine gets there. One send that all
+  recipients *execute at the same instant* would require abandoning per-entity
+  autonomy (the opposite of SIMD's single-instruction-lockstep model).
+
+- **(a) Broadcast/multicast primitive** — feasible and useful: one Rust-level
+  call fans an envelope out to N mailboxes (shared `Arc`'d args; no per-send Smol
+  dispatch) and returns N reply futures. Not simultaneity — cheaper *async*
+  fan-out. Immutable Values make the payload free to share. Candidate surface:
+  `aGroup broadcast: aMessage`. Relevant to C32's 2PC prepare/commit fan-out as a
+  perf option (does not affect correctness).
+
+- **(b) Data-parallel bulk operation** — the *real* SIMD case: many same-class
+  entities + a pure, uniform operation over their own state, executed vectorized
+  over a columnar (SoA) state layout (rayon/SIMD/GPU). Requires same class, pure
+  op, vectorizable layout, and giving up per-entity message-ordering. A
+  specialized fast path in the "moldable / bulk transform" spirit, not the general
+  send. This is the concrete shape Q9's "SIMD architecture" would most likely
+  take on CPU before any GPU work.
+
+Neither is needed for C32; recorded here for a later chunk.
+
 ## Q10: Transactional message dispatch (handler as a depth-1 transaction)
 
 **Status**: Open — candidate future chunk

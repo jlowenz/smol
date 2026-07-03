@@ -83,7 +83,7 @@ pub struct ContinuationContext {
     pub(crate) active_namespace: Arc<Namespace>,
     /// Active transaction context, so a `then:` continuation's outgoing entity
     /// sends are tagged with the same transaction as the code that scheduled it.
-    pub(crate) current_tx_ctx: Option<Arc<crate::shared_tx::TxContext>>,
+    pub(crate) current_tx_ctx: Option<crate::shared_tx::GenTx>,
     /// The entity whose coroutine created this continuation. A `then:` block is
     /// created inside that entity, so the floating continuation acts as it: this
     /// makes self-sends in the continuation dispatch synchronously (the sync
@@ -141,7 +141,7 @@ pub struct Evaluator {
     /// `atomic:` block. When `Some`, ivar writes go to the top shadow frame and
     /// outgoing entity sends are tagged with this context; nested `atomic:`
     /// pushes a `Child` whose `outer` is the previous head.
-    pub(crate) current_tx_ctx: RefCell<Option<Arc<crate::shared_tx::TxContext>>>,
+    pub(crate) current_tx_ctx: RefCell<Option<crate::shared_tx::GenTx>>,
     /// Depth of the active method stack. Maintained alongside `method_stack` so
     /// the common case — no active method — can be tested with a plain `Cell`
     /// read instead of a `RefCell` borrow.
@@ -296,13 +296,19 @@ impl Evaluator {
                 if let Some(v) = env.lookup_top_frame(name) {
                     return Some(v);
                 }
-                // 2. instance variables — inside a shared transaction, the
-                //    entity's shadow frames mask the live slot (read-your-writes).
-                if let InstanceKind::Entity(d) = &handle.0.kind
-                    && d.in_tx()
-                    && let Some(v) = d.tx_shadow_get(name)
-                {
-                    return Some(v);
+                // 2. instance variables — ctx-aware read-your-writes (C32). Only the
+                //    shadow frames belonging to the CURRENT transaction's ancestry
+                //    mask the live slot; unrelated interleaved frames (other txns,
+                //    possible because `#stm` frames don't lock) are never consulted.
+                //    Walk current_tx_ctx → parent → root; first shadow hit wins.
+                if let InstanceKind::Entity(d) = &handle.0.kind {
+                    let mut cur = self.current_tx_ctx.borrow().clone();
+                    while let Some(c) = cur {
+                        if let Some(v) = d.tx_shadow_get_for(c.ctx_id(), name) {
+                            return Some(v);
+                        }
+                        cur = c.parent();
+                    }
                 }
                 if let Some(v) = handle.ivar_storage().get_slot(name) {
                     return Some(v);
@@ -383,16 +389,33 @@ impl Evaluator {
                         if let InstanceKind::Entity(d) = &handle.0.kind {
                             // Durable intent always flows to the private current_tx.
                             crate::store_bridge::buffer_ivar(self, d.id, name, &value);
-                            // Inside a shared transaction the live slot must not
-                            // change until commit — redirect to the top shadow frame.
-                            if d.in_tx() {
+                            // Ctx-aware speculative write (C32): a write is shadowed
+                            // only when made UNDER a transaction this entity is
+                            // enrolled in (this dispatch runs tagged with that tx).
+                            // It is directed to *that* tx's frame — not the stack top,
+                            // which under interleaving may be another tx's frame. An
+                            // external (untagged) write, or a write by an entity not
+                            // enrolled in the current tx (e.g. a coordinator), falls
+                            // through to the live slot below.
+                            let cur_ctx_id =
+                                self.current_tx_ctx.borrow().as_ref().map(|c| c.ctx_id());
+                            if let Some(cid) = cur_ctx_id
+                                && d.has_frame_for(cid)
+                            {
                                 let ret = value.clone();
-                                d.tx_shadow_set(name.clone(), value);
+                                d.tx_shadow_set_for(cid, name.clone(), value);
                                 return Ok(ret);
                             }
                         }
+                        // Live write (external/non-tx entity, or a value object).
+                        // Apply once, then — for an entity — bump the version (C32;
+                        // gated on STM being active) so a concurrent STM transaction
+                        // detects it.
                         let ret = value.clone();
                         obj.set_slot(name.clone(), value);
+                        if let InstanceKind::Entity(d) = &handle.0.kind {
+                            d.bump_version_if_stm();
+                        }
                         return Ok(ret);
                     }
                     // Check class var.

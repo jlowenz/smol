@@ -18,9 +18,8 @@ use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
 use crate::namespace::Namespace;
 use crate::object::{IndexedStorage, Object};
-use crate::shared_tx::{ChildTxInner, RootTxInner, TxContext, next_ctx_id};
+use crate::shared_tx::{GenTx, TxMode};
 use crate::value::{Block, Value};
-use may::sync::Mutex;
 use triple_store::exec_context::ExecContext;
 use triple_store::fact::{Fact, StoredFact};
 use triple_store::term::Term;
@@ -1352,13 +1351,26 @@ fn commit_shared_buffer(
     }
 }
 
-/// Extract the `TxContext` carried by a transaction handle value.
+/// Begin a new transaction level of `requested` discipline as a child of the
+/// current context (or a fresh root if none). Root allocates a new shared TxId;
+/// a child reuses the tree's. `GenTx::begin` applies contagious-atomic coercion.
+fn begin_tx_level(ev: &Evaluator, requested: TxMode) -> GenTx {
+    let parent = ev.current_tx_ctx.borrow().clone();
+    let tx_id = match &parent {
+        Some(p) => p.tx_id(),
+        None => ev.store.alloc_tx_id(),
+    };
+    let buf = ev.store.begin_owned_with_id(ExecContext::System, tx_id);
+    GenTx::begin(requested, tx_id, buf, parent)
+}
+
+/// Extract the `GenTx` carried by a transaction handle value.
 ///
-/// Requires: `v` is the `Value::Handle` produced by `_primBeginSharedTx`.
-fn tx_ctx_from_handle(v: Value) -> Result<Arc<TxContext>, EvalError> {
+/// Requires: `v` is the `Value::Handle` produced by `_primBeginAtomicTx`/`Stm`.
+fn tx_ctx_from_handle(v: Value) -> Result<Arc<GenTx>, EvalError> {
     match v {
         Value::Handle(h) => h
-            .downcast::<TxContext>()
+            .downcast::<GenTx>()
             .map_err(|_| EvalError::TypeError("expected a transaction handle".into())),
         other => Err(EvalError::TypeError(format!(
             "expected a transaction handle, got {}",
@@ -1860,78 +1872,95 @@ fn obj_prim_tx(
 ) -> Result<Option<Value>, EvalError> {
     let ev = cx.ev;
     Ok(Some(match sel.as_ref() {
-        "_primBeginSharedTx" => {
-            // Begin a transaction level. If no transaction is active, create a
-            // Root under a fresh shared TxId; otherwise create a Child of the
-            // current context. Sets `current_tx_ctx` to the new level and returns
-            // it as an opaque handle.
+        "_primBeginAtomicTx" => {
+            // Begin a pessimistic (`#atomic`) transaction level. Root (no active tx)
+            // allocates a fresh shared TxId; a nested level reuses the tree's TxId.
+            // `GenTx::begin` picks root vs. child from `parent`. Sets
+            // `current_tx_ctx` and returns the level as an opaque handle.
             expect_arity(sel, 0, args.len())?;
-            let new_ctx: Arc<TxContext> = match ev.current_tx_ctx.borrow().clone() {
-                None => {
-                    let tx_id = ev.store.alloc_tx_id();
-                    let buf = ev.store.begin_owned_with_id(ExecContext::System, tx_id);
-                    Arc::new(TxContext::Root(Arc::new(RootTxInner {
-                        ctx_id: next_ctx_id(),
-                        tx_id,
-                        tx: Mutex::new(Some(buf)),
-                        enrolled: Mutex::new(Vec::new()),
-                    })))
-                }
-                Some(outer) => {
-                    let buf = ev
-                        .store
-                        .begin_owned_with_id(ExecContext::System, outer.tx_id());
-                    Arc::new(TxContext::Child(Arc::new(ChildTxInner {
-                        ctx_id: next_ctx_id(),
-                        outer,
-                        tx: Mutex::new(Some(buf)),
-                        participants: Mutex::new(Vec::new()),
-                    })))
+            let new_ctx = begin_tx_level(ev, TxMode::Atomic);
+            *ev.current_tx_ctx.borrow_mut() = Some(new_ctx.clone());
+            Value::Handle(Arc::new(new_ctx))
+        }
+        "_primBeginStmTx" => {
+            // Begin an optimistic (`#stm`) transaction level (C32). If the requested
+            // level is genuinely optimistic (not coerced to atomic by an atomic
+            // ancestor — contagious-atomic), arm the version-bump gate for its
+            // lifetime; the matching disarm is in commit/rollback.
+            expect_arity(sel, 0, args.len())?;
+            let new_ctx = begin_tx_level(ev, TxMode::Stm);
+            if new_ctx.discipline() == TxMode::Stm {
+                crate::entity::stm_active_enter();
+            }
+            *ev.current_tx_ctx.borrow_mut() = Some(new_ctx.clone());
+            Value::Handle(Arc::new(new_ctx))
+        }
+        "_primStmPrepare" => {
+            // STM two-phase commit, phase 1 (C32): the participant try-locks and
+            // validates itself for the tagged transaction context, voting
+            // commit/abort. The context comes from the tag on this message (set as
+            // `current_tx_ctx` for the dispatch), exactly like `_primExitTxMode:`.
+            expect_arity(sel, 0, args.len())?;
+            let d = match &cx.handle.0.kind {
+                InstanceKind::Entity(d) => d.as_ref(),
+                _ => {
+                    return Err(EvalError::TypeError(
+                        "_primStmPrepare: receiver must be an entity".into(),
+                    ));
                 }
             };
-            *ev.current_tx_ctx.borrow_mut() = Some(new_ctx.clone());
-            Value::Handle(new_ctx)
+            let ctx_id = match ev.current_tx_ctx.borrow().as_ref() {
+                Some(ctx) => ctx.ctx_id(),
+                None => {
+                    return Err(EvalError::TypeError(
+                        "_primStmPrepare: no active transaction context".into(),
+                    ));
+                }
+            };
+            Value::Bool(d.stm_try_prepare(ctx_id))
         }
         "_primCommitSharedTx:" => {
-            // Finalize a transaction level. Root: commit the context buffer to the
+            // Finalize a transaction level. Root: commit the level buffer to the
             // store and clear `current_tx_ctx`. Child: absorb the child buffer into
             // its parent and restore the parent as the active context.
             expect_arity(sel, 1, args.len())?;
             let ctx = tx_ctx_from_handle(force_value(args.remove(0))?)?;
-            match &*ctx {
-                TxContext::Root(r) => {
-                    let buf = r.tx.lock().unwrap().take();
+            let was_stm = ctx.discipline() == TxMode::Stm;
+            match ctx.parent() {
+                None => {
+                    let buf = ctx.buffer().lock().unwrap().take();
                     if let Some(tx) = buf {
                         commit_shared_buffer(ev, tx)?;
                     }
                     *ev.current_tx_ctx.borrow_mut() = None;
                 }
-                TxContext::Child(c) => {
-                    if let Some(child_buf) = c.tx.lock().unwrap().take()
-                        && let Some(parent_buf) = c.outer.buffer().lock().unwrap().as_mut()
+                Some(parent) => {
+                    if let Some(child_buf) = ctx.buffer().lock().unwrap().take()
+                        && let Some(parent_buf) = parent.buffer().lock().unwrap().as_mut()
                     {
                         parent_buf.absorb(child_buf);
                     }
-                    *ev.current_tx_ctx.borrow_mut() = Some(c.outer.clone());
+                    *ev.current_tx_ctx.borrow_mut() = Some(parent);
                 }
+            }
+            // Per-level disarm of the STM version-bump gate (armed per-level at
+            // begin iff the level is genuinely optimistic).
+            if was_stm {
+                crate::entity::stm_active_exit();
             }
             Value::Nil
         }
         "_primRollbackSharedTx:" => {
-            // Abort a transaction level. Root: drop the context buffer (its ops
-            // never commit) and clear `current_tx_ctx`. Child: drop the child
-            // buffer and restore the parent as the active context.
+            // Abort a transaction level. Root: drop the level buffer (its ops never
+            // commit) and clear `current_tx_ctx`. Child: drop the child buffer and
+            // restore the parent as the active context.
             expect_arity(sel, 1, args.len())?;
             let ctx = tx_ctx_from_handle(force_value(args.remove(0))?)?;
-            match &*ctx {
-                TxContext::Root(r) => {
-                    r.tx.lock().unwrap().take(); // drop = rollback
-                    *ev.current_tx_ctx.borrow_mut() = None;
-                }
-                TxContext::Child(c) => {
-                    c.tx.lock().unwrap().take(); // drop child ops
-                    *ev.current_tx_ctx.borrow_mut() = Some(c.outer.clone());
-                }
+            let was_stm = ctx.discipline() == TxMode::Stm;
+            ctx.buffer().lock().unwrap().take(); // drop = rollback (ops never commit)
+            *ev.current_tx_ctx.borrow_mut() = ctx.parent();
+            if was_stm {
+                crate::entity::stm_active_exit();
             }
             Value::Nil
         }
@@ -1973,29 +2002,28 @@ fn obj_prim_tx(
                     ));
                 }
             };
-            if !d.in_tx() {
-                return Ok(Some(Value::Nil)); // defensive: nothing to finalize
+            // The tx being finalized is the tag on this (pvtExitTx) message.
+            let Some(ctx) = ev.current_tx_ctx.borrow().clone() else {
+                return Ok(Some(Value::Nil)); // defensive: no active tx context
+            };
+            let ctx_id = ctx.ctx_id();
+            if !d.has_frame_for(ctx_id) {
+                return Ok(Some(Value::Nil)); // defensive: nothing to finalize here
             }
-            let ctx = ev.current_tx_ctx.borrow().clone();
             match outcome.as_ref() {
                 "commit" => {
-                    let parent_ctx_id = ctx.as_deref().and_then(|c| match c {
-                        TxContext::Child(ch) => Some(ch.outer.ctx_id()),
-                        TxContext::Root(_) => None,
-                    });
-                    match d.tx_commit_frame(parent_ctx_id) {
+                    let parent_ctx_id = ctx.parent().map(|p| p.ctx_id());
+                    match d.tx_commit_frame(ctx_id, parent_ctx_id) {
                         FrameCommitOutcome::RootCommitted(buf) => {
-                            if let Some(c) = ctx.as_deref()
-                                && let Some(ctx_buf) = c.buffer().lock().unwrap().as_mut()
-                            {
+                            if let Some(ctx_buf) = ctx.buffer().lock().unwrap().as_mut() {
                                 ctx_buf.absorb(buf);
                             }
                         }
                         FrameCommitOutcome::PassedUpTo(_) => {
                             // Lock passed up: become a participant of the parent so
                             // its later commit/rollback reaches this entity.
-                            if let Some(TxContext::Child(ch)) = ctx.as_deref() {
-                                ch.outer
+                            if let Some(parent) = ctx.parent() {
+                                parent
                                     .participants()
                                     .lock()
                                     .unwrap()
@@ -2005,7 +2033,7 @@ fn obj_prim_tx(
                         FrameCommitOutcome::MergedIntoAncestor => {}
                     }
                 }
-                "rollback" => d.tx_abort_frame(),
+                "rollback" => d.tx_abort_frame(ctx_id),
                 other => {
                     return Err(EvalError::TypeError(format!(
                         "_primExitTxMode: unknown outcome #{other}"

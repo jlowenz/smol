@@ -985,7 +985,7 @@ Transaction >> isAborted   [ ^status = #aborted ]
 Transaction >> pvtRunAtomic: aBlock [
     | txf |
     txf := Future new.
-    handle := self _primBeginSharedTx.
+    handle := self _primBeginAtomicTx.
     "OkToCommit uses handler-bind (HandlerContext) so its handler can `resume:` the
      commit point. Error is caught by an *outer* on:do: (unwinding) so it catches
      both signalled conditions (`tx abort`) and raw errors surfaced by awaiting a
@@ -1015,3 +1015,103 @@ Transaction >> pvtRollback [
 "Abort from within the block: signals an Error caught by the HandlerContext,
 which rolls back and rejects the result future."
 Transaction >> abort [ self error: 'transaction aborted' ]
+
+"════════════════════════════════════════════════════════════════════════════
+ Optimistic multi-entity transactions — #stm (C32)
+
+ `Transaction stm: aBlock` runs aBlock optimistically: participants are NOT
+ locked during the block (unrelated handlers interleave freely), and each records
+ the version it had when the transaction first touched it. At commit a two-phase
+ protocol try-locks and validates every participant; if any version changed (a
+ concurrent handler mutated it) or is already locked, the whole transaction
+ aborts and retries (up to `stmRetryLimit` times). Exhausting the retries rejects
+ the result future with a `TxConflict`.
+ ════════════════════════════════════════════════════════════════════════════"
+
+"Raised when an `#stm` transaction cannot commit within its retry budget because
+a concurrent mutation kept invalidating its optimistic read/write set. Being an
+Error, it surfaces when the result future is awaited."
+Error subclass: #TxConflict
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+"Participant-side phase-1 trampoline: try-lock + validate this participant for the
+tagged transaction, voting commit (true) / abort (false)."
+Object >> pvtStmPrepare [ ^self _primStmPrepare ]
+
+"How many times an #stm transaction re-runs its block before giving up. Override
+in a subclass for a different budget."
+Transaction class >> stmRetryLimit [ ^3 ]
+
+Transaction class >> stm: aBlock [
+    ^self new pvtRunStm: aBlock
+]
+
+Transaction >> pvtRunStm: aBlock [
+    | txf |
+    txf := Future new.
+    self pvtStmAttempt: aBlock result: txf retriesLeft: self class stmRetryLimit.
+    ^TxResult transaction: self result: txf
+]
+
+Transaction >> pvtMarkCommitted [ status := #committed ]
+Transaction >> pvtMarkAborted   [ status := #aborted ]
+
+"One optimistic attempt, structured exactly like `pvtRunAtomic` so `stm:` is
+*non-blocking*: the block's work future is chained with `then:` (never awaited in
+the coordinator), so `pvtStmAttempt:` returns immediately and the commit runs in
+the continuation. When the work resolves, `OkToCommit` is signalled and its
+HandlerContext handler runs the two-phase commit:
+  - committed → resolve the result future;
+  - version conflict → retry with a fresh snapshot while budget remains, else
+    reject with `TxConflict`.
+A raw Error (including `tx abort`, or a rejected participant reply surfaced while
+awaiting) is caught by the outer unwinding `on: Error do:`, which rolls back and
+rejects — errors are not retried. Retry re-enters `pvtStmAttempt:` (fresh STM
+level + fresh `then:`) from within the handler; `resume: nil` then ends the
+signalling continuation."
+Transaction >> pvtStmAttempt: aBlock result: txf retriesLeft: n [
+    handle := self _primBeginStmTx.
+    [ (HandlerContext new
+        on: OkToCommit do: [:c |
+            (self pvtStmCommit)
+              ifTrue:  [ self pvtMarkCommitted. txf resolveWith: c value ]
+              ifFalse: [ n > 0
+                  ifTrue:  [ self pvtStmAttempt: aBlock result: txf retriesLeft: n - 1 ]
+                  ifFalse: [ self pvtMarkAborted.
+                             txf rejectWith: (TxConflict withMessage: 'stm: retries exhausted') ] ].
+            c resume: nil ])
+      run: [ | f |
+        f := aBlock value: self.
+        f then: [ (OkToCommit value: f await) signal ] ] ]
+    on: Error do: [:e | self pvtStmRollback. self pvtMarkAborted. txf rejectWith: e]
+]
+
+"Two-phase commit. Phase 1: prepare (try-lock + validate) every participant.
+If all vote commit, phase 2 applies each participant's writes to live slots,
+unlocks, and commits the shared store transaction (returns true). Otherwise every
+participant is released and the shared transaction rolls back (returns false)."
+Transaction >> pvtStmCommit [
+    | participants allOk |
+    participants := self _primEnrolledParticipants: handle.
+    "Prepare (try-lock + validate) each participant, folding the votes. `and:`
+     short-circuits, so once one votes abort we stop locking further participants."
+    allOk := participants inject: true into: [:acc :p | acc and: [ (p pvtStmPrepare) await ]].
+    allOk
+        ifTrue: [
+            participants do: [:p | (p pvtExitTx: #commit) await].
+            self _primCommitSharedTx: handle.
+            ^true ]
+        ifFalse: [
+            participants do: [:p | (p pvtExitTx: #rollback) await].
+            self _primRollbackSharedTx: handle.
+            ^false ]
+]
+
+"Error-path rollback: release every participant (discarding its shadow) and roll
+back the shared transaction."
+Transaction >> pvtStmRollback [
+    (self _primEnrolledParticipants: handle) do: [:p | (p pvtExitTx: #rollback) await].
+    self _primRollbackSharedTx: handle
+]

@@ -265,7 +265,10 @@ fn with_durable_tx<R>(
     entity_id: EntityId,
     f: impl FnOnce(&mut triple_store::store::OwnedStoreTransaction) -> R,
 ) -> Option<R> {
-    if ev.current_tx_ctx.borrow().is_some() {
+    // Ctx-aware (C32): route durable ops to the frame of the tx this dispatch runs
+    // under, not the stack top (which under interleaving may be another tx's).
+    let cur_ctx_id = ev.current_tx_ctx.borrow().as_ref().map(|c| c.ctx_id());
+    if let Some(cid) = cur_ctx_id {
         let state = ev
             .registry
             .instance_entities
@@ -279,9 +282,9 @@ fn with_durable_tx<R>(
                 InstanceKind::ValueObject(_) => None,
             };
             if let Some(d) = data
-                && d.in_tx()
+                && d.has_frame_for(cid)
             {
-                return Some(d.with_frame_tx(f));
+                return Some(d.with_frame_tx_for(cid, f));
             }
         }
     }

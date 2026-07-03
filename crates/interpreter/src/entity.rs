@@ -4,14 +4,14 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::class::Class;
 use crate::class_registry::ClassRegistry;
 use crate::env::Env;
 use crate::eval::EvalError;
 use crate::object::Object;
-use crate::shared_tx::{TxContext, TxCtxId, TxFrame};
+use crate::shared_tx::{AtomicFrame, GenTx, StmFrame, TxCtxId, TxFrame, TxMode};
 use crate::value::{Block, Value};
 use triple_store::exec_context::ExecContext;
 use triple_store::id::TxId;
@@ -207,7 +207,7 @@ pub struct Envelope {
     /// Transaction context this message is sent under (C31), or `None` for an
     /// ordinary send. Set from the sender's `current_tx_ctx`. The receiving
     /// entity uses it for ancestry-based mailbox admission and auto-enrollment.
-    pub tx_tag: Option<Arc<crate::shared_tx::TxContext>>,
+    pub tx_tag: Option<crate::shared_tx::GenTx>,
 }
 
 /// Outcome of committing one transaction frame on an entity (see
@@ -241,16 +241,49 @@ pub struct EntityData {
     /// Shared store handle for temporal fact recording. All entities share the
     /// same underlying store; this is a cheap clone of the shared handle.
     pub store: Store,
-    /// Lock + shadow stack for multi-entity transactions (C31). Empty when the
-    /// entity is in no transaction. Each frame is owned by the context that
-    /// pushed it (one per held level along the current ancestry path) and holds
-    /// that level's speculative named-ivar writes. A non-empty stack means the
-    /// mailbox is locked; the depth is the nesting/lock count.
+    /// Speculative shadow stack for multi-entity transactions (C31/C32). Empty
+    /// when the entity is in no transaction. Each frame is owned by the context
+    /// that pushed it and holds that level's speculative named-ivar writes; the
+    /// variant records its concurrency discipline:
+    ///   - `Atomic` (`#atomic`) — **locking**: holding it locks the mailbox.
+    ///   - `Stm` (`#stm`, C32) — **non-locking** during the body; unrelated
+    ///     handlers interleave. Promoted to `Atomic` at commit phase 1.
     ///
-    /// Invariant: while non-empty, the frames' `ctx_id`s run from an ancestor
-    /// (bottom) to a descendant (top) of a single transaction tree — siblings
-    /// never coexist here because they serialize on the entity.
+    /// The mailbox is locked iff the stack contains any locking (`Atomic`) frame
+    /// (see `tx_holder`). Because `#stm` frames don't lock, frames from unrelated
+    /// transaction trees can interleave here; the locking (`Atomic`) frames among
+    /// them still form a single ancestor→descendant chain (atomic siblings
+    /// serialize), which `tx_commit_frame`'s ancestry-aware merge relies on.
     pub tx_frames: Mutex<Vec<TxFrame>>,
+    /// C32: monotonic version of this entity's *live* slot state. Bumped on any
+    /// live-slot write while an STM transaction is in flight (see
+    /// `bump_version_if_stm`). `#stm` transactions snapshot it at first touch and
+    /// re-check it at commit; a change means a concurrent handler mutated the
+    /// entity underneath the transaction (a conflict). Single-writer: only the
+    /// entity's own coroutine writes it. Speculative (shadow) writes never bump it.
+    pub version: AtomicU64,
+}
+
+/// C32: number of STM transactions currently in flight. While positive, live-slot
+/// writes bump the owning entity's `version` so optimistic conflict checks can
+/// detect concurrent mutation; at zero the bump is skipped, so entities pay only a
+/// single relaxed load per live write outside any STM transaction.
+static STM_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Enter an STM transaction: arm version bumping for its lifetime. Paired with
+/// [`stm_active_exit`] at commit/abort.
+pub(crate) fn stm_active_enter() {
+    STM_ACTIVE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Leave an STM transaction: disarm version bumping if this was the last one.
+pub(crate) fn stm_active_exit() {
+    STM_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Whether any STM transaction is currently in flight (the version-bump gate).
+pub(crate) fn stm_active() -> bool {
+    STM_ACTIVE.load(Ordering::Relaxed) != 0
 }
 
 impl EntityData {
@@ -284,9 +317,53 @@ impl EntityData {
         !self.tx_frames.lock().unwrap().is_empty()
     }
 
-    /// `ctx_id` of the context currently holding the entity (top frame), if any.
+    /// Current live-state version. Acquire load so a cross-thread validator that
+    /// observes a bump also observes the writes that preceded it.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Bump the live-state version, but only while some STM transaction is in
+    /// flight (the `STM_ACTIVE` gate). Single-writer — only the entity's own
+    /// coroutine writes its version — so a plain load + `Release` store suffices
+    /// (no atomic RMW); the `Release` publishes the new value to cross-thread
+    /// conflict validators.
+    ///
+    /// Requires: called from the entity's own coroutine (single-writer invariant).
+    /// Ensures: after a live-slot change, a concurrent `#stm` transaction that
+    ///   snapshotted an earlier version will see a different value at commit.
+    pub fn bump_version_if_stm(&self) {
+        if stm_active() {
+            self.version
+                .store(self.version.load(Ordering::Relaxed) + 1, Ordering::Release);
+        }
+    }
+
+    /// `ctx_id` of the context currently *locking* the entity's mailbox, if any.
+    ///
+    /// Only `#atomic` frames lock (C32); `#stm` frames are skipped, so an entity
+    /// held solely by STM transactions reports no holder and admits all messages.
+    /// The topmost locking frame is the innermost atomic lock along the ancestry
+    /// chain (atomic siblings serialize, so locking frames form a single chain).
     pub fn tx_holder(&self) -> Option<TxCtxId> {
-        self.tx_frames.lock().unwrap().last().map(|f| f.ctx_id)
+        self.tx_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|f| f.is_locking())
+            .map(|f| f.ctx_id())
+    }
+
+    /// Whether this entity already holds a frame for `ctx_id`. Used to dedup
+    /// enrollment for `#stm` levels, which do not lock and so cannot rely on
+    /// `tx_holder` (that reports only the top *locking* frame).
+    pub fn has_frame_for(&self, ctx_id: TxCtxId) -> bool {
+        self.tx_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.ctx_id() == ctx_id)
     }
 
     /// Enroll at a new level: push a fresh frame owned by `ctx_id`, opening this
@@ -294,113 +371,224 @@ impl EntityData {
     ///
     /// Ensures: durable ops buffered while this frame is on top commit under
     ///   `tx_id`, so the whole transaction tree commits atomically.
-    pub fn tx_push_frame(&self, ctx_id: TxCtxId, tx_id: TxId) {
+    pub fn tx_push_atomic_frame(&self, ctx_id: TxCtxId, tx_id: TxId) {
         let tx = self
             .store
             .begin_owned_with_id(ExecContext::Entity(self.id), tx_id);
-        self.tx_frames.lock().unwrap().push(TxFrame {
+        self.tx_frames
+            .lock()
+            .unwrap()
+            .push(TxFrame::Atomic(AtomicFrame {
+                ctx_id,
+                shadow: HashMap::new(),
+                tx,
+            }));
+    }
+
+    /// Enroll at a new `#stm` level (C32): push a non-locking `Stm` frame that
+    /// snapshots the entity's current `version` (this transaction's first touch of
+    /// the entity). The frame does not lock the mailbox, so unrelated handlers
+    /// keep running; the snapshot is re-checked at the two-phase commit.
+    ///
+    /// Ensures: the frame's `snapshot_version` equals the entity's version at
+    ///   enrollment; durable ops buffered while it is on top commit under `tx_id`.
+    pub fn tx_push_stm_frame(&self, ctx_id: TxCtxId, tx_id: TxId) {
+        let snapshot_version = self.version();
+        let tx = self
+            .store
+            .begin_owned_with_id(ExecContext::Entity(self.id), tx_id);
+        self.tx_frames.lock().unwrap().push(TxFrame::Stm(StmFrame {
             ctx_id,
             shadow: HashMap::new(),
             tx,
-        });
+            snapshot_version,
+        }));
     }
 
-    /// Run `f` with this entity's top frame's durable buffer.
+    /// Phase 1 of the STM two-phase commit (C32): try-lock and validate this
+    /// participant for context `ctx_id`.
     ///
-    /// Requires: `in_tx()`. Used by `store_bridge` to route durable ops to the
-    ///   active level's buffer instead of the private `current_tx`.
-    pub fn with_frame_tx<R>(&self, f: impl FnOnce(&mut OwnedStoreTransaction) -> R) -> R {
+    /// - **Try-lock:** if another context already locks the mailbox, vote abort
+    ///   (returns `false`) rather than blocking — so commit can never deadlock.
+    /// - **Validate:** compare the entity's live `version` to the snapshot the
+    ///   `#stm` frame captured at enrollment; a change means a concurrent handler
+    ///   mutated the entity, so vote abort.
+    /// - **On a commit vote:** promote the `#stm` frame to a locking `#atomic`
+    ///   frame, so the mailbox stays locked through phase 2 (apply) — closing the
+    ///   validate→apply TOCTOU window.
+    ///
+    /// Ensures: returns `true` iff the participant is now locked-and-validated for
+    ///   `ctx_id` (caller must drive phase 2 commit/release); `false` leaves the
+    ///   frame untouched (caller aborts the whole transaction).
+    pub fn stm_try_prepare(&self, ctx_id: TxCtxId) -> bool {
         let mut frames = self.tx_frames.lock().unwrap();
-        let top = frames
-            .last_mut()
-            .expect("with_frame_tx: entity has no active transaction frame");
-        f(&mut top.tx)
-    }
-
-    /// Speculatively write a named ivar into the top shadow frame.
-    ///
-    /// Requires: `in_tx()`.
-    pub fn tx_shadow_set(&self, name: Arc<str>, value: Value) {
-        let mut frames = self.tx_frames.lock().unwrap();
-        let top = frames
-            .last_mut()
-            .expect("tx_shadow_set: entity has no active transaction frame");
-        top.shadow.insert(name, value);
-    }
-
-    /// Read a named ivar from the shadow stack, scanning top-to-bottom.
-    ///
-    /// Ensures: `Some(v)` iff some frame holds a speculative value for `name`
-    ///   (read-your-writes with nesting); `None` if no frame does — the caller
-    ///   then falls through to the live slot.
-    pub fn tx_shadow_get(&self, name: &str) -> Option<Value> {
-        let frames = self.tx_frames.lock().unwrap();
-        frames
+        // Try-lock: any *other* context holding a lock means we cannot proceed.
+        let locked_by_other = frames
             .iter()
-            .rev()
-            .find_map(|f| f.shadow.get(name).cloned())
+            .any(|f| f.is_locking() && f.ctx_id() != ctx_id);
+        if locked_by_other {
+            return false;
+        }
+        let Some(i) = frames.iter().position(|f| f.ctx_id() == ctx_id) else {
+            return false; // defensive: no frame for this context
+        };
+        // Validate: live version must match the enrollment snapshot.
+        if frames[i].snapshot_version() != Some(self.version()) {
+            return false;
+        }
+        // Promote to a locking frame, preserving stack position.
+        let frame = frames.remove(i);
+        frames.insert(i, frame.into_locking());
+        true
     }
 
-    /// Commit the top transaction level, merging its speculative writes upward.
-    /// The returned `FrameCommitOutcome` tells the caller what happened so it can
-    /// finalize correctly (see the variants).
+    /// Run `f` with the durable buffer of the frame owned by `ctx_id` (C32:
+    /// ctx-aware — routes durable ops to the tx the write is made *under*, not the
+    /// stack top, which under interleaving may belong to another tx).
+    ///
+    /// Requires: the entity holds a frame for `ctx_id` (`has_frame_for`). Used by
+    ///   `store_bridge` to route durable ops to the active level's buffer instead
+    ///   of the private `current_tx`.
+    pub fn with_frame_tx_for<R>(
+        &self,
+        ctx_id: TxCtxId,
+        f: impl FnOnce(&mut OwnedStoreTransaction) -> R,
+    ) -> R {
+        let mut frames = self.tx_frames.lock().unwrap();
+        let frame = frames
+            .iter_mut()
+            .find(|f2| f2.ctx_id() == ctx_id)
+            .expect("with_frame_tx_for: entity has no frame for ctx");
+        f(frame.tx_mut())
+    }
+
+    /// Speculatively write a named ivar into the frame owned by `ctx_id` (C32:
+    /// ctx-aware — the write is directed to the *transaction it is made under*, not
+    /// the top of the stack, which under interleaving may belong to another tx).
+    ///
+    /// Requires: the entity holds a frame for `ctx_id` (`has_frame_for`).
+    pub fn tx_shadow_set_for(&self, ctx_id: TxCtxId, name: Arc<str>, value: Value) {
+        let mut frames = self.tx_frames.lock().unwrap();
+        let frame = frames
+            .iter_mut()
+            .find(|f| f.ctx_id() == ctx_id)
+            .expect("tx_shadow_set_for: entity has no frame for ctx");
+        frame.shadow_set(name, value);
+    }
+
+    /// Read a named ivar from the frame owned by `ctx_id`, if that frame holds a
+    /// speculative value for it (C32: ctx-aware — consulted only for frames in the
+    /// current transaction's ancestry, never unrelated interleaved frames).
+    ///
+    /// Ensures: `Some(v)` iff that ctx's frame has a speculative value for `name`.
+    ///   The caller walks the ancestry chain (nested read-your-writes) and falls
+    ///   through to the live slot on no hit.
+    pub fn tx_shadow_get_for(&self, ctx_id: TxCtxId, name: &str) -> Option<Value> {
+        self.tx_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|f| f.ctx_id() == ctx_id)
+            .and_then(|f| f.shadow_get(name).cloned())
+    }
+
+    /// Commit the top transaction level, merging its speculative writes into the
+    /// committing context's *genuine* parent. The returned `FrameCommitOutcome`
+    /// tells the caller what happened so it can finalize correctly (see variants).
     ///
     /// `parent_ctx_id`:
     ///   - `None` → committing the root level for this entity.
     ///   - `Some(parent)` → committing a child level, `parent` = the enclosing
     ///     context's id.
     ///
-    /// Requires: `in_tx()`.
-    pub fn tx_commit_frame(&self, parent_ctx_id: Option<TxCtxId>) -> FrameCommitOutcome {
+    /// Ancestry-aware (C32 S1): the merge target is chosen by *ancestry*, not by
+    /// stack adjacency. Because `#stm` frames do not lock the mailbox, an
+    /// unrelated frame from an interleaved transaction may sit between this frame
+    /// and its parent (or below a root frame). We therefore:
+    ///   - merge into the parent frame wherever it sits in the stack (searching
+    ///     downward), never into an unrelated interleaved frame;
+    ///   - for a root commit, apply to live slots regardless of any unrelated
+    ///     frame below — an unrelated frame is *not* an ancestor to merge into.
+    ///
+    /// Applying a root commit to live slots bumps the entity's version (C32 S2),
+    /// which correctly conflicts any interleaved `#stm` transaction that read it.
+    /// For atomic-only stacks the parent is always directly below, so behavior is
+    /// identical to the pre-C32 adjacency rule.
+    ///
+    /// `ctx_id` is the committing level; `parent_ctx_id` its enclosing context
+    /// (`None` at the root). The frame is located by `ctx_id` (not the stack top),
+    /// so nested/interleaved commits target the right level.
+    ///
+    /// Requires: the entity holds a frame for `ctx_id`.
+    pub fn tx_commit_frame(
+        &self,
+        ctx_id: TxCtxId,
+        parent_ctx_id: Option<TxCtxId>,
+    ) -> FrameCommitOutcome {
         let mut frames = self.tx_frames.lock().unwrap();
-        let top = frames
-            .pop()
-            .expect("tx_commit_frame: entity has no active transaction frame");
-        match frames.last_mut() {
-            // An ancestor frame remains: child writes supersede ancestor writes
-            // for shared keys (read-your-writes), and durable ops merge up. The
-            // entity is already a participant of that ancestor.
-            Some(below) => {
-                below.shadow.extend(top.shadow);
-                below.tx.absorb(top.tx);
-                FrameCommitOutcome::MergedIntoAncestor
-            }
-            None => match parent_ctx_id {
-                // Lock passes up to a parent that never separately enrolled this
-                // entity: keep the frame's shadow and durable buffer, retagged to
-                // the parent. The caller must enroll it as the parent's participant.
-                Some(parent) => {
-                    frames.push(TxFrame {
-                        ctx_id: parent,
-                        shadow: top.shadow,
-                        tx: top.tx,
-                    });
+        let i = frames
+            .iter()
+            .position(|f| f.ctx_id() == ctx_id)
+            .expect("tx_commit_frame: entity has no frame for ctx");
+        let (_top_ctx, top_shadow, top_tx) = frames.remove(i).into_parts();
+        match parent_ctx_id {
+            // Child level: merge into the genuine parent frame wherever it sits
+            // (an interleaved unrelated frame may lie above it). Child writes
+            // supersede the parent's for shared keys (read-your-writes) and
+            // durable ops merge up; the entity is already the parent's participant.
+            Some(parent) => {
+                if let Some(pf) = frames.iter_mut().rev().find(|f| f.ctx_id() == parent) {
+                    pf.absorb_child(top_shadow, top_tx);
+                    FrameCommitOutcome::MergedIntoAncestor
+                } else {
+                    // Parent never separately enrolled this entity: retag this
+                    // frame to the parent and pass the lock up (reinserting at the
+                    // committing frame's position to preserve stack ordering). The
+                    // caller must enroll it as the parent's participant.
+                    frames.insert(
+                        i,
+                        TxFrame::Atomic(AtomicFrame {
+                            ctx_id: parent,
+                            shadow: top_shadow,
+                            tx: top_tx,
+                        }),
+                    );
                     FrameCommitOutcome::PassedUpTo(parent)
                 }
-                // Root commit: speculative writes become live; hand the durable
-                // buffer to the caller to absorb into the context buffer.
-                None => {
-                    for (name, value) in top.shadow {
-                        self.data.set_slot(name, value);
-                    }
-                    FrameCommitOutcome::RootCommitted(top.tx)
+            }
+            // Root level for this entity: speculative writes become live; hand the
+            // durable buffer to the caller to absorb into the context buffer. Never
+            // merge into an unrelated interleaved frame that may sit below.
+            None => {
+                let wrote = !top_shadow.is_empty();
+                for (name, value) in top_shadow {
+                    self.data.set_slot(name, value);
                 }
-            },
+                // Applying speculative writes to live slots is a live-state change
+                // (C32): bump the version once (gated) so a concurrent STM
+                // transaction that read this entity conflicts at its commit check.
+                if wrote {
+                    self.bump_version_if_stm();
+                }
+                FrameCommitOutcome::RootCommitted(top_tx)
+            }
         }
     }
 
-    /// Abort the top transaction level: pop and discard its speculative writes
-    /// and its durable buffer (dropping the buffer rolls back its ops — they were
-    /// never absorbed into the context, so they never commit). Live slots are
-    /// untouched.
+    /// Abort the level owned by `ctx_id`: remove and discard its speculative
+    /// writes and durable buffer (dropping the buffer rolls back its ops — they
+    /// were never absorbed into the context, so they never commit). Located by
+    /// `ctx_id` (not the stack top) for nested/interleaved correctness. Live slots
+    /// are untouched.
     ///
-    /// Requires: `in_tx()`.
-    pub fn tx_abort_frame(&self) {
-        self.tx_frames
-            .lock()
-            .unwrap()
-            .pop()
-            .expect("tx_abort_frame: entity has no active transaction frame");
+    /// Requires: the entity holds a frame for `ctx_id`.
+    pub fn tx_abort_frame(&self, ctx_id: TxCtxId) {
+        let mut frames = self.tx_frames.lock().unwrap();
+        let i = frames
+            .iter()
+            .position(|f| f.ctx_id() == ctx_id)
+            .expect("tx_abort_frame: entity has no frame for ctx");
+        frames.remove(i);
     }
 }
 
@@ -485,6 +673,7 @@ pub(crate) fn new_entity_data(class: &Arc<Class>, store: Store) -> EntityData {
         shutdown: AtomicBool::new(false),
         store,
         tx_frames: Mutex::new(Vec::new()),
+        version: AtomicU64::new(0),
     }
 }
 
@@ -555,6 +744,7 @@ pub fn spawn_entity_bare(
             shutdown: AtomicBool::new(false),
             store,
             tx_frames: Mutex::new(Vec::new()),
+            version: AtomicU64::new(0),
         })),
     });
 
@@ -581,7 +771,7 @@ pub fn send_to_entity(
     selector: Arc<str>,
     args: Vec<Value>,
     chain: Vec<(Arc<Class>, Arc<Block>)>,
-    tx_tag: Option<Arc<crate::shared_tx::TxContext>>,
+    tx_tag: Option<crate::shared_tx::GenTx>,
 ) -> FutureHandle {
     let future = FutureHandle::new();
     let mut mb = data.mailbox.lock().unwrap();
@@ -706,7 +896,7 @@ fn arm_deadlock_check(
 /// The graph is built by traversing *transactions*, not by scanning the entity
 /// registry (see [[project_tx_design]]). It is anchored on the blocked `anchor`
 /// entity whose check fired: the transactions parked in its mailbox
-/// (`envelope.tx_tag` is an `Arc<TxContext>`) seed a worklist, and each
+/// (`envelope.tx_tag` is a `GenTx`) seed a worklist, and each
 /// transaction's `participants()` — the entities it holds — are inspected for
 /// their own parked waiters, enqueuing those transactions in turn. So only the
 /// transactions and entities in the wait-for component are visited.
@@ -733,7 +923,7 @@ pub(crate) fn detect_and_resolve_deadlock(
     // waiter ctx → an entity where its message is parked (for victim rejection).
     let mut target_entity: HashMap<TxCtxId, Arc<InstanceState>> = HashMap::new();
     // Transactions still to inspect; `visited` dedupes by ctx_id.
-    let mut worklist: Vec<Arc<TxContext>> = Vec::new();
+    let mut worklist: Vec<GenTx> = Vec::new();
     let mut visited: HashSet<TxCtxId> = HashSet::new();
 
     // Seed from the anchor's own parked waiters.
@@ -774,7 +964,7 @@ fn collect_entity_edges(
     st: &Arc<InstanceState>,
     edges: &mut HashMap<TxCtxId, HashSet<TxCtxId>>,
     target_entity: &mut HashMap<TxCtxId, Arc<InstanceState>>,
-    worklist: &mut Vec<Arc<TxContext>>,
+    worklist: &mut Vec<GenTx>,
 ) {
     let data = match &st.kind {
         InstanceKind::Entity(d) | InstanceKind::ClassEntity(d) => d.as_ref(),
@@ -976,13 +1166,25 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
         let tx_tag = envelope.tx_tag.clone();
         if let Some(ctx) = &tx_tag
             && !is_tx_coordinator()
-            && data.tx_holder() != Some(ctx.ctx_id())
         {
-            data.tx_push_frame(ctx.ctx_id(), ctx.tx_id());
-            ctx.participants()
-                .lock()
-                .unwrap()
-                .push(InstanceHandle(state.clone()));
+            let ctx_id = ctx.ctx_id();
+            // Enroll once per level. Atomic levels lock, so the top locking frame
+            // (`tx_holder`) being this ctx means already enrolled; STM levels do
+            // not lock, so dedup on frame presence instead.
+            let already_enrolled = match ctx.discipline() {
+                TxMode::Atomic => data.tx_holder() == Some(ctx_id),
+                TxMode::Stm => data.has_frame_for(ctx_id),
+            };
+            if !already_enrolled {
+                match ctx.discipline() {
+                    TxMode::Atomic => data.tx_push_atomic_frame(ctx_id, ctx.tx_id()),
+                    TxMode::Stm => data.tx_push_stm_frame(ctx_id, ctx.tx_id()),
+                }
+                ctx.participants()
+                    .lock()
+                    .unwrap()
+                    .push(InstanceHandle(state.clone()));
+            }
         }
 
         // The private per-message transaction. For a tagged message this stays
