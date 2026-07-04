@@ -1095,8 +1095,15 @@ participant is released and the shared transaction rolls back (returns false)."
 Transaction >> pvtStmCommit [
     | participants allOk |
     participants := self _primEnrolledParticipants: handle.
-    "Prepare (try-lock + validate) each participant, folding the votes. `and:`
-     short-circuits, so once one votes abort we stop locking further participants."
+    "Contagious-atomic: a requested #stm coerced to atomic (nested under an atomic
+     ancestor) commits pessimistically — no version validation, just apply and
+     commit, exactly like a nested atomic child. It can never conflict."
+    (self _primTxIsStm: handle) ifFalse: [
+        participants do: [:p | (p pvtExitTx: #commit) await].
+        self _primCommitSharedTx: handle.
+        ^true ].
+    "Optimistic path: prepare (try-lock + validate) each participant, folding the
+     votes. `and:` short-circuits, so once one votes abort we stop locking further."
     allOk := participants inject: true into: [:acc :p | acc and: [ (p pvtStmPrepare) await ]].
     allOk
         ifTrue: [

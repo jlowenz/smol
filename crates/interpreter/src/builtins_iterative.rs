@@ -1964,6 +1964,15 @@ fn obj_prim_tx(
             }
             Value::Nil
         }
+        "_primTxIsStm:" => {
+            // Whether the transaction handle's *effective* discipline is optimistic
+            // (`#stm`). A requested `#stm` coerced to atomic by an atomic ancestor
+            // (contagious-atomic) reports `false`, so the coordinator runs the
+            // pessimistic commit path — the coerced level behaves as nested atomic.
+            expect_arity(sel, 1, args.len())?;
+            let ctx = tx_ctx_from_handle(force_value(args.remove(0))?)?;
+            Value::Bool(ctx.discipline() == TxMode::Stm)
+        }
         "_primEnrolledParticipants:" => {
             // Return this level's participants as a Cons list (or nil). A Cons is a
             // Value (synchronous dispatch), so the coordinator iterates it in its

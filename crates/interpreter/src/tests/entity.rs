@@ -1121,6 +1121,54 @@ fn atomic_nested_inner_rollback_keeps_outer_write() {
 }
 
 #[test]
+fn stm_outer_with_nested_atomic_commits_both() {
+    // Mixed-mode nesting (C32 B): an #stm outer whose block runs a nested #atomic
+    // child on the same entity. The atomic child is a Child of the stm root; its
+    // commit absorbs into the outer, and the outer's optimistic commit (no
+    // conflict) applies both. a = 100 + 10 (outer stm) + 5 (inner atomic) = 115.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a tr |
+        a := Account new.
+        (a deposit: 100) await.
+        tr := (Transaction stm: [:tx |
+            (a deposit: 10) await.
+            ((Transaction atomic: [:tx2 | (a deposit: 5) await ]) await result await) ]) await.
+        tr result await.
+        a balance await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(115));
+}
+
+#[test]
+fn atomic_outer_with_nested_stm_is_coerced_and_commits() {
+    // Contagious-atomic end-to-end (C32 B): an #stm nested inside an #atomic outer
+    // is coerced to atomic (its parent is an AtomicTx), so it behaves as a nested
+    // atomic child — its writes absorb into the outer and commit with it (no
+    // optimistic/retry path). a = 100 + 10 + 5 = 115.
+    let src = r#"
+        Object subclass: #Account instanceVariableNames: 'balance'.
+        Account >> initialize [ balance := 0 ]
+        Account >> balance    [ ^balance ]
+        Account >> deposit: n  [ balance := balance + n ]
+
+        | a tr |
+        a := Account new.
+        (a deposit: 100) await.
+        tr := (Transaction atomic: [:tx |
+            (a deposit: 10) await.
+            ((Transaction stm: [:tx2 | (a deposit: 5) await ]) await result await) ]) await.
+        tr result await.
+        a balance await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(115));
+}
+
+#[test]
 fn atomic_sibling_children_have_independent_buffers() {
     // S5b: two sibling inner `atomic:` blocks under one outer touch different
     // accounts. The first commits (absorbs into the outer), the second aborts.
