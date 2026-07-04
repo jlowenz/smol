@@ -924,6 +924,39 @@ fn stm_conflict_retries_and_succeeds() {
     assert_eq!(run_in_coroutine(src), Value::Int(107));
 }
 
+#[test]
+fn stm_conflicts_with_interleaved_atomic_tx() {
+    // Two independent trees on one entity (C32 S1 ancestry-aware merge, end-to-end):
+    // an #stm tx S enrolls e (non-locking), then an unrelated #atomic tx A commits
+    // a write to e. On e the frames are [Stm(S), Atomic(A)]; A's root commit
+    // applies to LIVE and bumps e's version (it must NOT merge into S's shadow),
+    // so S conflicts and retries against the value A committed. Final 107 (vs 100
+    // if A's commit had wrongly landed in S's shadow / not bumped the version).
+    let src = r#"
+        Object subclass: #Cell instanceVariableNames: 'val'.
+        Cell >> initialize [ val := 0 ]
+        Cell >> val        [ ^val ]
+        Cell >> setVal: v  [ val := v ]
+
+        | e readDone go trS |
+        e := Cell new.
+        readDone := Future new.
+        go := Future new.
+        trS := Transaction stm: [:tx |
+            | cur |
+            cur := e val await.
+            [ readDone resolveWith: true ] on: Error do: [:x | nil].
+            go await.
+            (e setVal: cur + 100) await ].
+        readDone await.
+        (Transaction atomic: [:tA | (e setVal: 7) await ]) await result await.
+        go resolveWith: true.
+        trS result await.
+        e val await
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Int(107));
+}
+
 #[ignore = "pre-existing limitation (not C32): a tx block that RETURNS a pending \
 future hangs for BOTH atomic: and stm: — the coordinator never yields its \
 TxResult. Verified atomic: hangs identically. Un-ignore once deferred-future \
