@@ -958,9 +958,14 @@ fn stm_conflicts_with_interleaved_atomic_tx() {
 }
 
 #[ignore = "pre-existing limitation (not C32): a tx block that RETURNS a pending \
-future hangs for BOTH atomic: and stm: — the coordinator never yields its \
-TxResult. Verified atomic: hangs identically. Un-ignore once deferred-future \
-tx blocks are supported upstream."]
+future hangs for BOTH atomic: and stm:. Root cause: the coordinator's `on: Error \
+do:` forces each statement's result (force_after_each_stmt / ForceAcc, \
+eval_iterative.rs), and the protected block's value is the `then:`-continuation \
+future (a raw Value::Future). on:do: force-awaits it, so the coordinator blocks \
+until the block's returned future resolves instead of yielding its TxResult. \
+(Explicit Future *objects* survive — they are Value::Instance, not raw \
+Value::Future.) Fixing needs on:do: to not force a last-statement future while \
+still routing async rejections to the handler. Un-ignore then."]
 #[test]
 fn stm_returns_result_before_block_work_completes() {
     // Non-blocking (C32 point 8): `stm:` yields its TxResult immediately via the
