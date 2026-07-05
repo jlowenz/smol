@@ -68,7 +68,7 @@ Array >> inject: init into: aBlock [
     holder := ValueHolder initialValue: init.
     ^[self do: [:each |
         holder update: [:acc | aBlock value: acc value: each]
-    ]] then: [holder get]
+    ]] then: [holder get] orElse: #reject
 ]
 
 Array >> includes: v [
@@ -103,7 +103,7 @@ Array >> printString [
     holder := ValueHolder initialValue: '('.
     ^[self do: [:each |
         holder update: [:s | s , each printString , ' ']
-    ]] then: [holder get , ')']
+    ]] then: [holder get , ')'] orElse: #reject
 ]
 
 "ByteArray — fixed-size indexed collection of byte (0..255) slots."
@@ -140,7 +140,7 @@ ByteArray >> printString [
     holder := ValueHolder initialValue: '('.
     ^[self do: [:each |
         holder update: [:s | s , each printString , ' ']
-    ]] then: [holder get , ')']
+    ]] then: [holder get , ')'] orElse: #reject
 ]
 
 "OrderedCollection — growable sequence backed by an Array."
@@ -219,7 +219,7 @@ OrderedCollection >> pvtRemoveAt: idx [
 OrderedCollection >> remove: v ifAbsent: aBlock [
     0 to: size - 1 do: [:i |
         (storage at: i) = v ifTrue: [
-            (self pvtRemoveAt: i) then: [^v]
+            (self pvtRemoveAt: i) then: [^v] orElse: #reject
         ]
     ].
     ^aBlock value
@@ -269,7 +269,7 @@ OrderedCollection >> inject: init into: aBlock [
     holder := ValueHolder initialValue: init.
     ^[self do: [:each |
         holder update: [:acc | aBlock value: acc value: each]
-    ]] then: [holder get]
+    ]] then: [holder get] orElse: #reject
 ]
 
 OrderedCollection >> includes: v [
@@ -302,7 +302,7 @@ OrderedCollection >> printString [
     holder := ValueHolder initialValue: 'OrderedCollection ('.
     ^[self do: [:each |
         holder update: [:s | s , each printString , ' ']
-    ]] then: [holder get , ')']
+    ]] then: [holder get , ')'] orElse: #reject
 ]
 
 OrderedCollection >> pvtGrow [
@@ -573,7 +573,7 @@ Dictionary >> printString [
     holder := ValueHolder initialValue: 'Dictionary ('.
     ^[self associationsDo: [:assoc |
         holder update: [:s | s , assoc printString , ' ']
-    ]] then: [holder get , ')']
+    ]] then: [holder get , ')'] orElse: #reject
 ]
 
 Dictionary >> pvtRehash [
@@ -649,6 +649,13 @@ Condition >> resume: v [ ^self _primResume: v ]
 Condition >> return: v [ ^self _primReturn: v ]
 Condition >> retry     [ ^self _primRetry ]
 
+"Resumability (guide §2): whether a handler that completes without an explicit
+restart resumes (true) or aborts (false). A `Condition` is resumable; `Error`
+overrides to non-resumable. NOTE: the signal machinery currently derives the
+disposition from the `Error` class hierarchy directly; this method is the
+Smol-visible mirror (a per-class override of the *disposition* is future work)."
+Condition >> isResumable [ ^true ]
+
 Condition subclass: #Warning
     instanceVariableNames: ''
     classVariableNames: 'LoggingPolicy'
@@ -662,6 +669,8 @@ Condition subclass: #Error
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
+
+Error >> isResumable [ ^false ]
 
 "Signaled when resolveWith:/rejectWith: is sent to an already-settled Future.
 Carries an #ignore restart so a handler can choose to keep the first resolution."
@@ -909,15 +918,20 @@ Value subclass: #Future
 Future class >> new [ ^self _primNewValue: [:f | f pvtInit] ]
 Future >> pvtInit          [ handle := self _primNewFutureHandle ]
 Future >> await            [ ^handle await ]
-Future >> then: aBlock     [ ^handle then: aBlock ]
+"Total async chaining: run `tb` on resolution, `eb` on rejection. `eb` is a 1-arg
+block OR a symbol idiom — #signal (re-raise into the current handler chain),
+#reject (propagate the rejection down the chain), #value (resolve with the
+condition as a plain value). Bare `then:` was removed: the rejection arm must be
+stated so it cannot be silently dropped."
+Future >> then: tb orElse: eb [ ^handle then: tb orElse: eb ]
 Future >> resolveWith: v   [ ^self pvtSettle: (self _primResolveFuture: handle value: v) ]
 Future >> rejectWith: e    [ ^self pvtSettle: (self _primRejectFuture: handle error: e) ]
 
 "Seamless forwarding: any message an explicit Future does not itself understand
 implicitly awaits resolution and is re-sent to the resolved value — so an
 explicit Future behaves like an implicit one (which the evaluator force-resolves
-at every use point). await/then:/resolveWith:/rejectWith: act on the wrapper and
-are handled above; everything else forwards here."
+at every use point). await/then:orElse:/resolveWith:/rejectWith: act on the wrapper
+and are handled above; everything else forwards here."
 Future >> doesNotUnderstand: aMessage [ ^aMessage sendTo: handle await ]
 
 "Single-winner guard: if the prim reports the future was already settled, signal a
@@ -986,17 +1000,21 @@ Transaction >> pvtRunAtomic: aBlock [
     | txf |
     txf := Future new.
     handle := self _primBeginAtomicTx.
-    "OkToCommit uses handler-bind (HandlerContext) so its handler can `resume:` the
-     commit point. Error is caught by an *outer* on:do: (unwinding) so it catches
-     both signalled conditions (`tx abort`) and raw errors surfaced by awaiting a
-     rejected reply — e.g. a Deadlock the detector injects into a parked send,
-     which escapes the HandlerContext boundary rather than walking its chain."
-    [ (HandlerContext new
-        on: OkToCommit do: [:c | self pvtCommit. txf resolveWith: c value. c resume: nil])
+    "Both outcomes are handled by ONE HandlerContext (handler-bind), so the async
+     commit runs without a synchronous unwinding `on:do:` blocking the coordinator.
+     OkToCommit's handler can `resume:` the commit point; Error's handler catches
+     both signalled conditions (`tx abort`) and raw rejections surfaced through the
+     condition system — including a Deadlock the detector injects into a parked
+     reply — because `force_value`/`then:orElse:` route async rejections through
+     `signal_condition`. The work future's rejection arm re-raises (`orElse:
+     #signal`) into this same chain, so the Error handler is the single visible
+     place collecting the transaction's failure behavior."
+    (((HandlerContext new
+        on: OkToCommit do: [:c | self pvtCommit. txf resolveWith: c value. c resume: c value])
+        on: Error do: [:e | self pvtRollback. txf rejectWith: e]))
       run: [ | f |
         f := aBlock value: self.
-        f then: [ (OkToCommit value: f await) signal ] ] ]
-    on: Error do: [:e | self pvtRollback. txf rejectWith: e].
+        f then: [ (OkToCommit value: f await) signal ] orElse: #signal ].
     ^TxResult transaction: self result: txf
 ]
 
@@ -1073,7 +1091,7 @@ level + fresh `then:`) from within the handler; `resume: nil` then ends the
 signalling continuation."
 Transaction >> pvtStmAttempt: aBlock result: txf retriesLeft: n [
     handle := self _primBeginStmTx.
-    [ (HandlerContext new
+    (((HandlerContext new
         on: OkToCommit do: [:c |
             (self pvtStmCommit)
               ifTrue:  [ self pvtMarkCommitted. txf resolveWith: c value ]
@@ -1081,11 +1099,11 @@ Transaction >> pvtStmAttempt: aBlock result: txf retriesLeft: n [
                   ifTrue:  [ self pvtStmAttempt: aBlock result: txf retriesLeft: n - 1 ]
                   ifFalse: [ self pvtMarkAborted.
                              txf rejectWith: (TxConflict withMessage: 'stm: retries exhausted') ] ].
-            c resume: nil ])
+            c resume: c value ])
+        on: Error do: [:e | self pvtStmRollback. self pvtMarkAborted. txf rejectWith: e]))
       run: [ | f |
         f := aBlock value: self.
-        f then: [ (OkToCommit value: f await) signal ] ] ]
-    on: Error do: [:e | self pvtStmRollback. self pvtMarkAborted. txf rejectWith: e]
+        f then: [ (OkToCommit value: f await) signal ] orElse: #signal ]
 ]
 
 "Two-phase commit. Phase 1: prepare (try-lock + validate) every participant.

@@ -13,7 +13,7 @@
 //!
 //! See `docs/tx_design.md` and `docs/chunk_31_plan.md` (S1) for the full design.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,7 +21,7 @@ use may::sync::Mutex;
 
 use crate::entity::InstanceHandle;
 use crate::value::Value;
-use triple_store::id::TxId;
+use triple_store::id::{EntityId, TxId};
 use triple_store::store::OwnedStoreTransaction;
 
 /// Identifier for the shared store transaction (equal to `TxId.0`).
@@ -65,6 +65,13 @@ pub struct TxCommon {
     pub tx: Mutex<Option<OwnedStoreTransaction>>,
     /// Participants enrolled at this level (in enrollment order).
     pub participants: Mutex<Vec<InstanceHandle>>,
+    /// Ids of entities *created* under this level (born-in-tx). Such an entity is
+    /// private to this level — it has no committed baseline and is unreachable by
+    /// any other transaction — so on first state access it is *excluded* from
+    /// enrollment (writes go live) rather than shadowed/validated. Holds bare
+    /// `EntityId`s (not handles) so it never pins a transient alive. Ephemeral:
+    /// dropped with the level. See `docs/enrollment_provenance_design.md`.
+    pub spawned: Mutex<HashSet<EntityId>>,
 }
 
 /// An optimistic (`#stm`) transaction level. Its `parent` is typed
@@ -260,6 +267,7 @@ impl GenTx {
             tx_id,
             tx: Mutex::new(Some(tx)),
             participants: Mutex::new(Vec::new()),
+            spawned: Mutex::new(HashSet::new()),
         };
         match (requested, parent) {
             (TxMode::Stm, None) => GenTx::Stm(Arc::new(StmTx {
@@ -316,6 +324,11 @@ impl GenTx {
     /// This level's participant list.
     pub fn participants(&self) -> &Mutex<Vec<InstanceHandle>> {
         &self.common().participants
+    }
+
+    /// Ids of entities born under this level (excluded from enrollment).
+    pub fn spawned(&self) -> &Mutex<HashSet<EntityId>> {
+        &self.common().spawned
     }
 
     /// The enclosing level, lifted to `GenTx` (an `StmTx` parent becomes

@@ -329,6 +329,14 @@ pub(crate) enum Cont {
         env: Env,
     },
 
+    /// Like `ThenCheck`, but for `then:orElse:`: carries the rejection arm so a
+    /// future-yielding receiver block is handed to the async `then:orElse:` path.
+    ThenCheckOrElse {
+        cont_blk: Arc<crate::value::Block>,
+        else_val: Value,
+        env: Env,
+    },
+
     /// Sits below the `on:do:` handler block frame, inspecting the handler's outcome.
     ///
     /// Success path: fires normally → `acc` = handler result, pass through.
@@ -359,9 +367,16 @@ pub(crate) enum Cont {
     /// `Retry`: `handle_step_error` re-runs `body_blk` with the chain unchanged.
     /// `ReturnFromBlock(v)`: `handle_step_error` truncates the chain, yields `v`.
     /// Other errors / `^`-return: chain truncated as the guard is discarded.
+    ///
+    /// `sync` records how the body frame is run so a `retry` re-run preserves it:
+    /// `HandlerContext run:` is async (`false`); `on:do:` forces its body (`true`).
+    /// This is the unified handler mechanism: `on:do:` and `HandlerContext` both
+    /// register handlers in `handler_chain` (one ordered lookup), differing only in
+    /// body-forcing. See `docs/condition_system_guide.md`.
     HCRunGuard {
         chain_start_len: usize,
         body_blk: Arc<crate::value::Block>,
+        sync: bool,
     },
 
     /// Drives a `to:do:` / `to:by:do:` numeric loop on the heap `Cont` stack so
@@ -384,12 +399,15 @@ pub(crate) enum Cont {
     /// inner handlers removed from `handler_chain` (Common-Lisp handler-scoping);
     /// `removed` holds those entries, re-appended whenever the guard is left.
     ///
-    /// Success / `resume:`: the handler's value becomes the signal expression's
-    ///   value — the continuation below resumes with it (non-unwinding handler).
-    /// `return:` / `retry` / re-signal: propagate (to the enclosing `HCRunGuard`
-    ///   or an outer handler) after the chain is restored.
+    /// Success: disposition by condition kind (guide §2). `resumable` ⇒ the
+    ///   handler's value becomes the signal expression's value and the
+    ///   continuation resumes; otherwise (an Error) normal completion ABORTS —
+    ///   a local unwind (implicit `return:` of the handler's value).
+    /// `resume:`: always resumes. `return:` / `retry` / re-signal: propagate
+    ///   (to the enclosing `HCRunGuard` or an outer handler) after chain restore.
     SignalGuard {
         removed: Vec<crate::eval::HandlerPair>,
+        resumable: bool,
     },
 
     /// Sits below a `_primNewValue:` / `_primNewValueIndexed:init:` init block.
@@ -469,7 +487,7 @@ fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
             None
         }
         // Discarding a signal boundary re-enables the handlers it had disabled.
-        Cont::SignalGuard { removed } => {
+        Cont::SignalGuard { removed, .. } => {
             ev.handler_chain.borrow_mut().extend(removed);
             None
         }
@@ -630,15 +648,18 @@ fn handle_step_error(
                     Cont::HCRunGuard {
                         chain_start_len,
                         body_blk,
+                        sync,
                     } => match &other {
                         // Retry re-runs the body with this HC's handlers still
                         // registered (chain unchanged), mirroring the recursive loop.
+                        // Preserve body-forcing (`on:do:` is sync; `run:` is not).
                         EvalError::Retry => {
                             stack.push(Cont::HCRunGuard {
                                 chain_start_len,
                                 body_blk: body_blk.clone(),
+                                sync,
                             });
-                            push_block_frame(ev, &body_blk, vec![], false, stack)?;
+                            push_block_frame(ev, &body_blk, vec![], sync, stack)?;
                             return Ok(());
                         }
                         // A value returned from run:; truncate chain, deliver it.
@@ -653,7 +674,7 @@ fn handle_step_error(
                             ev.handler_chain.borrow_mut().truncate(chain_start_len);
                         }
                     },
-                    Cont::SignalGuard { removed } => {
+                    Cont::SignalGuard { removed, .. } => {
                         // Re-enable the handlers this signal had disabled.
                         ev.handler_chain.borrow_mut().extend(removed);
                         // `resume:` delivers a value to the signal point; return:/
@@ -925,7 +946,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
             // ── ForceAcc ──────────────────────────────────────────────────
             Cont::ForceAcc => {
                 let v = std::mem::replace(&mut acc, Value::Nil);
-                match force_value(v) {
+                match force_value(ev, v) {
                     Ok(forced) => acc = forced,
                     // A forced Future may resolve to an error (e.g. a signal raised in an
                     // entity). Route through handle_step_error so OnDoCatch/EnsureGuard
@@ -974,6 +995,30 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 }
             }
 
+            // ── ThenCheckOrElse (then:orElse: receiver-block completed) ────
+            Cont::ThenCheckOrElse {
+                cont_blk,
+                else_val,
+                mut env,
+            } => {
+                let recv_result = std::mem::replace(&mut acc, Value::Nil);
+                match recv_result {
+                    Value::Future(_) => {
+                        acc = crate::builtins::dispatch(
+                            ev,
+                            recv_result,
+                            Arc::from("then:orElse:"),
+                            vec![Value::Block(cont_blk), else_val],
+                            &mut env,
+                        )?;
+                    }
+                    // Non-future: receiver resolved; run then-block, else can't fire.
+                    _ => {
+                        push_block_frame(ev, &cont_blk, vec![], false, &mut stack)?;
+                    }
+                }
+            }
+
             // ── OnDoCatch (success path) ──────────────────────────────────
             Cont::OnDoCatch { .. } => {
                 // Body completed without raising a signal; acc = body result, pass through.
@@ -993,10 +1038,18 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
             }
 
             // ── SignalGuard (handler completed normally) ──────────────────
-            Cont::SignalGuard { removed } => {
-                // Re-enable the disabled handlers; acc (handler result) becomes
-                // the signal expression's value and the continuation resumes.
+            Cont::SignalGuard { removed, resumable } => {
+                // Re-enable the disabled handlers.
                 ev.handler_chain.borrow_mut().extend(removed);
+                if !resumable {
+                    // Non-resumable (Error): normal completion ABORTS — an implicit
+                    // local `return:` of the handler's value. Unwind to the nearest
+                    // enclosing HCRunGuard/OnDoCatch on this stack (or the fork top).
+                    let v = std::mem::replace(&mut acc, Value::Nil);
+                    handle_step_error(EvalError::ReturnFromBlock(v), ev, &mut stack, &mut acc)?;
+                }
+                // resumable: acc (handler result) becomes the signal expression's
+                // value and the continuation resumes.
             }
 
             // ── NewValueGuard (init block completed) ──────────────────────
@@ -1798,7 +1851,8 @@ fn dispatch_signal(
                 let removed = chain.split_off(i); // removed[0] = matched pair
                 (removed[0].1.clone(), removed)
             };
-            stack.push(Cont::SignalGuard { removed });
+            let resumable = crate::builtins_iterative::condition_is_resumable(ev, &cond_class);
+            stack.push(Cont::SignalGuard { removed, resumable });
             push_block_frame(ev, &handler_blk, vec![condition], false, stack)?;
             Ok(())
         }
@@ -1839,7 +1893,7 @@ fn dispatch_to_stack(
                 got: args.len(),
             });
         }
-        let cont_blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+        let cont_blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
         match receiver {
             // Genuine future: async spawn (no Rust stack growth).
             Value::Future(_) => {
@@ -1867,11 +1921,45 @@ fn dispatch_to_stack(
         }
         return Ok(());
     }
+    if selector.as_ref() == "then:orElse:" && !matches!(&receiver, Value::Instance(_)) {
+        if args.len() != 2 {
+            return Err(EvalError::ArityMismatch {
+                expected: 2,
+                got: args.len(),
+            });
+        }
+        let mut it = args.into_iter();
+        let cont_blk = as_block(ev, it.next().unwrap(), &selector)?;
+        let else_val = it.next().unwrap();
+        match receiver {
+            Value::Future(_) => {
+                *acc = crate::builtins::dispatch(
+                    ev,
+                    receiver,
+                    selector,
+                    vec![Value::Block(cont_blk), else_val],
+                    env,
+                )?;
+            }
+            Value::Block(ref blk) => {
+                stack.push(Cont::ThenCheckOrElse {
+                    cont_blk,
+                    else_val,
+                    env: env.clone(),
+                });
+                push_block_frame(ev, blk, vec![], false, stack)?;
+            }
+            _ => {
+                push_block_frame(ev, &cont_blk, vec![], false, stack)?;
+            }
+        }
+        return Ok(());
+    }
 
     // Force a Future receiver before dispatch. We must know the actual type to
     // look up a method. Blocking here is a cooperative yield in the may scheduler
     // — other coroutines (entities) run while this one waits for resolution.
-    let receiver = force_value(receiver)?;
+    let receiver = force_value(ev, receiver)?;
 
     // (0) `perform:` / `perform:withArguments:` — reflective send. Re-dispatch the
     // target selector on the *same* Cont stack so forwarding stays O(1) in Rust
@@ -1888,7 +1976,7 @@ fn dispatch_to_stack(
                 got: args.len(),
             });
         }
-        let target_sel = match force_value(args.remove(0))? {
+        let target_sel = match force_value(ev, args.remove(0))? {
             Value::Symbol(s) => s,
             _ => {
                 return Err(EvalError::TypeError(
@@ -1897,7 +1985,7 @@ fn dispatch_to_stack(
             }
         };
         let target_args = if is_with_args {
-            crate::builtins_iterative::cons_to_vec(args.remove(0))?
+            crate::builtins_iterative::cons_to_vec(ev, args.remove(0))?
         } else {
             vec![]
         };
@@ -1924,8 +2012,8 @@ fn dispatch_to_stack(
                 got: args.len(),
             });
         }
-        let body = as_block(args.into_iter().next().unwrap(), &selector)?;
-        let pairs = crate::builtins_iterative::extract_handler_pairs(handle)?;
+        let body = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
+        let pairs = crate::builtins_iterative::extract_handler_pairs(ev, handle)?;
         let chain_start_len = ev.handler_chain.borrow().len();
         {
             let mut chain = ev.handler_chain.borrow_mut();
@@ -1936,6 +2024,7 @@ fn dispatch_to_stack(
         stack.push(Cont::HCRunGuard {
             chain_start_len,
             body_blk: body.clone(),
+            sync: false,
         });
         push_block_frame(ev, &body, vec![], false, stack)?;
         return Ok(());
@@ -1954,8 +2043,8 @@ fn dispatch_to_stack(
                         got: args.len(),
                     });
                 }
-                let stop = crate::builtins_iterative::as_int(args.remove(0), &selector)?;
-                let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+                let stop = crate::builtins_iterative::as_int(ev, args.remove(0), &selector)?;
+                let blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
                 stack.push(Cont::ToDoStep {
                     blk,
                     next: n,
@@ -1971,14 +2060,14 @@ fn dispatch_to_stack(
                         got: args.len(),
                     });
                 }
-                let stop = crate::builtins_iterative::as_int(args.remove(0), &selector)?;
-                let step = crate::builtins_iterative::as_int(args.remove(0), &selector)?;
+                let stop = crate::builtins_iterative::as_int(ev, args.remove(0), &selector)?;
+                let step = crate::builtins_iterative::as_int(ev, args.remove(0), &selector)?;
                 if step == 0 {
                     return Err(EvalError::TypeError(
                         "to:by:do: step must be non-zero".into(),
                     ));
                 }
-                let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+                let blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
                 stack.push(Cont::ToDoStep {
                     blk,
                     next: n,
@@ -2008,7 +2097,7 @@ fn dispatch_to_stack(
                     got: args.len(),
                 });
             }
-            let condition = force_value(args.into_iter().next().unwrap())?;
+            let condition = force_value(ev, args.into_iter().next().unwrap())?;
             if !matches!(&condition, Value::Instance(_)) {
                 return Err(EvalError::TypeError(
                     "_primSignalCondition: requires a Condition instance".into(),
@@ -2023,7 +2112,7 @@ fn dispatch_to_stack(
                     got: args.len(),
                 });
             }
-            let msg = match force_value(args.into_iter().next().unwrap())? {
+            let msg = match force_value(ev, args.into_iter().next().unwrap())? {
                 Value::Str(s) => s,
                 other => Arc::from(format!("error: argument was {}", other.kind()).as_str()),
             };
@@ -2052,7 +2141,7 @@ fn dispatch_to_stack(
                         "_primNewValue: requires a Value subclass".into(),
                     ));
                 }
-                let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+                let blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
                 let indexed = if class.indexed_slot_kind.is_some() {
                     Some(0)
                 } else {
@@ -2081,8 +2170,8 @@ fn dispatch_to_stack(
                         "_primNewValueIndexed:init: requires class to declare indexedSlots:".into(),
                     ));
                 }
-                let n = crate::builtins_iterative::as_int(args.remove(0), &selector)?;
-                let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+                let n = crate::builtins_iterative::as_int(ev, args.remove(0), &selector)?;
+                let blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
                 let inst =
                     crate::builtins_iterative::make_value_instance(class, Some(n.max(0) as usize));
                 stack.push(Cont::NewValueGuard { inst: inst.clone() });
@@ -2126,7 +2215,7 @@ fn dispatch_to_stack(
                 got: args.len(),
             });
         }
-        let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
+        let blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
         let saved_ns = ev.active_namespace.borrow().clone();
         *ev.active_namespace.borrow_mut() = ns.clone();
         stack.push(Cont::NamespaceGuard { saved_ns });
@@ -2171,7 +2260,7 @@ fn dispatch_to_stack(
                     });
                 }
                 let ensure_blk_val = args.into_iter().next().unwrap();
-                let ensure_blk = as_block(ensure_blk_val, &selector)?;
+                let ensure_blk = as_block(ev, ensure_blk_val, &selector)?;
                 // EnsureGuard is pushed below body frame; fires when body completes.
                 stack.push(Cont::EnsureGuard { ensure_blk });
                 push_block_frame(ev, blk, vec![], true, stack)?;
@@ -2185,7 +2274,7 @@ fn dispatch_to_stack(
                     });
                 }
                 let mut iter = args.into_iter();
-                let catch_class_val = force_value(iter.next().unwrap())?;
+                let catch_class_val = force_value(ev, iter.next().unwrap())?;
                 let catch_class = match &catch_class_val {
                     Value::Instance(h) => h.0.class.clone(),
                     _ => {
@@ -2194,13 +2283,21 @@ fn dispatch_to_stack(
                         ));
                     }
                 };
-                let handler_blk = as_block(iter.next().unwrap(), &selector)?;
-                let body_blk = blk.clone();
-                // OnDoCatch is pushed below body frame; fires when body completes.
-                stack.push(Cont::OnDoCatch {
-                    catch_class,
-                    handler_blk,
-                    body_blk,
+                let handler_blk = as_block(ev, iter.next().unwrap(), &selector)?;
+                // Unified handler lookup: `on:do:` registers its single handler pair
+                // in `handler_chain` (so a signal finds it in the correct order
+                // relative to `HandlerContext` handlers, via one ordered walk),
+                // guarded by an `HCRunGuard`. `on:do:` differs from `run:` only in
+                // forcing its body synchronously (`sync = true`). Disposition
+                // (resume vs abort) is by condition kind (§2), same as `run:`.
+                let chain_start_len = ev.handler_chain.borrow().len();
+                ev.handler_chain
+                    .borrow_mut()
+                    .push((catch_class, handler_blk));
+                stack.push(Cont::HCRunGuard {
+                    chain_start_len,
+                    body_blk: blk.clone(),
+                    sync: true,
                 });
                 push_block_frame(ev, blk, vec![], true, stack)?;
                 return Ok(());
@@ -2218,8 +2315,8 @@ fn dispatch_to_stack(
                     got: args.len(),
                 });
             }
-            let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
-            let forced = force_value(receiver)?;
+            let blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
+            let forced = force_value(ev, receiver)?;
             if matches!(forced, Value::Nil) {
                 push_block_frame(ev, &blk, vec![], false, stack)?;
             } else {
@@ -2234,8 +2331,8 @@ fn dispatch_to_stack(
                     got: args.len(),
                 });
             }
-            let blk = as_block(args.into_iter().next().unwrap(), &selector)?;
-            let forced = force_value(receiver)?;
+            let blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
+            let forced = force_value(ev, receiver)?;
             if !matches!(forced, Value::Nil) {
                 push_block_frame(ev, &blk, vec![forced], false, stack)?;
             } else {
@@ -2251,9 +2348,9 @@ fn dispatch_to_stack(
                 });
             }
             let mut iter = args.into_iter();
-            let nil_blk = as_block(iter.next().unwrap(), &selector)?;
-            let not_nil_blk = as_block(iter.next().unwrap(), &selector)?;
-            let forced = force_value(receiver)?;
+            let nil_blk = as_block(ev, iter.next().unwrap(), &selector)?;
+            let not_nil_blk = as_block(ev, iter.next().unwrap(), &selector)?;
+            let forced = force_value(ev, receiver)?;
             if matches!(forced, Value::Nil) {
                 push_block_frame(ev, &nil_blk, vec![], false, stack)?;
             } else {
@@ -2269,9 +2366,9 @@ fn dispatch_to_stack(
                 });
             }
             let mut iter = args.into_iter();
-            let not_nil_blk = as_block(iter.next().unwrap(), &selector)?;
-            let nil_blk = as_block(iter.next().unwrap(), &selector)?;
-            let forced = force_value(receiver)?;
+            let not_nil_blk = as_block(ev, iter.next().unwrap(), &selector)?;
+            let nil_blk = as_block(ev, iter.next().unwrap(), &selector)?;
+            let forced = force_value(ev, receiver)?;
             if matches!(forced, Value::Nil) {
                 push_block_frame(ev, &nil_blk, vec![], false, stack)?;
             } else {

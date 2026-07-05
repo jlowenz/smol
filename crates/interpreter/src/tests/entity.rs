@@ -628,6 +628,96 @@ fn hc_then_signal_resolves_future_within_entity() {
 }
 
 #[test]
+fn handler_context_catches_async_future_rejection() {
+    // Errors flow through ONE channel: the condition system. A rejected Future
+    // surfaced by `await` must be catchable by a HandlerContext `Error` handler —
+    // the handler is live at the await site (that is HandlerContext's purpose).
+    // Before Stage 1 the rejection surfaced as a raw error that unwound past the
+    // HandlerContext (bypassing signal_condition), so the handler never fired.
+    let src = r#"
+        | f |
+        f := Future new.
+        f rejectWith: (Error withMessage: 'boom').
+        (HandlerContext new on: Error do: [:e | e return: ('caught: ' , e message)])
+            run: [ f await. 'not caught' ]
+    "#;
+    assert_eq!(
+        run_in_coroutine(src),
+        Value::Str(std::sync::Arc::from("caught: boom"))
+    );
+}
+
+// ── Unified handler lookup: on:do: and HandlerContext share one ordered chain ──
+
+fn str_val(s: &str) -> Value {
+    Value::Str(std::sync::Arc::from(s))
+}
+
+#[test]
+fn inner_on_do_shadows_outer_handler_context() {
+    // Unification (guide §3/§4): a signal must reach the *dynamically innermost*
+    // handler across BOTH forms. Here the inner `on:do:` is nested inside an outer
+    // HandlerContext; the inner one must win. Before unification, `dispatch_signal`
+    // only walked `handler_chain` (HC handlers), so the outer HC wrongly caught it.
+    let src = r#"
+        (HandlerContext new on: Error do: [:e | 'outer-HC'])
+            run: [ [ (Error withMessage: 'boom') signal. 'unreached' ]
+                     on: Error do: [:e | 'inner-onDo'] ]
+    "#;
+    assert_eq!(run_in_coroutine(src), str_val("inner-onDo"));
+}
+
+#[test]
+fn inner_handler_context_shadows_outer_on_do() {
+    // The mirror: an inner HandlerContext nested inside an outer `on:do:`. The
+    // inner HC must win — one ordered chain, innermost first, regardless of form.
+    let src = r#"
+        [ (HandlerContext new on: Error do: [:e | e return: 'inner-HC'])
+            run: [ (Error withMessage: 'boom') signal. 'unreached' ] ]
+          on: Error do: [:e | 'outer-onDo']
+    "#;
+    assert_eq!(run_in_coroutine(src), str_val("inner-HC"));
+}
+
+#[test]
+fn on_do_forces_its_body_future() {
+    // on:do:'s distinguishing property: it forces its body synchronously. The body
+    // makes an async entity send (`b boom`) and does NOT await it — its value is
+    // the raw reply future, which rejects. on:do:'s sync forcing awaits it, so the
+    // rejection surfaces inside the on:do: and is caught. Without body-forcing the
+    // on:do: would yield the pending future instead of catching. Proves the
+    // forcing survived the unification into the shared handler chain.
+    let src = r#"
+        Object subclass: #Boom instanceVariableNames: 'x'.
+        Boom >> boom [ self error: 'kaboom' ]
+
+        | b |
+        b := Boom new.
+        [ b boom ] on: Error do: [:e | 'caught-forced: ' , e message]
+    "#;
+    assert_eq!(run_in_coroutine(src), str_val("caught-forced: kaboom"));
+}
+
+#[test]
+fn on_do_disposition_is_by_condition_kind() {
+    // Unified disposition (§2): a handler's normal return resumes a *resumable*
+    // condition and aborts a *non-resumable* one — for `on:do:` too, not just
+    // HandlerContext. A `Warning` (resumable) resumes past the signal; an `Error`
+    // (non-resumable) unwinds to the on:do:, yielding the handler's value.
+    let resumes = r#"
+        [ (Warning withMessage: 'w') signal. 'after-signal' ]
+          on: Warning do: [:e | 'handled']
+    "#;
+    assert_eq!(run_in_coroutine(resumes), str_val("after-signal"));
+
+    let aborts = r#"
+        [ (Error withMessage: 'e') signal. 'after-signal' ]
+          on: Error do: [:e | 'handled']
+    "#;
+    assert_eq!(run_in_coroutine(aborts), str_val("handled"));
+}
+
+#[test]
 fn atomic_no_participants_commits_and_resolves_result() {
     // Minimal: no participant work. Exercises the HandlerContext + then: +
     // OkToCommit + resume: machinery in isolation.
@@ -957,15 +1047,6 @@ fn stm_conflicts_with_interleaved_atomic_tx() {
     assert_eq!(run_in_coroutine(src), Value::Int(107));
 }
 
-#[ignore = "pre-existing limitation (not C32): a tx block that RETURNS a pending \
-future hangs for BOTH atomic: and stm:. Root cause: the coordinator's `on: Error \
-do:` forces each statement's result (force_after_each_stmt / ForceAcc, \
-eval_iterative.rs), and the protected block's value is the `then:`-continuation \
-future (a raw Value::Future). on:do: force-awaits it, so the coordinator blocks \
-until the block's returned future resolves instead of yielding its TxResult. \
-(Explicit Future *objects* survive — they are Value::Instance, not raw \
-Value::Future.) Fixing needs on:do: to not force a last-statement future while \
-still routing async rejections to the handler. Un-ignore then."]
 #[test]
 fn stm_returns_result_before_block_work_completes() {
     // Non-blocking (C32 point 8): `stm:` yields its TxResult immediately via the
@@ -986,7 +1067,7 @@ fn stm_returns_result_before_block_work_completes() {
         a := Account new.
         (a deposit: 100) await.
         g := Future new.
-        tr := (Transaction stm: [:tx | (a deposit: 5) await. g ]) await.
+        tr := Transaction stm: [:tx | (a deposit: 5) await. g ].
         "TxResult available before g resolves; the write is still shadowed (live 100)."
         seen := a balance await.
         g resolveWith: true.
@@ -1520,6 +1601,7 @@ mod tx_admission {
             tx_id: TxId(1),
             tx: Mutex::new(None),
             participants: Mutex::new(Vec::new()),
+            spawned: Mutex::new(std::collections::HashSet::new()),
         }
     }
 

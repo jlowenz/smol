@@ -202,19 +202,22 @@ fn timer_fires_in_entity() {
         let mut env = crate::env::Env::new();
         ev.registry.populate_env(&mut env);
         // actor is the TA3 instance
-        let actor =
-            crate::builtins_iterative::force_value(ev.eval_program(&prog.stmts, &mut env).unwrap())
-                .unwrap();
+        let actor = crate::builtins_iterative::force_value(
+            &ev,
+            ev.eval_program(&prog.stmts, &mut env).unwrap(),
+        )
+        .unwrap();
         // Give the 50 ms timer ample time to fire
         may::coroutine::sleep(std::time::Duration::from_millis(300));
         // Query result — cross-entity send returns a Future chain
         let result = crate::builtins_iterative::force_value(
+            &ev,
             crate::builtins::dispatch(&ev, actor, Arc::from("getResult"), vec![], &mut env)
                 .unwrap(),
         )
         .unwrap();
         // ValueHolder::get is also cross-entity, so result may be a nested Future
-        let final_result = crate::builtins_iterative::force_value(result).unwrap();
+        let final_result = crate::builtins_iterative::force_value(&ev, result).unwrap();
         ev.shutdown();
         tx.send(final_result).unwrap();
     });

@@ -237,6 +237,58 @@ impl Evaluator {
             .instance_entities
             .write()
             .insert(id, handle.0.clone());
+        // Born-in-tx provenance: an entity created while a transaction context is
+        // active is private to that level — record its id in the level's `spawned`
+        // set so its first state access skips enrollment (writes go live) rather
+        // than shadowing/validating. Recorded here, before the entity processes any
+        // message, so its own coroutine sees the entry. See
+        // `docs/enrollment_provenance_design.md`.
+        if let Some(ctx) = self.current_tx_ctx.borrow().as_ref() {
+            ctx.spawned().lock().unwrap().insert(id);
+        }
+    }
+
+    /// Lazily enroll `handle`'s entity into transaction `ctx` on its first access
+    /// to transactional state (ivar read/write under `ctx`'s tag). Idempotent:
+    /// no-op if already enrolled at this level. Excluded (left unenrolled, so
+    /// writes go live) when the entity was **born in `ctx`** (private to the level)
+    /// or is a **transaction coordinator** (operates *on* transactions and writes
+    /// its own `status`/`handle` ivars under the tag). After it returns,
+    /// `d.has_frame_for(ctx.ctx_id())` is true iff the entity is now a participant.
+    /// See `docs/enrollment_provenance_design.md`.
+    pub(crate) fn ensure_tx_enrolled(
+        &self,
+        handle: &InstanceHandle,
+        ctx: &crate::shared_tx::GenTx,
+    ) {
+        use crate::shared_tx::TxMode;
+        let InstanceKind::Entity(d) = &handle.0.kind else {
+            return;
+        };
+        let cid = ctx.ctx_id();
+        if d.has_frame_for(cid) {
+            return; // already a participant of this level
+        }
+        // Born in this level → private object with no committed baseline, excluded.
+        if ctx.spawned().lock().unwrap().contains(&d.id) {
+            return;
+        }
+        // A transaction coordinator is never a participant of the tx it runs.
+        // Keyed on Transaction identity (no metaclass yet), matching the former
+        // mailbox-loop `is_tx_coordinator` guard.
+        if self
+            .registry
+            .kernel()
+            .lookup_class("Transaction")
+            .is_some_and(|tc| Class::is_subclass_of(&handle.0.class, &tc.0.class))
+        {
+            return;
+        }
+        match ctx.discipline() {
+            TxMode::Atomic => d.tx_push_atomic_frame(cid, ctx.tx_id()),
+            TxMode::Stm => d.tx_push_stm_frame(cid, ctx.tx_id()),
+        }
+        ctx.participants().lock().unwrap().push(handle.clone());
     }
 
     // ── Method receiver stack ─────────────────────────────────────────────────
@@ -302,7 +354,18 @@ impl Evaluator {
                 //    possible because `#stm` frames don't lock) are never consulted.
                 //    Walk current_tx_ctx → parent → root; first shadow hit wins.
                 if let InstanceKind::Entity(d) = &handle.0.kind {
-                    let mut cur = self.current_tx_ctx.borrow().clone();
+                    let cur_ctx = self.current_tx_ctx.borrow().clone();
+                    // Lazy read-enrollment (C32): reading one of this entity's own
+                    // ivars under a tx adds it to the validated read-set (snapshots
+                    // its version). Gated on the name being a declared ivar so
+                    // classvar/global reads never spuriously enroll; born-in-tx and
+                    // coordinator entities are excluded by `ensure_tx_enrolled`.
+                    if let Some(ctx) = cur_ctx.as_ref()
+                        && handle.ivar_storage().has_slot(name)
+                    {
+                        self.ensure_tx_enrolled(&handle, ctx);
+                    }
+                    let mut cur = cur_ctx;
                     while let Some(c) = cur {
                         if let Some(v) = d.tx_shadow_get_for(c.ctx_id(), name) {
                             return Some(v);
@@ -387,23 +450,31 @@ impl Evaluator {
                             )));
                         }
                         if let InstanceKind::Entity(d) = &handle.0.kind {
-                            // Durable intent always flows to the private current_tx.
+                            // Lazy enrollment (C32): the first write to one of this
+                            // entity's ivars under a tx tag enrolls it as a
+                            // participant, creating the frame the durable + shadow
+                            // writes route into. Born-in-tx and coordinator entities
+                            // are excluded by `ensure_tx_enrolled` and fall through
+                            // to the live write below.
+                            let cur_ctx = self.current_tx_ctx.borrow().clone();
+                            if let Some(ctx) = cur_ctx.as_ref() {
+                                self.ensure_tx_enrolled(&handle, ctx);
+                            }
+                            // Durable intent flows to the frame buffer (if enrolled)
+                            // or the private current_tx (otherwise).
                             crate::store_bridge::buffer_ivar(self, d.id, name, &value);
                             // Ctx-aware speculative write (C32): a write is shadowed
-                            // only when made UNDER a transaction this entity is
-                            // enrolled in (this dispatch runs tagged with that tx).
+                            // only when this entity is enrolled in the current tx.
                             // It is directed to *that* tx's frame — not the stack top,
                             // which under interleaving may be another tx's frame. An
                             // external (untagged) write, or a write by an entity not
-                            // enrolled in the current tx (e.g. a coordinator), falls
-                            // through to the live slot below.
-                            let cur_ctx_id =
-                                self.current_tx_ctx.borrow().as_ref().map(|c| c.ctx_id());
-                            if let Some(cid) = cur_ctx_id
-                                && d.has_frame_for(cid)
+                            // enrolled in the current tx (e.g. a coordinator or a
+                            // born-in-tx object), falls through to the live slot below.
+                            if let Some(ctx) = cur_ctx.as_ref()
+                                && d.has_frame_for(ctx.ctx_id())
                             {
                                 let ret = value.clone();
-                                d.tx_shadow_set_for(cid, name.clone(), value);
+                                d.tx_shadow_set_for(ctx.ctx_id(), name.clone(), value);
                                 return Ok(ret);
                             }
                         }

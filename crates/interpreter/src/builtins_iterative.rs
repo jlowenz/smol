@@ -40,23 +40,23 @@ pub fn dispatch(
     // `await` is universal — blocks until a Future resolves; no-op on non-futures.
     if selector.as_ref() == "await" {
         expect_arity(&selector, 0, args.len())?;
-        return force_value(recv);
+        return force_value(ev, recv);
     }
     // `isNil` / `notNil` are universal.
     if selector.as_ref() == "isNil" {
         expect_arity(&selector, 0, args.len())?;
-        return Ok(Value::Bool(matches!(force_value(recv)?, Value::Nil)));
+        return Ok(Value::Bool(matches!(force_value(ev, recv)?, Value::Nil)));
     }
     if selector.as_ref() == "notNil" {
         expect_arity(&selector, 0, args.len())?;
-        return Ok(Value::Bool(!matches!(force_value(recv)?, Value::Nil)));
+        return Ok(Value::Bool(!matches!(force_value(ev, recv)?, Value::Nil)));
     }
     // C31 S5c: deadlock-detection timeout (ms). Universal so `Transaction class`
     // sends reach it regardless of class-side vs instance dispatch. Stored in a VM
     // global read by the entity park loop.
     if selector.as_ref() == "_primSetDeadlockTimeoutMs:" {
         expect_arity(&selector, 1, args.len())?;
-        let ms = as_int(args.into_iter().next().unwrap(), &selector)?.max(0) as u64;
+        let ms = as_int(ev, args.into_iter().next().unwrap(), &selector)?.max(0) as u64;
         crate::entity::set_deadlock_timeout_ms(ms);
         return Ok(recv);
     }
@@ -67,13 +67,13 @@ pub fn dispatch(
     // `_primHash` is universal — handled here so all value kinds are covered.
     if selector.as_ref() == "_primHash" {
         expect_arity(&selector, 0, args.len())?;
-        let v = force_value(recv)?;
+        let v = force_value(ev, recv)?;
         return Ok(Value::Int(hash_value(&v)));
     }
     // `_primClass` — maps any value to its kernel class entity handle.
     if selector.as_ref() == "_primClass" {
         expect_arity(&selector, 0, args.len())?;
-        let recv = force_value(recv)?;
+        let recv = force_value(ev, recv)?;
         return value_to_class_handle(ev, &recv)
             .map(Value::Instance)
             .ok_or_else(|| mnu("Object", &selector));
@@ -81,8 +81,8 @@ pub fn dispatch(
     // `_primIsKindOf:` — true iff receiver's class is aClass or a subclass of it.
     if selector.as_ref() == "_primIsKindOf:" {
         expect_arity(&selector, 1, args.len())?;
-        let recv = force_value(recv)?;
-        let arg = force_value(args.into_iter().next().unwrap())?;
+        let recv = force_value(ev, recv)?;
+        let arg = force_value(ev, args.into_iter().next().unwrap())?;
         let recv_class = match value_to_class_handle(ev, &recv) {
             Some(h) => h.0.class.clone(),
             None => return Ok(Value::Bool(false)),
@@ -101,7 +101,7 @@ pub fn dispatch(
     // dispatch_entity so user-defined overrides are found.
     if selector.as_ref() == "hash" && !matches!(recv, Value::Instance(_) | Value::Future(_)) {
         expect_arity(&selector, 0, args.len())?;
-        let v = force_value(recv)?;
+        let v = force_value(ev, recv)?;
         return Ok(Value::Int(hash_value(&v)));
     }
     // `->` is universal — any receiver can create an Association.
@@ -138,6 +138,13 @@ pub fn dispatch(
         expect_arity(&selector, 1, args.len())?;
         let blk_val = args.into_iter().next().unwrap();
         return dispatch_then(ev, recv, blk_val, &selector, env);
+    }
+    if selector.as_ref() == "then:orElse:" {
+        expect_arity(&selector, 2, args.len())?;
+        let mut it = args.into_iter();
+        let then_val = it.next().unwrap();
+        let else_val = it.next().unwrap();
+        return dispatch_then_or_else(ev, recv, then_val, else_val, &selector, env);
     }
 
     match recv {
@@ -184,7 +191,7 @@ fn dispatch_then(
 ) -> Result<Value, EvalError> {
     match recv {
         Value::Future(future) => {
-            let blk = as_block(blk_val, selector)?;
+            let blk = as_block(ev, blk_val, selector)?;
             let result_future = crate::entity::FutureHandle::new();
             let result_reply = result_future.clone();
             let ctx = ev.fork_context();
@@ -197,7 +204,7 @@ fn dispatch_then(
                         let mut dummy_env = crate::env::Env::new();
                         let result = then_ev.eval_block(&blk, vec![], &mut dummy_env);
                         match result {
-                            Ok(v) => match force_value(v) {
+                            Ok(v) => match force_value(&then_ev, v) {
                                 Ok(forced) => result_reply.resolve_ok(forced),
                                 Err(e) => result_reply.resolve_err(e),
                             },
@@ -210,7 +217,7 @@ fn dispatch_then(
             Ok(Value::Future(result_future))
         }
         Value::Block(recv_blk) => {
-            let cont_blk = as_block(blk_val, selector)?;
+            let cont_blk = as_block(ev, blk_val, selector)?;
             let result = ev.eval_block(&recv_blk, vec![], env)?;
             match result {
                 Value::Future(future) => {
@@ -226,7 +233,7 @@ fn dispatch_then(
                                 let mut dummy_env = crate::env::Env::new();
                                 let r = then_ev.eval_block(&cont_blk, vec![], &mut dummy_env);
                                 match r {
-                                    Ok(v) => match force_value(v) {
+                                    Ok(v) => match force_value(&then_ev, v) {
                                         Ok(forced) => result_reply.resolve_ok(forced),
                                         Err(e) => result_reply.resolve_err(e),
                                     },
@@ -242,7 +249,130 @@ fn dispatch_then(
             }
         }
         _ => {
-            let blk = as_block(blk_val, selector)?;
+            let blk = as_block(ev, blk_val, selector)?;
+            ev.eval_block(&blk, vec![], env)
+        }
+    }
+}
+
+/// Run the rejection arm of `then:orElse:` in the continuation coroutine, settling
+/// `result_reply` accordingly. `else_val` is either a 1-arg Block (invoked with the
+/// carried condition) or one of the symbol idioms:
+///   - `#signal`  — re-raise the condition in this (replayed) handler chain; a
+///     handler's value resolves the result, an unhandled re-raise rejects it.
+///   - `#reject`  — propagate the rejection down the chain unchanged.
+///   - `#value`   — resolve the result with the condition as an ordinary value.
+///
+/// See `docs/enrollment_provenance_design.md` (Stage 1: async errors → conditions).
+fn run_reject_arm(ev: &Evaluator, else_val: Value, err: EvalError, result_reply: &FutureHandle) {
+    let cond = match &err {
+        EvalError::Signal(c) => c.clone(),
+        // Control-flow variants never reach a reject arm; synthesize defensively.
+        _ => make_error_value(&ev.registry, &format!("{err}")),
+    };
+    let settle = |r: Result<Value, EvalError>, reply: &FutureHandle| match r {
+        Ok(v) => match force_value(ev, v) {
+            Ok(f) => reply.resolve_ok(f),
+            Err(e) => reply.resolve_err(e),
+        },
+        // `^`-return and a handler's `return:` both mean "this (discarded) chain
+        // result is v" — a clean completion, not a rejection.
+        Err(EvalError::Return(v, _)) | Err(EvalError::ReturnFromBlock(v)) => reply.resolve_ok(v),
+        Err(e) => reply.resolve_err(e),
+    };
+    match else_val {
+        Value::Symbol(s) if &*s == "reject" => result_reply.resolve_err(err),
+        Value::Symbol(s) if &*s == "value" => result_reply.resolve_ok(cond),
+        Value::Symbol(s) if &*s == "signal" => {
+            let mut env = Env::new();
+            settle(signal_condition(ev, cond, &mut env), result_reply);
+        }
+        Value::Block(b) => {
+            let mut env = Env::new();
+            settle(ev.eval_block(&b, vec![cond], &mut env), result_reply);
+        }
+        // Unknown symbol / non-block else arg: fail loudly rather than silently drop.
+        other => result_reply.resolve_err(EvalError::TypeError(format!(
+            "then:orElse: expects a 1-arg block or #signal/#reject/#value, got {}",
+            other.kind()
+        ))),
+    }
+}
+
+/// `then:orElse:` — total async chaining: run `then_blk` on resolution, `else_val`
+/// on rejection (a 1-arg block or a `#signal`/`#reject`/`#value` symbol). Returns a
+/// composable future. Mirrors `dispatch_then`'s receiver handling; the else arm
+/// only fires on a genuine (async) future rejection.
+#[inline(never)]
+fn dispatch_then_or_else(
+    ev: &Evaluator,
+    recv: Value,
+    then_val: Value,
+    else_val: Value,
+    selector: &Arc<str>,
+    env: &mut Env,
+) -> Result<Value, EvalError> {
+    match recv {
+        Value::Future(future) => {
+            let blk = as_block(ev, then_val, selector)?;
+            let result_future = crate::entity::FutureHandle::new();
+            let result_reply = result_future.clone();
+            let ctx = ev.fork_context();
+            crate::entity::init_coroutine_stack();
+            may::go!(move || {
+                let then_ev = ctx.into_evaluator();
+                match future.wait() {
+                    Err(e) => run_reject_arm(&then_ev, else_val, e, &result_reply),
+                    Ok(_) => {
+                        let mut dummy_env = crate::env::Env::new();
+                        match then_ev.eval_block(&blk, vec![], &mut dummy_env) {
+                            Ok(v) => match force_value(&then_ev, v) {
+                                Ok(forced) => result_reply.resolve_ok(forced),
+                                Err(e) => result_reply.resolve_err(e),
+                            },
+                            Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
+                            Err(e) => result_reply.resolve_err(e),
+                        }
+                    }
+                }
+            });
+            Ok(Value::Future(result_future))
+        }
+        Value::Block(recv_blk) => {
+            let then_blk = as_block(ev, then_val, selector)?;
+            let result = ev.eval_block(&recv_blk, vec![], env)?;
+            match result {
+                Value::Future(future) => {
+                    let result_future = crate::entity::FutureHandle::new();
+                    let result_reply = result_future.clone();
+                    let ctx = ev.fork_context();
+                    crate::entity::init_coroutine_stack();
+                    may::go!(move || {
+                        let then_ev = ctx.into_evaluator();
+                        match future.wait() {
+                            Err(e) => run_reject_arm(&then_ev, else_val, e, &result_reply),
+                            Ok(_) => {
+                                let mut dummy_env = crate::env::Env::new();
+                                match then_ev.eval_block(&then_blk, vec![], &mut dummy_env) {
+                                    Ok(v) => match force_value(&then_ev, v) {
+                                        Ok(forced) => result_reply.resolve_ok(forced),
+                                        Err(e) => result_reply.resolve_err(e),
+                                    },
+                                    Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
+                                    Err(e) => result_reply.resolve_err(e),
+                                }
+                            }
+                        }
+                    });
+                    Ok(Value::Future(result_future))
+                }
+                // Receiver already resolved (no rejection possible): run then-block.
+                _ => ev.eval_block(&then_blk, vec![], env),
+            }
+        }
+        // Already-resolved value: run then-block; else arm cannot fire.
+        _ => {
+            let blk = as_block(ev, then_val, selector)?;
             ev.eval_block(&blk, vec![], env)
         }
     }
@@ -372,15 +502,36 @@ pub(crate) fn expect_arity(
 ///   cooperatively rather than blocking the OS thread.
 /// Ensures: returns the first non-Future value reachable by following the chain,
 ///   or propagates any error from the future.
-pub(crate) fn force_value(v: Value) -> Result<Value, EvalError> {
+/// Resolve `v` to a non-future value, blocking on any pending future.
+///
+/// A rejected future's condition flows through the ONE error channel — the
+/// condition system. On rejection we `signal_condition` the carried condition at
+/// this (live) await site, so a `HandlerContext` handler in the current/replayed
+/// chain can handle it (`resume:` the await with a substitute value, `retry`, or
+/// reject/unwind). `signal_condition` re-raises unhandled `Error`s, preserving the
+/// prior unwinding behavior when no handler matches. A `resume:` value may itself
+/// be a future, so it is re-forced. See `docs/enrollment_provenance_design.md`
+/// (Stage 1: async errors through the condition system).
+///
+/// Non-condition errors (control-flow variants; not-yet-promoted raw errors)
+/// propagate unchanged — Stage 2 routes genuine raw errors through here too.
+pub(crate) fn force_value(ev: &Evaluator, v: Value) -> Result<Value, EvalError> {
     match v {
-        Value::Future(f) => force_value(f.wait()?),
+        Value::Future(f) => match f.wait() {
+            Ok(inner) => force_value(ev, inner),
+            Err(EvalError::Signal(cond)) => {
+                let mut env = Env::new();
+                let handled = signal_condition(ev, cond, &mut env)?;
+                force_value(ev, handled)
+            }
+            Err(e) => Err(e),
+        },
         v => Ok(v),
     }
 }
 
-pub(crate) fn as_int(v: Value, selector: &Arc<str>) -> Result<i64, EvalError> {
-    match force_value(v)? {
+pub(crate) fn as_int(ev: &Evaluator, v: Value, selector: &Arc<str>) -> Result<i64, EvalError> {
+    match force_value(ev, v)? {
         Value::Int(n) => Ok(n),
         _ => Err(EvalError::TypeError(format!(
             "{selector}: argument must be Int"
@@ -388,8 +539,12 @@ pub(crate) fn as_int(v: Value, selector: &Arc<str>) -> Result<i64, EvalError> {
     }
 }
 
-pub(crate) fn as_block(v: Value, selector: &Arc<str>) -> Result<Arc<Block>, EvalError> {
-    match force_value(v)? {
+pub(crate) fn as_block(
+    ev: &Evaluator,
+    v: Value,
+    selector: &Arc<str>,
+) -> Result<Arc<Block>, EvalError> {
+    match force_value(ev, v)? {
         Value::Block(b) => Ok(b),
         _ => Err(EvalError::TypeError(format!(
             "{selector}: argument must be a Block"
@@ -405,22 +560,22 @@ pub(crate) fn as_block(v: Value, selector: &Arc<str>) -> Result<Arc<Block>, Eval
 ///
 /// Requires: `list` is `Value::Nil` or a chain of `Cons` ValueObjects.
 /// Ensures: returns elements in list order; a non-Cons node terminates the walk.
-pub(crate) fn cons_to_vec(list: Value) -> Result<Vec<Value>, EvalError> {
+pub(crate) fn cons_to_vec(ev: &Evaluator, list: Value) -> Result<Vec<Value>, EvalError> {
     let mut out = Vec::new();
-    let mut node = force_value(list)?;
+    let mut node = force_value(ev, list)?;
     while let Value::Instance(h) = node {
         let obj = match &h.0.kind {
             InstanceKind::ValueObject(o) => o.clone(),
             _ => break,
         };
         out.push(obj.get_slot("head").unwrap_or(Value::Nil));
-        node = force_value(obj.get_slot("tail").unwrap_or(Value::Nil))?;
+        node = force_value(ev, obj.get_slot("tail").unwrap_or(Value::Nil))?;
     }
     Ok(out)
 }
 
-fn bigint_from_value(v: Value, sel: &Arc<str>) -> Result<BigInt, EvalError> {
-    match force_value(v)? {
+fn bigint_from_value(ev: &Evaluator, v: Value, sel: &Arc<str>) -> Result<BigInt, EvalError> {
+    match force_value(ev, v)? {
         Value::Int(n) => Ok(BigInt::from(n)),
         Value::LargeInt(b) => Ok((*b).clone()),
         _ => Err(EvalError::TypeError(format!(
@@ -691,7 +846,7 @@ fn dispatch_int(
     match sel.as_ref() {
         "+" => {
             expect_arity(sel, 1, args.len())?;
-            let arg = force_value(args.remove(0))?;
+            let arg = force_value(ev, args.remove(0))?;
             match arg {
                 Value::Int(m) => match n.checked_add(m) {
                     Some(r) => Ok(Value::Int(r)),
@@ -705,7 +860,7 @@ fn dispatch_int(
         }
         "-" => {
             expect_arity(sel, 1, args.len())?;
-            let arg = force_value(args.remove(0))?;
+            let arg = force_value(ev, args.remove(0))?;
             match arg {
                 Value::Int(m) => match n.checked_sub(m) {
                     Some(r) => Ok(Value::Int(r)),
@@ -719,7 +874,7 @@ fn dispatch_int(
         }
         "*" => {
             expect_arity(sel, 1, args.len())?;
-            let arg = force_value(args.remove(0))?;
+            let arg = force_value(ev, args.remove(0))?;
             match arg {
                 Value::Int(m) => match n.checked_mul(m) {
                     Some(r) => Ok(Value::Int(r)),
@@ -733,7 +888,7 @@ fn dispatch_int(
         }
         "/" => {
             expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
+            match force_value(ev, args.remove(0))? {
                 Value::Int(d) => {
                     if d == 0 {
                         return Err(EvalError::TypeError("division by zero".into()));
@@ -753,7 +908,7 @@ fn dispatch_int(
         }
         "//" => {
             expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
+            match force_value(ev, args.remove(0))? {
                 Value::Int(d) => {
                     if d == 0 {
                         return Err(EvalError::TypeError("division by zero".into()));
@@ -778,7 +933,7 @@ fn dispatch_int(
         }
         "\\\\" => {
             expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
+            match force_value(ev, args.remove(0))? {
                 Value::Int(d) => {
                     if d == 0 {
                         return Err(EvalError::TypeError("division by zero".into()));
@@ -803,27 +958,31 @@ fn dispatch_int(
         }
         "<" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(n < as_int(args.remove(0), sel)?))
+            Ok(Value::Bool(n < as_int(ev, args.remove(0), sel)?))
         }
         ">" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(n > as_int(args.remove(0), sel)?))
+            Ok(Value::Bool(n > as_int(ev, args.remove(0), sel)?))
         }
         "<=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(n <= as_int(args.remove(0), sel)?))
+            Ok(Value::Bool(n <= as_int(ev, args.remove(0), sel)?))
         }
         ">=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(n >= as_int(args.remove(0), sel)?))
+            Ok(Value::Bool(n >= as_int(ev, args.remove(0), sel)?))
         }
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Int(n) == force_value(args.remove(0))?))
+            Ok(Value::Bool(
+                Value::Int(n) == force_value(ev, args.remove(0))?,
+            ))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Int(n) != force_value(args.remove(0))?))
+            Ok(Value::Bool(
+                Value::Int(n) != force_value(ev, args.remove(0))?,
+            ))
         }
         "negated" => {
             expect_arity(sel, 0, args.len())?;
@@ -845,11 +1004,11 @@ fn dispatch_int(
         }
         "max:" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Int(n.max(as_int(args.remove(0), sel)?)))
+            Ok(Value::Int(n.max(as_int(ev, args.remove(0), sel)?)))
         }
         "min:" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Int(n.min(as_int(args.remove(0), sel)?)))
+            Ok(Value::Int(n.min(as_int(ev, args.remove(0), sel)?)))
         }
         "asString" => {
             expect_arity(sel, 0, args.len())?;
@@ -867,8 +1026,8 @@ fn dispatch_int(
         }
         "to:do:" => {
             expect_arity(sel, 2, args.len())?;
-            let stop = as_int(args.remove(0), sel)?;
-            let blk = as_block(args.remove(0), sel)?;
+            let stop = as_int(ev, args.remove(0), sel)?;
+            let blk = as_block(ev, args.remove(0), sel)?;
             let mut i = n;
             while i <= stop {
                 ev.eval_block(&blk, vec![Value::Int(i)], env)?;
@@ -878,9 +1037,9 @@ fn dispatch_int(
         }
         "to:by:do:" => {
             expect_arity(sel, 3, args.len())?;
-            let stop = as_int(args.remove(0), sel)?;
-            let step = as_int(args.remove(0), sel)?;
-            let blk = as_block(args.remove(0), sel)?;
+            let stop = as_int(ev, args.remove(0), sel)?;
+            let step = as_int(ev, args.remove(0), sel)?;
+            let blk = as_block(ev, args.remove(0), sel)?;
             if step == 0 {
                 return Err(EvalError::TypeError(
                     "to:by:do: step must be non-zero".into(),
@@ -910,7 +1069,7 @@ fn dispatch_largeint(
     match sel.as_ref() {
         "+" | "-" | "*" => {
             expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(args.remove(0), sel)?;
+            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
             let result = match sel.as_ref() {
                 "+" => (*n).clone() + rhs,
                 "-" => (*n).clone() - rhs,
@@ -921,7 +1080,7 @@ fn dispatch_largeint(
         }
         "/" => {
             expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(args.remove(0), sel)?;
+            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
             if rhs.is_zero() {
                 return Err(EvalError::TypeError("division by zero".into()));
             }
@@ -929,7 +1088,7 @@ fn dispatch_largeint(
         }
         "//" => {
             expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(args.remove(0), sel)?;
+            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
             if rhs.is_zero() {
                 return Err(EvalError::TypeError("division by zero".into()));
             }
@@ -937,7 +1096,7 @@ fn dispatch_largeint(
         }
         "\\\\" => {
             expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(args.remove(0), sel)?;
+            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
             if rhs.is_zero() {
                 return Err(EvalError::TypeError("division by zero".into()));
             }
@@ -945,34 +1104,34 @@ fn dispatch_largeint(
         }
         "<" => {
             expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(args.remove(0), sel)?;
+            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
             Ok(Value::Bool(*n < rhs))
         }
         ">" => {
             expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(args.remove(0), sel)?;
+            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
             Ok(Value::Bool(*n > rhs))
         }
         "<=" => {
             expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(args.remove(0), sel)?;
+            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
             Ok(Value::Bool(*n <= rhs))
         }
         ">=" => {
             expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(args.remove(0), sel)?;
+            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
             Ok(Value::Bool(*n >= rhs))
         }
         "=" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(
-                Value::LargeInt(n) == force_value(args.remove(0))?,
+                Value::LargeInt(n) == force_value(ev, args.remove(0))?,
             ))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(
-                Value::LargeInt(n) != force_value(args.remove(0))?,
+                Value::LargeInt(n) != force_value(ev, args.remove(0))?,
             ))
         }
         "negated" => {
@@ -1003,8 +1162,8 @@ fn dispatch_largeint(
 
 // ── Float ────────────────────────────────────────────────────────────────────
 
-fn as_float_coerce(v: Value, sel: &Arc<str>) -> Result<f64, EvalError> {
-    match force_value(v)? {
+fn as_float_coerce(ev: &Evaluator, v: Value, sel: &Arc<str>) -> Result<f64, EvalError> {
+    match force_value(ev, v)? {
         Value::Float(f) => Ok(f),
         Value::Int(n) => Ok(n as f64),
         _ => Err(EvalError::TypeError(format!(
@@ -1023,43 +1182,47 @@ fn dispatch_float(
     match sel.as_ref() {
         "+" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Float(f + as_float_coerce(args.remove(0), sel)?))
+            Ok(Value::Float(f + as_float_coerce(ev, args.remove(0), sel)?))
         }
         "-" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Float(f - as_float_coerce(args.remove(0), sel)?))
+            Ok(Value::Float(f - as_float_coerce(ev, args.remove(0), sel)?))
         }
         "*" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Float(f * as_float_coerce(args.remove(0), sel)?))
+            Ok(Value::Float(f * as_float_coerce(ev, args.remove(0), sel)?))
         }
         "/" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Float(f / as_float_coerce(args.remove(0), sel)?))
+            Ok(Value::Float(f / as_float_coerce(ev, args.remove(0), sel)?))
         }
         "<" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(f < as_float_coerce(args.remove(0), sel)?))
+            Ok(Value::Bool(f < as_float_coerce(ev, args.remove(0), sel)?))
         }
         ">" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(f > as_float_coerce(args.remove(0), sel)?))
+            Ok(Value::Bool(f > as_float_coerce(ev, args.remove(0), sel)?))
         }
         "<=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(f <= as_float_coerce(args.remove(0), sel)?))
+            Ok(Value::Bool(f <= as_float_coerce(ev, args.remove(0), sel)?))
         }
         ">=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(f >= as_float_coerce(args.remove(0), sel)?))
+            Ok(Value::Bool(f >= as_float_coerce(ev, args.remove(0), sel)?))
         }
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Float(f) == force_value(args.remove(0))?))
+            Ok(Value::Bool(
+                Value::Float(f) == force_value(ev, args.remove(0))?,
+            ))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Float(f) != force_value(args.remove(0))?))
+            Ok(Value::Bool(
+                Value::Float(f) != force_value(ev, args.remove(0))?,
+            ))
         }
         "negated" => {
             expect_arity(sel, 0, args.len())?;
@@ -1111,14 +1274,14 @@ fn dispatch_nil(
         "=" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(matches!(
-                force_value(args.remove(0))?,
+                force_value(ev, args.remove(0))?,
                 Value::Nil
             )))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(!matches!(
-                force_value(args.remove(0))?,
+                force_value(ev, args.remove(0))?,
                 Value::Nil
             )))
         }
@@ -1146,7 +1309,7 @@ fn dispatch_str(
         }
         "at:" => {
             expect_arity(sel, 1, args.len())?;
-            let idx = as_int(args.remove(0), sel)? as usize;
+            let idx = as_int(ev, args.remove(0), sel)? as usize;
             // 1-based index (Smalltalk convention).
             s.chars()
                 .nth(idx.wrapping_sub(1))
@@ -1155,7 +1318,7 @@ fn dispatch_str(
         }
         "," => {
             expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
+            match force_value(ev, args.remove(0))? {
                 Value::Str(other) => Ok(Value::Str(Arc::from(format!("{s}{other}").as_str()))),
                 _ => Err(EvalError::TypeError(format!(
                     "{sel}: argument must be String"
@@ -1164,11 +1327,15 @@ fn dispatch_str(
         }
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Str(s) == force_value(args.remove(0))?))
+            Ok(Value::Bool(
+                Value::Str(s) == force_value(ev, args.remove(0))?,
+            ))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(Value::Str(s) != force_value(args.remove(0))?))
+            Ok(Value::Bool(
+                Value::Str(s) != force_value(ev, args.remove(0))?,
+            ))
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
@@ -1188,15 +1355,15 @@ fn dispatch_str(
         }
         "copyFrom:to:" => {
             expect_arity(sel, 2, args.len())?;
-            let from = (as_int(args.remove(0), sel)? as usize).saturating_sub(1);
-            let to = as_int(args.remove(0), sel)? as usize;
+            let from = (as_int(ev, args.remove(0), sel)? as usize).saturating_sub(1);
+            let to = as_int(ev, args.remove(0), sel)? as usize;
             let chars: Vec<char> = s.chars().collect();
             let slice: String = chars.get(from..to).unwrap_or(&[]).iter().collect();
             Ok(Value::Str(Arc::from(slice.as_str())))
         }
         "includesSubString:" => {
             expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
+            match force_value(ev, args.remove(0))? {
                 Value::Str(sub) => Ok(Value::Bool(s.contains(sub.as_ref()))),
                 _ => Err(EvalError::TypeError(format!(
                     "{sel}: argument must be String"
@@ -1220,13 +1387,13 @@ fn dispatch_symbol(
         "=" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(
-                Value::Symbol(s) == force_value(args.remove(0))?,
+                Value::Symbol(s) == force_value(ev, args.remove(0))?,
             ))
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(
-                Value::Symbol(s) != force_value(args.remove(0))?,
+                Value::Symbol(s) != force_value(ev, args.remove(0))?,
             ))
         }
         "printString" => {
@@ -1462,14 +1629,15 @@ fn obj_prim_core(
     sel: &Arc<str>,
     args: &mut Vec<Value>,
 ) -> Result<Option<Value>, EvalError> {
+    let ev = cx.ev;
     Ok(Some(match sel.as_ref() {
         "=" => {
             expect_arity(sel, 1, args.len())?;
-            Value::Bool(*cx.self_val == force_value(args.remove(0))?)
+            Value::Bool(*cx.self_val == force_value(ev, args.remove(0))?)
         }
         "~=" => {
             expect_arity(sel, 1, args.len())?;
-            Value::Bool(*cx.self_val != force_value(args.remove(0))?)
+            Value::Bool(*cx.self_val != force_value(ev, args.remove(0))?)
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
@@ -1502,7 +1670,7 @@ fn obj_prim_indexed(
     Ok(Some(match sel.as_ref() {
         "_primAt:" => {
             expect_arity(sel, 1, args.len())?;
-            let n = as_int(args.remove(0), sel)?;
+            let n = as_int(ev, args.remove(0), sel)?;
             let indexed = obj.indexed.as_ref().ok_or_else(|| {
                 EvalError::TypeError(format!("{sel}: receiver has no indexed storage"))
             })?;
@@ -1541,7 +1709,7 @@ fn obj_prim_indexed(
         }
         "_primAt:put:" => {
             expect_arity(sel, 2, args.len())?;
-            let n = as_int(args.remove(0), sel)?;
+            let n = as_int(ev, args.remove(0), sel)?;
             let v = args.remove(0);
             let indexed = obj.indexed.as_ref().ok_or_else(|| {
                 EvalError::TypeError(format!("{sel}: receiver has no indexed storage"))
@@ -1672,7 +1840,7 @@ fn obj_prim_conditions(
     Ok(Some(match sel.as_ref() {
         "error:" => {
             expect_arity(sel, 1, args.len())?;
-            let msg = match force_value(args.remove(0))? {
+            let msg = match force_value(ev, args.remove(0))? {
                 Value::Str(s) => s,
                 other => Arc::from(format!("error: argument was {}", other.kind()).as_str()),
             };
@@ -1680,7 +1848,7 @@ fn obj_prim_conditions(
         }
         "_primSignalCondition:" => {
             expect_arity(sel, 1, args.len())?;
-            let condition = force_value(args.remove(0))?;
+            let condition = force_value(ev, args.remove(0))?;
             if !matches!(&condition, Value::Instance(_)) {
                 return Err(EvalError::TypeError(
                     "_primSignalCondition: requires a Condition instance".into(),
@@ -1707,8 +1875,8 @@ fn obj_prim_conditions(
             // This arm preserves the recursive behavior for any direct
             // `builtins::dispatch` caller.
             expect_arity(sel, 1, args.len())?;
-            let body = as_block(args.remove(0), sel)?;
-            let handler_pairs = extract_handler_pairs(cx.handle)?;
+            let body = as_block(ev, args.remove(0), sel)?;
+            let handler_pairs = extract_handler_pairs(cx.ev, cx.handle)?;
 
             // Push handler pairs onto handler_chain.
             let chain_start_len = ev.handler_chain.borrow().len();
@@ -1751,7 +1919,7 @@ fn obj_prim_history(
             let eid = entity_id.ok_or_else(|| {
                 EvalError::TypeError("historyOf: requires an entity receiver".into())
             })?;
-            let pred_name = match force_value(args.remove(0))? {
+            let pred_name = match force_value(ev, args.remove(0))? {
                 Value::Symbol(s) | Value::Str(s) => s,
                 other => {
                     return Err(EvalError::TypeError(format!(
@@ -1777,7 +1945,7 @@ fn obj_prim_history(
             let eid = entity_id.ok_or_else(|| {
                 EvalError::TypeError("historyOf:from:to: requires an entity receiver".into())
             })?;
-            let pred_name = match force_value(args.remove(0))? {
+            let pred_name = match force_value(ev, args.remove(0))? {
                 Value::Symbol(s) | Value::Str(s) => s,
                 other => {
                     return Err(EvalError::TypeError(format!(
@@ -1786,8 +1954,8 @@ fn obj_prim_history(
                     )));
                 }
             };
-            let from_ms = as_int(args.remove(0), sel)?;
-            let to_ms = as_int(args.remove(0), sel)?;
+            let from_ms = as_int(ev, args.remove(0), sel)?;
+            let to_ms = as_int(ev, args.remove(0), sel)?;
             let pred = ev.registry.store.lookup(&pred_name).ok_or_else(|| {
                 EvalError::TypeError(format!(
                     "historyOf:from:to: unknown predicate '{pred_name}'"
@@ -1832,7 +2000,7 @@ fn obj_prim_timers(
             // Ensures: the timer callback will not be called if it has not already fired.
             //   No-op if already fired. Returns Value::Nil.
             expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
+            match force_value(ev, args.remove(0))? {
                 Value::Handle(h) => {
                     ev.os.cancel_timer(&h);
                     Value::Nil
@@ -1849,7 +2017,7 @@ fn obj_prim_timers(
             // Requires: args[0] is a Value::Handle returned by _primScheduleTimer:block:.
             // Ensures: returns Value::Bool(true) iff the timer has not fired and is not cancelled.
             expect_arity(sel, 1, args.len())?;
-            match force_value(args.remove(0))? {
+            match force_value(ev, args.remove(0))? {
                 Value::Handle(h) => Value::Bool(ev.os.timer_pending(&h)),
                 other => {
                     return Err(EvalError::TypeError(format!(
@@ -1924,7 +2092,7 @@ fn obj_prim_tx(
             // store and clear `current_tx_ctx`. Child: absorb the child buffer into
             // its parent and restore the parent as the active context.
             expect_arity(sel, 1, args.len())?;
-            let ctx = tx_ctx_from_handle(force_value(args.remove(0))?)?;
+            let ctx = tx_ctx_from_handle(force_value(ev, args.remove(0))?)?;
             let was_stm = ctx.discipline() == TxMode::Stm;
             match ctx.parent() {
                 None => {
@@ -1955,7 +2123,7 @@ fn obj_prim_tx(
             // commit) and clear `current_tx_ctx`. Child: drop the child buffer and
             // restore the parent as the active context.
             expect_arity(sel, 1, args.len())?;
-            let ctx = tx_ctx_from_handle(force_value(args.remove(0))?)?;
+            let ctx = tx_ctx_from_handle(force_value(ev, args.remove(0))?)?;
             let was_stm = ctx.discipline() == TxMode::Stm;
             ctx.buffer().lock().unwrap().take(); // drop = rollback (ops never commit)
             *ev.current_tx_ctx.borrow_mut() = ctx.parent();
@@ -1970,7 +2138,7 @@ fn obj_prim_tx(
             // (contagious-atomic) reports `false`, so the coordinator runs the
             // pessimistic commit path — the coerced level behaves as nested atomic.
             expect_arity(sel, 1, args.len())?;
-            let ctx = tx_ctx_from_handle(force_value(args.remove(0))?)?;
+            let ctx = tx_ctx_from_handle(force_value(ev, args.remove(0))?)?;
             Value::Bool(ctx.discipline() == TxMode::Stm)
         }
         "_primEnrolledParticipants:" => {
@@ -1978,7 +2146,7 @@ fn obj_prim_tx(
             // Value (synchronous dispatch), so the coordinator iterates it in its
             // own coroutine and the pvtExitTx: sends it makes are tagged.
             expect_arity(sel, 1, args.len())?;
-            let ctx = tx_ctx_from_handle(force_value(args.remove(0))?)?;
+            let ctx = tx_ctx_from_handle(force_value(ev, args.remove(0))?)?;
             let parts: Vec<Value> = ctx
                 .participants()
                 .lock()
@@ -1994,7 +2162,7 @@ fn obj_prim_tx(
             // the coordinator. `outcome` is #commit or #rollback. The transaction
             // context is taken from the tag on this (pvtExitTx) message.
             expect_arity(sel, 1, args.len())?;
-            let outcome = match force_value(args.remove(0))? {
+            let outcome = match force_value(ev, args.remove(0))? {
                 Value::Symbol(s) => s,
                 other => {
                     return Err(EvalError::TypeError(format!(
@@ -2059,10 +2227,11 @@ fn obj_prim_tx(
 /// `_primResolveFuture:value:`, `_primRejectFuture:error:`.
 #[inline(never)]
 fn obj_prim_futures(
-    _cx: &ObjPrim,
+    cx: &ObjPrim,
     sel: &Arc<str>,
     args: &mut Vec<Value>,
 ) -> Result<Option<Value>, EvalError> {
+    let ev = cx.ev;
     Ok(Some(match sel.as_ref() {
         "_primNewFutureHandle" => {
             expect_arity(sel, 0, args.len())?;
@@ -2071,7 +2240,7 @@ fn obj_prim_futures(
         "_primResolveFuture:value:" => {
             expect_arity(sel, 2, args.len())?;
             let h = args.remove(0);
-            let v = force_value(args.remove(0))?;
+            let v = force_value(ev, args.remove(0))?;
             match h {
                 Value::Future(fh) => Value::Bool(fh.try_resolve_ok(v)),
                 other => {
@@ -2085,7 +2254,7 @@ fn obj_prim_futures(
         "_primRejectFuture:error:" => {
             expect_arity(sel, 2, args.len())?;
             let h = args.remove(0);
-            let e = force_value(args.remove(0))?;
+            let e = force_value(ev, args.remove(0))?;
             match h {
                 Value::Future(fh) => Value::Bool(fh.try_resolve_err(EvalError::Signal(e))),
                 other => {
@@ -2109,6 +2278,7 @@ fn obj_prim_futures(
 ///   ready to push onto `ev.handler_chain` so that `signal_condition`'s reverse
 ///   walk matches the most-recently-registered handler first.
 pub(crate) fn extract_handler_pairs(
+    ev: &Evaluator,
     handle: &InstanceHandle,
 ) -> Result<Vec<crate::eval::HandlerPair>, EvalError> {
     let pairs_val = match &handle.0.kind {
@@ -2122,7 +2292,7 @@ pub(crate) fn extract_handler_pairs(
     };
 
     let mut handler_pairs: Vec<crate::eval::HandlerPair> = Vec::new();
-    let mut node = force_value(pairs_val)?;
+    let mut node = force_value(ev, pairs_val)?;
     while let Value::Instance(node_h) = node {
         let node_obj = match &node_h.0.kind {
             InstanceKind::ValueObject(o) => o.clone(),
@@ -2130,8 +2300,8 @@ pub(crate) fn extract_handler_pairs(
             InstanceKind::ClassEntity(_) => break,
         };
         // head is an Association(key=cls, value=blk); tail is rest.
-        let head_val = force_value(node_obj.get_slot("head").unwrap_or(Value::Nil))?;
-        let tail = force_value(node_obj.get_slot("tail").unwrap_or(Value::Nil))?;
+        let head_val = force_value(ev, node_obj.get_slot("head").unwrap_or(Value::Nil))?;
+        let tail = force_value(ev, node_obj.get_slot("tail").unwrap_or(Value::Nil))?;
 
         let assoc_h = match head_val {
             Value::Instance(h) => h,
@@ -2148,8 +2318,8 @@ pub(crate) fn extract_handler_pairs(
                 continue;
             }
         };
-        let cls_val = force_value(assoc_obj.get_slot("key").unwrap_or(Value::Nil))?;
-        let blk_val = force_value(assoc_obj.get_slot("value").unwrap_or(Value::Nil))?;
+        let cls_val = force_value(ev, assoc_obj.get_slot("key").unwrap_or(Value::Nil))?;
+        let blk_val = force_value(ev, assoc_obj.get_slot("value").unwrap_or(Value::Nil))?;
 
         let cls = match cls_val {
             Value::Instance(ch) => ch.0.class.clone(),
@@ -2211,17 +2381,40 @@ pub(crate) fn signal_condition(
             let removed = chain.split_off(i);
             (removed[0].1.clone(), removed)
         };
+        let resumable = condition_is_resumable(ev, &cond_class);
         let outcome = ev.eval_block(&handler_block, vec![condition], env);
         ev.handler_chain.borrow_mut().extend(removed);
-        // Normal return or `resume:` both deliver a value to the signal point;
-        // return:/retry/re-signal propagate.
+        // Disposition (docs/condition_system_guide.md §2): an explicit `resume:`
+        // always resumes; `return:`/`retry`/re-signal propagate. On *normal*
+        // handler completion the default depends on the condition's kind: a
+        // resumable condition resumes (deliver the value to the signal point); a
+        // non-resumable one (an Error) ABORTS — a local unwind, expressed as an
+        // implicit `return:` of the handler's value.
         return match outcome {
-            Ok(v) | Err(EvalError::Resume(v)) => Ok(v),
+            Err(EvalError::Resume(v)) => Ok(v),
+            Ok(v) if resumable => Ok(v),
+            Ok(v) => Err(EvalError::ReturnFromBlock(v)),
             Err(e) => Err(e),
         };
     }
 
     apply_unhandled_policy(ev, condition)
+}
+
+/// Whether a signalled condition resumes by default when a handler completes
+/// without invoking an explicit restart. Keyed on the `Error` hierarchy: `Error`
+/// (and subclasses) are non-resumable — handling one aborts (local unwind); every
+/// other `Condition` is resumable — handling resumes the signal point. See
+/// `docs/condition_system_guide.md` §2.
+///
+/// ⚠ Keys on the class hierarchy, not the overridable `isResumable` method — a
+/// per-class override of the *disposition* is a future refinement.
+pub(crate) fn condition_is_resumable(ev: &Evaluator, cond_class: &Arc<Class>) -> bool {
+    !ev.registry
+        .kernel()
+        .lookup_class("Error")
+        .map(|h| crate::class::Class::is_subclass_of(cond_class, &h.0.class))
+        .unwrap_or(false)
 }
 
 /// Apply the unhandled-condition policy by class: `Error` → raise
@@ -2568,11 +2761,11 @@ pub(crate) fn dispatch_class_builtin(
     match selector.as_ref() {
         "=" => {
             expect_arity(&selector, 1, args.len())?;
-            Ok(Value::Bool(self_val == force_value(args[0].clone())?))
+            Ok(Value::Bool(self_val == force_value(ev, args[0].clone())?))
         }
         "~=" => {
             expect_arity(&selector, 1, args.len())?;
-            Ok(Value::Bool(self_val != force_value(args.remove(0))?))
+            Ok(Value::Bool(self_val != force_value(ev, args.remove(0))?))
         }
         "_primNew" => {
             expect_arity(&selector, 0, args.len())?;
@@ -2624,7 +2817,7 @@ pub(crate) fn dispatch_class_builtin(
                     "_primNewValue: requires a Value subclass".into(),
                 ));
             }
-            let blk = as_block(args.remove(0), &selector)?;
+            let blk = as_block(ev, args.remove(0), &selector)?;
             let indexed = if class.indexed_slot_kind.is_some() {
                 Some(0)
             } else {
@@ -2653,8 +2846,8 @@ pub(crate) fn dispatch_class_builtin(
                     "_primNewValueIndexed:init: requires class to declare indexedSlots:".into(),
                 ));
             }
-            let n = as_int(args.remove(0), &selector)?;
-            let blk = as_block(args.remove(0), &selector)?;
+            let n = as_int(ev, args.remove(0), &selector)?;
+            let blk = as_block(ev, args.remove(0), &selector)?;
             let inst = make_value_instance(class, Some(n.max(0) as usize));
             ev.eval_block(&blk, vec![Value::Instance(inst.clone())], env)?;
             freeze_value_instance(&inst);
@@ -2667,8 +2860,8 @@ pub(crate) fn dispatch_class_builtin(
             //   is responsible for all Smol-level dispatch (e.g. Timer >> pvtTimerFired).
             //   Returns Value::Handle opaque to callers.
             expect_arity(&selector, 2, args.len())?;
-            let ms = as_int(args.remove(0), &selector)?.max(0) as u64;
-            let blk = as_block(args.remove(0), &selector)?;
+            let ms = as_int(ev, args.remove(0), &selector)?.max(0) as u64;
+            let blk = as_block(ev, args.remove(0), &selector)?;
             let ctx = ev.fork_context();
             let callback = Box::new(move || {
                 may::go!(move || {
@@ -2682,7 +2875,7 @@ pub(crate) fn dispatch_class_builtin(
         }
         "_primNew:" => {
             expect_arity(&selector, 1, args.len())?;
-            let n = as_int(args.remove(0), &selector)?;
+            let n = as_int(ev, args.remove(0), &selector)?;
             if class.indexed_slot_kind.is_none() {
                 return Err(EvalError::TypeError(
                     "_primNew: requires class to declare indexedSlots:".into(),
@@ -2713,7 +2906,7 @@ pub(crate) fn dispatch_class_builtin(
         }
         "_primInstancesOf:" => {
             expect_arity(&selector, 1, args.len())?;
-            let target_handle = match force_value(args.remove(0))? {
+            let target_handle = match force_value(ev, args.remove(0))? {
                 Value::Instance(h) => h,
                 other => {
                     return Err(EvalError::TypeError(format!(

@@ -313,7 +313,7 @@ impl RecursiveEvaluator {
         let mut last = Value::Nil;
         for stmt in stmts {
             let v = self.eval_stmt(stmt, env)?;
-            last = crate::builtins_iterative::force_value(v)?;
+            last = crate::builtins_iterative::force_value(&self.inner, v)?;
         }
         Ok(last)
     }

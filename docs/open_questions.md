@@ -294,3 +294,39 @@ entity the existing path always commits on success, so live slots and the store
 do not diverge; the crash case terminates the entity, making leftover live slots
 moot. The value of this idea is the new failure policy and the unification, not a
 correctness repair.
+
+---
+
+## Q11: Durable garbage collection of orphaned entity facts
+
+**Status**: Open — recording now; scheduling deferred (see recommendation)
+**Raised**: C32 enrollment redesign (born-in-tx exclusion)
+
+In-memory entities are reclaimed by `Arc` refcount, but the **durable facts** an
+entity writes to the store are never reclaimed. An entity can become unreachable
+while its facts persist — leaving orphan facts. The concrete driver is the C32
+enrollment redesign (see `docs/enrollment_provenance_design.md`): a **born-in-tx**
+entity writes its facts *live / per-message* (it is deliberately excluded from the
+transaction). If its transaction **rolls back and it never escaped**, those facts
+are orphaned by design — an accepted, recorded debt of choosing full born-in-tx
+exclusion over shadow-buffering.
+
+**Tensions to resolve:**
+
+- **Unify with Q3 (value-object glacier).** Orphaned entity facts and orphaned
+  value objects are the same problem — unreferenced records in the fact space —
+  and the same mark-sweep-over-reference-edges pass reclaims both. Building them
+  together is the least-wasted-effort path.
+- **Retention vs. history (P5, State Has History).** A rolled-back born-in-tx
+  temporary arguably *never had legitimate history* → reclaim freely. A committed
+  entity later made unreferenced *did* have history → retention policy is the same
+  open question Q3 raises for values in closed-interval facts. Distinguish
+  "rolled back" (reclaim) from "committed then orphaned" (history policy).
+- **VM dependency: none.** Durable reclamation is a store-layer concern; a correct
+  glacier/mark-sweep pass does not require the custom VM. Efficient/generational
+  collection may later benefit from VM allocation control, but that does not gate a
+  first correct pass. GC does **not** need to precede the VM.
+
+**Recommendation:** schedule alongside Q3 as a single store-layer reclamation pass,
+when fact accumulation begins to matter (dev/test accumulation is slow). Not a VM
+prerequisite.

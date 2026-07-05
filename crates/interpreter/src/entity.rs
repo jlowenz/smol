@@ -11,7 +11,7 @@ use crate::class_registry::ClassRegistry;
 use crate::env::Env;
 use crate::eval::EvalError;
 use crate::object::Object;
-use crate::shared_tx::{AtomicFrame, GenTx, StmFrame, TxCtxId, TxFrame, TxMode};
+use crate::shared_tx::{AtomicFrame, GenTx, StmFrame, TxCtxId, TxFrame};
 use crate::value::{Block, Value};
 use triple_store::exec_context::ExecContext;
 use triple_store::id::TxId;
@@ -1071,30 +1071,12 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
     let ev = Evaluator::with_registry(registry);
     ev.current_entity_id.set(Some(data.id));
 
-    // C31 S5b: a transaction coordinator (any entity that is-a `Transaction` —
-    // the class entity itself, whose `state.class` is `Transaction` under the
-    // current no-metaclass representation, or a `Transaction` instance/subclass)
-    // must NOT auto-enroll as a participant when it receives a tagged message.
-    // The inner `atomic:` send is tagged with the outer tx, so without this the
-    // coordinator would join the outer participant list and later be sent
-    // `pvtExitTx:`, which it does not understand. Tag *propagation* still happens
-    // (below), so the inner coordinator still sees the outer ctx and builds a
-    // Child. We key on Transaction *identity* rather than a flag so that ordinary
-    // classes-as-data can still participate; a trait would be the cleaner tag once
-    // traits exist. NOTE: this reflexive-subclass match depends on class entities
-    // sharing their class (no metaclass); revisit when the metaclass hierarchy is
-    // designed.
-    //
-    // Computed per tagged message rather than once at startup: the `Transaction`
-    // class entity's loop begins *during* kernel load, before `Transaction` is
-    // registered in the namespace, so a startup lookup would cache `false`.
-    let class_state = state.class.clone();
-    let is_tx_coordinator = || {
-        ev.registry
-            .kernel()
-            .lookup_class("Transaction")
-            .is_some_and(|tc| Class::is_subclass_of(&class_state, &tc.0.class))
-    };
+    // C31 S5b / C32: a transaction coordinator (any entity that is-a `Transaction`)
+    // must NOT enroll as a participant of the tx it runs — it writes its own
+    // `status`/`handle` ivars under the tag. That exclusion now lives in
+    // `Evaluator::ensure_tx_enrolled` (lazy enrollment), keyed on Transaction
+    // identity, alongside the born-in-tx exclusion. Tag propagation still happens
+    // below so nested coordinators see the outer ctx.
 
     let mut env = global_env;
 
@@ -1159,33 +1141,15 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
             }
         }
 
-        // C31: enroll into the tagged transaction level on the first message at
-        // that level (push a frame, opening this entity's durable buffer under the
-        // shared TxId, and record participation). Subsequent messages at the same
-        // level reuse the existing frame.
+        // C32: enrollment is *lazy* — an entity becomes a participant of a tagged
+        // transaction on first access to its own transactional state (ivar
+        // read/write), handled in `Evaluator::ensure_tx_enrolled` via
+        // `assign_var`/`lookup_var`. Merely receiving a tagged message no longer
+        // enrolls (that over-enrolled class entities and pure-computation
+        // helpers). The tag is still propagated below so writes route to the frame
+        // buffer and outgoing sends inherit it. See
+        // `docs/enrollment_provenance_design.md`.
         let tx_tag = envelope.tx_tag.clone();
-        if let Some(ctx) = &tx_tag
-            && !is_tx_coordinator()
-        {
-            let ctx_id = ctx.ctx_id();
-            // Enroll once per level. Atomic levels lock, so the top locking frame
-            // (`tx_holder`) being this ctx means already enrolled; STM levels do
-            // not lock, so dedup on frame presence instead.
-            let already_enrolled = match ctx.discipline() {
-                TxMode::Atomic => data.tx_holder() == Some(ctx_id),
-                TxMode::Stm => data.has_frame_for(ctx_id),
-            };
-            if !already_enrolled {
-                match ctx.discipline() {
-                    TxMode::Atomic => data.tx_push_atomic_frame(ctx_id, ctx.tx_id()),
-                    TxMode::Stm => data.tx_push_stm_frame(ctx_id, ctx.tx_id()),
-                }
-                ctx.participants()
-                    .lock()
-                    .unwrap()
-                    .push(InstanceHandle(state.clone()));
-            }
-        }
 
         // The private per-message transaction. For a tagged message this stays
         // empty — durable ivar writes route to the entity's frame buffer (see
