@@ -2177,7 +2177,7 @@ hc := HandlerContext new on: Error do: [:e | e invokeRestart: #useDefault].
 hc run: [
     | e |
     e := Error new.
-    e := e addRestart: #useDefault block: ['fallback'].
+    e := e addRestart: #useDefault block: [:c | 'fallback'].
     e signal
 ]
 "#;
@@ -2193,11 +2193,46 @@ hc := HandlerContext new on: Error do: [:e | e invokeRestart: #useValue: with: 9
 hc run: [
     | e |
     e := Error new.
-    e := e addRestart: #useValue: block: [:v | v].
+    e := e addRestart: #useValue: block: [:c :v | v].
     e signal
 ]
 "#;
     assert_eq!(eval(src), Value::Int(99));
+}
+
+#[test]
+fn invoke_restart_control_restart_unwinds_via_return() {
+    // A control restart: the restart block performs its own transfer (`c return:`)
+    // instead of resuming. The block receives the condition (first arg) and aborts
+    // the protected region with a value — the `resume:` default is never reached.
+    let src = r#"
+| hc |
+hc := HandlerContext new on: Error do: [:e | e invokeRestart: #abort].
+hc run: [
+    | e |
+    e := Error new.
+    e := e addRestart: #abort block: [:c | c return: 'aborted'].
+    e signal.
+    'unreachable'
+]
+"#;
+    assert_eq!(eval(src), Value::Str(Arc::from("aborted")));
+}
+
+#[test]
+fn invoke_restart_block_receives_condition() {
+    // The restart block can read state off the condition it is passed.
+    let src = r#"
+| hc |
+hc := HandlerContext new on: Error do: [:e | e invokeRestart: #echo].
+hc run: [
+    | e |
+    e := Error withMessage: 'boom'.
+    e := e addRestart: #echo block: [:c | c message].
+    e signal
+]
+"#;
+    assert_eq!(eval(src), Value::Str(Arc::from("boom")));
 }
 
 // ── Chunk 28b: Cross-entity HandlerContext propagation ────────────────────────

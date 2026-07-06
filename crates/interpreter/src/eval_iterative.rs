@@ -307,18 +307,6 @@ pub(crate) enum Cont {
         ensure_blk: Arc<crate::value::Block>,
     },
 
-    /// Marks the bottom of an `on:do:` body on the stack.
-    ///
-    /// Success path: fires and simply passes `acc` through (body result unchanged).
-    /// Signal path: `handle_step_error` intercepts it, checks `catch_class`, runs
-    ///   handler via `HandleOnDoResult` or re-raises.
-    /// Return (`^`) path: passes through — unwind drops it without running handler.
-    OnDoCatch {
-        catch_class: Arc<crate::class::Class>,
-        handler_blk: Arc<crate::value::Block>,
-        body_blk: Arc<crate::value::Block>,
-    },
-
     /// Sits below a `then:` receiver-block frame. After the receiver block
     /// evaluates, inspects its result: a `Future` is handed to the async `then:`
     /// path (spawns a continuation coroutine); any other value runs the
@@ -335,17 +323,6 @@ pub(crate) enum Cont {
         cont_blk: Arc<crate::value::Block>,
         else_val: Value,
         env: Env,
-    },
-
-    /// Sits below the `on:do:` handler block frame, inspecting the handler's outcome.
-    ///
-    /// Success path: fires normally → `acc` = handler result, pass through.
-    /// `Retry`: `handle_step_error` intercepts → re-runs body with fresh `OnDoCatch`.
-    /// `Resume(v)` / `ReturnFromBlock(v)`: `handle_step_error` sets `acc = v`, resumes.
-    HandleOnDoResult {
-        catch_class: Arc<crate::class::Class>,
-        handler_blk: Arc<crate::value::Block>,
-        body_blk: Arc<crate::value::Block>,
     },
 
     /// Resume a `^`-return unwind after an ensure block has run.
@@ -528,7 +505,7 @@ fn unwind_stack_to_depth(
                 push_block_frame(ev, &ensure_blk, vec![], false, stack)?;
                 return Ok(UnwindOutcome::Interrupted);
             }
-            // Frames are torn down; OnDoCatch and other entries are discarded.
+            // Frames are torn down; HCRunGuard and other entries are discarded.
             other => {
                 if let Some(depth) = teardown_frame(ev, other)
                     && depth == target_depth
@@ -556,7 +533,7 @@ fn cleanup_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
 ///   to continue; if the stack is exhausted, `EvalError::Return` propagates.
 ///
 /// All other errors: the stack is scanned for the nearest `EnsureGuard` (cleanup)
-///   or `OnDoCatch` / `HandleOnDoResult` (condition handling). `CallFrame`s
+///   or `HCRunGuard` (condition handling). `CallFrame`s
 ///   encountered during the scan are cleaned up. If the scan exhausts the stack
 ///   the error propagates.
 fn handle_step_error(
@@ -583,8 +560,8 @@ fn handle_step_error(
             }
         }
         other => {
-            // Scan the stack for the nearest EnsureGuard (cleanup) or OnDoCatch/
-            // HandleOnDoResult (condition handling), cleaning up frames along the way.
+            // Scan the stack for the nearest EnsureGuard (cleanup) or HCRunGuard
+            // (condition handling), cleaning up frames along the way.
             while let Some(cont) = stack.pop() {
                 match cont {
                     Cont::EnsureGuard { ensure_blk } => {
@@ -593,57 +570,6 @@ fn handle_step_error(
                         // ensure blocks take 0 args; ArityMismatch cannot occur here.
                         push_block_frame(ev, &ensure_blk, vec![], false, stack)?;
                         return Ok(());
-                    }
-                    Cont::OnDoCatch {
-                        catch_class,
-                        handler_blk,
-                        body_blk,
-                    } => {
-                        if let EvalError::Signal(ref cond) = other {
-                            let signal_class = match cond {
-                                Value::Instance(h) => h.0.class.clone(),
-                                _ => continue,
-                            };
-                            if Class::is_subclass_of(&signal_class, &catch_class) {
-                                let cond_val = cond.clone();
-                                stack.push(Cont::HandleOnDoResult {
-                                    catch_class,
-                                    handler_blk: handler_blk.clone(),
-                                    body_blk,
-                                });
-                                push_block_frame(ev, &handler_blk, vec![cond_val], false, stack)?;
-                                return Ok(());
-                            }
-                        }
-                        // Signal class doesn't match, or error isn't a Signal; keep scanning.
-                    }
-                    Cont::HandleOnDoResult {
-                        catch_class,
-                        handler_blk,
-                        body_blk,
-                    } => {
-                        match &other {
-                            EvalError::Retry => {
-                                stack.push(Cont::OnDoCatch {
-                                    catch_class,
-                                    handler_blk: handler_blk.clone(),
-                                    body_blk: body_blk.clone(),
-                                });
-                                push_block_frame(ev, &body_blk, vec![], true, stack)?;
-                                return Ok(());
-                            }
-                            EvalError::Resume(v) => {
-                                *acc = v.clone();
-                                return Ok(());
-                            }
-                            EvalError::ReturnFromBlock(v) => {
-                                *acc = v.clone();
-                                return Ok(());
-                            }
-                            _ => {
-                                // Not Retry/Resume/ReturnFromBlock; keep scanning for outer handler.
-                            }
-                        }
                     }
                     Cont::HCRunGuard {
                         chain_start_len,
@@ -949,7 +875,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 match force_value(ev, v) {
                     Ok(forced) => acc = forced,
                     // A forced Future may resolve to an error (e.g. a signal raised in an
-                    // entity). Route through handle_step_error so OnDoCatch/EnsureGuard
+                    // entity). Route through handle_step_error so HCRunGuard/EnsureGuard
                     // on the stack can intercept it.
                     Err(e) => handle_step_error(e, ev, &mut stack, &mut acc)?,
                 }
@@ -1019,16 +945,6 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 }
             }
 
-            // ── OnDoCatch (success path) ──────────────────────────────────
-            Cont::OnDoCatch { .. } => {
-                // Body completed without raising a signal; acc = body result, pass through.
-            }
-
-            // ── HandleOnDoResult (success path) ───────────────────────────
-            Cont::HandleOnDoResult { .. } => {
-                // Handler completed normally; acc = handler result, pass through.
-            }
-
             // ── HCRunGuard (success path) ─────────────────────────────────
             Cont::HCRunGuard {
                 chain_start_len, ..
@@ -1044,7 +960,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 if !resumable {
                     // Non-resumable (Error): normal completion ABORTS — an implicit
                     // local `return:` of the handler's value. Unwind to the nearest
-                    // enclosing HCRunGuard/OnDoCatch on this stack (or the fork top).
+                    // enclosing HCRunGuard on this stack (or the fork top).
                     let v = std::mem::replace(&mut acc, Value::Nil);
                     handle_step_error(EvalError::ReturnFromBlock(v), ev, &mut stack, &mut acc)?;
                 }
@@ -1664,7 +1580,8 @@ fn drain_tail_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
 ///   (2) `Block >> value` family → `push_block_frame(sync=false)`.
 ///   (3) `Block >> syncValue` → `push_block_frame(sync=true)`.
 ///   (4) `Block >> ensure:` → push `EnsureGuard`, then `push_block_frame(sync=true)` for body.
-///   (5) `Block >> on:do:` → push `OnDoCatch`, then `push_block_frame(sync=true)` for body.
+///   (5) `Block >> on:do:` → register handler pair in `handler_chain`, push
+///       `HCRunGuard { sync: true }`, then `push_block_frame(sync=true)` for body.
 ///   (6) `Bool >> ifTrue:` family → `push_block_frame(false)` for selected branch.
 ///   (7) Universal nil-guard family (`ifNil:` / `ifNotNil:` / combined) → inline.
 ///   (8) All other selectors → `builtins::dispatch`.
@@ -1846,12 +1763,15 @@ fn dispatch_signal(
         .rposition(|(hc, _)| Class::is_subclass_of(&cond_class, hc));
     match idx {
         Some(i) => {
-            let (handler_blk, removed) = {
+            let (handler_class, handler_blk, removed) = {
                 let mut chain = ev.handler_chain.borrow_mut();
                 let removed = chain.split_off(i); // removed[0] = matched pair
-                (removed[0].1.clone(), removed)
+                (removed[0].0.clone(), removed[0].1.clone(), removed)
             };
-            let resumable = crate::builtins_iterative::condition_is_resumable(ev, &cond_class);
+            // Disposition is keyed on the *handler's declared class* (static,
+            // predictable for the handler author), not the signalled instance's
+            // class — see `class_is_resumable`.
+            let resumable = crate::builtins_iterative::class_is_resumable(ev, &handler_class);
             stack.push(Cont::SignalGuard { removed, resumable });
             push_block_frame(ev, &handler_blk, vec![condition], false, stack)?;
             Ok(())

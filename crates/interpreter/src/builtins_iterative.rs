@@ -2376,20 +2376,20 @@ pub(crate) fn signal_condition(
         // handlers disabled (only outer clusters active), so a re-signal from the
         // handler defers to an outer handler rather than re-matching this one.
         // Restore the disabled handlers afterward.
-        let (handler_block, removed) = {
+        let (handler_class, handler_block, removed) = {
             let mut chain = ev.handler_chain.borrow_mut();
             let removed = chain.split_off(i);
-            (removed[0].1.clone(), removed)
+            (removed[0].0.clone(), removed[0].1.clone(), removed)
         };
-        let resumable = condition_is_resumable(ev, &cond_class);
+        let resumable = class_is_resumable(ev, &handler_class);
         let outcome = ev.eval_block(&handler_block, vec![condition], env);
         ev.handler_chain.borrow_mut().extend(removed);
         // Disposition (docs/condition_system_guide.md §2): an explicit `resume:`
         // always resumes; `return:`/`retry`/re-signal propagate. On *normal*
-        // handler completion the default depends on the condition's kind: a
-        // resumable condition resumes (deliver the value to the signal point); a
-        // non-resumable one (an Error) ABORTS — a local unwind, expressed as an
-        // implicit `return:` of the handler's value.
+        // handler completion the default depends on the *handler's declared class*:
+        // a resumable class resumes (deliver the value to the signal point); a
+        // non-resumable one (an Error handler) ABORTS — a local unwind, expressed
+        // as an implicit `return:` of the handler's value.
         return match outcome {
             Err(EvalError::Resume(v)) => Ok(v),
             Ok(v) if resumable => Ok(v),
@@ -2401,19 +2401,34 @@ pub(crate) fn signal_condition(
     apply_unhandled_policy(ev, condition)
 }
 
-/// Whether a signalled condition resumes by default when a handler completes
-/// without invoking an explicit restart. Keyed on the `Error` hierarchy: `Error`
-/// (and subclasses) are non-resumable — handling one aborts (local unwind); every
-/// other `Condition` is resumable — handling resumes the signal point. See
+/// Whether a handler that completes without an explicit restart resumes (`true`)
+/// or aborts (`false`) by default.
+///
+/// Keyed on the **handler's declared class** — the class named at the handler site
+/// (`on: SomeClass do:` / `HandlerContext on: SomeClass do:`), NOT the concrete
+/// class of the signalled instance. This makes disposition static and predictable
+/// for the handler author: a handler declared for `Error` always aborts, even when
+/// the signalled condition is a resumable `Error` subclass. See
 /// `docs/condition_system_guide.md` §2.
 ///
-/// ⚠ Keys on the class hierarchy, not the overridable `isResumable` method — a
-/// per-class override of the *disposition* is a future refinement.
-pub(crate) fn condition_is_resumable(ev: &Evaluator, cond_class: &Arc<Class>) -> bool {
+/// Reads the class-side `isResumable` predicate by **constant-folding** its body
+/// (`^true` / `^false`) — pure AST inspection, so it never re-enters `step_loop`
+/// and adds no Rust stack depth (conditions subclass `Value`, so a real send would
+/// run inline). Falls back to the `Error`-hierarchy default when the predicate is
+/// absent or its body is not a literal `^true`/`^false`.
+pub(crate) fn class_is_resumable(ev: &Evaluator, handler_class: &Arc<Class>) -> bool {
+    if let Some((method, _)) = handler_class.lookup_class_method("isResumable")
+        && method.body.len() == 1
+        && let crate::ast::Stmt::Return(crate::ast::Expr::Lit(crate::ast::Literal::Bool(b))) =
+            &method.body[0]
+    {
+        return *b;
+    }
+    // Structural fallback: `Error` (and subclasses) non-resumable, else resumable.
     !ev.registry
         .kernel()
         .lookup_class("Error")
-        .map(|h| crate::class::Class::is_subclass_of(cond_class, &h.0.class))
+        .map(|h| crate::class::Class::is_subclass_of(handler_class, &h.0.class))
         .unwrap_or(false)
 }
 

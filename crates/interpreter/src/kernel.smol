@@ -630,18 +630,22 @@ Condition >> pvtFindRestart: name in: node [
 Condition >> hasRestart: name [ ^(self pvtFindRestart: name in: restarts) notNil ]
 Condition >> availableRestarts [ ^#() ]
 
+"Run the named restart block, passing it the condition so it may perform its own
+transfer (`c return:` / `c resume:` / `c retry`). A transfer unwinds before the
+enclosing `resume:` runs, so the block's choice wins; a block that completes
+normally defaults to resuming with its value."
 Condition >> invokeRestart: name [
     | blk |
     blk := self pvtFindRestart: name in: restarts.
     blk isNil ifTrue: [self error: 'no restart named: ', name].
-    ^self resume: blk value
+    ^self resume: (blk value: self)
 ]
 
 Condition >> invokeRestart: name with: arg [
     | blk |
     blk := self pvtFindRestart: name in: restarts.
     blk isNil ifTrue: [self error: 'no restart named: ', name].
-    ^self resume: (blk value: arg)
+    ^self resume: (blk value: self value: arg)
 ]
 
 Condition >> signal    [ ^self _primSignalCondition: self ]
@@ -650,11 +654,15 @@ Condition >> return: v [ ^self _primReturn: v ]
 Condition >> retry     [ ^self _primRetry ]
 
 "Resumability (guide §2): whether a handler that completes without an explicit
-restart resumes (true) or aborts (false). A `Condition` is resumable; `Error`
-overrides to non-resumable. NOTE: the signal machinery currently derives the
-disposition from the `Error` class hierarchy directly; this method is the
-Smol-visible mirror (a per-class override of the *disposition* is future work)."
-Condition >> isResumable [ ^true ]
+restart resumes (true) or aborts (false). This is a *class-level* policy keyed on
+the class named at the handler site (`on: SomeClass do:` / `HandlerContext on:
+SomeClass do:`), NOT the concrete class of the signalled instance — so a handler
+declared for `Error` always aborts, even for a resumable `Error` subclass. The
+signal machinery reads this class-side predicate (constant-folded, so it must
+return a literal `true`/`false`). `Condition` is resumable; `Error` overrides to
+non-resumable. The instance-side method delegates for Smol ergonomics."
+Condition class >> isResumable [ ^true ]
+Condition >> isResumable       [ ^self class isResumable ]
 
 Condition subclass: #Warning
     instanceVariableNames: ''
@@ -670,7 +678,7 @@ Condition subclass: #Error
     classVariableNames: ''
     indexedSlots: #none.
 
-Error >> isResumable [ ^false ]
+Error class >> isResumable [ ^false ]
 
 "Signaled when resolveWith:/rejectWith: is sent to an already-settled Future.
 Carries an #ignore restart so a handler can choose to keep the first resolution."
@@ -940,7 +948,7 @@ existing resolution (the late attempt becomes a no-op returning nil)."
 Future >> pvtSettle: won [
     won ifTrue: [ ^self ].
     ^((FutureAlreadyResolved withMessage: 'future already resolved')
-        addRestart: #ignore block: [ nil ]) signal
+        addRestart: #ignore block: [:c | nil ]) signal
 ]
 
 "Internal condition: signaled by the commit continuation once the block's work

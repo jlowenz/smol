@@ -610,14 +610,14 @@ Condition >> invokeRestart: name [
     | blk |
     blk := self pvtFindRestart: name in: restarts.
     blk isNil ifTrue: [self error: 'no restart named: ', name].
-    ^self resume: blk value
+    ^self resume: (blk value: self)
 ]
 
 Condition >> invokeRestart: name with: arg [
     | blk |
     blk := self pvtFindRestart: name in: restarts.
     blk isNil ifTrue: [self error: 'no restart named: ', name].
-    ^self resume: (blk value: arg)
+    ^self resume: (blk value: self value: arg)
 ]
 
 Condition >> signal    [ ^self _primSignalCondition: self ]

@@ -700,10 +700,12 @@ fn on_do_forces_its_body_future() {
 
 #[test]
 fn on_do_disposition_is_by_condition_kind() {
-    // Unified disposition (§2): a handler's normal return resumes a *resumable*
-    // condition and aborts a *non-resumable* one — for `on:do:` too, not just
-    // HandlerContext. A `Warning` (resumable) resumes past the signal; an `Error`
-    // (non-resumable) unwinds to the on:do:, yielding the handler's value.
+    // Unified disposition (§2): a handler's normal return resumes when its declared
+    // class is resumable and aborts when non-resumable — for `on:do:` too, not just
+    // HandlerContext. Here the handler class matches the condition kind: a `Warning`
+    // handler (resumable) resumes past the signal; an `Error` handler (non-resumable)
+    // unwinds to the on:do:, yielding the handler's value. (See
+    // `disposition_keys_on_handler_class_not_condition_class` for the distinction.)
     let resumes = r#"
         [ (Warning withMessage: 'w') signal. 'after-signal' ]
           on: Warning do: [:e | 'handled']
@@ -715,6 +717,36 @@ fn on_do_disposition_is_by_condition_kind() {
           on: Error do: [:e | 'handled']
     "#;
     assert_eq!(run_in_coroutine(aborts), str_val("handled"));
+}
+
+#[test]
+fn disposition_keys_on_handler_class_not_condition_class() {
+    // Resumability is determined by the class named at the handler site, NOT the
+    // concrete class of the signalled condition. A handler declared for `Error`
+    // aborts even when the actual condition is a resumable `Error` subclass — so
+    // handler authors get a static, predictable contract.
+    let src = r#"
+        Error subclass: #ResumableError instanceVariableNames: ''.
+        ResumableError class >> isResumable [ ^true ].
+        [ (ResumableError withMessage: 'e') signal. 'after-signal' ]
+          on: Error do: [:e | 'handled']
+    "#;
+    // Handler declared `Error` (non-resumable) → aborts, yields the handler value.
+    assert_eq!(run_in_coroutine(src), str_val("handled"));
+}
+
+#[test]
+fn disposition_resumes_when_handler_declares_resumable_class() {
+    // The flip side: when the handler is declared for the resumable subclass
+    // itself, its normal completion resumes past the signal.
+    let src = r#"
+        Error subclass: #ResumableError instanceVariableNames: ''.
+        ResumableError class >> isResumable [ ^true ].
+        [ (ResumableError withMessage: 'e') signal. 'after-signal' ]
+          on: ResumableError do: [:e | 'handled']
+    "#;
+    // Handler declared `ResumableError` (resumable) → resumes, block continues.
+    assert_eq!(run_in_coroutine(src), str_val("after-signal"));
 }
 
 #[test]

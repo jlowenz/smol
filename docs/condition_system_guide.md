@@ -26,45 +26,51 @@ highly-concurrent** runtime. That last fact drives most of the non-obvious rules
 
 ---
 
-## 2. Resumability is a property of the CONDITION, not the handler
+## 2. Resumability is keyed on the HANDLER's declared class
 
 The single most important rule. Following CL (`signal` vs `error`) and ANSI
 Smalltalk (`Exception >> isResumable`):
 
-- **`Error` (and subclasses) are non-resumable.** The default disposition when a
-  handler finishes *without* invoking an explicit restart is to **abort**
-  (locally unwind the protected computation).
+- **`Error` (and subclasses) are non-resumable.** When a handler *declared for*
+  `Error` finishes *without* invoking an explicit restart, the default disposition
+  is to **abort** (locally unwind the protected computation).
 - **`Condition` / `Warning` / `Notification` / control conditions (e.g.
-  `OkToCommit`) are resumable.** The default disposition is to **resume** the
-  signal point with the handler's value.
+  `OkToCommit`) are resumable.** A handler declared for one of these, on normal
+  completion, **resumes** the signal point with the handler's value.
 
-`Condition >> isResumable` encodes this. It is **not** a separate registry — it
-*is* the class-hierarchy check, expressed as an ordinary overridable method:
-`Error`'s `isResumable` answers false, `Warning`/`Notification` answer true, and
-subclasses inherit that by default. Because it's a method, a subclass **may
-override** it (a recoverable `Error` variant that answers true, say). That is the
-Smalltalk convention and the "we're all adults" default — the position in the
-hierarchy gives the sane default; the override is available when a subclass
-genuinely means something different. A handler may *also* override per-signal by
-explicitly invoking a restart (§4). So: hierarchy sets the default disposition,
-`isResumable` lets a class refine it, explicit restarts let a handler refine it —
-safe default **and** full control.
+The disposition is read from the class **named at the handler site** — the
+`SomeClass` in `on: SomeClass do:` / `HandlerContext on: SomeClass do:` — **not**
+the concrete runtime class of the signalled instance. This is deliberate: it gives
+the *handler author* a static, predictable contract. A handler written for `Error`
+assumes it unwinds; if disposition were read from the signalled instance, a
+resumable `Error` subclass could silently flip that handler from abort to resume,
+continuing an errored computation the author meant to abandon. Keying on the
+declared class removes that entire silent-bug class while still letting a signaler
+define a resumable subclass and a handler opt into it *by declaring that class*.
 
-Why keyed on the condition, not the handler: it matches every developer's mental
-model ("errors don't just continue"), it keeps a condition's behavior consistent
-wherever it's handled, and it removes an entire silent-bug class (a resuming
-handler accidentally continuing an errored computation).
+`isResumable` is a **class-side** method (`Condition class >> isResumable ^true`,
+`Error class >> isResumable ^false`; an instance-side `Condition >> isResumable`
+delegates for ergonomics). Subclasses inherit the sane default and **may override**
+(`MyRecoverableError class >> isResumable [ ^true ]`). A handler may *also* override
+per-signal by explicitly invoking a restart (§4). So: the declared class sets the
+disposition, a class-side override refines it, explicit restarts refine per-handler
+— safe default **and** full control.
 
 Implemented: `signal_condition` and the flattened `SignalGuard` path branch on
-`condition_is_resumable` — normal handler completion resumes a resumable condition
-and aborts (implicit local `return:`) a non-resumable one. This applies to **both**
-handler forms (see §3), so a `Warning` caught by an `on:do:` *resumes* past the
-signal — a deliberate divergence from classic Smalltalk (where `on:do:` always
-unwinds), chosen so disposition is one consistent rule keyed on the condition.
+`class_is_resumable(handler_class)` — the class of the *matched handler*, not the
+condition. `class_is_resumable` reads the class-side `isResumable` predicate by
+**constant-folding** its body (a literal `^true`/`^false`), so it performs no Smol
+send and never re-enters `step_loop` (conditions subclass `Value`, so a real send
+would run inline and rebuild Rust stack depth — the C31.5 regression). A predicate
+that is absent or not a bool literal falls back to the `Error`-hierarchy default.
+This applies to **both** handler forms (§3), so a `Warning` caught by an `on:do:`
+*resumes* past the signal — a deliberate divergence from classic Smalltalk (where
+`on:do:` always unwinds), chosen so disposition is one consistent rule.
 
-> ⚠ CURRENT: `condition_is_resumable` keys on the `Error` class hierarchy, not the
-> overridable `isResumable` *method* — a per-class override of the disposition is
-> future work. `isResumable` exists in the kernel as the Smol-visible mirror.
+> Contract: `isResumable` must be a class-side method returning a literal `true`
+> or `false`. A computed (instance-state-dependent) override is not honored — it
+> falls back to the hierarchy default — because resumability is a class-level
+> policy resolved without evaluating Smol in the signal path.
 
 ---
 
@@ -139,17 +145,24 @@ completes the control flow with a transfer. A restart may do several things and
 then `resume: v` (continue with a repaired value), `return: v` (abort the region),
 or `retry` — the restart *block itself* chooses the transfer.
 
-> ⚠ CURRENT: two gaps here. (1) `invokeRestart:` is `^self resume: blk value` — it
-> **hardcodes resume** and passes the restart block **no arguments** (not even the
-> condition). So today you cannot express a control restart like `#abort` that
-> unwinds, and a restart block can't see the condition unless it closed over it.
-> Target: the restart block receives the condition (so it can `e return:` / `e
-> resume:` explicitly), and `invokeRestart:` does not force resume — the block's
-> own transfer wins, defaulting to resume only if the block performs none.
+The restart block **receives the condition** as its first argument (and, for
+`invokeRestart:with:`, the supplied value as its second), so it can call
+`c return:` / `c resume:` / `c retry` explicitly. `invokeRestart:` does **not**
+force resume: it evaluates the block, and any transfer the block performs unwinds
+before the enclosing `resume:` is reached — so the block's own transfer wins. A
+block that completes normally defaults to resuming with its value. This makes
+control restarts like `#abort` expressible:
+
+```smalltalk
+"signaler offers an abort restart"
+e := e addRestart: #abort block: [:c | c return: 'aborted'].
+"handler chooses it — unwinds the region rather than resuming"
+... on: Error do: [:e | e invokeRestart: #abort]
+```
 
 The **default disposition** (§2) is simply the implicit restart chosen when the
-handler returns without invoking one: `resume:` for resumable conditions, an
-implicit local `return:` (abort) for non-resumable ones.
+handler returns without invoking one: `resume:` when the handler's declared class
+is resumable, an implicit local `return:` (abort) when it is not.
 
 ---
 

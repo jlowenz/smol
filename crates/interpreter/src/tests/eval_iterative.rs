@@ -715,7 +715,7 @@ fn cascade_binary_message() {
 
 #[test]
 fn on_do_non_matching_inner_handler_propagates() {
-    // OnDoCatch: signal class doesn't match handler class (eval_iterative.rs lines 356-357).
+    // Unified handler_chain lookup: signal class doesn't match inner handler's class.
     // Inner on:do: catches OrderedCollection but signal is Error → propagates to outer.
     let src = "
         | result |
@@ -731,9 +731,8 @@ fn on_do_non_matching_inner_handler_propagates() {
 
 #[test]
 fn on_do_handler_re_signals_propagates_to_outer() {
-    // HandleOnDoResult other-error arm (eval_iterative.rs lines 383-385):
-    // an error raised inside an on:do: handler is not Retry/Resume/ReturnFromBlock,
-    // so it keeps scanning and is caught by the outer on:do:.
+    // An error raised inside an on:do: handler is a fresh signal that finds the
+    // outer handler via the ordered handler_chain walk.
     let src = "
         | result |
         result := ValueHolder initialValue: 'none'.
@@ -748,7 +747,6 @@ fn on_do_handler_re_signals_propagates_to_outer() {
 
 #[test]
 fn on_do_resume_with_value() {
-    // HandleOnDoResult Resume arm (eval_iterative.rs lines 375-377):
     // handler calls resume: which delivers a value back through on:do:.
     let src = "
         [Error signal: 'x'] on: Error do: [:e | e resume: 99]
