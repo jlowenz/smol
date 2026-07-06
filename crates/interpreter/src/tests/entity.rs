@@ -22,6 +22,7 @@ fn future_already_resolved_returns_immediately() {
     assert_eq!(fut.wait(), Ok(Value::Int(7))); // idempotent reads
 }
 
+#[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "FutureHandle resolved twice")]
 fn future_double_resolve_panics_in_debug() {

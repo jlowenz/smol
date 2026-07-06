@@ -5,6 +5,9 @@ default:
 test:
     cargo nextest run --workspace
 
+rel-test:
+    cargo nextest run --workspace --release
+
 # Fallback test runner using built-in cargo test.
 test-cargo:
     cargo test --workspace
