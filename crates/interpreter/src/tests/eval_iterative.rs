@@ -75,7 +75,7 @@ fn step_probe_nested_then() {
   [2] then: [:b |
     [3] then: [:c |
       [4] then: [:d |
-        [5] then: [:e | 6 ]]]]]
+        [5] then: [:e | 6 ] orElse: #reject] orElse: #reject] orElse: #reject] orElse: #reject] orElse: #reject
 "#;
     let r = eval_probe(src);
     eprintln!(

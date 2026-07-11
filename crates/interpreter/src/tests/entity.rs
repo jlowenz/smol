@@ -671,7 +671,7 @@ fn hc_then_signal_resolves_future_within_entity() {
             ((HandlerContext new
                 on: OkToCommit do: [:c | txf resolveWith: c value. c resume: nil])
                 on: Error do: [:e | txf rejectWith: e. e return: nil])
-              run: [ 42 then: [:v | (OkToCommit value: 99) signal ] ].
+              run: [ 42 then: [:v | (OkToCommit value: 99) signal ] orElse: #reject ].
             ^txf
         ]
         | c |

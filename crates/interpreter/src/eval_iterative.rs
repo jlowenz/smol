@@ -307,18 +307,11 @@ pub(crate) enum Cont {
         ensure_blk: Arc<crate::value::Block>,
     },
 
-    /// Sits below a `then:` receiver-block frame. After the receiver block
-    /// evaluates, inspects its result: a `Future` is handed to the async `then:`
-    /// path (spawns a continuation coroutine); any other value runs the
-    /// continuation block on the step-loop stack. This keeps the synchronous
-    /// `then:` arms off the Rust call stack (no recursive `eval_block`).
-    ThenCheck {
-        cont_blk: Arc<crate::value::Block>,
-        env: Env,
-    },
-
-    /// Like `ThenCheck`, but for `then:orElse:`: carries the rejection arm so a
-    /// future-yielding receiver block is handed to the async `then:orElse:` path.
+    /// Sits below a `then:orElse:` receiver-block frame. After the receiver block
+    /// evaluates, inspects its result: a `Future` is handed to the async
+    /// `then:orElse:` path (spawns a continuation coroutine), carrying the rejection
+    /// arm; any other value runs the continuation block on the step-loop stack. This
+    /// keeps the synchronous arms off the Rust call stack (no recursive `eval_block`).
     ThenCheckOrElse {
         cont_blk: Arc<crate::value::Block>,
         else_val: Value,
@@ -896,29 +889,6 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 let body_result = acc.clone();
                 stack.push(Cont::RestoreAcc { value: body_result });
                 push_block_frame(ev, &ensure_blk, vec![], false, &mut stack)?;
-            }
-
-            // ── ThenCheck (then: receiver-block completed) ────────────────
-            Cont::ThenCheck { cont_blk, mut env } => {
-                let recv_result = std::mem::replace(&mut acc, Value::Nil);
-                match recv_result {
-                    // Receiver yielded a future: hand off to the async `then:`
-                    // path, which spawns a continuation coroutine (fresh stack).
-                    Value::Future(_) => {
-                        acc = crate::builtins::dispatch(
-                            ev,
-                            recv_result,
-                            Arc::from("then:"),
-                            vec![Value::Block(cont_blk)],
-                            &mut env,
-                        )?;
-                    }
-                    // Non-future: run the continuation on the step-loop stack with
-                    // the receiver's (resolved) value; its result becomes the result.
-                    other => {
-                        push_block_frame(ev, &cont_blk, vec![other], false, &mut stack)?;
-                    }
-                }
             }
 
             // ── ThenCheckOrElse (then:orElse: receiver-block completed) ────
@@ -1793,55 +1763,22 @@ fn dispatch_to_stack(
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
-    // `then:` must see the raw receiver (including Futures) so that
-    // `Future then: [blk]` chains asynchronously without eager resolution.
+    // `then:orElse:` must see the raw receiver (including Futures) so that
+    // `Future then: [blk] orElse: eb` chains asynchronously without eager resolution.
     //
     // The synchronous arms (resolved-value receiver, or block receiver that
     // yields a non-future) run the continuation on the step-loop `Cont` stack
-    // rather than via a recursive `eval_block`, so deep `then:` chains do not
-    // grow the Rust coroutine stack. The genuine-Future arm spawns a
+    // rather than via a recursive `eval_block`, so deep `then:orElse:` chains do
+    // not grow the Rust coroutine stack. The genuine-Future arm spawns a
     // continuation coroutine (fresh stack), delegated to the builtins handler.
     //
     // This early interception (before `force_value` below) exists *only* to avoid
     // eagerly forcing a raw `Value::Future` receiver — chaining is the whole point.
     // A `Value::Instance` (e.g. the explicit `Future`) is never force-blocked, so it
-    // falls through to ordinary user-method lookup, letting `Future >> then:`
-    // delegate to its handle. That keeps `then:` symmetric with `await`.
-    if selector.as_ref() == "then:" && !matches!(&receiver, Value::Instance(_)) {
-        if args.len() != 1 {
-            return Err(EvalError::ArityMismatch {
-                expected: 1,
-                got: args.len(),
-            });
-        }
-        let cont_blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
-        match receiver {
-            // Genuine future: async spawn (no Rust stack growth).
-            Value::Future(_) => {
-                *acc = crate::builtins::dispatch(
-                    ev,
-                    receiver,
-                    selector,
-                    vec![Value::Block(cont_blk)],
-                    env,
-                )?;
-            }
-            // Block receiver: evaluate it on the step-loop stack (unforced, so a
-            // future result is visible), then `ThenCheck` decides.
-            Value::Block(ref blk) => {
-                stack.push(Cont::ThenCheck {
-                    cont_blk,
-                    env: env.clone(),
-                });
-                push_block_frame(ev, blk, vec![], false, stack)?;
-            }
-            // Already-resolved value: run the continuation with that value.
-            other => {
-                push_block_frame(ev, &cont_blk, vec![other], false, stack)?;
-            }
-        }
-        return Ok(());
-    }
+    // falls through to ordinary user-method lookup, letting `Future >> then:orElse:`
+    // delegate to its handle. That keeps chaining symmetric with `await`.
+    //
+    // (Bare `then:` was removed — it did not cover the reject outcome.)
     if selector.as_ref() == "then:orElse:" && !matches!(&receiver, Value::Instance(_)) {
         if args.len() != 2 {
             return Err(EvalError::ArityMismatch {
