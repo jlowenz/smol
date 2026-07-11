@@ -33,7 +33,7 @@ Rust source only, so `just cov` numbers say nothing about Smol kernel code cover
 
 `COROUTINE_STACK_SIZE` in `entity.rs` is given in **`usize` words** (`may`'s `set_stack_size` multiplies by 8 bytes), so `0x8000` = **256 KB**, not 32 KB (an earlier note had the unit wrong). As of C31.5 it is split by build: **debug = 256 KB** (`0x8000`), **release = 64 KB** (`0x2000`). Debug match-arm locals are laid out non-overlapping, so debug frames are ~8× release; the split keeps dev headroom while sizing release for per-entity density.
 
-C31.5 flattened **all** synchronous nesting in the iterative path onto the heap `Cont` stack — instance/class method calls, `value`/`on:do:`/`ensure:`/`then:`, `HandlerContext run:`, signals (CL handler-scoping), value construction (`_primNewValue:`), all iteration (`to:do:` and everything built on it), and `Namespace do:` — so the Rust stack per coroutine is a small constant independent of Smol nesting depth (nested loops / `then:` / `Namespace do:` = `step_loop` depth 1). The remaining per-dispatch cost is the depth of one builtin-dispatch chain (~5 KB release / ~40 KB debug). A debug-only `step_probe` Cargo feature (`probe::ProbeState` on `Evaluator`) measures `step_loop` depth and per-level Rust-stack deltas. The only `eval_block` → `step_loop` recursions left are intentionally async (genuine-`Future` `then:` continuations and timer callbacks each run in a fresh `may` coroutine) and the recursive-evaluator fallback arms (not used by the iterative path).
+C31.5 flattened **all** synchronous nesting in the iterative path onto the heap `Cont` stack — instance/class method calls, `value`/`on:do:`/`ensure:`/`then:`, `HandlerContext run:`, signals (CL handler-scoping), value construction (`_primNewValue:`), all iteration (`to:do:` and everything built on it), and `Namespace do:` — so the Rust stack per coroutine is a small constant independent of Smol nesting depth (nested loops / `then:` / `Namespace do:` = `step_loop` depth 1). The remaining per-dispatch cost is the depth of one builtin-dispatch chain (~5 KB release / ~40 KB debug). A debug-only `step_probe` Cargo feature (`probe::ProbeState` on `Evaluator`) measures `step_loop` depth and per-level Rust-stack deltas. The only `eval_block` → `step_loop` recursions left are intentionally async (genuine-`Future` `then:` continuations and timer callbacks each run in a fresh `may` coroutine).
 
 ### Futures
 
@@ -68,23 +68,26 @@ Claude Code to do the audit explicitly; it has done this successfully as of chun
 Neither item blocks ongoing chunk work; both should be scheduled before the
 kernel grows significantly beyond its current size.
 
-### Two-path evaluator architecture (C29.8)
+### Single evaluator (recursive path retired)
 
-The interpreter has two independent evaluation paths:
+The interpreter has one evaluation path: the **iterative** evaluator
+(`eval.rs` + `eval_iterative.rs`, kernel `kernel.smol`, entry
+`Evaluator::eval_program`). Dispatch is `builtins_iterative.rs`
+(`dispatch(ev: &Evaluator, ...)`); block-eval ops are handled by
+`dispatch_to_stack` + `push_block_frame`. `builtins.rs` is a re-export shim for
+`builtins_iterative` (backward compat).
 
-| Path | Module | Kernel | Entry point |
-|------|--------|--------|-------------|
-| Iterative | `eval.rs` + `eval_iterative.rs` | `kernel.smol` (Smol-recursive loops + TCO) | `Evaluator::eval_program` / `IEvaluator::eval_program` |
-| Recursive | `eval_recursive.rs` | `kernel_recursive.smol` (`_primWhileTrue:` etc.) | `RecursiveEvaluator::eval_program` |
-
-Dispatch:
-- Iterative: `builtins_iterative.rs` (`dispatch(ev: &Evaluator, ...)`) — block-eval ops handled by `dispatch_to_stack` + `push_block_frame`.
-- Recursive: `builtins_recursive.rs` (`dispatch(ev: &RecursiveEvaluator, ...)`) — includes `ensure:`, `on:do:`, `syncValue`, `ifNil:` family.
-- `builtins.rs` is a re-export shim for `builtins_iterative` (backward compat).
-
-`test_helpers::eval(src)` runs both paths independently and asserts they agree on results.
-
-To retire the recursive evaluator: `git rm eval_recursive.rs builtins_recursive.rs kernel_recursive.smol` + remove from `lib.rs` + simplify `test_helpers.rs` to run one evaluator.
+The former recursive evaluator (`eval_recursive.rs`, `builtins_recursive.rs`,
+`kernel_recursive.smol`) was retired (2026-07). It had provided a differential
+cross-check during the iterative evaluator's construction (C29–C31.5), but its
+independence was largely illusory: collections (`Array`/`OrderedCollection`/
+`Dictionary`) are `Object` subclasses (entities), and *all* entity message
+handlers run on the iterative evaluator (`run_entity_loop`), so any collection- or
+entity-involving code already executed iterative dispatch regardless of the
+top-level evaluator. The `then:` arity change (blocks became 1-arg, receiving the
+resolved value) exposed this coupling and prompted removal. `test_helpers::eval`,
+`eval_diff`, and `eval_err_diff` all now run the iterative evaluator only
+(`eval_diff`/`eval_err_diff` are retained as aliases so call sites are unchanged).
 
 ## Preferences and Rules
 
