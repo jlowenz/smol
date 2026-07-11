@@ -68,7 +68,7 @@ Array >> inject: init into: aBlock [
     holder := ValueHolder initialValue: init.
     ^[self do: [:each |
         holder update: [:acc | aBlock value: acc value: each]
-    ]] then: [holder get] orElse: #reject
+    ]] then: [:done | holder get] orElse: #reject
 ]
 
 Array >> includes: v [
@@ -103,7 +103,7 @@ Array >> printString [
     holder := ValueHolder initialValue: '('.
     ^[self do: [:each |
         holder update: [:s | s , each printString , ' ']
-    ]] then: [holder get , ')'] orElse: #reject
+    ]] then: [:done | holder get , ')'] orElse: #reject
 ]
 
 "ByteArray — fixed-size indexed collection of byte (0..255) slots."
@@ -140,7 +140,7 @@ ByteArray >> printString [
     holder := ValueHolder initialValue: '('.
     ^[self do: [:each |
         holder update: [:s | s , each printString , ' ']
-    ]] then: [holder get , ')'] orElse: #reject
+    ]] then: [:done | holder get , ')'] orElse: #reject
 ]
 
 "OrderedCollection — growable sequence backed by an Array."
@@ -219,7 +219,7 @@ OrderedCollection >> pvtRemoveAt: idx [
 OrderedCollection >> remove: v ifAbsent: aBlock [
     0 to: size - 1 do: [:i |
         (storage at: i) = v ifTrue: [
-            (self pvtRemoveAt: i) then: [^v] orElse: #reject
+            (self pvtRemoveAt: i) then: [:done | ^v] orElse: #reject
         ]
     ].
     ^aBlock value
@@ -269,7 +269,7 @@ OrderedCollection >> inject: init into: aBlock [
     holder := ValueHolder initialValue: init.
     ^[self do: [:each |
         holder update: [:acc | aBlock value: acc value: each]
-    ]] then: [holder get] orElse: #reject
+    ]] then: [:done | holder get] orElse: #reject
 ]
 
 OrderedCollection >> includes: v [
@@ -302,7 +302,7 @@ OrderedCollection >> printString [
     holder := ValueHolder initialValue: 'OrderedCollection ('.
     ^[self do: [:each |
         holder update: [:s | s , each printString , ' ']
-    ]] then: [holder get , ')'] orElse: #reject
+    ]] then: [:done | holder get , ')'] orElse: #reject
 ]
 
 OrderedCollection >> pvtGrow [
@@ -573,7 +573,7 @@ Dictionary >> printString [
     holder := ValueHolder initialValue: 'Dictionary ('.
     ^[self associationsDo: [:assoc |
         holder update: [:s | s , assoc printString , ' ']
-    ]] then: [holder get , ')'] orElse: #reject
+    ]] then: [:done | holder get , ')'] orElse: #reject
 ]
 
 Dictionary >> pvtRehash [
@@ -875,6 +875,37 @@ Timer >> pvtTimerFired [ ^block value ]
 Timer >> cancel        [ self _primCancelTimer: handle ]
 Timer >> isPending     [ ^self _primTimerPending: handle ]
 
+"── TCP sockets (C-web spike) ─────────────────────────────────────────────────"
+"Passive value wrappers over opaque OS socket handles (same shape as Timer). The
+ `accept`/`read`/`write:` prims run their parking I/O on a fresh coroutine and
+ answer a Future, so the async-everywhere model holds — chain with `then:orElse:`."
+
+Value subclass: #TcpSocket
+    instanceVariableNames: 'handle'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+TcpSocket class >> pvtWrapping: h [ ^self _primNewValue: [:s | s pvtHandle: h] ]
+TcpSocket >> pvtHandle: h    [ handle := h ]
+TcpSocket >> read            [ ^self _primTcpRead: handle ]          "Future of Str; '' = EOF"
+TcpSocket >> write: aString  [ ^self _primTcpWrite: handle with: aString ]  "Future of Int"
+TcpSocket >> close           [ ^self _primTcpClose: handle ]
+
+Value subclass: #TcpListener
+    instanceVariableNames: 'handle'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+TcpListener class >> onPort: port [
+    ^self _primNewValue: [:l | l pvtHandle: (self _primTcpListen: port)]
+]
+TcpListener >> pvtHandle: h [ handle := h ]
+"Answer a Future of the next inbound TcpSocket; rejection propagates down-chain.
+ the resolved handle is passed to the `then:` block (1-arg)."
+TcpListener >> accept [
+    ^(self _primTcpAccept: handle) then: [:h | TcpSocket pvtWrapping: h] orElse: #reject
+]
+
 "── World ────────────────────────────────────────────────────────────────────"
 "Environment-level queries over the live entity registry."
 Object subclass: #World
@@ -1022,7 +1053,7 @@ Transaction >> pvtRunAtomic: aBlock [
         on: Error do: [:e | self pvtRollback. txf rejectWith: e]))
       run: [ | f |
         f := aBlock value: self.
-        f then: [ (OkToCommit value: f await) signal ] orElse: #signal ].
+        f then: [:val | (OkToCommit value: val) signal ] orElse: #signal ].
     ^TxResult transaction: self result: txf
 ]
 
@@ -1111,7 +1142,7 @@ Transaction >> pvtStmAttempt: aBlock result: txf retriesLeft: n [
         on: Error do: [:e | self pvtStmRollback. self pvtMarkAborted. txf rejectWith: e]))
       run: [ | f |
         f := aBlock value: self.
-        f then: [ (OkToCommit value: f await) signal ] orElse: #signal ]
+        f then: [:val | (OkToCommit value: val) signal ] orElse: #signal ]
 ]
 
 "Two-phase commit. Phase 1: prepare (try-lock + validate) every participant.

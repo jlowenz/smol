@@ -199,10 +199,10 @@ fn dispatch_then(
             may::go!(move || {
                 match future.wait() {
                     Err(e) => result_reply.resolve_err(e),
-                    Ok(_) => {
+                    Ok(v) => {
                         let then_ev = ctx.into_evaluator();
                         let mut dummy_env = crate::env::Env::new();
-                        let result = then_ev.eval_block(&blk, vec![], &mut dummy_env);
+                        let result = then_ev.eval_block(&blk, vec![v], &mut dummy_env);
                         match result {
                             Ok(v) => match force_value(&then_ev, v) {
                                 Ok(forced) => result_reply.resolve_ok(forced),
@@ -228,10 +228,10 @@ fn dispatch_then(
                     may::go!(move || {
                         match future.wait() {
                             Err(e) => result_reply.resolve_err(e),
-                            Ok(_) => {
+                            Ok(v) => {
                                 let then_ev = ctx.into_evaluator();
                                 let mut dummy_env = crate::env::Env::new();
-                                let r = then_ev.eval_block(&cont_blk, vec![], &mut dummy_env);
+                                let r = then_ev.eval_block(&cont_blk, vec![v], &mut dummy_env);
                                 match r {
                                     Ok(v) => match force_value(&then_ev, v) {
                                         Ok(forced) => result_reply.resolve_ok(forced),
@@ -245,12 +245,12 @@ fn dispatch_then(
                     });
                     Ok(Value::Future(result_future))
                 }
-                _ => ev.eval_block(&cont_blk, vec![], env),
+                other => ev.eval_block(&cont_blk, vec![other], env),
             }
         }
-        _ => {
+        already_resolved => {
             let blk = as_block(ev, blk_val, selector)?;
-            ev.eval_block(&blk, vec![], env)
+            ev.eval_block(&blk, vec![already_resolved], env)
         }
     }
 }
@@ -323,9 +323,9 @@ fn dispatch_then_or_else(
                 let then_ev = ctx.into_evaluator();
                 match future.wait() {
                     Err(e) => run_reject_arm(&then_ev, else_val, e, &result_reply),
-                    Ok(_) => {
+                    Ok(v) => {
                         let mut dummy_env = crate::env::Env::new();
-                        match then_ev.eval_block(&blk, vec![], &mut dummy_env) {
+                        match then_ev.eval_block(&blk, vec![v], &mut dummy_env) {
                             Ok(v) => match force_value(&then_ev, v) {
                                 Ok(forced) => result_reply.resolve_ok(forced),
                                 Err(e) => result_reply.resolve_err(e),
@@ -351,9 +351,9 @@ fn dispatch_then_or_else(
                         let then_ev = ctx.into_evaluator();
                         match future.wait() {
                             Err(e) => run_reject_arm(&then_ev, else_val, e, &result_reply),
-                            Ok(_) => {
+                            Ok(v) => {
                                 let mut dummy_env = crate::env::Env::new();
-                                match then_ev.eval_block(&then_blk, vec![], &mut dummy_env) {
+                                match then_ev.eval_block(&then_blk, vec![v], &mut dummy_env) {
                                     Ok(v) => match force_value(&then_ev, v) {
                                         Ok(forced) => result_reply.resolve_ok(forced),
                                         Err(e) => result_reply.resolve_err(e),
@@ -367,13 +367,13 @@ fn dispatch_then_or_else(
                     Ok(Value::Future(result_future))
                 }
                 // Receiver already resolved (no rejection possible): run then-block.
-                _ => ev.eval_block(&then_blk, vec![], env),
+                other => ev.eval_block(&then_blk, vec![other], env),
             }
         }
         // Already-resolved value: run then-block; else arm cannot fire.
-        _ => {
+        already_resolved => {
             let blk = as_block(ev, then_val, selector)?;
-            ev.eval_block(&blk, vec![], env)
+            ev.eval_block(&blk, vec![already_resolved], env)
         }
     }
 }
@@ -535,6 +535,20 @@ pub(crate) fn as_int(ev: &Evaluator, v: Value, selector: &Arc<str>) -> Result<i6
         Value::Int(n) => Ok(n),
         _ => Err(EvalError::TypeError(format!(
             "{selector}: argument must be Int"
+        ))),
+    }
+}
+
+/// Coerce a value to an opaque OS handle (from `Value::Handle`), forcing futures.
+pub(crate) fn as_handle(
+    ev: &Evaluator,
+    v: Value,
+    selector: &Arc<str>,
+) -> Result<crate::os_interface::OsHandle, EvalError> {
+    match force_value(ev, v)? {
+        Value::Handle(h) => Ok(h),
+        _ => Err(EvalError::TypeError(format!(
+            "{selector}: argument must be an OS Handle"
         ))),
     }
 }
@@ -2027,6 +2041,88 @@ fn obj_prim_timers(
                 }
             }
         }
+        // ── TCP sockets (C-web spike) ──────────────────────────────────────────
+        // `accept`/`read`/`write` return a Future resolved from a fresh may
+        // coroutine that performs the parking I/O, preserving async-everywhere.
+        // `_primTcpListen:` is class-side (see dispatch_class_builtin); these four
+        // are sent to `self` on the socket/listener *values*.
+        "_primTcpAccept:" => {
+            // Requires: args[0] is a listener Handle. Returns a Future of a stream Handle.
+            expect_arity(sel, 1, args.len())?;
+            let listener = as_handle(ev, args.remove(0), sel)?;
+            let fh = FutureHandle::new();
+            let (fh2, os, registry) = (fh.clone(), ev.os.clone(), ev.registry.clone());
+            may::go!(move || match os.tcp_accept(&listener) {
+                Ok(stream) => {
+                    fh2.try_resolve_ok(Value::Handle(stream));
+                }
+                Err(e) => {
+                    fh2.try_resolve_err(EvalError::Signal(make_error_value(
+                        &registry,
+                        &format!("tcp_accept failed: {e}"),
+                    )));
+                }
+            });
+            Value::Future(fh)
+        }
+        "_primTcpRead:" => {
+            // Requires: args[0] is a stream Handle. Returns a Future of a Str
+            // (utf8-lossy; empty string means EOF). Spike: single read, ≤64 KiB.
+            expect_arity(sel, 1, args.len())?;
+            let stream = as_handle(ev, args.remove(0), sel)?;
+            let fh = FutureHandle::new();
+            let (fh2, os, registry) = (fh.clone(), ev.os.clone(), ev.registry.clone());
+            may::go!(move || match os.tcp_read(&stream, 65536) {
+                Ok(bytes) => {
+                    let s = String::from_utf8_lossy(&bytes);
+                    fh2.try_resolve_ok(Value::Str(Arc::from(s.as_ref())));
+                }
+                Err(e) => {
+                    fh2.try_resolve_err(EvalError::Signal(make_error_value(
+                        &registry,
+                        &format!("tcp_read failed: {e}"),
+                    )));
+                }
+            });
+            Value::Future(fh)
+        }
+        "_primTcpWrite:with:" => {
+            // Requires: args[0] stream Handle, args[1] a Str. Returns a Future of the
+            // Int byte count written.
+            expect_arity(sel, 2, args.len())?;
+            let stream = as_handle(ev, args.remove(0), sel)?;
+            let data = force_value(ev, args.remove(0))?;
+            let bytes: Vec<u8> = match data {
+                Value::Str(s) => s.as_bytes().to_vec(),
+                other => {
+                    return Err(EvalError::TypeError(format!(
+                        "_primTcpWrite:with: expects a Str, got {}",
+                        other.kind()
+                    )));
+                }
+            };
+            let fh = FutureHandle::new();
+            let (fh2, os, registry) = (fh.clone(), ev.os.clone(), ev.registry.clone());
+            may::go!(move || match os.tcp_write(&stream, &bytes) {
+                Ok(n) => {
+                    fh2.try_resolve_ok(Value::Int(n as i64));
+                }
+                Err(e) => {
+                    fh2.try_resolve_err(EvalError::Signal(make_error_value(
+                        &registry,
+                        &format!("tcp_write failed: {e}"),
+                    )));
+                }
+            });
+            Value::Future(fh)
+        }
+        "_primTcpClose:" => {
+            // Requires: args[0] is a stream Handle. Synchronous shutdown; answers nil.
+            expect_arity(sel, 1, args.len())?;
+            let stream = as_handle(ev, args.remove(0), sel)?;
+            ev.os.tcp_close(&stream);
+            Value::Nil
+        }
         _ => return Ok(None),
     }))
 }
@@ -2887,6 +2983,22 @@ pub(crate) fn dispatch_class_builtin(
             });
             let handle = ev.os.schedule_timer(ms, callback);
             Ok(Value::Handle(handle))
+        }
+        "_primTcpListen:" => {
+            // Class-side (sent to `self` = the listener's class in `onPort:`).
+            // Requires: args[0] is a port Int in [0, 65535]. Returns Value::Handle.
+            expect_arity(&selector, 1, args.len())?;
+            let port = as_int(ev, args.remove(0), &selector)?;
+            let port = u16::try_from(port).map_err(|_| {
+                EvalError::TypeError("_primTcpListen: port out of range 0..=65535".into())
+            })?;
+            match ev.os.tcp_listen(port) {
+                Ok(h) => Ok(Value::Handle(h)),
+                Err(e) => Err(EvalError::Signal(make_error_value(
+                    &ev.registry,
+                    &format!("tcp_listen failed: {e}"),
+                ))),
+            }
         }
         "_primNew:" => {
             expect_arity(&selector, 1, args.len())?;

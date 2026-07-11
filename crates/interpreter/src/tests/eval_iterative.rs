@@ -71,11 +71,11 @@ fn step_probe_nested_then() {
     // Right-nested then:: each continuation block itself evaluates another
     // `[..] then: [..]`. All synchronous (Int results), so no parking/migration.
     let src = r#"
-[1] then: [
-  [2] then: [
-    [3] then: [
-      [4] then: [
-        [5] then: [ 6 ]]]]]
+[1] then: [:a |
+  [2] then: [:b |
+    [3] then: [:c |
+      [4] then: [:d |
+        [5] then: [:e | 6 ]]]]]
 "#;
     let r = eval_probe(src);
     eprintln!(

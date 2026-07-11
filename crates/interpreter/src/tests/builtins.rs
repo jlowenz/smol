@@ -1456,19 +1456,33 @@ fn if_not_nil_if_nil_non_nil_receiver() {
 
 #[test]
 fn then_on_non_future_runs_block_synchronously() {
-    assert_eq!(eval_diff("42 then: [99]"), Value::Int(99));
-    assert_eq!(eval_diff("'hi' then: [1]"), Value::Int(1));
-    assert_eq!(eval_diff("nil then: [true]"), Value::Bool(true));
+    // then: blocks are 1-arg: they receive the resolved receiver value (iterative
+    // path only — the recursive evaluator retains the legacy 0-arg then:).
+    assert_eq!(eval("42 then: [:v | 99]"), Value::Int(99));
+    assert_eq!(eval("'hi' then: [:v | 1]"), Value::Int(1));
+    assert_eq!(eval("nil then: [:v | true]"), Value::Bool(true));
+}
+
+#[test]
+fn then_passes_resolved_value_to_block() {
+    // The resolved receiver value is delivered as the block argument.
+    assert_eq!(eval("42 then: [:v | v + 1]"), Value::Int(43));
+    assert_eq!(eval("[10 * 4] then: [:v | v + 2]"), Value::Int(42));
+    // Future receiver: the resolved value flows into the block.
+    assert_eq!(
+        eval("| f | f := Future new. f resolveWith: 40. (f then: [:v | v + 2]) await"),
+        Value::Int(42)
+    );
 }
 
 #[test]
 fn then_on_block_evaluates_receiver_then_continuation() {
     // Receiver block runs first, then continuation runs synchronously (result is not a Future).
-    assert_eq!(eval_diff("[1 + 1] then: [42]"), Value::Int(42));
+    assert_eq!(eval("[1 + 1] then: [:v | 42]"), Value::Int(42));
     // Continuation can read values established before the receiver block ran.
     assert_eq!(
-        eval_diff(
-            "| holder | holder := ValueHolder initialValue: 0. [holder set: 7] then: [holder get]"
+        eval(
+            "| holder | holder := ValueHolder initialValue: 0. [holder set: 7] then: [:v | holder get]"
         ),
         Value::Int(7)
     );
@@ -1480,13 +1494,12 @@ fn then_on_block_with_future_result_chains_async() {
     let src = r#"
 | holder |
 holder := ValueHolder initialValue: 0.
-[holder set: 99] then: [holder get]
+[holder set: 99] then: [:v | holder get]
 "#;
     // holder set: returns a Future (cross-entity send to holder entity);
     // but since [holder set: 99] evaluates to the Future returned by set:,
-    // the continuation [holder get] chains after it.
-    // The resolved result is 99.
-    assert_eq!(eval_diff(src), Value::Int(99));
+    // the continuation [:v | holder get] chains after it. The resolved result is 99.
+    assert_eq!(eval(src), Value::Int(99));
 }
 
 #[test]
@@ -1495,9 +1508,9 @@ fn then_on_block_loop_then_read() {
     let src = r#"
 | holder |
 holder := ValueHolder initialValue: 0.
-[3 timesRepeat: [holder update: [:n | n + 1]]] then: [holder get]
+[3 timesRepeat: [holder update: [:n | n + 1]]] then: [:v | holder get]
 "#;
-    assert_eq!(eval_diff(src), Value::Int(3));
+    assert_eq!(eval(src), Value::Int(3));
 }
 
 // ── then: on Future receiver ──────────────────────────────────────────────────
@@ -1511,7 +1524,7 @@ fn then_on_future_receiver_chains_after_resolution() {
     let src = r#"
 | vh |
 vh := ValueHolder initialValue: 0.
-(vh set: 42) then: [vh get]
+(vh set: 42) then: [:v | vh get]
 "#;
     assert_eq!(eval(src), Value::Int(42));
 }

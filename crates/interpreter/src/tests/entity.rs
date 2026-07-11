@@ -585,6 +585,61 @@ fn run_in_coroutine(src: &str) -> Value {
 }
 
 #[test]
+fn tcp_server_serves_one_request_roundtrip() {
+    // C-web spike end-to-end: a Smol server binds a listener, accepts one
+    // connection, reads the request, writes a response containing "Hello", and
+    // closes. A plain std::net client (this thread) drives it. Exercises the full
+    // async socket path: _primTcpListen:/Accept:/Read:/Write:/Close: + Future
+    // chaining resolved from I/O coroutines.
+    use std::io::{Read as _, Write as _};
+
+    crate::entity::init_coroutine_stack();
+    let base_ev = crate::eval::Evaluator::new();
+    let registry = base_ev.registry.clone();
+    // Port chosen to be uncommon; the client retry-connects to absorb the bind race.
+    let port = 47653u16;
+    let src = format!(
+        r#"
+        | listener sock req |
+        listener := TcpListener onPort: {port}.
+        sock := listener accept await.
+        req := sock read await.
+        (sock write: 'HTTP/1.1 200 OK Hello') await.
+        sock close.
+        'served'
+        "#
+    );
+    let prog = crate::parser::Parser::parse(&src).expect("parse");
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    may::go!(move || {
+        let ev = crate::eval::Evaluator::with_registry(registry);
+        let mut env = crate::env::Env::new();
+        ev.registry.populate_env(&mut env);
+        let v = ev.eval_program(&prog.stmts, &mut env).expect("server eval");
+        tx.send(v).unwrap();
+    });
+
+    // Client: retry-connect to absorb the server's bind latency.
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream = None;
+    for _ in 0..100 {
+        if let Ok(s) = std::net::TcpStream::connect(&addr) {
+            stream = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut stream = stream.expect("client could not connect to Smol server");
+    stream.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap(); // reads until server closes (EOF)
+    assert!(resp.contains("Hello"), "unexpected response: {resp:?}");
+
+    let served = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert_eq!(served, str_val("served"));
+}
+
+#[test]
 fn hc_within_entity_method_runs() {
     // Probe: does HandlerContext run: work when invoked from inside an entity's
     // own method (current_entity_id = that entity), vs. top-level eval?
@@ -616,7 +671,7 @@ fn hc_then_signal_resolves_future_within_entity() {
             ((HandlerContext new
                 on: OkToCommit do: [:c | txf resolveWith: c value. c resume: nil])
                 on: Error do: [:e | txf rejectWith: e. e return: nil])
-              run: [ 42 then: [ (OkToCommit value: 99) signal ] ].
+              run: [ 42 then: [:v | (OkToCommit value: 99) signal ] ].
             ^txf
         ]
         | c |

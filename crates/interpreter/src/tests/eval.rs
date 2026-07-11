@@ -414,10 +414,10 @@ fn sync_value_block_sequences_cross_entity_sends() {
 #[test]
 fn future_then_chains_after_completion() {
     assert_eq!(
-        eval_diff(
+        eval(
             "| a s | a := Array new: 3. a at: 0 put: 1. a at: 1 put: 2. a at: 2 put: 3.
             s := ValueHolder initialValue: 0.
-            (a do: [:e | s update: [:old | old + e]]) then: [s get]"
+            (a do: [:e | s update: [:old | old + e]]) then: [:v | s get]"
         ),
         Value::Int(6)
     );
@@ -1260,9 +1260,9 @@ d at: 'a' put: 1.
 d at: 'b' put: 2.
 d at: 'c' put: 3.
 s := ValueHolder initialValue: 0.
-(d do: [:v | s update: [:old| old + v]]) then: [s get].
+(d do: [:v | s update: [:old| old + v]]) then: [:r | s get].
 "#;
-    assert_eq!(eval_diff(src), Value::Int(6));
+    assert_eq!(eval(src), Value::Int(6));
 }
 
 #[test]
@@ -1272,9 +1272,9 @@ fn dict_keys_do() {
 d := Dictionary new.
 d at: 'x' put: 0.
 r := OrderedCollection new.
-(d keysDo: [:k | r add: k]) then: [r size].
+(d keysDo: [:k | r add: k]) then: [:v | r size].
 "#;
-    assert_eq!(eval_diff(src), Value::Int(1));
+    assert_eq!(eval(src), Value::Int(1));
 }
 
 #[test]
@@ -1336,8 +1336,6 @@ fn dict_eq_class_mismatch() {
 #[test]
 fn dict_eq_key_absent_in_other() {
     // a has 'x', b has 'y' — same size but different keys.
-    // Uses eval (not eval_diff): kernel_recursive.smol's False >> = sends ifTrue:ifFalse:
-    // to its argument, which breaks when the argument is non-Bool (e.g. Int value).
     let src = r#"
 | a b |
 a := Dictionary new. a at: 'x' put: 1.
@@ -1378,15 +1376,15 @@ fn dict_growth_beyond_initial_capacity() {
     let src = r#"
 | d |
 d := Dictionary new.
-(1 to: 12 do: [:i | d at: i put: i * i]) then: [d size]
+(1 to: 12 do: [:i | d at: i put: i * i]) then: [:v | d size]
 "#;
-    assert_eq!(eval_diff(src), Value::Int(12));
+    assert_eq!(eval(src), Value::Int(12));
     let src2 = r#"
 | d |
 d := Dictionary new.
-(1 to: 12 do: [:i | d at: i put: i * i]) then: [d at: 7]
+(1 to: 12 do: [:i | d at: i put: i * i]) then: [:v | d at: 7]
 "#;
-    assert_eq!(eval_diff(src2), Value::Int(49));
+    assert_eq!(eval(src2), Value::Int(49));
 }
 
 #[test]
@@ -2482,7 +2480,7 @@ fn future_then_runs_after_resolution() {
         | f |
         f := Future new.
         f resolveWith: 10.
-        (f then: [ f await + 1 ]) await
+        (f then: [:v | v + 1 ]) await
     "#;
     assert_eq!(eval(src), Value::Int(11));
 }
@@ -2500,7 +2498,7 @@ fn signal_in_then_continuation_caught_by_enclosing_hc() {
         f := Future new.
         f resolveWith: 7.
         cont := (HandlerContext new on: Error do: [:e | e resume: 99])
-            run: [ f then: [ (Error signal: 'from continuation') + 1 ] ].
+            run: [ f then: [:v | (Error signal: 'from continuation') + 1 ] ].
         cont await
     "#;
     // If the HC handler is captured into the then: continuation via fork_context,

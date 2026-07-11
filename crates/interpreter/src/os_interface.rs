@@ -1,6 +1,13 @@
 use std::any::Any;
-use std::sync::Arc;
+use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use may::net::{TcpListener, TcpStream};
+
+/// Opaque socket handle type alias — a listener or stream, boxed as `Arc<dyn Any>`
+/// and surfaced to Smol as `Value::Handle` (same convention as timers).
+pub type OsHandle = Arc<dyn Any + Send + Sync>;
 
 /// OS/world boundary for the interpreter.
 ///
@@ -35,6 +42,50 @@ pub trait OsInterface: Send + Sync {
     ///
     /// Requires: `handle` was returned by `schedule_timer` on this implementation.
     fn timer_pending(&self, handle: &Arc<dyn Any + Send + Sync>) -> bool;
+
+    // ── TCP sockets (C-web spike) ──────────────────────────────────────────────
+    //
+    // These are synchronous, *coroutine-parking* operations: on the default
+    // implementation they yield the calling `may` coroutine to the runtime's I/O
+    // reactor rather than blocking an OS thread, so they must be invoked from
+    // within a `may` coroutine. The primitive layer wraps `accept`/`read`/`write`
+    // in a fresh coroutine + `Future` so the async-everywhere model is preserved.
+    // Default bodies return `Unsupported` so alternative `OsInterface`s (e.g. test
+    // fakes) need not provide networking.
+
+    /// Bind a TCP listener on `127.0.0.1:port`.
+    ///
+    /// Ensures: on success returns an opaque listener handle for `tcp_accept`.
+    fn tcp_listen(&self, _port: u16) -> io::Result<OsHandle> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "tcp_listen"))
+    }
+
+    /// Accept one inbound connection (parks the coroutine until one arrives).
+    ///
+    /// Requires: `listener` was returned by `tcp_listen` on this implementation.
+    /// Ensures: on success returns an opaque stream handle for `tcp_read`/`tcp_write`.
+    fn tcp_accept(&self, _listener: &OsHandle) -> io::Result<OsHandle> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "tcp_accept"))
+    }
+
+    /// Read up to `max` bytes from `stream` (parks until data or EOF).
+    ///
+    /// Requires: `stream` was returned by `tcp_accept` on this implementation.
+    /// Ensures: an empty `Vec` means EOF (peer closed).
+    fn tcp_read(&self, _stream: &OsHandle, _max: usize) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "tcp_read"))
+    }
+
+    /// Write `bytes` to `stream` (parks until written).
+    ///
+    /// Requires: `stream` was returned by `tcp_accept` on this implementation.
+    /// Ensures: returns the number of bytes written.
+    fn tcp_write(&self, _stream: &OsHandle, _bytes: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "tcp_write"))
+    }
+
+    /// Shut down and close `stream`. Idempotent; errors are ignored.
+    fn tcp_close(&self, _stream: &OsHandle) {}
 }
 
 // ── DefaultOsInterface ────────────────────────────────────────────────────────
@@ -86,4 +137,52 @@ impl OsInterface for DefaultOsInterface {
             .map(|t| !t.cancelled.load(Ordering::Relaxed) && !t.fired.load(Ordering::Relaxed))
             .unwrap_or(false)
     }
+
+    fn tcp_listen(&self, port: u16) -> io::Result<OsHandle> {
+        let listener = TcpListener::bind(("127.0.0.1", port))?;
+        Ok(Arc::new(listener) as OsHandle)
+    }
+
+    fn tcp_accept(&self, listener: &OsHandle) -> io::Result<OsHandle> {
+        let listener = Arc::clone(listener)
+            .downcast::<TcpListener>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "not a TcpListener handle"))?;
+        let (stream, _peer) = listener.accept()?;
+        Ok(Arc::new(Mutex::new(stream)) as OsHandle)
+    }
+
+    fn tcp_read(&self, stream: &OsHandle, max: usize) -> io::Result<Vec<u8>> {
+        let stream = downcast_stream(stream)?;
+        let mut buf = vec![0u8; max];
+        let n = stream
+            .lock()
+            .expect("stream mutex poisoned")
+            .read(&mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    fn tcp_write(&self, stream: &OsHandle, bytes: &[u8]) -> io::Result<usize> {
+        let stream = downcast_stream(stream)?;
+        stream.lock().expect("stream mutex poisoned").write(bytes)
+    }
+
+    fn tcp_close(&self, stream: &OsHandle) {
+        if let Ok(stream) = downcast_stream(stream) {
+            let _ = stream
+                .lock()
+                .expect("stream mutex poisoned")
+                .shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// Downcast an opaque handle to a shared, lockable `TcpStream`.
+/// `may::net::TcpStream` reads/writes through `&mut self`, so the stream is held
+/// behind a `Mutex`; each connection is served by a single coroutine, so the lock
+/// is uncontended in practice.
+fn downcast_stream(handle: &OsHandle) -> io::Result<Arc<Mutex<TcpStream>>> {
+    Arc::clone(handle)
+        .downcast::<Mutex<TcpStream>>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "not a TcpStream handle"))
 }

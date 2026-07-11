@@ -913,10 +913,10 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                             &mut env,
                         )?;
                     }
-                    // Non-future: run the continuation on the step-loop stack;
-                    // its result becomes the `then:` result.
-                    _ => {
-                        push_block_frame(ev, &cont_blk, vec![], false, &mut stack)?;
+                    // Non-future: run the continuation on the step-loop stack with
+                    // the receiver's (resolved) value; its result becomes the result.
+                    other => {
+                        push_block_frame(ev, &cont_blk, vec![other], false, &mut stack)?;
                     }
                 }
             }
@@ -938,9 +938,10 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                             &mut env,
                         )?;
                     }
-                    // Non-future: receiver resolved; run then-block, else can't fire.
-                    _ => {
-                        push_block_frame(ev, &cont_blk, vec![], false, &mut stack)?;
+                    // Non-future: receiver resolved; run then-block with its value,
+                    // else can't fire.
+                    other => {
+                        push_block_frame(ev, &cont_blk, vec![other], false, &mut stack)?;
                     }
                 }
             }
@@ -1834,9 +1835,9 @@ fn dispatch_to_stack(
                 });
                 push_block_frame(ev, blk, vec![], false, stack)?;
             }
-            // Already-resolved value: run the continuation on the step-loop stack.
-            _ => {
-                push_block_frame(ev, &cont_blk, vec![], false, stack)?;
+            // Already-resolved value: run the continuation with that value.
+            other => {
+                push_block_frame(ev, &cont_blk, vec![other], false, stack)?;
             }
         }
         return Ok(());
@@ -1869,8 +1870,8 @@ fn dispatch_to_stack(
                 });
                 push_block_frame(ev, blk, vec![], false, stack)?;
             }
-            _ => {
-                push_block_frame(ev, &cont_blk, vec![], false, stack)?;
+            other => {
+                push_block_frame(ev, &cont_blk, vec![other], false, stack)?;
             }
         }
         return Ok(());
