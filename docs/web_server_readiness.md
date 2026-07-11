@@ -4,6 +4,21 @@
 *current tree-walking interpreter* needs to host a fast web server, and treats that
 server as a forcing function for correctness, capability, and performance work.
 
+## Spike log
+
+**2026-07-11 — async TCP spike (commit 64953ce).** First non-blocking network I/O.
+`OsInterface` gained `tcp_listen/accept/read/write/close` over `may::net`
+(coroutine-parking, not OS-thread-blocking); prims `_primTcpListen:` (class-side)
+and `_primTcpAccept:/Read:/Write:with:/Close:` (value-side, returning Futures
+resolved from fresh I/O coroutines); kernel `Value` classes `TcpListener`/
+`TcpSocket`. A Smol server (bind → accept → read → write → close) serves a real
+`std::net` client end-to-end. **Confirmed first wall = string processing** (as
+predicted below): no CRLF in a string literal, so the response is not yet real
+HTTP; `read` resolves to a utf8-lossy `Str`. Still to do before load-testing:
+concurrent accept-loop, HTTP parsing, and a byte-buffer/stream + CRLF-capable
+strings. Load testing (where GC and value-object churn should dominate) is the next
+increment.
+
 **Why a web server as the driver.** It stresses exactly the three things the
 interpreter has not been pushed on: sustained concurrency, real non-blocking I/O,
 and allocation churn in a long-lived process. It is also the best possible
