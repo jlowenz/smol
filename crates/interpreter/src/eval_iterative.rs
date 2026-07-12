@@ -679,17 +679,18 @@ fn handle_eval_expr(
         }
         Expr::Send { receiver, message } => {
             if matches!(receiver.as_ref(), Expr::Super) {
+                let selector = message.selector();
                 match message {
-                    Message::Unary(sel) => {
+                    Message::Unary(_) => {
                         if let Err(e) =
-                            dispatch_super_to_stack(ev, sel, vec![], &mut env, stack, acc)
+                            dispatch_super_to_stack(ev, selector, vec![], &mut env, stack, acc)
                         {
                             handle_step_error(e, ev, stack, acc)?;
                         }
                     }
-                    Message::Binary { op, arg } => {
+                    Message::Binary { arg, .. } => {
                         stack.push(Cont::SuperCollectArgs {
-                            selector: op,
+                            selector,
                             done: vec![],
                             pending: VecDeque::new(),
                             env: env.clone(),
@@ -697,11 +698,6 @@ fn handle_eval_expr(
                         stack.push(Cont::EvalExpr { expr: *arg, env });
                     }
                     Message::Keyword { parts } => {
-                        let selector: Arc<str> = parts
-                            .iter()
-                            .map(|(k, _)| k.as_ref())
-                            .collect::<String>()
-                            .into();
                         let mut exprs: VecDeque<Expr> = parts.into_iter().map(|(_, e)| e).collect();
                         let first = exprs.pop_front().expect("keyword message has no parts");
                         stack.push(Cont::SuperCollectArgs {
@@ -1186,16 +1182,18 @@ fn handle_after_receiver(
     acc: &mut Value,
 ) -> Result<(), EvalError> {
     let receiver = acc.clone();
+    let selector = message.selector();
     match message {
-        Message::Unary(sel) => {
-            if let Err(e) = dispatch_to_stack(ev, receiver, sel, vec![], &mut env, stack, acc) {
+        Message::Unary(_) => {
+            if let Err(e) = dispatch_to_stack(ev, receiver, selector, vec![], &mut env, stack, acc)
+            {
                 handle_step_error(e, ev, stack, acc)?;
             }
         }
-        Message::Binary { op, arg } => {
+        Message::Binary { arg, .. } => {
             stack.push(Cont::CollectArgs {
                 receiver,
-                selector: op,
+                selector,
                 done: vec![],
                 pending: VecDeque::new(), // first arg already being pushed
                 env: env.clone(),
@@ -1203,11 +1201,6 @@ fn handle_after_receiver(
             stack.push(Cont::EvalExpr { expr: *arg, env });
         }
         Message::Keyword { parts } => {
-            let selector: Arc<str> = parts
-                .iter()
-                .map(|(k, _)| k.as_ref())
-                .collect::<String>()
-                .into();
             let mut exprs: VecDeque<Expr> = parts.into_iter().map(|(_, e)| e).collect();
             let first = exprs.pop_front().expect("keyword message has no parts");
             stack.push(Cont::CollectArgs {
@@ -1309,16 +1302,18 @@ fn handle_cascade_step(
             pending,
             env: env.clone(),
         });
+        let selector = msg.selector();
         match msg {
-            Message::Unary(sel) => {
-                if let Err(e) = dispatch_to_stack(ev, recv, sel, vec![], &mut env, stack, acc) {
+            Message::Unary(_) => {
+                if let Err(e) = dispatch_to_stack(ev, recv, selector, vec![], &mut env, stack, acc)
+                {
                     handle_step_error(e, ev, stack, acc)?;
                 }
             }
-            Message::Binary { op, arg } => {
+            Message::Binary { arg, .. } => {
                 stack.push(Cont::CollectArgs {
                     receiver: recv,
-                    selector: op,
+                    selector,
                     done: vec![],
                     pending: VecDeque::new(),
                     env: env.clone(),
@@ -1326,11 +1321,6 @@ fn handle_cascade_step(
                 stack.push(Cont::EvalExpr { expr: *arg, env });
             }
             Message::Keyword { parts } => {
-                let selector: Arc<str> = parts
-                    .iter()
-                    .map(|(k, _)| k.as_ref())
-                    .collect::<String>()
-                    .into();
                 let mut exprs: VecDeque<Expr> = parts.into_iter().map(|(_, e)| e).collect();
                 let first = exprs.pop_front().expect("keyword message has no parts");
                 stack.push(Cont::CollectArgs {
@@ -2376,7 +2366,28 @@ pub(crate) fn push_method_call_frame(
 /// Install a method definition into its class, mirroring `eval_stmt` in eval.rs.
 fn install_method_def(ev: &Evaluator, def: MethodDef, env: &Env) -> Result<(), EvalError> {
     use crate::entity::InstanceKind;
-    let class = match ev.lookup_var(&def.class_name, env) {
+    let receiver = ev.lookup_var(&def.class_name, env);
+    // `aTrait >> selector [...]` — add the method to the trait's provided-method
+    // dict rather than a class method dict. A named trait built by `Trait named:`
+    // is extended this way. Class-side trait methods are deferred (plan §8).
+    if let Some(v) = &receiver
+        && let Some(data) = crate::builtins_iterative::trait_data_of(v)
+    {
+        if def.is_class_side {
+            return Err(EvalError::TypeError(
+                "class-side trait methods are not supported".into(),
+            ));
+        }
+        check_prim_sends_in_body(&def.body)?;
+        let method = Arc::new(Method {
+            pattern: def.pattern.clone(),
+            locals: def.locals.clone(),
+            body: def.body.clone(),
+        });
+        data.insert_own_method(def.pattern.selector(), method);
+        return Ok(());
+    }
+    let class = match receiver {
         Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassEntity(_)) => {
             h.0.class.clone()
         }

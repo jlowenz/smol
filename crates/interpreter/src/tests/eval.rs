@@ -2710,3 +2710,162 @@ fn default_dnu_resume_substitutes_send_result() {
     "#;
     assert_eq!(eval(src), Value::Int(99));
 }
+
+// ---- Traits (docs/traits_plan.md) ------------------------------------------
+
+#[test]
+fn trait_basic_composition() {
+    // A trait's provided method is flattened into a using class and dispatchable.
+    let src = r#"
+        Trait named: #Greeter.
+        Greeter >> greet [ ^'hi ' , self who ].
+        Object subclass: #Person uses: Greeter instanceVariableNames: 'who'.
+        Person >> who: w [ who := w ].
+        Person >> who [ ^who ].
+        | p | p := Person new. p who: 'sam'. p greet
+    "#;
+    assert_eq!(eval(src), Value::Str("hi sam".into()));
+}
+
+#[test]
+fn trait_class_overrides_trait() {
+    // class-defined method wins over the flattened trait method (class > trait).
+    let src = r#"
+        Trait named: #T.
+        T >> tag [ ^'trait' ].
+        Value subclass: #Thing uses: T instanceVariableNames: ''.
+        Thing >> tag [ ^'class' ].
+        Thing new tag
+    "#;
+    assert_eq!(eval(src), Value::Str("class".into()));
+}
+
+#[test]
+fn trait_requirements_derived_from_self_sends() {
+    let src = r#"
+        Trait named: #T.
+        T >> a [ ^self b + self c ].
+        T >> b [ ^1 ].
+        (T requirements) size
+    "#;
+    // sends: b (provided), c (not provided) -> requirement {c}
+    assert_eq!(eval(src), Value::Int(1));
+}
+
+#[test]
+fn trait_sum_conflict_raises_when_sent() {
+    let src = r#"
+        Trait named: #A.
+        A >> foo [ ^1 ].
+        Trait named: #B.
+        B >> foo [ ^2 ].
+        Value subclass: #C uses: (A + B) instanceVariableNames: ''.
+        C new foo
+    "#;
+    assert_signal_contains(&eval_err(src), "unresolved trait conflict");
+}
+
+#[test]
+fn trait_conflict_resolved_by_exclusion() {
+    let src = r#"
+        Trait named: #A.
+        A >> foo [ ^1 ].
+        Trait named: #B.
+        B >> foo [ ^2 ].
+        Value subclass: #C uses: (A + (B - { #foo })) instanceVariableNames: ''.
+        C new foo
+    "#;
+    assert_eq!(eval(src), Value::Int(1));
+}
+
+#[test]
+fn trait_asymmetric_override() {
+    // (A - B) + B : union where B wins every conflict.
+    let src = r#"
+        Trait named: #A.
+        A >> foo [ ^1 ].
+        A >> bar [ ^10 ].
+        Trait named: #B.
+        B >> foo [ ^2 ].
+        Value subclass: #C uses: ((A - B) + B) instanceVariableNames: ''.
+        (C new foo) + (C new bar)
+    "#;
+    assert_eq!(eval(src), Value::Int(12));
+}
+
+#[test]
+fn trait_conflict_resolved_by_class_method() {
+    let src = r#"
+        Trait named: #A.
+        A >> foo [ ^1 ].
+        Trait named: #B.
+        B >> foo [ ^2 ].
+        Value subclass: #C uses: (A + B) instanceVariableNames: ''.
+        C >> foo [ ^99 ].
+        C new foo
+    "#;
+    assert_eq!(eval(src), Value::Int(99));
+}
+
+#[test]
+fn trait_aliasing_adds_entry_point() {
+    let src = r#"
+        Trait named: #A.
+        A >> foo [ ^42 ].
+        Value subclass: #C uses: (A @ { #fooA -> #foo }) instanceVariableNames: ''.
+        (C new fooA) + (C new foo)
+    "#;
+    assert_eq!(eval(src), Value::Int(84));
+}
+
+#[test]
+fn trait_named_from_expression() {
+    let src = r#"
+        Trait named: #A.
+        A >> a [ ^1 ].
+        Trait named: #B.
+        B >> b [ ^2 ].
+        Trait named: #AB from: A + B.
+        Value subclass: #C uses: AB instanceVariableNames: ''.
+        (C new a) + (C new b)
+    "#;
+    assert_eq!(eval(src), Value::Int(3));
+}
+
+#[test]
+fn trait_shared_ancestor_not_a_conflict() {
+    // A method reaching two sums via the same provenance must not conflict.
+    let src = r#"
+        Trait named: #Base.
+        Base >> shared [ ^7 ].
+        Value subclass: #C uses: (Base + Base) instanceVariableNames: ''.
+        C new shared
+    "#;
+    assert_eq!(eval(src), Value::Int(7));
+}
+
+#[test]
+fn trait_reflection_name_and_print() {
+    let src = r#"
+        Trait named: #Greeter.
+        Greeter name
+    "#;
+    assert_eq!(eval(src), Value::Symbol("Greeter".into()));
+    let src2 = r#"
+        Trait named: #Greeter.
+        Greeter printString
+    "#;
+    assert_eq!(eval(src2), Value::Str("Trait(#Greeter)".into()));
+}
+
+#[test]
+fn trait_conflicts_reflection() {
+    let src = r#"
+        Trait named: #A.
+        A >> foo [ ^1 ].
+        Trait named: #B.
+        B >> foo [ ^2 ].
+        ((A + B) conflicts) size
+    "#;
+    assert_eq!(eval(src), Value::Int(1));
+}

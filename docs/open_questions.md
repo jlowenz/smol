@@ -330,3 +330,51 @@ exclusion over shadow-buffering.
 **Recommendation:** schedule alongside Q3 as a single store-layer reclamation pass,
 when fact accumulation begins to matter (dev/test accumulation is slow). Not a VM
 prerequisite.
+
+---
+
+## Q12: Trait composition — compile-time fail-fast for conflicts & requirements
+
+**Status:** Open (deferred). Traits MVP implemented with **deferred, send-time**
+enforcement.
+
+`docs/traits_plan.md` §4/§6 specify *fail-fast at class-definition time*: an
+unresolved conflict marker or an unmet derived requirement should error when the
+class is composed. The MVP cannot honor this because the definition model is
+incremental — `Value subclass: #Html uses: <TExpr> …` runs as one statement, and the
+class's own methods (`Html >> foo [...]`) arrive on *later* statements. At the
+instant `uses:` executes there is no "class method set" to validate against, and no
+end-of-definition point to hook (method extensions from other files are coming, so a
+"when the source file finishes" hook would be wrong too).
+
+**What the MVP does instead (per-selector send-time):**
+- Trait methods are flattened into the class dict at `uses:` time.
+- A conflict flattens as a **sentinel method** (`Object >> pvtTraitConflictFor:`) that
+  raises `TraitConflict` *when the conflicting selector is actually sent*. A later
+  class-defined method (or a non-conflicting override) replaces the sentinel via
+  normal dict insertion.
+- An unmet requirement is simply a `self`-send that fails (DNU/MNU) when reached.
+- `Trait >> requirements` / `conflicts` expose the derived sets for inspection, but
+  composition does not consult them to fail.
+
+**Intended follow-up (whole-class send-time gate).** The originally intended
+semantics are stronger: a class left with *any* unresolved conflict or unmet
+requirement should reject **every** send to the class/instance (not only the offending
+selector) — the class is unusable until the author resolves the composition. This
+needs a **status flag on `Class`** (e.g. `unresolved: RwLock<{conflicts, reqs}>`) set
+at `uses:` time and cleared when later class-defined methods satisfy the last
+outstanding item; dispatch consults it before method lookup. Deferred only because it
+adds a `Class` field (touches ~15 constructors) plus a per-dispatch check — a
+self-contained change on top of the MVP. The current per-selector sentinel is a
+correct-but-narrower subset of this behavior.
+
+**Tension / when to revisit:** true fail-fast needs an **active-environment /
+moldable feedback loop** — a point at which "the definition surface has settled" is
+observable (e.g. a live image where redefinition triggers re-validation), and it must
+account for cross-file method extensions (Q-adjacent to Q8 code-as-facts). Once that
+exists, re-validate composed classes on change and surface unresolved
+conflicts/unmet requirements eagerly.
+
+**Also deferred (traits_plan §8):** per-class provenance/requirements side tables for
+reflection/tooling (not stored on `Class` in the MVP to avoid touching every class
+constructor); public-protocol markers; class-side trait methods; `super` in traits.

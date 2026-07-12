@@ -380,6 +380,38 @@ Association >> printString [
 "Shorthand for building Associations via binary message -> ."
 Object >> -> aVal [ ^Association key: self value: aVal ]
 
+"Trait — a stateless, first-class unit of behavioral reuse (docs/traits_plan.md).
+ The `data` ivar holds the native TraitData payload (method dict + provenance).
+ The +/-/@ algebra builds fresh traits; requirements are derived from method bodies."
+Value subclass: #Trait
+    instanceVariableNames: 'data'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+"Create an empty named trait; extend it with `aTrait >> selector [...]`."
+Trait class >> named: n [ ^self _primNewTrait: n ]
+
+"Name a trait built from a composition expression; binds the name in scope."
+Trait class >> named: n from: aTrait [ ^self _primDefineTrait: n from: aTrait ]
+
+"Sum / union. Conflicting selectors (differing provenance) become conflict markers."
+Trait >> + other [ ^self _primTraitSum: other ]
+
+"Exclusion. Right operand is polymorphic: a Trait (drop its provided selectors)
+ or an Array of Symbols (drop that explicit selector set)."
+Trait >> - arg [
+    (arg isKindOf: Trait) ifTrue: [^self _primTraitExcludeTrait: arg].
+    ^self _primTraitExcludeSelectors: arg
+]
+
+"Aliasing: add entry points. Argument is an Array of Associations #newSel -> #oldSel."
+Trait >> @ aliases [ ^self _primTraitAlias: aliases ]
+
+Trait >> name          [ ^self _primTraitName ]
+Trait >> requirements  [ ^self _primTraitRequirements ]
+Trait >> conflicts     [ ^self _primTraitConflicts ]
+Trait >> printString   [ ^'Trait(' , self _primTraitName printString , ')' ]
+
 "Cons — immutable singly-linked list node.
  nil is the empty list; isNil / isEmpty are the emptiness checks."
 Value subclass: #Cons
@@ -716,6 +748,26 @@ Error subclass: #Deadlock
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
+
+"Signaled when a class inherits an unresolved trait conflict (two composed traits
+provide the same selector with differing provenance) and that selector is sent
+without a class-defined override. Carries the offending selector."
+Error subclass: #TraitConflict
+    instanceVariableNames: 'selector'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+TraitConflict class >> selector: sel [
+    ^self _primNewValue: [:c | c pvtSetSelector: sel]
+]
+TraitConflict >> pvtSetSelector: sel [
+    selector := sel.
+    self pvtSetMessage: 'unresolved trait conflict: #', sel asString
+]
+TraitConflict >> selector [ ^selector ]
+
+"Sentinel entry point installed for an unresolved trait conflict; raises when sent."
+Object >> pvtTraitConflictFor: sel [ ^(TraitConflict selector: sel) signal ]
 
 "HandlerContext — non-unwinding handler registration (CL handler-bind analog).
 pairs is a Cons-of-Association linked list (or nil):

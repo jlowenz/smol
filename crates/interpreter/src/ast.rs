@@ -31,6 +31,23 @@ pub enum Message {
     },
 }
 
+impl Message {
+    /// The selector string of this send: the unary/binary name, or the keyword
+    /// parts concatenated (`[(at:, _), (put:, _)]` → `at:put:`). Mirrors
+    /// [`crate::class::MethodPattern::selector`] on the definition side.
+    pub fn selector(&self) -> Arc<str> {
+        match self {
+            Message::Unary(s) => s.clone(),
+            Message::Binary { op, .. } => op.clone(),
+            Message::Keyword { parts } => parts
+                .iter()
+                .map(|(k, _)| k.as_ref())
+                .collect::<String>()
+                .into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Lit(Literal),

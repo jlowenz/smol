@@ -666,6 +666,84 @@ pub(crate) fn freeze_value_instance(inst: &InstanceHandle) {
     }
 }
 
+/// Read the native [`TraitData`] payload from a `Trait` value object (`data` ivar).
+///
+/// Ensures: returns `Some` iff `v` is a `Value::Instance` whose `data` ivar holds a
+/// `Value::Handle` downcastable to `TraitData`.
+pub(crate) fn trait_data_of(v: &Value) -> Option<Arc<crate::traits::TraitData>> {
+    let Value::Instance(h) = v else { return None };
+    let InstanceKind::ValueObject(obj) = &h.0.kind else {
+        return None;
+    };
+    let Some(Value::Handle(any)) = obj.get_slot("data") else {
+        return None;
+    };
+    any.downcast::<crate::traits::TraitData>().ok()
+}
+
+/// Wrap a [`TraitData`] as a frozen `Trait` value object (kernel `Trait` class).
+pub(crate) fn make_trait_value(
+    ev: &Evaluator,
+    data: Arc<crate::traits::TraitData>,
+) -> Result<Value, EvalError> {
+    let cls = ev
+        .registry
+        .kernel()
+        .lookup_class("Trait")
+        .ok_or_else(|| EvalError::UndefinedVariable(Arc::from("Trait")))?
+        .0
+        .class
+        .clone();
+    let inst = make_value_instance(cls, None);
+    if let InstanceKind::ValueObject(obj) = &inst.0.kind {
+        let handle: Arc<dyn std::any::Any + Send + Sync> = data;
+        obj.set_slot(Arc::from("data"), Value::Handle(handle));
+        obj.freeze();
+    }
+    Ok(Value::Instance(inst))
+}
+
+/// Bind a trait's name in the current scope, mirroring class-name binding in
+/// [`handle_subclass`]: kernel-scope traits get a global binding; others are
+/// scoped to the current frame.
+fn bind_trait_name(ev: &Evaluator, name: Arc<str>, trait_val: Value, env: &mut Env) {
+    if Arc::ptr_eq(&ev.active_namespace(), &ev.registry.kernel()) {
+        env.define_global(name, trait_val);
+    } else {
+        env.define(name, trait_val);
+    }
+}
+
+/// Build the sentinel method for an unresolved trait conflict on `sel`. Its body
+/// signals a `TraitConflict` carrying the selector; it keeps `pattern` so the
+/// method arity matches any real send. Replaced when the class defines `sel`.
+fn conflict_sentinel_method(
+    pattern: &crate::class::MethodPattern,
+    sel: &str,
+) -> Result<crate::class::Method, EvalError> {
+    let src = format!("self pvtTraitConflictFor: #'{sel}'");
+    let prog = crate::parser::Parser::parse(&src)
+        .map_err(|e| EvalError::TypeError(format!("trait conflict sentinel parse: {e:?}")))?;
+    Ok(crate::class::Method {
+        pattern: pattern.clone(),
+        locals: vec![],
+        body: prog.stmts,
+    })
+}
+
+/// Extract the elements of a pointer-indexed value object (an `Array`), if `v` is one.
+fn array_pointer_elements(v: &Value) -> Option<Vec<Value>> {
+    use crate::object::IndexedStorage;
+    let Value::Instance(h) = v else { return None };
+    let InstanceKind::ValueObject(obj) = &h.0.kind else {
+        return None;
+    };
+    match obj.indexed.as_ref()? {
+        IndexedStorage::Pointer(slots) => Some(slots.lock().clone()),
+        _ => None,
+    }
+}
+
 /// Build a nil-terminated `Cons` list (a frozen `Value`) from `items`, in order.
 ///
 /// Mirrors Array-literal construction (eval.rs): the interpreter instantiates a
@@ -1518,6 +1596,9 @@ pub(crate) fn dispatch_object_primitive(
     if let Some(v) = obj_prim_core(&cx, sel, &mut args)? {
         return Ok(v);
     }
+    if let Some(v) = obj_prim_traits(&cx, sel, &mut args)? {
+        return Ok(v);
+    }
     if let Some(v) = obj_prim_indexed(&cx, sel, &mut args)? {
         return Ok(v);
     }
@@ -1574,6 +1655,128 @@ fn obj_prim_core(
         }
         _ => return Ok(None),
     }))
+}
+
+/// Trait algebra primitives on a `Trait` value object: `+`/`-`/`@` builders plus
+/// reflection (`name`, derived `requirements`, `conflicts`). Each expects the
+/// receiver's `data` ivar to hold a [`TraitData`].
+#[inline(never)]
+fn obj_prim_traits(
+    cx: &ObjPrim,
+    sel: &Arc<str>,
+    args: &mut Vec<Value>,
+) -> Result<Option<Value>, EvalError> {
+    use crate::traits::TraitData;
+    let ev = cx.ev;
+    // Fast reject: only trait selectors reach here.
+    if !sel.starts_with("_primTrait") {
+        return Ok(None);
+    }
+    let Some(data) = trait_data_of(cx.self_val) else {
+        return Err(EvalError::TypeError(format!(
+            "{sel}: receiver is not a Trait"
+        )));
+    };
+    Ok(Some(match sel.as_ref() {
+        "_primTraitName" => {
+            expect_arity(sel, 0, args.len())?;
+            Value::Symbol(data.name.read().clone())
+        }
+        "_primTraitSum:" => {
+            expect_arity(sel, 1, args.len())?;
+            let other = force_value(ev, args.remove(0))?;
+            let other = trait_data_of(&other)
+                .ok_or_else(|| EvalError::TypeError(format!("{sel}: argument is not a Trait")))?;
+            make_trait_value(ev, TraitData::sum(&data, &other))?
+        }
+        "_primTraitExcludeTrait:" => {
+            expect_arity(sel, 1, args.len())?;
+            let other = force_value(ev, args.remove(0))?;
+            let other = trait_data_of(&other)
+                .ok_or_else(|| EvalError::TypeError(format!("{sel}: argument is not a Trait")))?;
+            make_trait_value(ev, TraitData::exclude_trait(&data, &other))?
+        }
+        "_primTraitExcludeSelectors:" => {
+            expect_arity(sel, 1, args.len())?;
+            let arr = force_value(ev, args.remove(0))?;
+            let elems = array_pointer_elements(&arr).ok_or_else(|| {
+                EvalError::TypeError(format!("{sel}: argument must be an Array of Symbols"))
+            })?;
+            let mut set = std::collections::HashSet::new();
+            for e in elems {
+                match force_value(ev, e)? {
+                    Value::Symbol(s) => {
+                        set.insert(s);
+                    }
+                    _ => {
+                        return Err(EvalError::TypeError(format!(
+                            "{sel}: selector-set elements must be Symbols"
+                        )));
+                    }
+                }
+            }
+            make_trait_value(ev, TraitData::exclude_selectors(&data, &set))?
+        }
+        "_primTraitAlias:" => {
+            // Argument: Array of Associations `#newSel -> #oldSel`.
+            expect_arity(sel, 1, args.len())?;
+            let arr = force_value(ev, args.remove(0))?;
+            let elems = array_pointer_elements(&arr).ok_or_else(|| {
+                EvalError::TypeError(format!("{sel}: argument must be an Array of Associations"))
+            })?;
+            let mut aliases: Vec<(Arc<str>, Arc<str>)> = vec![];
+            for e in elems {
+                let assoc = force_value(ev, e)?;
+                let (Value::Instance(_), Some(k), Some(v)) = (
+                    &assoc,
+                    assoc_slot(&assoc, "key"),
+                    assoc_slot(&assoc, "value"),
+                ) else {
+                    return Err(EvalError::TypeError(format!(
+                        "{sel}: alias elements must be Associations #new -> #old"
+                    )));
+                };
+                match (k, v) {
+                    (Value::Symbol(new_sel), Value::Symbol(old_sel)) => {
+                        aliases.push((new_sel, old_sel))
+                    }
+                    _ => {
+                        return Err(EvalError::TypeError(format!(
+                            "{sel}: alias key and value must be Symbols"
+                        )));
+                    }
+                }
+            }
+            make_trait_value(ev, TraitData::alias(&data, &aliases))?
+        }
+        "_primTraitRequirements" => {
+            expect_arity(sel, 0, args.len())?;
+            let mut reqs: Vec<Value> = data.requirements().into_iter().map(Value::Symbol).collect();
+            reqs.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            build_array(ev, reqs)?
+        }
+        "_primTraitConflicts" => {
+            expect_arity(sel, 0, args.len())?;
+            let mut cs: Vec<Value> = data
+                .conflict_selectors()
+                .into_iter()
+                .map(Value::Symbol)
+                .collect();
+            cs.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            build_array(ev, cs)?
+        }
+        _ => return Ok(None),
+    }))
+}
+
+/// Read a named slot from an `Association` value object (or any value object).
+fn assoc_slot(v: &Value, name: &str) -> Option<Value> {
+    let Value::Instance(h) = v else { return None };
+    if let InstanceKind::ValueObject(obj) = &h.0.kind {
+        obj.get_slot(name)
+    } else {
+        None
+    }
 }
 
 /// Indexed-slot primitives: `_primAt:`, `_primAt:put:`, `_primSize`, `_primAsString`.
@@ -2870,6 +3073,42 @@ pub(crate) fn dispatch_class_builtin(
             freeze_value_instance(&inst);
             Ok(Value::Instance(inst))
         }
+        "_primNewTrait:" => {
+            // Create a fresh empty trait named by the Symbol argument, binding the
+            // name in the current scope (like `subclass:`). Methods are added
+            // afterward via `aTrait >> selector [...]` (install_method_def).
+            expect_arity(&selector, 1, args.len())?;
+            let name = match force_value(ev, args.remove(0))? {
+                Value::Symbol(s) | Value::Str(s) => s,
+                _ => {
+                    return Err(EvalError::TypeError(
+                        "_primNewTrait: name must be a Symbol".into(),
+                    ));
+                }
+            };
+            let tv = make_trait_value(ev, crate::traits::TraitData::new_empty(name.clone()))?;
+            bind_trait_name(ev, name, tv.clone(), env);
+            Ok(tv)
+        }
+        "_primDefineTrait:from:" => {
+            // Name a composed trait expression and bind it in the current scope.
+            expect_arity(&selector, 2, args.len())?;
+            let name = match force_value(ev, args.remove(0))? {
+                Value::Symbol(s) | Value::Str(s) => s,
+                _ => {
+                    return Err(EvalError::TypeError(
+                        "_primDefineTrait:from: name must be a Symbol".into(),
+                    ));
+                }
+            };
+            let src = force_value(ev, args.remove(0))?;
+            let data = trait_data_of(&src).ok_or_else(|| {
+                EvalError::TypeError("_primDefineTrait:from: source is not a Trait".into())
+            })?;
+            *data.name.write() = name.clone();
+            bind_trait_name(ev, name, src.clone(), env);
+            Ok(src)
+        }
         "_primScheduleTimer:block:" => {
             // Requires: args[0] is Value::Int (≥ 0, milliseconds); args[1] is Value::Block.
             // Ensures: after ms milliseconds (if not cancelled), evaluates the block in a
@@ -2996,9 +3235,15 @@ fn handle_subclass(
     let mut ivar_names: Vec<Arc<str>> = vec![];
     let mut class_var_names: Vec<Arc<str>> = vec![];
     let mut indexed_slot_kind: Option<IndexedSlotKind> = None;
+    let mut used_trait: Option<Arc<crate::traits::TraitData>> = None;
 
     for (kw, arg) in keywords.iter().zip(args.iter()) {
         match *kw {
+            "uses:" => {
+                used_trait = Some(trait_data_of(arg).ok_or_else(|| {
+                    EvalError::TypeError("uses: argument must be a Trait".into())
+                })?);
+            }
             "subclass:" => match arg {
                 Value::Symbol(s) => class_name = Some(s.clone()),
                 _ => {
@@ -3095,6 +3340,25 @@ fn handle_subclass(
         is_value: declared_is_value,
         class_object: std::sync::OnceLock::new(),
     });
+    // Flatten a composed trait's provided methods into the new class's method dict
+    // (docs/traits_plan.md §1). Class-defined methods arrive on later statements and
+    // overwrite these entries, giving the required `class > trait > super` precedence.
+    // A conflict marker is flattened as a sentinel that raises `TraitConflict` when
+    // sent; a later class-defined method (or a non-conflicting override) replaces it.
+    // NOTE (deferred): fail-fast validation of unresolved conflicts / unmet
+    // requirements at composition time needs an active-environment feedback loop and
+    // must account for cross-file method extensions — see docs/open_questions.md.
+    if let Some(trait_data) = &used_trait {
+        let mut dict = new_class.methods.write();
+        for (sel, entry) in trait_data.methods.read().iter() {
+            let method = if entry.is_conflict {
+                Arc::new(conflict_sentinel_method(&entry.method.pattern, sel)?)
+            } else {
+                entry.method.clone()
+            };
+            dict.insert(sel.clone(), method);
+        }
+    }
     let class_handle = spawn_class_entity(
         new_class.clone(),
         ev.registry.clone(),

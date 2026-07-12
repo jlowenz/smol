@@ -1,8 +1,21 @@
 # Traits plan
 
-**Status:** design settled for an MVP; implementation is the next work chunk.
+**Status:** **MVP implemented** (2026-07-11). Runtime `TraitData` behind a `Trait`
+value object; `Trait named:` / `named:from:`; `+`/`-`/`@` algebra; derived
+requirements; `subclass:…uses:…` flattening with conflict sentinels. Rust tests in
+`crates/interpreter/src/tests/eval.rs` (`trait_*`).
+
+**One deviation from §4/§6 — deferred, not dropped:** compile-time *fail-fast* for
+unresolved conflicts and unmet requirements is not possible under the incremental
+definition model (class methods arrive on statements *after* `uses:`). The MVP
+enforces at **send time** instead: a conflict flattens as a sentinel raising
+`TraitConflict` when sent; an unmet requirement fails as a normal DNU/MNU. Tracked as
+**Q12** in `docs/open_questions.md`; revisit once an active-environment feedback loop
+exists.
+
 Deferred to a later version: public-protocol markers (§8), class-side trait methods
-(§8). Disallowed for now: `super` in trait methods (§4).
+(§8), per-class provenance/requirements reflection tables. Disallowed for now:
+`super` in trait methods (§4).
 
 Traits are the prerequisite that several things wait on: the extensibility story
 for non-subclassable scalars ([[design_scalar_representation]] / behavioral reuse via
