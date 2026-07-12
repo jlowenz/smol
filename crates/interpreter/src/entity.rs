@@ -918,6 +918,18 @@ pub(crate) fn detect_and_resolve_deadlock(
     anchor: &Arc<InstanceState>,
     registry: &ClassRegistry,
 ) -> bool {
+    // Serialize detection+resolution across all blocked entities' timers. Each
+    // waiting entity arms its own repeating check, so for a single cycle multiple
+    // timers fire ~simultaneously; without this lock two runs can independently
+    // select and abort *different* victims (HashMap/HashSet iteration is
+    // nondeterministic), collapsing the whole cycle instead of breaking it once.
+    // Holding this lock, the first run rejects one victim — synchronously removing
+    // its parked message (`reject_parked_message_for_ctx`) — so any subsequent run
+    // rebuilds an acyclic graph and finds nothing. Acquired before any mailbox
+    // lock and taken nowhere else, so it introduces no lock-ordering cycle.
+    static RESOLVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _resolve_guard = RESOLVE.lock().unwrap();
+
     // waiter ctx → the holder ctxs it is blocked behind.
     let mut edges: HashMap<TxCtxId, HashSet<TxCtxId>> = HashMap::new();
     // waiter ctx → an entity where its message is parked (for victim rejection).
