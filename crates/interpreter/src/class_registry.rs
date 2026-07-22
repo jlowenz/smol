@@ -164,29 +164,9 @@ impl ClassRegistry {
             .ok();
         kernel.register(InstanceHandle(block_state));
 
-        // `Int` is the class of small integers (`Value::Int`). Subclass of Object;
-        // user-defined methods dispatch via `push_method_call_frame(UserMethodFound::Primitive)`.
-        let int_class = Arc::new(Class {
-            name: Arc::from("Int"),
-            superclass: Some(object_class.clone()),
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-            class_object: std::sync::OnceLock::new(),
-        });
-        let int_state = Arc::new(InstanceState {
-            class: int_class.clone(),
-            kind: InstanceKind::ClassEntity(Box::new(new_entity_data(
-                &int_class,
-                store.clone_handle(),
-            ))),
-        });
-        int_class.class_object.set(Arc::downgrade(&int_state)).ok();
-        kernel.register(InstanceHandle(int_state));
+        // The numeric tower (Magnitude/Number/Integer/MachineInteger/ArbitraryInteger/
+        // Float) and String/Symbol are defined in `kernel.smol` under `Value`, like the
+        // Boolean hierarchy — not bootstrapped here. See docs/numeric_tower_plan.md.
 
         let mut roots = HashMap::new();
         roots.insert(Arc::from("Kernel"), kernel.clone());
@@ -282,18 +262,7 @@ impl ClassRegistry {
             class_object: std::sync::OnceLock::new(),
         });
 
-        let int_class = Arc::new(Class {
-            name: Arc::from("Int"),
-            superclass: Some(object_class.clone()),
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-            class_object: std::sync::OnceLock::new(),
-        });
+        // Numeric tower + String/Symbol live in kernel.smol (see new()).
 
         let mut roots = HashMap::new();
         roots.insert(Arc::from("Kernel"), kernel.clone());
@@ -374,7 +343,7 @@ impl ClassRegistry {
         let block_handle = spawn_class_entity(
             block_class.clone(),
             arc.clone(),
-            bootstrap_env.clone(),
+            bootstrap_env,
             store.clone_handle(),
         );
         let block_id = match &block_handle.0.kind {
@@ -389,25 +358,6 @@ impl ClassRegistry {
             .set(Arc::downgrade(&block_handle.0))
             .ok();
         kernel.register(block_handle);
-
-        let int_handle = spawn_class_entity(
-            int_class.clone(),
-            arc.clone(),
-            bootstrap_env,
-            store.clone_handle(),
-        );
-        let int_id = match &int_handle.0.kind {
-            InstanceKind::ClassEntity(d) => d.id,
-            _ => unreachable!(),
-        };
-        arc.class_entities
-            .write()
-            .insert(int_id, int_handle.0.clone());
-        int_class
-            .class_object
-            .set(Arc::downgrade(&int_handle.0))
-            .ok();
-        kernel.register(int_handle);
 
         arc.register_class_predicates(&object_class);
         arc.register_class_predicates(&value_class);

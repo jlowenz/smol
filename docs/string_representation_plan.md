@@ -89,7 +89,7 @@ Incremental construction lives in a **separate mutable `Object`**:
   `Character`s.
 - Reconcile §3 control-char helpers: `String cr` becomes `String with: Character cr`.
 
-## 7. Non-subclassable scalars (DECIDED) — terminology OPEN
+## 7. Non-subclassable scalars (DECIDED) — mechanism RESOLVED 2026-07-12
 
 **Decision:** encoded scalar value classes are **not subclassable** (no subtypes).
 
@@ -110,14 +110,34 @@ Domain types → a **wrapper value object** (a `ValueObject` with a `String`/`In
 ivar) + a **trait** that delegates string-like behavior to the inner carrier. This is
 `can-act-as` (structural conformance) instead of a false `is-a` (nominal subtype).
 
-**⚠ TERMINOLOGY (open):** "final" is wrong — it implies *no new methods*, but we want
-**open to method addition, closed to subclassing**. Candidate terms:
-- `leaf` / "leaf value class" — structural, bottom-of-hierarchy (leaning candidate).
-- "subclass-closed / extension-open" — precise but verbose.
-- `sealed` — **avoid**: in Java/Kotlin/Scala/C# it means *restricted permitted
-  subclasses*, a different thing.
-- `terminal`.
-Pick a ubiquitous-language term before implementing (DDD: consistent language).
+**MECHANISM (resolved — no user-facing "final"/"leaf" modifier).** Closedness is
+**not a declarable modifier** (that would enable closed systems antithetical to
+Smalltalk's open-system ethos). It is a **consequence of category membership**:
+
+- **`vmSubclass:`** defines a **VM-substrate** class (the built-in tower). It is
+  visible in kernel source (`Number vmSubclass: #Integer`) and marks the boundary
+  between the VM substrate and the user's open world (`Object subclass: #Foo`).
+  Users cannot successfully invoke it — there is no way in Smol to supply a class's
+  native/immediate representation.
+- **The `subclass:` block is representational, not taste-based.** The VM refuses
+  `subclass:` **only where subclassing is representationally impossible** — a class
+  whose instances are a **fixed VM encoding** with no room to carry a subclass tag:
+  the **encoded leaves** (`MachineInteger`, `ArbitraryInteger`, `Float`, `String`,
+  `Symbol`, `True`, `False`). Everything else stays open, including the **abstract
+  VM classes** (`Magnitude`, `Number`, `Integer`) — a subclass supplies its own
+  boxed representation, so it is representable.
+- **Taste is never a hard constraint.** A representable-but-questionable design
+  (e.g. a wrapping `Integer subclass: #ModularInteger` that breaks LSP) is the
+  user's prerogative; Smalltalk does not paternalistically block it, and neither do
+  we. Soft guidance (a lint/warning) may come later and never blocks.
+
+One rule: **block subclassing iff representationally impossible.** "leaf" survives
+only as *descriptive* vocabulary for the encoded-and-therefore-closed classes; it is
+not a modifier. ("final"/"sealed"/"immediate" all rejected: "final" implies no new
+methods; "sealed" means *restricted-permitted-subclasses* elsewhere; "immediate"
+names unboxed layout — true for `MachineInteger` but false for the boxed
+`ArbitraryInteger`/`String`, so it can't unify the set. The unifier is
+*VM-provided-ness*, named by `vmSubclass:`.) See `numeric_tower_plan.md` §4b.
 
 **Escape hatch (documented, NOT built):** a class-tagged encoding
 (`Value::Str { class: ClassId, data: Arc<str> }`) could allow scalar subclasses, at

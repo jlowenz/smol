@@ -2869,3 +2869,72 @@ fn trait_conflicts_reflection() {
     "#;
     assert_eq!(eval(src), Value::Int(1));
 }
+
+// ── Numeric tower & scalar value classes (docs/numeric_tower_plan.md S1) ──────
+
+#[test]
+fn scalar_class_identity() {
+    assert_eq!(eval("42 class = MachineInteger"), Value::Bool(true));
+    assert_eq!(
+        eval("(1000000000000 * 1000000000000) class = ArbitraryInteger"),
+        Value::Bool(true)
+    );
+    assert_eq!(eval("3.5 class = Float"), Value::Bool(true));
+    assert_eq!(eval("'hi' class = String"), Value::Bool(true));
+    assert_eq!(eval("#foo class = Symbol"), Value::Bool(true));
+    assert_eq!(eval("true class = True"), Value::Bool(true));
+    assert_eq!(eval("false class = False"), Value::Bool(true));
+}
+
+#[test]
+fn scalars_are_kind_of_value() {
+    // The reparenting fix: every scalar answers `isKindOf: Value` (was false for Int).
+    assert_eq!(eval("42 isKindOf: Value"), Value::Bool(true));
+    assert_eq!(eval("3.5 isKindOf: Value"), Value::Bool(true));
+    assert_eq!(eval("'hi' isKindOf: Value"), Value::Bool(true));
+    assert_eq!(eval("#foo isKindOf: Value"), Value::Bool(true));
+    assert_eq!(eval("true isKindOf: Value"), Value::Bool(true));
+    assert_eq!(
+        eval("(1000000000000 * 1000000000000) isKindOf: Value"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn integer_tower_membership() {
+    // MachineInteger < Integer < Number < Magnitude < Value < Object.
+    assert_eq!(eval("42 isKindOf: Integer"), Value::Bool(true));
+    assert_eq!(eval("42 isKindOf: Number"), Value::Bool(true));
+    assert_eq!(eval("42 isKindOf: Magnitude"), Value::Bool(true));
+    assert_eq!(eval("42 isKindOf: Object"), Value::Bool(true));
+    // ArbitraryInteger is also an Integer.
+    assert_eq!(
+        eval("(1000000000000 * 1000000000000) isKindOf: Integer"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn float_is_number_not_integer() {
+    assert_eq!(eval("3.5 isKindOf: Number"), Value::Bool(true));
+    assert_eq!(eval("3.5 isKindOf: Magnitude"), Value::Bool(true));
+    assert_eq!(eval("3.5 isKindOf: Integer"), Value::Bool(false));
+}
+
+#[test]
+fn string_symbol_are_value_leaves_not_magnitudes() {
+    // String/Symbol are direct Value leaves, deliberately NOT under Magnitude.
+    assert_eq!(eval("'hi' isKindOf: Magnitude"), Value::Bool(false));
+    assert_eq!(eval("#foo isKindOf: Magnitude"), Value::Bool(false));
+    assert_eq!(eval("'hi' isKindOf: Number"), Value::Bool(false));
+}
+
+#[test]
+fn scalar_arithmetic_unaffected_by_tower() {
+    // S1 does not touch arithmetic; the Rust primitive layer still handles it.
+    assert_eq!(eval("2 + 3"), Value::Int(5));
+    assert_eq!(eval("'ab' , 'cd'"), Value::Str("abcd".into()));
+    assert_eq!(eval("'hi' size"), Value::Int(2));
+    // Migrated `Integer >> timesRepeat:` still resolves and runs (was `Int >>`).
+    assert_eq!(eval("5 timesRepeat: [ 0 ]"), Value::Nil);
+}

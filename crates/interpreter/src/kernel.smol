@@ -807,6 +807,57 @@ HandlerContext >> on: anArray run: body [
 
 HandlerContext >> run: body        [ ^self _primHCRun: body ]
 
+"Numeric tower & scalar value classes (docs/numeric_tower_plan.md).
+All are encodings of Value instances, reparented under Value so `isKindOf: Value`
+holds. Representation runs down the is-a spine: MachineInteger = Value::Int(i64),
+ArbitraryInteger = Value::LargeInt(BigInt), Float = Value::Float(f64). Integer is the
+abstract shared class (bare `Int` retired); integer literals produce MachineInteger,
+promoting to ArbitraryInteger on overflow. String/Symbol are direct Value leaves (not
+Magnitudes). Reflection is routed via lookup_user_method arms + value_to_class_handle.
+S1a: ordinary subclass:; the encoded leaves become vmSubclass: (closed) in S1b.
+Arithmetic still lives in the Rust primitive layer (dispatch_int/dispatch_float);
+S2–S4 move the protocol into Smol on these classes."
+
+Value subclass: #Magnitude
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Magnitude subclass: #Number
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Number subclass: #Integer
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Integer subclass: #MachineInteger
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Integer subclass: #ArbitraryInteger
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Number subclass: #Float
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Value subclass: #String
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
+Value subclass: #Symbol
+    instanceVariableNames: ''
+    classVariableNames: ''
+    indexedSlots: #none.
+
 "Boolean hierarchy — True and False are singleton-style classes.
 Value::Bool(b) is the runtime representation; Bool is routed through
 lookup_user_method so these methods are found at step (1) of dispatch_to_stack."
@@ -885,7 +936,7 @@ Block >> whileFalse [
 "timesRepeat: recurses on (self - 1) instead of mutating a counter variable,
 avoiding NonLocalBlockAssignment. The iterative evaluator handles this O(1) via
 TCO; the old evaluator uses the _primTimesRepeat: alias in dispatch_int directly."
-Int >> timesRepeat: aBlock [
+Integer >> timesRepeat: aBlock [
     self > 0 ifFalse: [ ^nil ].
     aBlock value.
     ^(self - 1) timesRepeat: aBlock

@@ -655,18 +655,15 @@ ByteBuf new: 8
 
 // ── Error cases ───────────────────────────────────────────────────────────
 
+// Since the numeric tower / scalar value classes landed, every scalar
+// (Float/String/Symbol/MachineInteger/ArbitraryInteger) routes through
+// user-method lookup and reaches the default `Object>>doesNotUnderstand:`, which
+// signals a MessageNotUnderstood condition — consistent with Bool/Nil/Int.
 #[test]
 fn mnu_for_unknown_float_selector() {
-    assert!(matches!(
-        eval_err_diff("1.5 unknownMsg"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(&eval_err("1.5 unknownMsg"), "does not understand");
 }
 
-// C33: Bool/Nil route through user-method lookup, so an unknown selector now
-// reaches the default `Object>>doesNotUnderstand:`, which signals a
-// MessageNotUnderstood condition (iterative path only; the recursive kernel has
-// no DNU). Str/Symbol/Float/LargeInt still surface the raw error on both paths.
 #[test]
 fn mnu_for_unknown_bool_selector() {
     assert_signal_contains(&eval_err("true unknownMsg"), "does not understand");
@@ -679,26 +676,20 @@ fn mnu_for_unknown_nil_selector() {
 
 #[test]
 fn mnu_for_unknown_string_selector() {
-    assert!(matches!(
-        eval_err_diff("'hi' unknownMsg"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(&eval_err("'hi' unknownMsg"), "does not understand");
 }
 
 #[test]
 fn mnu_for_unknown_symbol_selector() {
-    assert!(matches!(
-        eval_err_diff("#foo unknownMsg"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(&eval_err("#foo unknownMsg"), "does not understand");
 }
 
 #[test]
 fn mnu_for_unknown_largeint_selector() {
-    assert!(matches!(
-        eval_err_diff("99999999999999999999 unknownMsg"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    assert_signal_contains(
+        &eval_err("99999999999999999999 unknownMsg"),
+        "does not understand",
+    );
 }
 
 // ── _primAt: / _primAt:put: / _primSize / _primAsString / error: ──────────
@@ -987,15 +978,15 @@ fn as_int_type_error() {
 #[test]
 fn as_block_type_error() {
     // After C29.6, loop primitives are Smol recursive methods. The body argument
-    // is not type-checked eagerly; errors surface as MNU when `aBlock value` is sent
-    // to a non-Block. The condition must evaluate to false so that `aBlock value` is
+    // is not type-checked eagerly; errors surface when `aBlock value` is sent to a
+    // non-Block. The condition must evaluate to false so that `aBlock value` is
     // actually reached; otherwise the method exits before calling the body.
-    // 'notABlock' is a Str, which does not route through user-method lookup, so
-    // it still surfaces the raw MNU error on both paths.
-    assert!(matches!(
-        eval_err_diff("[true] whileTrue: 'notABlock'"),
-        crate::eval::EvalError::MessageNotUnderstood { .. }
-    ));
+    // 'notABlock' is a Str, which now routes through user-method lookup and reaches
+    // `Object>>doesNotUnderstand:`, signalling a MessageNotUnderstood condition.
+    assert_signal_contains(
+        &eval_err("[true] whileTrue: 'notABlock'"),
+        "does not understand",
+    );
     // Use [false] so the condition is false on the first check, meaning aBlock value
     // (Int 42) is reached. Int routes through DNU (C33), so this signals.
     assert_signal_contains(&eval_err("[false] whileFalse: 42"), "does not understand");

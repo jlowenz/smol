@@ -359,10 +359,46 @@ pub(crate) fn lookup_user_method(
             })
         }
         Value::Int(n) => {
-            let int_cls = ev.registry.kernel().lookup_class("Int")?;
-            let (method, def_class) = int_cls.0.class.lookup(selector)?;
+            let cls = ev.registry.kernel().lookup_class("MachineInteger")?;
+            let (method, def_class) = cls.0.class.lookup(selector)?;
             Some(UserMethodFound::Primitive {
                 self_value: Value::Int(*n),
+                method,
+                def_class,
+            })
+        }
+        Value::LargeInt(n) => {
+            let cls = ev.registry.kernel().lookup_class("ArbitraryInteger")?;
+            let (method, def_class) = cls.0.class.lookup(selector)?;
+            Some(UserMethodFound::Primitive {
+                self_value: Value::LargeInt(n.clone()),
+                method,
+                def_class,
+            })
+        }
+        Value::Float(f) => {
+            let cls = ev.registry.kernel().lookup_class("Float")?;
+            let (method, def_class) = cls.0.class.lookup(selector)?;
+            Some(UserMethodFound::Primitive {
+                self_value: Value::Float(*f),
+                method,
+                def_class,
+            })
+        }
+        Value::Str(s) => {
+            let cls = ev.registry.kernel().lookup_class("String")?;
+            let (method, def_class) = cls.0.class.lookup(selector)?;
+            Some(UserMethodFound::Primitive {
+                self_value: Value::Str(s.clone()),
+                method,
+                def_class,
+            })
+        }
+        Value::Symbol(s) => {
+            let cls = ev.registry.kernel().lookup_class("Symbol")?;
+            let (method, def_class) = cls.0.class.lookup(selector)?;
+            Some(UserMethodFound::Primitive {
+                self_value: Value::Symbol(s.clone()),
                 method,
                 def_class,
             })
@@ -379,7 +415,7 @@ pub(crate) fn lookup_user_method(
                 def_class,
             })
         }
-        _ => None, // Float, Str, Symbol, LargeInt, Future, Namespace
+        _ => None, // Future, Namespace, Handle
     }
 }
 
@@ -1050,7 +1086,7 @@ fn dispatch_int(
             }
             Ok(Value::Nil)
         }
-        _ => dispatch_primitive_fallback(ev, "Int", sel, args),
+        _ => dispatch_primitive_fallback(ev, "MachineInteger", sel, args),
     }
 }
 
@@ -1154,7 +1190,7 @@ fn dispatch_largeint(
             let f = n.to_f64().unwrap_or(f64::INFINITY);
             Ok(Value::Float(f))
         }
-        _ => dispatch_primitive_fallback(ev, "LargeInt", sel, args),
+        _ => dispatch_primitive_fallback(ev, "ArbitraryInteger", sel, args),
     }
 }
 
@@ -2719,7 +2755,8 @@ fn value_to_class_handle(ev: &Evaluator, v: &Value) -> Option<InstanceHandle> {
                 "False"
             }
         }
-        Value::Int(_) | Value::LargeInt(_) => "Int",
+        Value::Int(_) => "MachineInteger",
+        Value::LargeInt(_) => "ArbitraryInteger",
         Value::Float(_) => "Float",
         Value::Str(_) => "String",
         Value::Symbol(_) => "Symbol",
