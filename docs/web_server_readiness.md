@@ -28,22 +28,23 @@ profiled workload to hand the eventual VM design, so work spiked now is reusable
 
 ## Baseline — what exists today (grounded in the tree)
 
-| Area | State | Reference |
-|------|-------|-----------|
-| Concurrency | `may` green threads, per-entity mailboxes, reduction-counter cooperative scheduling, Futures | `entity.rs`, CLAUDE.md C29.5/C31.5 |
-| Per-coroutine Rust stack | Bounded, independent of Smol nesting; debug 256 KB / release 64 KB per entity | CLAUDE.md C31.5 |
-| I/O surface | **Timers only** (`schedule_timer`/`cancel_timer`/`timer_pending`). No sockets/files/network. | `os_interface.rs` |
-| Entry point | stdin/stdout REPL | `main.rs` |
-| Types | Int, LargeInt (BigInt), Float, Str, ByteArray, Array, OrderedCollection, Dictionary (open-addressing hash map), Association, Cons | `kernel.smol`, `value.rs` |
-| String algorithms | Near-zero: `copyFrom:to:`, `includesSubString:`, `asString` | `builtins_iterative.rs` |
-| GC | **None.** Entities and value objects live forever; `value_objects` registry grows per value created. | CLAUDE.md, `open_questions.md` Q3/Q11 |
-| Condition system | Complete (async errors, handler-class disposition, restarts) | `docs/condition_system_guide.md` |
+| Area                     | State                                                                                                                             | Reference                             |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| Concurrency              | `may` green threads, per-entity mailboxes, reduction-counter cooperative scheduling, Futures                                      | `entity.rs`, CLAUDE.md C29.5/C31.5    |
+| Per-coroutine Rust stack | Bounded, independent of Smol nesting; debug 256 KB / release 64 KB per entity                                                     | CLAUDE.md C31.5                       |
+| I/O surface              | **Timers only** (`schedule_timer`/`cancel_timer`/`timer_pending`). No sockets/files/network.                                      | `os_interface.rs`                     |
+| Entry point              | stdin/stdout REPL                                                                                                                 | `main.rs`                             |
+| Types                    | Int, LargeInt (BigInt), Float, Str, ByteArray, Array, OrderedCollection, Dictionary (open-addressing hash map), Association, Cons | `kernel.smol`, `value.rs`             |
+| String algorithms        | Near-zero: `copyFrom:to:`, `includesSubString:`, `asString`                                                                       | `builtins_iterative.rs`               |
+| GC                       | **None.** Entities and value objects live forever; `value_objects` registry grows per value created.                              | CLAUDE.md, `open_questions.md` Q3/Q11 |
+| Condition system         | Complete (async errors, handler-class disposition, restarts)                                                                      | `docs/condition_system_guide.md`      |
 
 ---
 
 ## The two hard blockers
 
 ### B1. Networking (capability)
+
 No non-blocking socket primitives. `may` ships its own I/O reactor (`may::net`), so
 the path is: extend `OsInterface` with TCP `listen`/`accept`/`read`/`write` that
 **yield to the scheduler and never block the OS worker thread**, surfaced to Smol as
@@ -51,6 +52,7 @@ the path is: extend `OsInterface` with TCP `listen`/`accept`/`read`/`write` that
 (crypto + handshake state machine) — defer to a second phase.
 
 ### B2. Garbage collection (correctness)
+
 A long-running server leaks per request without reclamation — fatal, not cosmetic.
 Open item #5 (Q11, tx-orphan facts) is *part* of this, but the general problem is
 **entity + value-object lifetime**: the `value_objects` content-hash registry and
@@ -63,6 +65,7 @@ prerequisite — but a hard prerequisite for *this*.
 ## By axis
 
 ### 1. Correctness — sound under sustained load
+
 - **GC** (B2) — highest-priority correctness item.
 - **Per-entity footprint at scale** — 64 KB stack (release) + mailbox per entity;
   10k connections ≈ 640 MB of stacks alone. *This is a live concern even in release
@@ -80,6 +83,7 @@ prerequisite — but a hard prerequisite for *this*.
   deadlock detection is currently tx-scoped only.
 
 ### 2. Capability — features to add
+
 - **Non-blocking networking** (B1) + Smol socket/stream classes.
 - **Streams** — `ReadStream`/`WriteStream` over bytes; essential for HTTP parsing and
   response assembly.
@@ -105,6 +109,7 @@ prerequisite — but a hard prerequisite for *this*.
   once the primitive surface is understood.
 
 ### 3. Performance — throughput/latency
+
 - **Tree-walker cost** — every request walks the AST. The real fix is the bytecode VM
   (deferred). Interim wins: inline/polymorphic method-lookup caches; eliminate
   per-dispatch argument cloning (already flagged in the perf-review item); prune
@@ -134,6 +139,7 @@ then string/stream ergonomics, then method-dispatch cost.** The spike also gives
 eventual VM a concrete, profiled workload.
 
 **Two decisions that gate the build-out (should precede the stdlib work):**
+
 - **Traits** — because it changes the shape of core/library classes (above).
 - **Transients** — because it changes how every collection/string is built.
 

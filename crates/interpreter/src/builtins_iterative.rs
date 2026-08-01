@@ -419,6 +419,17 @@ pub(crate) fn lookup_user_method(
     }
 }
 
+/// The fixed set of VM-encoded value-class names — classes whose instances are a
+/// native `Value` encoding (docs/numeric_tower_plan.md §4b). These are defined via
+/// `vmSubclass:` and are **closed**: `subclass:` on them is rejected. The set mirrors
+/// the encodings `value_to_class_handle` produces for scalar `Value` variants.
+pub(crate) fn is_encoded_leaf_name(name: &str) -> bool {
+    matches!(
+        name,
+        "MachineInteger" | "ArbitraryInteger" | "Float" | "String" | "Symbol" | "True" | "False"
+    )
+}
+
 fn mnu(recv_kind: &'static str, selector: &Arc<str>) -> EvalError {
     EvalError::MessageNotUnderstood {
         receiver_kind: recv_kind,
@@ -2972,6 +2983,7 @@ fn dispatch_class(
     let current = ev.current_entity_id.get();
     if current == Some(entity_id)
         || selector.starts_with("subclass:")
+        || selector.starts_with("vmSubclass:")
         || handle.0.class.inherits_is_value()
         || matches!(selector.as_ref(), "=" | "~=")
     {
@@ -3245,8 +3257,9 @@ pub(crate) fn dispatch_class_builtin(
             println!("{:?}", s);
             Ok(Value::Str(s))
         }
-        sel if sel.contains("subclass:") => {
+        sel if sel.contains("subclass:") || sel.starts_with("vmSubclass:") => {
             // Extract the handle back from self_val to pass the Arc<Class> as superclass.
+            // (`vmSubclass:` has a capital S, so `contains("subclass:")` misses it.)
             handle_subclass(ev, class, selector, args, env)
         }
         _ => Err(EvalError::MessageNotUnderstood {
@@ -3281,12 +3294,12 @@ fn handle_subclass(
                     EvalError::TypeError("uses: argument must be a Trait".into())
                 })?);
             }
-            "subclass:" => match arg {
+            "subclass:" | "vmSubclass:" => match arg {
                 Value::Symbol(s) => class_name = Some(s.clone()),
                 _ => {
-                    return Err(EvalError::TypeError(
-                        "subclass: argument must be a Symbol".into(),
-                    ));
+                    return Err(EvalError::TypeError(format!(
+                        "{kw} argument must be a Symbol"
+                    )));
                 }
             },
             "instanceVariableNames:" => match arg {
@@ -3341,6 +3354,27 @@ fn handle_subclass(
 
     let name =
         class_name.ok_or_else(|| EvalError::TypeError("subclass: name is required".into()))?;
+
+    // Encoded-leaf closedness (docs/numeric_tower_plan.md §4b). `vmSubclass:` defines
+    // a VM-encoded value class (closed by construction); it is reserved for the fixed
+    // set of names the VM actually has an encoding for — users cannot invent one.
+    // Plain `subclass:` cannot subclass such a leaf: its fixed encoding carries no
+    // room for a subclass tag. Abstract tower classes (Magnitude/Number/Integer) are
+    // not leaves, so they stay open.
+    let is_vm = selector.starts_with("vmSubclass:");
+    if is_vm {
+        if !is_encoded_leaf_name(&name) {
+            return Err(EvalError::TypeError(format!(
+                "vmSubclass: is reserved for VM-encoded value classes; #{name} has no VM encoding"
+            )));
+        }
+    } else if is_encoded_leaf_name(&superclass.name) {
+        return Err(EvalError::TypeError(format!(
+            "cannot subclass the VM-encoded value class {}: encoded scalars are closed \
+             (add methods or use a trait/wrapper instead)",
+            superclass.name
+        )));
+    }
 
     // Validate ivar name uniqueness across the superclass chain.
     let super_ivars = superclass.all_instance_vars();

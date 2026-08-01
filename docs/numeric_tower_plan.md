@@ -237,7 +237,14 @@ are meaningless and should error or be absent.
 
 ## 6. Step breakdown (proposed; refine when starting)
 
-- **S1 — Hierarchy + reflection (correctness fix).** Reparent `Int` under a chain
+- **S1 — Hierarchy + reflection (correctness fix). DONE 2026-07-21** (S1a =
+  hierarchy+reflection, committed `82e8c13`; S1b = `vmSubclass:` + leaf closedness).
+  Closedness is enforced by a name-based allowlist (`is_encoded_leaf_name`) rather
+  than a new `Class` field — avoids touching ~15 `Class` constructors; the allowlist
+  mirrors the encodings `value_to_class_handle` produces. `subclass:` rejects a leaf
+  superclass; `vmSubclass:` requires an allowlisted name. Note: `vmSubclass:` has a
+  capital S, so the routing arm needed `starts_with("vmSubclass:")` alongside the
+  `contains("subclass:")` check. Reparent `Int` under a chain
   to `Value`; introduce `Magnitude`, `Number`, `Integer` (abstract) and the two
   leaves + `Float` via `vmSubclass:` in kernel.smol; implement `vmSubclass:`
   (VM-substrate class definition; user-invocation rejected) and make `subclass:`
@@ -249,10 +256,30 @@ are meaningless and should error or be absent.
   tower level. **No behavior change to arithmetic yet** — `dispatch_int` etc. stay
   as-is, now reachable as the primitive layer. This is the smallest shippable
   increment and closes the observed correctness bugs (`class`, `isKindOf: Value`).
-- **S2 — Comparison protocol.** Move `Magnitude` comparisons to Smol; expose
-  `_prim…Lt:`; fix cross-type `<` via coercion. Tests incl. `2 < 3.5`.
-- **S3 — Coercion protocol.** `generality`/`coerce:`/`retry:coercing:` on `Number`;
-  rewrite public `+ - * /` in Smol over machine/large/float primitives; fix
+- **S2.0 — `value` projection seam (foundation for S2/S3).** Before any protocol
+  moves to Smol, establish the projection seam that lets both comparison (S2) and
+  coercion (S3) be written against a representation-agnostic hook (§4 "value
+  projection seam"):
+  ```
+  Number >> value          [ ^self subclassResponsibility ]   "placement OPEN, see below"
+  MachineInteger >> value  [ ^self ]
+  ArbitraryInteger >> value[ ^self ]
+  Float >> value           [ ^self ]
+  ```
+  A user subclass answers its ivar (`AuditedInteger >> value [^amount]`) and inherits
+  everything above. **OPEN: does `value` live on `Integer` or `Number`?** If the seam
+  is uniform across the whole numeric tower (Float grounds arithmetic through it too),
+  it belongs on `Number` (leaning); if only integers need it, on `Integer`. Decide
+  when writing S2.0. Ground the same-representation `_prim` operations on the leaves
+  here too (see §4: single `_primLt:`/`_primAdd:` branching internally on the
+  `Value::` variant is the leaning choice over per-representation selectors).
+- **S2 — Comparison protocol.** Move `Magnitude` comparisons (`<=`, `>`, `>=`,
+  `max:`, `min:`, `between:and:`) to Smol in terms of `<`/`=`; leaf `<` routes
+  `^self value _primLt: aNumber value` for same-kind, else double-dispatch; fix
+  cross-type `<`. Tests incl. `2 < 3.5`.
+- **S3 — Coercion protocol.** Double-dispatch `adaptToInteger:andSend:` /
+  `adaptToFloat:andSend:` (§4 — NOT a central `generality` table); rewrite public
+  `+ - * /` in Smol over the same-rep primitives + `adaptTo…` fallback; fix
   `2 + 3.5` symmetry. Tests for every operand-type pair + promotion/demotion.
 - **S4 — Integer protocol build-out in Smol** (`gcd:`, `factorial`, `even`, …),
   demonstrating the payoff: real numeric behavior authored in the language.

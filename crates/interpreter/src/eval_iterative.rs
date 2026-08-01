@@ -2042,6 +2042,7 @@ fn dispatch_to_stack(
     {
         let sync = ev.current_entity_id.get() == Some(d.id)
             || selector.starts_with("subclass:")
+            || selector.starts_with("vmSubclass:")
             || handle.0.class.inherits_is_value()
             || matches!(selector.as_ref(), "=" | "~=");
         if sync && let Some((method, def_class)) = handle.0.class.lookup_class_method(&selector) {

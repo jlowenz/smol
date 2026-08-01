@@ -2938,3 +2938,64 @@ fn scalar_arithmetic_unaffected_by_tower() {
     // Migrated `Integer >> timesRepeat:` still resolves and runs (was `Int >>`).
     assert_eq!(eval("5 timesRepeat: [ 0 ]"), Value::Nil);
 }
+
+// ── Encoded-leaf closedness / vmSubclass: (docs/numeric_tower_plan.md §4b, S1b) ──
+
+#[test]
+fn cannot_subclass_encoded_leaf() {
+    for leaf in [
+        "MachineInteger",
+        "ArbitraryInteger",
+        "Float",
+        "String",
+        "Symbol",
+        "True",
+        "False",
+    ] {
+        let src = format!(
+            "{leaf} subclass: #Foo instanceVariableNames: '' classVariableNames: '' indexedSlots: #none"
+        );
+        match eval_err(&src) {
+            crate::eval::EvalError::TypeError(msg) => {
+                assert!(
+                    msg.contains("cannot subclass") && msg.contains(leaf),
+                    "unexpected message for {leaf}: {msg}"
+                );
+            }
+            other => panic!("expected TypeError for {leaf}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn abstract_tower_classes_stay_open() {
+    // Magnitude/Number/Integer are not encoded leaves; subclassing them is allowed.
+    assert_eq!(
+        eval(
+            "Number subclass: #Fraction instanceVariableNames: 'n d' classVariableNames: '' indexedSlots: #none. (Fraction new) isKindOf: Number"
+        ),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval(
+            "Integer subclass: #ModInt instanceVariableNames: 'r' classVariableNames: '' indexedSlots: #none. (ModInt new) isKindOf: Integer"
+        ),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn vm_subclass_reserved_for_encoded_names() {
+    // A user cannot invent a VM-encoded class: vmSubclass: rejects unknown names.
+    match eval_err(
+        "Object vmSubclass: #Fake instanceVariableNames: '' classVariableNames: '' indexedSlots: #none",
+    ) {
+        crate::eval::EvalError::TypeError(msg) => {
+            assert!(
+                msg.contains("vmSubclass:") && msg.contains("Fake"),
+                "got: {msg}"
+            );
+        }
+        other => panic!("expected TypeError, got {other:?}"),
+    }
+}

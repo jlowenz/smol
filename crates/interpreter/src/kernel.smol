@@ -833,27 +833,31 @@ Number subclass: #Integer
     classVariableNames: ''
     indexedSlots: #none.
 
-Integer subclass: #MachineInteger
+"The encoded leaves (fixed native Value representation) are defined with
+vmSubclass:, marking them closed — `subclass:` on them is rejected. The abstract
+tower classes above (Magnitude/Number/Integer) stay open ordinary subclasses."
+
+Integer vmSubclass: #MachineInteger
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
 
-Integer subclass: #ArbitraryInteger
+Integer vmSubclass: #ArbitraryInteger
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
 
-Number subclass: #Float
+Number vmSubclass: #Float
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
 
-Value subclass: #String
+Value vmSubclass: #String
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
 
-Value subclass: #Symbol
+Value vmSubclass: #Symbol
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
@@ -867,12 +871,12 @@ Value subclass: #Boolean
     classVariableNames: ''
     indexedSlots: #none.
 
-Boolean subclass: #True
+Boolean vmSubclass: #True
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
 
-Boolean subclass: #False
+Boolean vmSubclass: #False
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
