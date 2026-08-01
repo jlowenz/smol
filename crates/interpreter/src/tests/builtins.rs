@@ -991,25 +991,28 @@ fn comparison_type_errors() {
 // yields itself (see the note at `whileTrue:`/`whileFalse:` in kernel.smol). The
 // test was validating an artifact that no longer exists, not a real contract.
 
+// S3 behavior change: a non-numeric argument no longer produces a Rust `TypeError`
+// from the arithmetic primitive. Arithmetic now lives in Smol on the tower, and an
+// argument that is not an encoded number is handed to the coercion edge
+// (`adaptToInteger:andSend:`), whose refusing default on Object signals a `Error`
+// condition naming both operand and operator. This is strictly more informative and
+// is the same edge a user `Fraction` overrides to join the tower.
+
 #[test]
-fn bigint_from_value_type_error() {
-    // bigint_from_value is called for LargeInt arithmetic; wrong type should TypeError.
-    assert!(matches!(
-        eval_err_diff("99999999999999999999 + 'bad'"),
-        crate::eval::EvalError::TypeError(_)
-    ));
+fn bigint_coercion_error_for_non_number() {
+    assert_signal_contains(
+        &eval_err_diff("99999999999999999999 + 'bad'"),
+        "cannot coerce",
+    );
 }
 
-// ── Int arithmetic type errors ────────────────────────────────────────────
+// ── Int arithmetic coercion errors ────────────────────────────────────────
 
 #[test]
-fn int_arithmetic_type_errors() {
+fn int_arithmetic_coercion_errors() {
     for op in ["+", "-", "*", "/", "//", "\\\\"] {
         let src = format!("1 {op} 'bad'");
-        assert!(
-            matches!(eval_err_diff(&src), crate::eval::EvalError::TypeError(_)),
-            "op {op}: expected TypeError"
-        );
+        assert_signal_contains(&eval_err_diff(&src), "cannot coerce");
     }
 }
 
@@ -1017,11 +1020,9 @@ fn int_arithmetic_type_errors() {
 
 #[test]
 fn float_arithmetic_type_error() {
-    // Arithmetic is still the Rust primitive layer (S3 not yet done): TypeError.
-    assert!(matches!(
-        eval_err_diff("1.5 + 'bad'"),
-        crate::eval::EvalError::TypeError(_)
-    ));
+    // S3: arithmetic routes through Smol; a non-number argument reaches the coercion
+    // edge, whose refusing default signals rather than raising a Rust TypeError.
+    assert_signal_contains(&eval_err_diff("1.5 + 'bad'"), "cannot coerce");
     // Comparison routes through Smol now: `Float >> <` projects the arg with `value`
     // before `_primLt:`, and `nil` (not a Value) does not understand `value`, so this
     // surfaces as a MessageNotUnderstood signal rather than a bare TypeError.

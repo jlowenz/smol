@@ -207,3 +207,43 @@ fn colon_colon_token() {
     assert_eq!(tokens[0], Token::ColonColon);
     assert_eq!(tokens[1], Token::Eof);
 }
+
+#[test]
+fn binary_operator_symbol_literals() {
+    // `#+` etc. — a binary selector as a symbol literal, as in ANSI Smalltalk.
+    // Previously only `#word`, `#'quoted'` and `#(` were recognised, so `#+` lexed
+    // as a `#` BinOp and failed to parse.
+    for op in ["+", "-", "*", "/", "<", ">", "=", "~", "@", ",", "&"] {
+        assert_eq!(
+            tok(&format!("#{op}"))[0],
+            Token::Symbol(op.into()),
+            "symbol literal #{op}"
+        );
+    }
+}
+
+#[test]
+fn two_character_binary_operator_symbols() {
+    // The one-or-two-character operator rule applies inside a symbol too, so `#//`
+    // is a single symbol rather than `#/` followed by `/`.
+    for op in ["//", "\\\\", "<=", ">=", "~=", "~~", "->", ">>"] {
+        let tokens = tok(&format!("#{op}"));
+        assert_eq!(tokens[0], Token::Symbol(op.into()), "symbol literal #{op}");
+        assert_eq!(tokens[1], Token::Eof, "#{op} must lex as one token");
+    }
+}
+
+#[test]
+fn binary_operator_symbol_does_not_swallow_following_tokens() {
+    assert_eq!(
+        tok("3 perform: #+ withArguments: nil"),
+        vec![
+            Token::Int(3),
+            Token::Keyword("perform:".into()),
+            Token::Symbol("+".into()),
+            Token::Keyword("withArguments:".into()),
+            Token::Nil,
+            Token::Eof,
+        ]
+    );
+}

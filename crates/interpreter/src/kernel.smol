@@ -823,8 +823,9 @@ comparability is the `Ordered` trait (§2a), not a class, so String `uses: Order
 without being a Number. Reflection is routed via lookup_user_method arms +
 value_to_class_handle. S1a: ordinary subclass:; the encoded leaves become vmSubclass:
 (closed) in S1b. S2 moved the comparison protocol into Smol (Ordered trait + leaf
-`_primLt:`); arithmetic still lives in the Rust primitive layer (dispatch_int/
-dispatch_float) pending S3–S4."
+`_primLt:`) and S3 the arithmetic (leaf `_primAdd:` … + the `adaptTo…andSend:`
+coercion edge); the Rust `dispatch_int`/`dispatch_float` arms these now shadow are
+pruned in S5."
 
 "Ordered — the base comparability trait (docs/numeric_tower_plan.md §2a). Comparability
 is a *capability*, not a representation, so it lives on the trait axis (§4d), NOT as a
@@ -918,6 +919,136 @@ Number           >> < aNumber [ ^self value < aNumber ]
 MachineInteger   >> < aNumber [ ^self _primLt: aNumber value ]
 ArbitraryInteger >> < aNumber [ ^self _primLt: aNumber value ]
 Float            >> < aNumber [ ^self _primLt: aNumber value ]
+
+"Arithmetic (plan §4, S3). Same seam→prim shape as `<`: the `_prim` grounding lives
+on the LEAVES (where self IS the encoding), abstract Number projects self and
+reconstructs. `_primAdd:` and friends promote across all three leaf encodings in
+Rust — any Float ⇒ f64, else any LargeInt ⇒ BigInt, else i64 with overflow
+promoting and results demoting when they fit a word — so cross-type arithmetic
+(`2 + 3.5`, symmetric with `3.5 + 2`) is fixed there, exactly as `2 < 3.5` was.
+
+An operand that is NOT an encoded number (a user Fraction, Complex, or wrapper)
+cannot reach the primitive, so the leaf hands the operation to the ARGUMENT via
+`adaptToInteger:andSend:` / `adaptToFloat:andSend:` — double dispatch, so a new
+number type integrates by implementing two methods ON ITSELF, with no central
+generality table to edit and NO change to these closed vmSubclass: leaves. That
+extension edge is the committed design; `pvtIsEncodedNumber` is merely how the
+leaves detect the case internally (private, swappable, invisible to an extender).
+
+`//` and `\\` are integer protocol and are deliberately absent from Float.
+
+Abstract `Number` projects SELF ONLY (`self value + aNumber`, not `aNumber value`):
+the inner send re-dispatches on a leaf receiver, so a leaf argument grounds in the
+primitive while a second wrapper still reaches double dispatch. Projecting the
+argument here would silently receiver-wins-wrap `wrapperA + wrapperB` (plan §4e
+case 2). `withValue:` then reconstructs the receiver's kind around the result."
+
+Object           >> pvtIsEncodedNumber [ ^false ]
+MachineInteger   >> pvtIsEncodedNumber [ ^true ]
+ArbitraryInteger >> pvtIsEncodedNumber [ ^true ]
+Float            >> pvtIsEncodedNumber [ ^true ]
+
+Number >> + aNumber  [ ^self withValue: (self value + aNumber) ]
+Number >> - aNumber  [ ^self withValue: (self value - aNumber) ]
+Number >> * aNumber  [ ^self withValue: (self value * aNumber) ]
+Number >> / aNumber  [ ^self withValue: (self value / aNumber) ]
+
+Integer >> // aNumber  [ ^self withValue: (self value // aNumber) ]
+Integer >> \\ aNumber  [ ^self withValue: (self value \\ aNumber) ]
+
+MachineInteger >> + aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primAdd: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #+ ] ]
+MachineInteger >> - aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primSub: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #- ] ]
+MachineInteger >> * aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primMul: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #* ] ]
+MachineInteger >> / aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primDiv: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #/ ] ]
+MachineInteger >> // aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primQuo: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #// ] ]
+MachineInteger >> \\ aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primRem: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #\\ ] ]
+
+ArbitraryInteger >> + aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primAdd: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #+ ] ]
+ArbitraryInteger >> - aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primSub: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #- ] ]
+ArbitraryInteger >> * aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primMul: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #* ] ]
+ArbitraryInteger >> / aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primDiv: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #/ ] ]
+ArbitraryInteger >> // aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primQuo: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #// ] ]
+ArbitraryInteger >> \\ aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primRem: aNumber ]
+        ifFalse: [ aNumber adaptToInteger: self andSend: #\\ ] ]
+
+Float >> + aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primAdd: aNumber ]
+        ifFalse: [ aNumber adaptToFloat: self andSend: #+ ] ]
+Float >> - aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primSub: aNumber ]
+        ifFalse: [ aNumber adaptToFloat: self andSend: #- ] ]
+Float >> * aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primMul: aNumber ]
+        ifFalse: [ aNumber adaptToFloat: self andSend: #* ] ]
+Float >> / aNumber [
+    ^aNumber pvtIsEncodedNumber
+        ifTrue:  [ self _primDiv: aNumber ]
+        ifFalse: [ aNumber adaptToFloat: self andSend: #/ ] ]
+
+"The coercion edge. A number type that is not an encoded leaf implements these two
+methods to join the tower: it receives the original RECEIVER plus the operator
+symbol, promotes the receiver into its own domain, and performs the operation.
+
+The refusing defaults sit on Object, not Number, so that `3 + 'bad'` reports a clear
+coercion error rather than a MessageNotUnderstood naming an internal selector — the
+same reason `pvtIsEncodedNumber` defaults at the root.
+
+PROVISIONAL PLACEMENT: these three fallbacks belong on a `NumberCoercion` TRAIT
+(capability axis, §4d) rather than accreting numeric vocabulary on Object. That needs
+a standalone `SomeClass uses: SomeTrait.` statement — `uses:` is currently a clause of
+subclass:/vmSubclass: only, and Object is bootstrapped in Rust — which is a
+trait-system step with its own design questions. See plan §4f, `NumberCoercion` trait.
+
+`Float >> adaptToInteger:andSend:` is the worked example. It is not reachable from
+integer arithmetic (the primitive already promotes Int→Float), but it documents the
+shape and keeps Float a well-behaved participant if an integer-like user class ever
+delegates to it."
+
+Object >> adaptToInteger: anInteger andSend: aSymbol [
+    ^self error: 'cannot coerce ', self printString, ' to a number for ', aSymbol asString ]
+Object >> adaptToFloat: aFloat andSend: aSymbol [
+    ^self error: 'cannot coerce ', self printString, ' to a number for ', aSymbol asString ]
+
+Float >> adaptToInteger: anInteger andSend: aSymbol [
+    ^anInteger asFloat perform: aSymbol withArguments: (Cons with: self rest: nil) ]
 
 Value vmSubclass: #String
     uses: Ordered

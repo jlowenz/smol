@@ -3123,3 +3123,238 @@ fn user_number_subclass_inherits_via_value_seam() {
         Value::Int(5)
     );
 }
+
+// ── Numeric tower S3: arithmetic in Smol, coercion edge ───────────────────────
+
+#[test]
+fn s3_same_type_arithmetic_all_leaves() {
+    assert_eq!(eval("7 + 5"), Value::Int(12));
+    assert_eq!(eval("7 - 5"), Value::Int(2));
+    assert_eq!(eval("7 * 5"), Value::Int(35));
+    assert_eq!(eval("7 / 2"), Value::Int(3));
+    assert_eq!(eval("7 // 2"), Value::Int(3));
+    assert_eq!(eval("7 \\\\ 2"), Value::Int(1));
+    assert_eq!(eval("1.5 + 2.5"), Value::Float(4.0));
+    assert_eq!(eval("1.5 - 0.5"), Value::Float(1.0));
+    assert_eq!(eval("1.5 * 2.0"), Value::Float(3.0));
+    assert_eq!(eval("3.0 / 2.0"), Value::Float(1.5));
+    assert_eq!(
+        eval("99999999999999999999 - 99999999999999999998"),
+        Value::Int(1)
+    );
+}
+
+#[test]
+fn s3_negative_division_floors_and_takes_divisor_sign() {
+    // `//` floors toward negative infinity, `\\` takes the sign of the divisor —
+    // Smalltalk semantics, preserved through the move into Smol.
+    assert_eq!(eval("-7 // 2"), Value::Int(-4));
+    assert_eq!(eval("-7 \\\\ 2"), Value::Int(1));
+    assert_eq!(eval("7 // -2"), Value::Int(-4));
+    assert_eq!(eval("7 \\\\ -2"), Value::Int(-1));
+    // `/` between integers truncates rather than flooring (unchanged behavior).
+    assert_eq!(eval("-7 / 2"), Value::Int(-3));
+}
+
+#[test]
+fn s3_cross_type_arithmetic_is_symmetric() {
+    // The reported bug: `2 + 3.5` errored while `3.5 + 2` worked. The promoting
+    // primitive fixes both directions, exactly as `_primLt:` did for `2 < 3.5`.
+    assert_eq!(eval("2 + 3.5"), Value::Float(5.5));
+    assert_eq!(eval("3.5 + 2"), Value::Float(5.5));
+    assert_eq!(eval("2 - 0.5"), Value::Float(1.5));
+    assert_eq!(eval("0.5 - 2"), Value::Float(-1.5));
+    assert_eq!(eval("2 * 1.5"), Value::Float(3.0));
+    assert_eq!(eval("1.5 * 2"), Value::Float(3.0));
+    assert_eq!(eval("3 / 2.0"), Value::Float(1.5));
+    assert_eq!(eval("3.0 / 2"), Value::Float(1.5));
+}
+
+#[test]
+fn s3_machine_and_arbitrary_integers_mix() {
+    // Cross-representation integer arithmetic promotes to BigInt in either order.
+    assert_eq!(
+        eval("99999999999999999999 + 1 = 100000000000000000000"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval("1 + 99999999999999999999 = 100000000000000000000"),
+        Value::Bool(true)
+    );
+    // …and to Float when a Float joins in.
+    assert_eq!(eval("(99999999999999999999 * 0.0)"), Value::Float(0.0));
+}
+
+#[test]
+fn s3_overflow_promotes_and_result_demotes() {
+    // Representation follows magnitude, not operand history: overflow promotes to
+    // ArbitraryInteger, and a result that fits a machine word demotes back.
+    assert_eq!(
+        eval("(4611686018427387904 * 4) class printString"),
+        Value::Str("ArbitraryInteger".into())
+    );
+    assert_eq!(
+        eval("(99999999999999999999 - 99999999999999999998) class printString"),
+        Value::Str("MachineInteger".into())
+    );
+    // i64::MIN edge cases that overflow the machine fast path.
+    assert_eq!(eval("(-9223372036854775807 - 1) \\\\ -1"), Value::Int(0));
+    assert_eq!(
+        eval("((-9223372036854775807 - 1) / -1) class printString"),
+        Value::Str("ArbitraryInteger".into())
+    );
+}
+
+#[test]
+fn s3_division_by_zero_errors_on_both_integer_leaves() {
+    assert!(matches!(
+        eval_err("1 / 0"),
+        crate::eval::EvalError::TypeError(_)
+    ));
+    assert!(matches!(
+        eval_err("1 // 0"),
+        crate::eval::EvalError::TypeError(_)
+    ));
+    assert!(matches!(
+        eval_err("1 \\\\ 0"),
+        crate::eval::EvalError::TypeError(_)
+    ));
+    assert!(matches!(
+        eval_err("99999999999999999999 / 0"),
+        crate::eval::EvalError::TypeError(_)
+    ));
+}
+
+#[test]
+fn s3_float_has_no_integer_division_protocol() {
+    // `//` and `\\` are Integer protocol; Float is not given them.
+    assert_signal_contains(&eval_err("1.5 // 2.0"), "does not understand");
+    assert_signal_contains(&eval_err("1.5 \\\\ 2.0"), "does not understand");
+}
+
+#[test]
+fn s3_non_number_argument_reaches_the_coercion_edge() {
+    // Not a Rust TypeError: the leaf hands the operation to the argument, whose
+    // refusing default names both operand and operator.
+    assert_signal_contains(&eval_err("3 + 'bad'"), "cannot coerce");
+    assert_signal_contains(&eval_err("3 + 'bad'"), "+");
+    assert_signal_contains(&eval_err("3.5 * nil"), "cannot coerce");
+}
+
+#[test]
+fn s3_user_number_joins_the_tower_without_changing_the_kernel() {
+    // The openness test. `Half` is a structured number with no encoded leaf: it
+    // implements ONLY `adaptToInteger:andSend:` on itself. No kernel leaf method,
+    // no allowlist, and no central generality table is touched — which is the whole
+    // point of routing the non-encoded case through double dispatch.
+    let src = "Number subclass: #Half instanceVariableNames: 'halves' \
+                   classVariableNames: '' indexedSlots: #none. \
+               Half class >> halves: h [ ^self _primNewValue: [:x | x setHalves: h] ]. \
+               Half >> setHalves: h [ halves := h ]. \
+               Half >> halves [ ^halves ]. \
+               Half >> adaptToInteger: anInteger andSend: aSymbol [ \
+                   ^Half halves: ((anInteger * 2) perform: aSymbol withArguments: (Cons with: halves rest: nil)) ]. \
+               ";
+    // `3 + (Half halves: 1)` — the leaf can't handle a Half, so Half promotes the
+    // receiver into halves (3 → 6) and performs the operation there: 6 + 1 = 7 halves.
+    assert_eq!(
+        eval(&format!("{src} (3 + (Half halves: 1)) halves")),
+        Value::Int(7)
+    );
+    // Non-commutative operators keep operand order: 6 - 1 = 5 halves, not 1 - 6.
+    assert_eq!(
+        eval(&format!("{src} (3 - (Half halves: 1)) halves")),
+        Value::Int(5)
+    );
+}
+
+#[test]
+fn s3_wrapper_reconstructs_via_the_value_seam() {
+    // Story A continued from S2.0: a wrapper that implements `value` + `withValue:`
+    // gets closed arithmetic for free from abstract `Number`, which projects SELF
+    // ONLY and reconstructs the receiver's kind around the result.
+    let src = "Number subclass: #Boxed instanceVariableNames: 'n' \
+                   classVariableNames: '' indexedSlots: #none. \
+               Boxed class >> of: x [ ^self _primNewValue: [:b | b setN: x] ]. \
+               Boxed >> setN: x [ n := x ]. \
+               Boxed >> value [ ^n ]. \
+               Boxed >> withValue: v [ ^Boxed of: v ]. \
+               ";
+    assert_eq!(
+        eval(&format!("{src} ((Boxed of: 5) + 3) value")),
+        Value::Int(8)
+    );
+    assert_eq!(
+        eval(&format!("{src} ((Boxed of: 5) + 3) class printString")),
+        Value::Str("Boxed".into())
+    );
+    // Cross-type through the seam: the projected leaf promotes, then reconstructs.
+    assert_eq!(
+        eval(&format!("{src} ((Boxed of: 5) * 1.5) value")),
+        Value::Float(7.5)
+    );
+    // The inherited `withValue:` default is the escape hatch: a wrapper that does
+    // NOT reconstruct answers the bare leaf.
+    let bare = "Number subclass: #Peek instanceVariableNames: 'n' \
+                    classVariableNames: '' indexedSlots: #none. \
+                Peek class >> of: x [ ^self _primNewValue: [:b | b setN: x] ]. \
+                Peek >> setN: x [ n := x ]. \
+                Peek >> value [ ^n ]. \
+                ";
+    assert_eq!(eval(&format!("{bare} (Peek of: 5) + 3")), Value::Int(8));
+}
+
+#[test]
+fn s3_encoded_number_predicate_is_leaf_private() {
+    // The branch mechanism is an implementation detail of the leaves: encoded
+    // numbers answer true, everything else inherits false from Object — including a
+    // user Number subclass, which is exactly what routes it to the coercion edge.
+    assert_eq!(eval("3 pvtIsEncodedNumber"), Value::Bool(true));
+    assert_eq!(eval("3.5 pvtIsEncodedNumber"), Value::Bool(true));
+    assert_eq!(
+        eval("99999999999999999999 pvtIsEncodedNumber"),
+        Value::Bool(true)
+    );
+    assert_eq!(eval("'x' pvtIsEncodedNumber"), Value::Bool(false));
+    assert_eq!(
+        eval(
+            "Number subclass: #Wrapped instanceVariableNames: '' classVariableNames: '' \
+                 indexedSlots: #none. \
+             Wrapped class >> make [ ^self _primNewValue: [:x | x] ]. \
+             Wrapped make pvtIsEncodedNumber"
+        ),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn perform_accepts_binary_operator_symbols() {
+    assert_eq!(
+        eval("6 perform: #+ withArguments: (Cons with: 1 rest: nil)"),
+        Value::Int(7)
+    );
+    assert_eq!(
+        eval("6 perform: #// withArguments: (Cons with: 4 rest: nil)"),
+        Value::Int(1)
+    );
+    assert_eq!(
+        eval("6 perform: #< withArguments: (Cons with: 7 rest: nil)"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn perform_with_arguments_rejects_a_non_cons_list() {
+    // Previously an Array (or any non-Cons) silently unpacked to ZERO arguments,
+    // turning a mistake into a confusing failure at the target selector.
+    assert!(matches!(
+        eval_err("6 perform: #abs withArguments: {1}"),
+        crate::eval::EvalError::TypeError(_)
+    ));
+    assert!(matches!(
+        eval_err("6 perform: #+ withArguments: 1"),
+        crate::eval::EvalError::TypeError(_)
+    ));
+    // nil remains the valid empty argument list.
+    assert_eq!(eval("-6 perform: #abs withArguments: nil"), Value::Int(6));
+}

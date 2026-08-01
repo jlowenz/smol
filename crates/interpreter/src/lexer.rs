@@ -256,6 +256,16 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// The characters a binary selector may be built from. `-` is included here but
+    /// handled separately at the top level, where a following digit makes it a
+    /// negative-number sign rather than an operator.
+    fn is_binop_char(c: char) -> bool {
+        matches!(
+            c,
+            '+' | '-' | '*' | '/' | '\\' | '<' | '>' | '=' | '~' | '@' | ',' | '&'
+        )
+    }
+
     fn read_binop(&mut self, first: char) -> Token {
         let mut s = String::new();
         s.push(first);
@@ -317,6 +327,17 @@ impl<'src> Lexer<'src> {
                         self.advance();
                         Ok(Token::ArrayLiteralOpen)
                     }
+                    // `#+`, `#//`, `#\\`, … — a binary selector as a symbol literal,
+                    // as in ANSI Smalltalk. `read_binop` applies the same
+                    // one-or-two-character operator rule used for operator tokens, so
+                    // `#//` is one symbol rather than `#/` followed by `/`.
+                    Some(ch) if Self::is_binop_char(ch) => {
+                        let first = self.advance().unwrap();
+                        match self.read_binop(first) {
+                            Token::BinOp(op) => Ok(Token::Symbol(op)),
+                            other => Ok(other),
+                        }
+                    }
                     _ => Ok(self.read_binop('#')),
                 }
             }
@@ -374,9 +395,7 @@ impl<'src> Lexer<'src> {
                     Ok(self.read_binop('-'))
                 }
             }
-            '+' | '*' | '/' | '\\' | '<' | '>' | '=' | '~' | '@' | ',' | '&' => {
-                Ok(self.read_binop(c))
-            }
+            c if Self::is_binop_char(c) => Ok(self.read_binop(c)),
             c => Err(LexError::UnexpectedChar(c, start)),
         }
     }

@@ -526,19 +526,38 @@ pub(crate) fn as_block(
 /// element is left unforced so a `Value::Future` argument stays transparent.
 ///
 /// Requires: `list` is `Value::Nil` or a chain of `Cons` ValueObjects.
-/// Ensures: returns elements in list order; a non-Cons node terminates the walk.
+/// Ensures: returns elements in list order; a node that is neither `nil` nor a
+/// `Cons` is a `TypeError`. Terminating the walk silently on such a node (the
+/// earlier behavior) turned `perform: #foo withArguments: anArray` into a
+/// zero-argument send, surfacing as a confusing arity or coercion failure far from
+/// the actual mistake.
 pub(crate) fn cons_to_vec(ev: &Evaluator, list: Value) -> Result<Vec<Value>, EvalError> {
     let mut out = Vec::new();
     let mut node = force_value(ev, list)?;
-    while let Value::Instance(h) = node {
-        let obj = match &h.0.kind {
-            InstanceKind::ValueObject(o) => o.clone(),
-            _ => break,
-        };
-        out.push(obj.get_slot("head").unwrap_or(Value::Nil));
-        node = force_value(ev, obj.get_slot("tail").unwrap_or(Value::Nil))?;
+    loop {
+        match node {
+            Value::Nil => return Ok(out),
+            Value::Instance(ref h) => {
+                let obj = match &h.0.kind {
+                    InstanceKind::ValueObject(o) if &*h.0.class.name == "Cons" => o.clone(),
+                    _ => {
+                        return Err(EvalError::TypeError(format!(
+                            "withArguments: expects a Cons list or nil, got {}",
+                            h.0.class.name
+                        )));
+                    }
+                };
+                out.push(obj.get_slot("head").unwrap_or(Value::Nil));
+                node = force_value(ev, obj.get_slot("tail").unwrap_or(Value::Nil))?;
+            }
+            other => {
+                return Err(EvalError::TypeError(format!(
+                    "withArguments: expects a Cons list or nil, got {}",
+                    other.kind()
+                )));
+            }
+        }
     }
-    Ok(out)
 }
 
 fn bigint_from_value(ev: &Evaluator, v: Value, sel: &Arc<str>) -> Result<BigInt, EvalError> {
@@ -618,6 +637,129 @@ fn numeric_lt(ev: &Evaluator, a: Value, b: Value, sel: &Arc<str>) -> Result<bool
         _ => Err(EvalError::TypeError(format!(
             "{sel}: operands must be numeric"
         ))),
+    }
+}
+
+/// The arithmetic operations grounded by the tower's `_prim…` selectors (S3).
+///
+/// One variant per public operator; the promotion policy is shared
+/// (`numeric_binop`) rather than written per representation, mirroring the
+/// single-selector `_primLt:` precedent from S2.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumOp {
+    Add,
+    Sub,
+    Mul,
+    /// `/` — truncating division between integer leaves, true division once a
+    /// `Float` is involved.
+    Div,
+    /// `//` — floor division. Integer leaves only.
+    Quo,
+    /// `\\` — modulo with the sign of the divisor. Integer leaves only.
+    Rem,
+}
+
+/// Arithmetic over the numeric leaf encodings with the tower's promotion policy:
+/// any `Float` operand ⇒ `f64`; else any `LargeInt` ⇒ `BigInt`; else `i64` with
+/// overflow promoting to `BigInt`. Results demote back to `Int` whenever they fit
+/// a machine word (`normalize_bigint`), so representation is chosen by magnitude
+/// rather than by operand history.
+///
+/// This is the single Rust grounding the tower's `+ - * / // \\` route to via
+/// `_primAdd:` and friends (docs/numeric_tower_plan.md §4). Cross-type arithmetic
+/// (`2 + 3.5`) is fixed entirely here — the Smol `adaptTo…andSend:` double
+/// dispatch is reached only for operands that are *not* encoded numbers.
+///
+/// Requires: `a` and `b` force to numeric leaves; `op` is `Quo`/`Rem` only when
+/// both are integer leaves. Ensures: the promoted result, or a `TypeError` for a
+/// non-numeric operand, a `Float` operand to `//`/`\\`, or division by zero.
+fn numeric_binop(
+    ev: &Evaluator,
+    op: NumOp,
+    a: Value,
+    b: Value,
+    sel: &Arc<str>,
+) -> Result<Value, EvalError> {
+    let a = force_value(ev, a)?;
+    let b = force_value(ev, b)?;
+
+    if matches!(a, Value::Float(_)) || matches!(b, Value::Float(_)) {
+        let (x, y) = (leaf_to_f64(&a, sel)?, leaf_to_f64(&b, sel)?);
+        return match op {
+            NumOp::Add => Ok(Value::Float(x + y)),
+            NumOp::Sub => Ok(Value::Float(x - y)),
+            NumOp::Mul => Ok(Value::Float(x * y)),
+            NumOp::Div => Ok(Value::Float(x / y)),
+            // `//` and `\\` are integer protocol; Float never reaches them from
+            // the kernel (they are defined on the Integer leaves only), so this
+            // is a guard against a hand-sent primitive.
+            NumOp::Quo | NumOp::Rem => Err(EvalError::TypeError(format!(
+                "{sel}: operands must be integers"
+            ))),
+        };
+    }
+
+    // Both operands are integer leaves. The i64 fast path covers the common case;
+    // anything that overflows or involves a LargeInt goes through BigInt.
+    if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
+        let (x, y) = (*x, *y);
+        let fast = match op {
+            NumOp::Add => x.checked_add(y),
+            NumOp::Sub => x.checked_sub(y),
+            NumOp::Mul => x.checked_mul(y),
+            NumOp::Div | NumOp::Quo | NumOp::Rem => {
+                if y == 0 {
+                    return Err(EvalError::TypeError("division by zero".into()));
+                }
+                // `checked_rem` (not `%`) because `i64::MIN % -1` overflows and
+                // would panic in debug; `None` falls through to the BigInt path.
+                match (op, x.checked_rem(y)) {
+                    (_, None) => None,
+                    (NumOp::Div, Some(_)) => x.checked_div(y),
+                    (NumOp::Quo, Some(r)) => {
+                        let borrow = r != 0 && (r < 0) != (y < 0);
+                        x.checked_div(y).map(|q| if borrow { q - 1 } else { q })
+                    }
+                    (_, Some(r)) => Some(if r != 0 && (r < 0) != (y < 0) {
+                        r + y
+                    } else {
+                        r
+                    }),
+                }
+            }
+        };
+        if let Some(r) = fast {
+            return Ok(Value::Int(r));
+        }
+    }
+
+    let x = leaf_to_bigint(&a, sel)?;
+    let y = leaf_to_bigint(&b, sel)?;
+    if matches!(op, NumOp::Div | NumOp::Quo | NumOp::Rem) && y.is_zero() {
+        return Err(EvalError::TypeError("division by zero".into()));
+    }
+    Ok(normalize_bigint(match op {
+        NumOp::Add => x + y,
+        NumOp::Sub => x - y,
+        NumOp::Mul => x * y,
+        NumOp::Div => x / y,
+        NumOp::Quo => bigint_floor_div(x, &y),
+        NumOp::Rem => bigint_floor_rem(x, &y),
+    }))
+}
+
+/// Maps an arithmetic `_prim…` selector to its operation, or `None` if `sel` is
+/// not one of them. Lets each leaf's dispatch table carry a single arm for all
+/// six operators.
+fn arith_prim_op(sel: &str) -> Option<NumOp> {
+    match sel {
+        "_primAdd:" => Some(NumOp::Add),
+        "_primSub:" => Some(NumOp::Sub),
+        "_primMul:" => Some(NumOp::Mul),
+        "_primDiv:" => Some(NumOp::Div),
+        "_primQuo:" => Some(NumOp::Quo),
+        "_primRem:" => Some(NumOp::Rem),
+        _ => None,
     }
 }
 
@@ -1071,6 +1213,11 @@ fn dispatch_int(
                 sel,
             )?))
         }
+        _ if arith_prim_op(sel).is_some() => {
+            expect_arity(sel, 1, args.len())?;
+            let op = arith_prim_op(sel).expect("guarded by the match arm");
+            numeric_binop(ev, op, Value::Int(n), args.remove(0), sel)
+        }
         "<" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(n < as_int(ev, args.remove(0), sel)?))
@@ -1226,6 +1373,11 @@ fn dispatch_largeint(
                 sel,
             )?))
         }
+        _ if arith_prim_op(sel).is_some() => {
+            expect_arity(sel, 1, args.len())?;
+            let op = arith_prim_op(sel).expect("guarded by the match arm");
+            numeric_binop(ev, op, Value::LargeInt(n), args.remove(0), sel)
+        }
         "<" => {
             expect_arity(sel, 1, args.len())?;
             let rhs = bigint_from_value(ev, args.remove(0), sel)?;
@@ -1328,6 +1480,11 @@ fn dispatch_float(
                 args.remove(0),
                 sel,
             )?))
+        }
+        _ if arith_prim_op(sel).is_some() => {
+            expect_arity(sel, 1, args.len())?;
+            let op = arith_prim_op(sel).expect("guarded by the match arm");
+            numeric_binop(ev, op, Value::Float(f), args.remove(0), sel)
         }
         "<" => {
             expect_arity(sel, 1, args.len())?;
