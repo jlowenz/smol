@@ -119,17 +119,8 @@ and deletes the broad fallback arms (S5 prune), not new math.
   over blue-book `generality`/`coerce:`/`retry:coercing:` because it is the *more
   open* mechanism (no global table), matching Smol's ethos. Fixes `2 + 3.5` /
   `2 < 3.5` symmetry.
-- **The `value` projection seam (DECIDED).** `Integer >> value` is a
-  `subclassResponsibility`; leaves answer `^self` (`MachineInteger >> value [^self]`),
-  a user subclass answers its ivar (`AuditedInteger >> value [^amount]`). Abstract
-  `Integer` arithmetic/derived methods route through `value` + same-rep primitives,
-  so a **user `Integer` subclass implements essentially ONE method (`value`)** and
-  inherits all of `Integer` (`even`, `gcd:`, `to:do:`, `factorial`, coercion). This
-  is what makes `Integer` genuinely open+useful rather than closed-or-vacuous —
-  representation-specific `_prim` work lives on the leaves; a subclass reaches it
-  transitively through `value`. Minor wart: `value` is a slightly unnatural public
-  method (`3 value` is legal); naming (`value` vs `primitiveValue`) is a small open
-  call, not a design issue.
+- **The seam pair: `value` / `withValue:` (DECIDED 2026-07-31, refines the earlier
+  single-method `value` seam).** See §4e.
 - `Integer` protocol: `even`, `odd`, `gcd:`, `lcm:`, `factorial`, `isPrime`,
   `timesRepeat:` (already there), `to:do:`/`to:by:do:` (already there), bit ops if
   desired.
@@ -199,7 +190,12 @@ Therefore (classic Smalltalk template-method / subclass-responsibility split):
 handles both (encoded values via `lookup_user_method` arms → primitive `self`;
 `ValueObject`s via their class); shared abstract code never depends on which.
 **Design constraint for S2–S4:** every method promoted onto `Magnitude`/`Number`/
-`Integer` must be encoding-agnostic (protocol self-sends only).
+`Integer` must be encoding-agnostic — either pure protocol self-sends, or routed
+through the §4e seam pair (`self withValue: (self value _prim…: arg value)`), which
+is itself encoding-agnostic because both halves are overridable. It must never name
+a `Value` variant or assume `self` *is* a leaf. (§4e supersedes the stricter
+"protocol self-sends only" reading of this paragraph: Story A methods do reach
+`_prim`s, but only via the seam.)
 
 ## 4d. Two axes: representation (`is-a`) vs algebra (traits) — DECIDED
 
@@ -226,6 +222,100 @@ QuickCheck law-classes, Scala `cats-laws`, Pharo algebraic test traits. Fits Smo
 "observable" goal and the planned Smol SUnit framework (CLAUDE.md tooling item 2).
 Depends on: Smol testing framework + a property/generator mechanism — neither
 exists. Cross-link there; do not build now.
+
+## 4e. The seam pair — `value` / `withValue:` (DECIDED 2026-07-31)
+
+Two subclassing stories coexist under the tower, and the seam decides how far the
+cheap one reaches. Earlier drafts (§4, §4c) stated them in tension; this section is
+authoritative.
+
+- **Story A — delegation.** A *wrapper* (`AuditedInteger` holding `amount`,
+  `ModularInteger` holding a residue + modulus, a domain `Money`) is represented by
+  an underlying encoded number. It implements the seam pair and inherits the whole
+  abstract protocol.
+- **Story B — subclass responsibility.** A *structured* number (`Fraction`,
+  `Complex`) has no single underlying scalar. It overrides `+ - * / <` itself and
+  inherits only the derived protocol (`even`, `max:`, `between:and:`, …). Abstract
+  code never forces it through the seam.
+
+### Placement
+
+- **`Magnitude`'s seam is `<` (plus `=`), NOT `value`.** Its members include
+  non-numeric comparables — `Character`, later `Date`, version tuples, compound keys
+  — for which "the underlying encoded scalar" is meaningless or a lie (a `Date` is
+  several ivars; projecting to one silently picks an axis). `<=`, `>`, `>=`, `max:`,
+  `min:`, `between:and:` need only `<`, so `Magnitude >> <` is
+  `subclassResponsibility` and nothing else is required.
+- **The seam pair lives on `Number`, not `Integer`.** Uniform placement lets the
+  coercion protocol (§4) and every same-representation `_prim` call be written once
+  against `value`, and gives wrappers of *any* numeric representation (a `Money`
+  over `Float`, an `AuditedInteger` over `MachineInteger`) the same freebie. Putting
+  it on `Integer` only would cost `Number`'s coercion code its uniform way to reach a
+  raw operand. The price — `Fraction`/`Complex` inherit a `value` they cannot honor —
+  is paid in a `subclassResponsibility` error they would have hit anyway under Story
+  B, which is what that mechanism is for.
+
+### Naming — `value` (DECIDED)
+
+`value` is kept. It does **not** collide conceptually with `Block >> value`: both
+mean *reduce the receiver to its value* — a block by running, a number by being
+itself. That uniformity is the long-standing `aBlockOrValue value` idiom (Pharo
+historically carried `Object >> value [^self]` for exactly this). `primitiveValue` /
+`encodedValue` were rejected: they assert substrate status that is false of a user
+wrapper answering the same selector. Accepted risk: `value` is the highest-traffic
+selector in the image, so a user class that is a `Number` *and* uses `value` for its
+own domain meaning has a conflict — narrow, since it only reaches classes under
+`Number`.
+
+### Contract
+
+```
+Number >> value              [ ^self subclassResponsibility ]
+Number >> withValue: aValue  [ ^aValue ]              "default: escape to the leaf"
+MachineInteger >> value      [ ^self ]
+MachineInteger >> withValue: aValue [ ^aValue ]       "inherited; identity"
+```
+
+`value` — *Requires:* nothing. *Ensures:* answers an **encoded leaf**
+(`MachineInteger`/`ArbitraryInteger`/`Float`), never merely "a Number" — so a
+wrapper-of-a-wrapper answers `^inner value` and recurses to ground. This is what
+lets abstract methods hand the result straight to a `_prim`.
+
+`withValue:` — the **reconstruction** half, without which arithmetic on a wrapper
+would answer a bare leaf and silently discard the receiver's identity. *Requires:*
+`aValue` is an encoded leaf. *Ensures:* answers the receiver's kind carrying the
+receiver's other state, or a leaf if the operation escapes the wrapper. Written on
+the receiver (not `self class new:`) precisely so it can carry sibling ivars forward
+and normalize: `ModularInteger >> withValue: n [ ^self class value: n \\ modulus ]`.
+
+Abstract arithmetic is then the template
+`Integer >> + aNumber [ ^self withValue: (self value _primAdd: aNumber value) ]`,
+and a wrapper implements **two** methods to get closed arithmetic.
+
+**Immutability wrinkle (confirmed S2.0).** A user `Number` subclass is a `Value`,
+so its instances are **frozen** after construction — ivars can be mutated *only*
+inside a `_primNewValue:` builder block (the `Condition` pattern), never by a plain
+setter on a live instance. Therefore a wrapper's `withValue:` reconstruction must
+route through a class-side value factory
+(`ModularInteger >> withValue: n [ ^self class value: n \\ modulus ]`, where
+`ModularInteger class >> value: n [ ^self _primNewValue: [:m | m setN: n ...] ]`),
+**not** `self copy setN:` — `copy` of a frozen value followed by a setter fails the
+same freeze check. The S2.0 seam test (`user_number_subclass_inherits_via_value_seam`)
+constructs its wrapper via exactly this builder path. S3, when it implements the
+leaf/wrapper `withValue:` reconstructions, must follow it.
+
+### Three cases where blind reconstruction is wrong
+
+1. **Not closed under the operation.** `audited / 2` may be a `Float` or `Fraction`;
+   wrapping that back into `AuditedInteger` is a lie. Division (and any op that can
+   leave the wrapper's domain) must be allowed to escape — the inherited default
+   `withValue: [^aValue]` is the escape hatch, and such ops call it deliberately.
+2. **Two different wrappers.** `audited + money` — receiver-wins reconstruction
+   silently breaks type symmetry. This is the job of the `adaptTo…:andSend:` double
+   dispatch (§4): a wrapper participates in coercion like any other number rather
+   than getting a free wrap.
+3. **Leaves.** The leaves inherit `withValue: [^aValue]` unchanged, which keeps the
+   same template correct at the bottom of the tower with no leaf-specific code.
 
 ## 5. Construction contract (unchanged from string plan §4)
 
@@ -256,23 +346,22 @@ are meaningless and should error or be absent.
   tower level. **No behavior change to arithmetic yet** — `dispatch_int` etc. stay
   as-is, now reachable as the primitive layer. This is the smallest shippable
   increment and closes the observed correctness bugs (`class`, `isKindOf: Value`).
-- **S2.0 — `value` projection seam (foundation for S2/S3).** Before any protocol
-  moves to Smol, establish the projection seam that lets both comparison (S2) and
-  coercion (S3) be written against a representation-agnostic hook (§4 "value
-  projection seam"):
+- **S2.0 — seam pair `value`/`withValue:` (foundation for S2/S3).** Before any
+  protocol moves to Smol, establish the seam that lets comparison (S2) and coercion
+  (S3) be written against a representation-agnostic hook. Placement and naming are
+  DECIDED — see §4e:
   ```
-  Number >> value          [ ^self subclassResponsibility ]   "placement OPEN, see below"
-  MachineInteger >> value  [ ^self ]
-  ArbitraryInteger >> value[ ^self ]
-  Float >> value           [ ^self ]
+  Number >> value             [ ^self subclassResponsibility ]
+  Number >> withValue: aValue [ ^aValue ]
+  MachineInteger >> value     [ ^self ]
+  ArbitraryInteger >> value   [ ^self ]
+  Float >> value              [ ^self ]
   ```
-  A user subclass answers its ivar (`AuditedInteger >> value [^amount]`) and inherits
-  everything above. **OPEN: does `value` live on `Integer` or `Number`?** If the seam
-  is uniform across the whole numeric tower (Float grounds arithmetic through it too),
-  it belongs on `Number` (leaning); if only integers need it, on `Integer`. Decide
-  when writing S2.0. Ground the same-representation `_prim` operations on the leaves
-  here too (see §4: single `_primLt:`/`_primAdd:` branching internally on the
-  `Value::` variant is the leaning choice over per-representation selectors).
+  (leaves inherit `withValue:` unchanged). `Magnitude >> <` is declared
+  `subclassResponsibility` here as Magnitude's own seam. Ground the
+  same-representation `_prim` operations on the leaves here too (see §4: single
+  `_primLt:`/`_primAdd:` branching internally on the `Value::` variant is the leaning
+  choice over per-representation selectors).
 - **S2 — Comparison protocol.** Move `Magnitude` comparisons (`<=`, `>`, `>=`,
   `max:`, `min:`, `between:and:`) to Smol in terms of `<`/`=`; leaf `<` routes
   `^self value _primLt: aNumber value` for same-kind, else double-dispatch; fix
@@ -291,8 +380,11 @@ Each step is independently committable; S1 alone fixes the reported bugs.
 
 ## 7. Open questions / deferred
 
-- **§3 name** for the arbitrary-precision leaf (blocker for S1). MachineInteger
-  decided; arbitrary side leaning `ArbitraryInteger`.
+- **RESOLVED (§3):** arbitrary-precision leaf named `ArbitraryInteger`; bare `Int`
+  retired in favour of abstract `Integer` (landed S1a, `82e8c13`).
+- **RESOLVED (§4e):** seam placement, naming, and shape — `value`/`withValue:` pair
+  on `Number` (not `Integer`); `Magnitude`'s seam is `<`, it gets no `value`;
+  `value` kept over `primitiveValue`/`encodedValue`.
 - **RESOLVED (§4b):** closedness mechanism — `vmSubclass:` + representational-block
   rule; no user-facing modifier; abstract classes (incl. `Integer`) open.
 - **`_prim` naming/rework** — kept a **separate thread** (2026-07-12); co-design
@@ -301,10 +393,8 @@ Each step is independently committable; S1 alone fixes the reported bugs.
   added. Design later.
 - **Float subtyping under Number only** — Float is a `Number` but not an `Integer`;
   confirm no code assumes Number == Integer.
-- **`Int` name retirement** — kernel currently says `Int`. Decide whether
-  `MachineInteger` fully replaces the user-facing name `Int`, or `Int` survives as
-  an alias / as the abstract `Integer`. (Leaning: `Integer` is the abstract shared
-  class; literals produce `MachineInteger`; drop bare `Int`.)
+- **RESOLVED — `Int` name retirement** — done in S1a: `Integer` is the abstract
+  shared class, literals produce `MachineInteger`, bare `Int` is gone.
 - **Performance** — moving arithmetic dispatch into Smol adds message sends on the
   hot path. Mitigation: keep same-type fast path as a single primitive call;
   measure before/after (ties into the queued performance review).

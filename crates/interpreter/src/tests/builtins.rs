@@ -979,17 +979,24 @@ fn as_int_type_error() {
 fn as_block_type_error() {
     // After C29.6, loop primitives are Smol recursive methods. The body argument
     // is not type-checked eagerly; errors surface when `aBlock value` is sent to a
-    // non-Block. The condition must evaluate to false so that `aBlock value` is
-    // actually reached; otherwise the method exits before calling the body.
-    // 'notABlock' is a Str, which now routes through user-method lookup and reaches
-    // `Object>>doesNotUnderstand:`, signalling a MessageNotUnderstood condition.
+    // non-Block that does not understand `value`, reaching `Object>>doesNotUnderstand:`
+    // (a MessageNotUnderstood condition). Note this is a *polymorphism* check, not a
+    // real block type-check: any receiver that does respond to `value` (e.g. a Number
+    // since the S2.0 seam) would be accepted and evaluate to itself. Both receivers
+    // below are chosen precisely because they do NOT understand `value`.
+    // 'notABlock' is a Str; the condition stays true so the body is reached.
     assert_signal_contains(
         &eval_err("[true] whileTrue: 'notABlock'"),
         "does not understand",
     );
-    // Use [false] so the condition is false on the first check, meaning aBlock value
-    // (Int 42) is reached. Int routes through DNU (C33), so this signals.
-    assert_signal_contains(&eval_err("[false] whileFalse: 42"), "does not understand");
+    // #notABlock is a Symbol (no `value` method — it is a direct Value leaf, not a
+    // Number). [false] means the condition is false on the first check, so the body
+    // `#notABlock value` is reached and DNUs. (Was Int 42 before the S2.0 numeric
+    // seam gave MachineInteger>>value; 42 now answers itself and would loop forever.)
+    assert_signal_contains(
+        &eval_err("[false] whileFalse: #notABlock"),
+        "does not understand",
+    );
 }
 
 #[test]

@@ -329,6 +329,12 @@ Object >> isEmpty [ ^false ]
 Object >> class [ ^self _primClass ]
 Object >> isKindOf: aClass [ ^self _primIsKindOf: aClass ]
 
+"Marks an abstract method that a concrete subclass must supply. Signals rather
+than returning nil so a missing override fails loudly at the point of use."
+Object >> subclassResponsibility [
+    ^Error signal: self class name, ' must implement this method (subclass responsibility)'
+]
+
 "Default handling of a send that failed normal lookup: signal a
 MessageNotUnderstood condition carrying the reified message. Override in a
 subclass to intercept/forward arbitrary messages (proxies, transparent futures).
@@ -851,6 +857,36 @@ Number vmSubclass: #Float
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
+
+"S2.0 — the seams the abstract tower is written against (plan §4e).
+
+Magnitude's seam is `<` alone: every other comparison is derived from it, and
+nothing about a comparable implies it projects to a single scalar (a Date, a
+version tuple, a compound key do not). It is NOT declared here, though: a user
+method shadows the Rust builtin (dispatch step 1 beats builtin dispatch), so
+declaring `<` abstract before the leaves implement it would break every numeric
+comparison. It lands in S2 alongside the leaf `<` implementations.
+
+Number's seam is the PAIR `value` / `withValue:`:
+  value       projects the receiver onto its encoded leaf (MachineInteger /
+              ArbitraryInteger / Float) so abstract code can hand it to a _prim.
+              A wrapper answers its ivar; a wrapper-of-a-wrapper answers
+              `^inner value` and recurses to ground.
+  withValue:  reconstructs the receiver's kind around a computed leaf, carrying
+              the receiver's other state. The inherited default answers the bare
+              leaf — which is both the leaves' own (identity) behavior and the
+              deliberate escape hatch for operations that leave a wrapper's
+              domain (`/` may answer a Float).
+Together they let a wrapper implement TWO methods and inherit closed arithmetic.
+Structured numbers (Fraction, Complex) have no single underlying scalar; they
+override the arithmetic itself and never reach the seam."
+
+Number >> value             [ ^self subclassResponsibility ]
+Number >> withValue: aValue [ ^aValue ]
+
+MachineInteger   >> value [ ^self ]
+ArbitraryInteger >> value [ ^self ]
+Float            >> value [ ^self ]
 
 Value vmSubclass: #String
     instanceVariableNames: ''

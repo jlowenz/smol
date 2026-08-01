@@ -2999,3 +2999,58 @@ fn vm_subclass_reserved_for_encoded_names() {
         other => panic!("expected TypeError, got {other:?}"),
     }
 }
+
+// ── S2.0 seam: value / withValue: (docs/numeric_tower_plan.md §4e) ────────────
+
+#[test]
+fn leaves_project_to_self_via_value() {
+    // Each encoded numeric leaf answers `^self` to `value`, grounding the seam.
+    assert_eq!(eval("42 value"), Value::Int(42));
+    assert_eq!(eval("3.5 value"), Value::Float(3.5));
+    // ArbitraryInteger: force a value past the machine-word range; it stays a leaf.
+    assert!(matches!(
+        eval("(1000000000000 * 1000000000000) value"),
+        Value::LargeInt(_)
+    ));
+}
+
+#[test]
+fn number_withvalue_default_answers_the_leaf() {
+    // The inherited Number>>withValue: reconstruction default answers the bare leaf
+    // (identity for a leaf receiver; the escape hatch for a wrapper). A leaf sending
+    // it to another leaf simply yields that leaf.
+    assert_eq!(eval("42 withValue: 7"), Value::Int(7));
+    assert_eq!(eval("3.5 withValue: 9"), Value::Int(9));
+}
+
+#[test]
+fn abstract_number_value_is_subclass_responsibility() {
+    // Number itself has no representation, so `value` is a subclass responsibility.
+    // A user subclass of Number that fails to implement it hits the loud signal.
+    assert_signal_contains(
+        &eval_err(
+            "Number subclass: #Vague instanceVariableNames: '' classVariableNames: '' indexedSlots: #none. \
+             Vague new value",
+        ),
+        "subclass responsibility",
+    );
+}
+
+#[test]
+fn user_number_subclass_inherits_via_value_seam() {
+    // Story A: a wrapper implements `value` (project) and inherits everything the
+    // abstract tower routes through it. A Number subclass is a Value (immutable), so
+    // it is constructed via the _primNewValue: builder — ivars are set inside the
+    // builder block, then frozen (same pattern as Condition). `value` then grounds
+    // the seam by returning the underlying leaf.
+    assert_eq!(
+        eval(
+            "Number subclass: #Boxed instanceVariableNames: 'n' classVariableNames: '' indexedSlots: #none. \
+             Boxed class >> of: x [ ^self _primNewValue: [:b | b setN: x] ]. \
+             Boxed >> setN: x [ n := x ]. \
+             Boxed >> value [ ^n ]. \
+             (Boxed of: 5) value",
+        ),
+        Value::Int(5)
+    );
+}
