@@ -3358,3 +3358,151 @@ fn perform_with_arguments_rejects_a_non_cons_list() {
     // nil remains the valid empty argument list.
     assert_eq!(eval("-6 perform: #abs withArguments: nil"), Value::Int(6));
 }
+
+// ── Numeric tower S4: Integer/Number protocol authored in Smol ────────────────
+
+#[test]
+fn s4_number_sign_abs_and_negated() {
+    assert_eq!(eval("5 negated"), Value::Int(-5));
+    assert_eq!(eval("-5 negated"), Value::Int(5));
+    assert_eq!(eval("-5 abs"), Value::Int(5));
+    assert_eq!(eval("5 abs"), Value::Int(5));
+    assert_eq!(eval("0 abs"), Value::Int(0));
+    assert_eq!(eval("-2.5 abs"), Value::Float(2.5));
+    assert_eq!(eval("-2.5 negated"), Value::Float(2.5));
+    // sign classifies the receiver, so it answers a plain Integer even for a Float.
+    assert_eq!(eval("-7 sign"), Value::Int(-1));
+    assert_eq!(eval("0 sign"), Value::Int(0));
+    assert_eq!(eval("7 sign"), Value::Int(1));
+    assert_eq!(eval("-2.5 sign"), Value::Int(-1));
+    assert_eq!(eval("0.0 sign"), Value::Int(0));
+}
+
+#[test]
+fn s4_number_squared_reciprocal_is_zero() {
+    assert_eq!(eval("7 squared"), Value::Int(49));
+    assert_eq!(eval("1.5 squared"), Value::Float(2.25));
+    assert_eq!(eval("4 reciprocal"), Value::Int(0)); // integer division truncates
+    assert_eq!(eval("4.0 reciprocal"), Value::Float(0.25));
+    assert_eq!(eval("0 isZero"), Value::Bool(true));
+    assert_eq!(eval("1 isZero"), Value::Bool(false));
+    // NOTE: `0.0 isZero` is currently FALSE — `=` is not on the tower and does not
+    // promote across representations (`2 = 2.0` is false while `2 < 2.0` promotes).
+    // Tracked as an open gap; see docs/numeric_tower_plan.md §4g.
+}
+
+#[test]
+fn s4_negated_promotes_at_the_machine_word_boundary() {
+    // i64::MIN has no positive machine-word counterpart, so `negated` must promote.
+    assert_eq!(
+        eval("(-9223372036854775807 - 1) negated class printString"),
+        Value::Str("ArbitraryInteger".into())
+    );
+    assert_eq!(
+        eval("(-9223372036854775807 - 1) abs > 0"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn s4_integer_even_and_odd() {
+    assert_eq!(eval("4 even"), Value::Bool(true));
+    assert_eq!(eval("4 odd"), Value::Bool(false));
+    assert_eq!(eval("7 even"), Value::Bool(false));
+    assert_eq!(eval("7 odd"), Value::Bool(true));
+    assert_eq!(eval("0 even"), Value::Bool(true));
+    // `\\` takes the sign of the divisor, so negative odds still classify correctly.
+    assert_eq!(eval("-7 odd"), Value::Bool(true));
+    assert_eq!(eval("-4 even"), Value::Bool(true));
+}
+
+#[test]
+fn s4_integer_gcd_and_lcm() {
+    assert_eq!(eval("12 gcd: 18"), Value::Int(6));
+    assert_eq!(eval("18 gcd: 12"), Value::Int(6));
+    assert_eq!(eval("17 gcd: 5"), Value::Int(1));
+    assert_eq!(eval("12 gcd: 0"), Value::Int(12));
+    assert_eq!(eval("0 gcd: 12"), Value::Int(12));
+    // Negative operands answer a non-negative gcd, per the usual convention.
+    assert_eq!(eval("-12 gcd: 8"), Value::Int(4));
+    assert_eq!(eval("12 gcd: -8"), Value::Int(4));
+    assert_eq!(eval("4 lcm: 6"), Value::Int(12));
+    assert_eq!(eval("6 lcm: 4"), Value::Int(12));
+    assert_eq!(eval("7 lcm: 3"), Value::Int(21));
+    assert_eq!(eval("-4 lcm: 6"), Value::Int(12));
+    assert_eq!(eval("0 lcm: 5"), Value::Int(0));
+}
+
+#[test]
+fn s4_integer_factorial_promotes_exactly() {
+    assert_eq!(eval("0 factorial"), Value::Int(1));
+    assert_eq!(eval("1 factorial"), Value::Int(1));
+    assert_eq!(eval("5 factorial"), Value::Int(120));
+    assert_eq!(eval("20 factorial"), Value::Int(2432902008176640000));
+    // 21! exceeds i64: the leaf primitives promote, so the result stays exact.
+    assert_eq!(
+        eval("21 factorial class printString"),
+        Value::Str("ArbitraryInteger".into())
+    );
+    assert_eq!(
+        eval("21 factorial printString"),
+        Value::Str("51090942171709440000".into())
+    );
+    assert_eq!(eval("30 factorial > (20 factorial)"), Value::Bool(true));
+    assert_signal_contains(&eval_err("-1 factorial"), "factorial of a negative");
+}
+
+#[test]
+fn s4_integer_is_prime() {
+    assert_eq!(eval("2 isPrime"), Value::Bool(true));
+    assert_eq!(eval("3 isPrime"), Value::Bool(true));
+    assert_eq!(eval("97 isPrime"), Value::Bool(true));
+    assert_eq!(eval("7919 isPrime"), Value::Bool(true));
+    assert_eq!(eval("1 isPrime"), Value::Bool(false));
+    assert_eq!(eval("0 isPrime"), Value::Bool(false));
+    assert_eq!(eval("-7 isPrime"), Value::Bool(false));
+    assert_eq!(eval("4 isPrime"), Value::Bool(false));
+    assert_eq!(eval("9 isPrime"), Value::Bool(false));
+    assert_eq!(eval("7917 isPrime"), Value::Bool(false)); // 3 × 7 × 13 × 29
+}
+
+#[test]
+fn s4_protocol_is_encoding_agnostic_for_a_wrapper() {
+    // The §4c payoff, and its CURRENT LIMIT. A wrapper implementing only the seam
+    // (`value` + `withValue:`) inherits every method whose self-sends keep the
+    // wrapper in RECEIVER position with leaf arguments. Methods that put the
+    // receiver into an ARGUMENT position (`squared` = self * self, `factorial`,
+    // `gcd:`, `lcm:`) do NOT yet work: the leaf sees a non-encoded operand and hits
+    // the coercion edge, whose refusing default declines. See §4g — a seam-based
+    // default for `adaptTo…andSend:` would close this.
+    let src = "Integer subclass: #Boxed instanceVariableNames: 'n' \
+                   classVariableNames: '' indexedSlots: #none. \
+               Boxed class >> of: x [ ^self _primNewValue: [:b | b setN: x] ]. \
+               Boxed >> setN: x [ n := x ]. \
+               Boxed >> value [ ^n ]. \
+               Boxed >> withValue: v [ ^Boxed of: v ]. \
+               ";
+    assert_eq!(
+        eval(&format!("{src} (Boxed of: -7) abs value")),
+        Value::Int(7)
+    );
+    assert_eq!(
+        eval(&format!("{src} (Boxed of: 7) negated value")),
+        Value::Int(-7)
+    );
+    assert_eq!(
+        eval(&format!("{src} ((Boxed of: 5) + 3) value")),
+        Value::Int(8)
+    );
+    // Quantities keep the receiver's kind through reconstruction…
+    assert_eq!(
+        eval(&format!("{src} (Boxed of: -7) abs class printString")),
+        Value::Str("Boxed".into())
+    );
+    // …while classifications answer plain values.
+    assert_eq!(eval(&format!("{src} (Boxed of: -7) sign")), Value::Int(-1));
+    // Comparison already projects its argument with `value`, so `<`-derived protocol
+    // works in either position.
+    assert_eq!(eval(&format!("{src} (Boxed of: 3) < 5")), Value::Bool(true));
+    assert_eq!(eval(&format!("{src} 5 < (Boxed of: 7)")), Value::Bool(true));
+}

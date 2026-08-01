@@ -1146,6 +1146,84 @@ Block >> whileFalse [
     ^self whileFalse
 ]
 
+"── Number and Integer protocol (plan §4c, S4) ───────────────────────────────
+
+Authored in Smol on the ABSTRACT classes, which is the payoff of the tower: this is
+real numeric behavior a user can read, edit, and extend, not hardcoded Rust. Every
+method here is ENCODING-AGNOSTIC (§4c) — pure protocol self-sends, never a `_prim`,
+never a named Value variant, never an assumption that `self` IS a leaf. So they work
+unchanged for a user `ModularInteger` or a `Boxed` wrapper, whose `self` is a boxed
+ValueObject: each self-send re-dispatches, reaching the leaves (or the wrapper's own
+overrides) at the bottom.
+
+Two shapes recur. `negated` is written `self * -1` rather than `0 - self` because the
+receiver must stay on the LEFT: with the receiver on the left a wrapper enters via
+`Number >> *`, which projects and reconstructs through the seam; with the receiver on
+the right it would instead have to satisfy the coercion edge. `abs`/`sign` answer via
+comparison, so they inherit cross-type correctness from `<` for free.
+
+Recursion rather than loop accumulation throughout: a method temporary cannot be
+assigned from inside a block (Smol_Patterns pattern 1), and the ValueHolder
+accumulator pattern would drag an entity into pure value arithmetic. `gcd:` and
+`pvtHasNoOddFactorFrom:` are tail-recursive (TCO makes them O(1) stack); `factorial`
+is not, but the iterative evaluator holds its frames on the heap Cont stack, so depth
+costs heap rather than Rust stack."
+
+Number >> negated    [ ^self * -1 ]
+Number >> abs        [ ^self < 0 ifTrue: [ self negated ] ifFalse: [ self ] ]
+Number >> squared    [ ^self * self ]
+Number >> reciprocal [ ^1 / self ]
+Number >> isZero     [ ^self = 0 ]
+
+"sign answers a plain Integer (-1/0/1), not the receiver's kind: it is a
+classification of the receiver, not a quantity in the receiver's domain, so it must
+NOT go through withValue:."
+Number >> sign [
+    self < 0 ifTrue: [ ^-1 ].
+    self > 0 ifTrue: [ ^1 ].
+    ^0
+]
+
+Integer >> even [ ^(self \\ 2) = 0 ]
+Integer >> odd  [ ^self even not ]
+
+"Euclid's algorithm, tail-recursive. `abs` on the base case keeps the result
+non-negative for negative operands, per the usual convention gcd(-12, 8) = 4."
+Integer >> gcd: anInteger [
+    anInteger isZero ifTrue: [ ^self abs ].
+    ^anInteger gcd: self \\ anInteger
+]
+
+"lcm via gcd. Guards zero first: lcm(0, n) = 0 and the gcd would be zero, so the
+division is undefined."
+Integer >> lcm: anInteger [
+    (self isZero or: [ anInteger isZero ]) ifTrue: [ ^0 ].
+    ^((self // (self gcd: anInteger)) * anInteger) abs
+]
+
+"Overflow is not a special case here: the leaf primitives promote to
+ArbitraryInteger as the product grows, so 30 factorial is exact."
+Integer >> factorial [
+    self < 0 ifTrue: [ ^self error: 'factorial of a negative integer' ].
+    self <= 1 ifTrue: [ ^1 ].
+    ^self * (self - 1) factorial
+]
+
+"Trial division by odd candidates, stopping at sqrt(self) via `k * k > self` — the
+tower has no float sqrt, and squaring the candidate avoids needing one. The helper is
+tail-recursive so the whole search is O(1) in stack."
+Integer >> isPrime [
+    self < 2 ifTrue: [ ^false ].
+    self even ifTrue: [ ^self = 2 ].
+    ^self pvtHasNoOddFactorFrom: 3
+]
+
+Integer >> pvtHasNoOddFactorFrom: k [
+    k * k > self ifTrue: [ ^true ].
+    (self \\ k) isZero ifTrue: [ ^false ].
+    ^self pvtHasNoOddFactorFrom: k + 2
+]
+
 "timesRepeat: recurses on (self - 1) instead of mutating a counter variable,
 avoiding NonLocalBlockAssignment. The iterative evaluator handles this O(1) via
 TCO; the old evaluator uses the _primTimesRepeat: alias in dispatch_int directly."
