@@ -959,45 +959,37 @@ fn int_negated_min_promotes_to_bigint() {
 // ── Type errors in helper functions ───────────────────────────────────────
 
 #[test]
-fn as_int_type_error() {
-    // as_int is called when an Int is expected but another type is given.
+fn comparison_type_errors() {
+    // Comparison now routes through Smol (Ordered trait + leaf `<` → `_primLt:`,
+    // numeric-tower S2). When the Int stays the receiver, a non-numeric operand
+    // reaches `_primLt:` and fails as a TypeError from `numeric_lt`.
     assert!(matches!(
         eval_err_diff("1 < 'hello'"),
         crate::eval::EvalError::TypeError(_)
     ));
     assert!(matches!(
-        eval_err_diff("1 > true"),
+        eval_err_diff("1 < true"),
         crate::eval::EvalError::TypeError(_)
     ));
+    // `max:` derives from `<` (Ordered), so it too bottoms out in `_primLt:`.
     assert!(matches!(
         eval_err_diff("1 max: 'x'"),
         crate::eval::EvalError::TypeError(_)
     ));
+    // `>` flips to `arg < self` (Ordered), making the non-numeric arg the receiver;
+    // a Bool has no `<`, so this surfaces as a MessageNotUnderstood signal instead.
+    assert_signal_contains(&eval_err_diff("1 > true"), "does not understand");
 }
 
-#[test]
-fn as_block_type_error() {
-    // After C29.6, loop primitives are Smol recursive methods. The body argument
-    // is not type-checked eagerly; errors surface when `aBlock value` is sent to a
-    // non-Block that does not understand `value`, reaching `Object>>doesNotUnderstand:`
-    // (a MessageNotUnderstood condition). Note this is a *polymorphism* check, not a
-    // real block type-check: any receiver that does respond to `value` (e.g. a Number
-    // since the S2.0 seam) would be accepted and evaluate to itself. Both receivers
-    // below are chosen precisely because they do NOT understand `value`.
-    // 'notABlock' is a Str; the condition stays true so the body is reached.
-    assert_signal_contains(
-        &eval_err("[true] whileTrue: 'notABlock'"),
-        "does not understand",
-    );
-    // #notABlock is a Symbol (no `value` method — it is a direct Value leaf, not a
-    // Number). [false] means the condition is false on the first check, so the body
-    // `#notABlock value` is reached and DNUs. (Was Int 42 before the S2.0 numeric
-    // seam gave MachineInteger>>value; 42 now answers itself and would loop forever.)
-    assert_signal_contains(
-        &eval_err("[false] whileFalse: #notABlock"),
-        "does not understand",
-    );
-}
+// `as_block_type_error` was removed in numeric-tower S2 (2026-08-01). It asserted
+// that a non-Block loop body signals "does not understand #value" — but that only
+// ever held by accident: it relied on the body type happening not to implement
+// `value`. Once the value/withValue: seam was lifted to `Value >> value [^self]`
+// (§4e), EVERY value answers `value` (reducing to itself, the block-or-value idiom),
+// so there is no value that DNUs it. Per C29.6, loop bodies are deliberately NOT
+// eagerly type-checked; a non-block body is now simply evaluated via `value` and
+// yields itself (see the note at `whileTrue:`/`whileFalse:` in kernel.smol). The
+// test was validating an artifact that no longer exists, not a real contract.
 
 #[test]
 fn bigint_from_value_type_error() {
@@ -1025,14 +1017,15 @@ fn int_arithmetic_type_errors() {
 
 #[test]
 fn float_arithmetic_type_error() {
+    // Arithmetic is still the Rust primitive layer (S3 not yet done): TypeError.
     assert!(matches!(
         eval_err_diff("1.5 + 'bad'"),
         crate::eval::EvalError::TypeError(_)
     ));
-    assert!(matches!(
-        eval_err_diff("1.5 < nil"),
-        crate::eval::EvalError::TypeError(_)
-    ));
+    // Comparison routes through Smol now: `Float >> <` projects the arg with `value`
+    // before `_primLt:`, and `nil` (not a Value) does not understand `value`, so this
+    // surfaces as a MessageNotUnderstood signal rather than a bare TypeError.
+    assert_signal_contains(&eval_err_diff("1.5 < nil"), "does not understand");
 }
 
 // ── Bool type errors ──────────────────────────────────────────────────────

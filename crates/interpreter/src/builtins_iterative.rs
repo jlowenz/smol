@@ -560,6 +560,67 @@ fn normalize_bigint(b: BigInt) -> Value {
     }
 }
 
+/// Widen a numeric leaf (`Int`/`LargeInt`/`Float`) to `f64` for a mixed comparison.
+///
+/// Requires: `v` is a numeric leaf. Ensures: the `f64` nearest `v` (`LargeInt`
+/// out of `f64` range saturates to ±∞, preserving order at the extremes).
+fn leaf_to_f64(v: &Value, sel: &Arc<str>) -> Result<f64, EvalError> {
+    use num_traits::ToPrimitive;
+    match v {
+        Value::Int(n) => Ok(*n as f64),
+        Value::Float(f) => Ok(*f),
+        Value::LargeInt(b) => Ok(b
+            .to_f64()
+            .unwrap_or(if b.sign() == num_bigint::Sign::Minus {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            })),
+        _ => Err(EvalError::TypeError(format!(
+            "{sel}: operand must be numeric"
+        ))),
+    }
+}
+
+/// Widen an integer leaf (`Int`/`LargeInt`) to `BigInt` for a mixed integer compare.
+///
+/// Requires: `v` is `Int` or `LargeInt` (Float is handled on the f64 path before
+/// this is called). Ensures: the exact `BigInt` value.
+fn leaf_to_bigint(v: &Value, sel: &Arc<str>) -> Result<BigInt, EvalError> {
+    match v {
+        Value::Int(n) => Ok(BigInt::from(*n)),
+        Value::LargeInt(b) => Ok((**b).clone()),
+        _ => Err(EvalError::TypeError(format!(
+            "{sel}: operand must be integer"
+        ))),
+    }
+}
+
+/// Total-order `<` over the numeric leaf encodings, promoting as needed: any `Float`
+/// operand ⇒ `f64` compare; else any `LargeInt` ⇒ `BigInt` compare; else `i64`. This
+/// is the single Rust grounding the tower's `<` routes to via `_primLt:`
+/// (docs/numeric_tower_plan.md §2a). Cross-type numeric comparison (`2 < 3.5`) is
+/// fixed entirely here; user structured numbers override `<` and never reach it.
+///
+/// Requires: `a`, `b` force to numeric leaves. Ensures: `a < b` under the promoted
+/// comparison, or a `TypeError` when an operand is non-numeric.
+fn numeric_lt(ev: &Evaluator, a: Value, b: Value, sel: &Arc<str>) -> Result<bool, EvalError> {
+    let a = force_value(ev, a)?;
+    let b = force_value(ev, b)?;
+    match (&a, &b) {
+        (Value::Float(_), _) | (_, Value::Float(_)) => {
+            Ok(leaf_to_f64(&a, sel)? < leaf_to_f64(&b, sel)?)
+        }
+        (Value::LargeInt(_), _) | (_, Value::LargeInt(_)) => {
+            Ok(leaf_to_bigint(&a, sel)? < leaf_to_bigint(&b, sel)?)
+        }
+        (Value::Int(x), Value::Int(y)) => Ok(x < y),
+        _ => Err(EvalError::TypeError(format!(
+            "{sel}: operands must be numeric"
+        ))),
+    }
+}
+
 /// Smalltalk `//`: floor division (truncates toward negative infinity).
 fn bigint_floor_div(n: BigInt, d: &BigInt) -> BigInt {
     use num_traits::Signed;
@@ -1001,6 +1062,15 @@ fn dispatch_int(
                 )),
             }
         }
+        "_primLt:" => {
+            expect_arity(sel, 1, args.len())?;
+            Ok(Value::Bool(numeric_lt(
+                ev,
+                Value::Int(n),
+                args.remove(0),
+                sel,
+            )?))
+        }
         "<" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(n < as_int(ev, args.remove(0), sel)?))
@@ -1147,6 +1217,15 @@ fn dispatch_largeint(
             }
             Ok(normalize_bigint(bigint_floor_rem((*n).clone(), &rhs)))
         }
+        "_primLt:" => {
+            expect_arity(sel, 1, args.len())?;
+            Ok(Value::Bool(numeric_lt(
+                ev,
+                Value::LargeInt(n),
+                args.remove(0),
+                sel,
+            )?))
+        }
         "<" => {
             expect_arity(sel, 1, args.len())?;
             let rhs = bigint_from_value(ev, args.remove(0), sel)?;
@@ -1240,6 +1319,15 @@ fn dispatch_float(
         "/" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Float(f / as_float_coerce(ev, args.remove(0), sel)?))
+        }
+        "_primLt:" => {
+            expect_arity(sel, 1, args.len())?;
+            Ok(Value::Bool(numeric_lt(
+                ev,
+                Value::Float(f),
+                args.remove(0),
+                sel,
+            )?))
         }
         "<" => {
             expect_arity(sel, 1, args.len())?;
@@ -1365,6 +1453,16 @@ fn dispatch_str(
             expect_arity(sel, 1, args.len())?;
             match force_value(ev, args.remove(0))? {
                 Value::Str(other) => Ok(Value::Str(Arc::from(format!("{s}{other}").as_str()))),
+                _ => Err(EvalError::TypeError(format!(
+                    "{sel}: argument must be String"
+                ))),
+            }
+        }
+        // Lexicographic `<`, grounding `String >> <` (the Ordered trait's requirement).
+        "_primStrLt:" => {
+            expect_arity(sel, 1, args.len())?;
+            match force_value(ev, args.remove(0))? {
+                Value::Str(other) => Ok(Value::Bool(*s < *other)),
                 _ => Err(EvalError::TypeError(format!(
                     "{sel}: argument must be String"
                 ))),

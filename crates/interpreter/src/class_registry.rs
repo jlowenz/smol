@@ -164,9 +164,10 @@ impl ClassRegistry {
             .ok();
         kernel.register(InstanceHandle(block_state));
 
-        // The numeric tower (Magnitude/Number/Integer/MachineInteger/ArbitraryInteger/
-        // Float) and String/Symbol are defined in `kernel.smol` under `Value`, like the
-        // Boolean hierarchy — not bootstrapped here. See docs/numeric_tower_plan.md.
+        // The numeric tower (Number/Integer/MachineInteger/ArbitraryInteger/Float) and
+        // String/Symbol are defined in `kernel.smol` under `Value`, like the Boolean
+        // hierarchy — not bootstrapped here. Comparability is the `Ordered` trait, not a
+        // class (docs/numeric_tower_plan.md §2a).
 
         let mut roots = HashMap::new();
         roots.insert(Arc::from("Kernel"), kernel.clone());

@@ -10,7 +10,7 @@ set of irreducible leaf primitives in Rust. This directly serves the project's
 "observable and manipulable in the language" goal: today the small/large integer
 split and all arithmetic live in hardcoded Rust (`dispatch_int`/`dispatch_float`)
 and can never be seen or extended from Smol. After this chunk, the *concepts*
-(Magnitude, Number, Integer, coercion) live in `kernel.smol`; Rust provides only
+(`Ordered`, Number, Integer, coercion) live in `kernel.smol`; Rust provides only
 the operations that genuinely require machine/host support.
 
 ---
@@ -32,38 +32,62 @@ Current behavior demonstrates the problem:
 The unified "just call it Int" option was rejected: it permanently pushes
 representation-hiding into the VM and forecloses ever exposing the distinction.
 
-## 2. Hierarchy (DECIDED — Option A)
+## 2. Hierarchy (DECIDED — Option A; comparability revised to a trait 2026-08-01)
 
-Everything remains ultimately under `Value` (fixes the `isKindOf: Value` bug):
+Everything remains ultimately under `Value` (fixes the `isKindOf: Value` bug).
+**Comparability is no longer a class node** — it is the `Ordered` trait on the
+capability axis (see §2a below and §4d). The is-a spine carries *representation*
+only:
 
 ```
 Value
-├── Magnitude              comparison protocol: <, <=, >, >=, max:, min:, between:and:
-│   └── Number             arithmetic + coercion: + - * / , generality/coerce:/retry:coercing:
-│       ├── Integer        gcd:, factorial, //, \\, even, odd, bit ops, isPrime …
-│       │   ├── MachineInteger     fixed machine word (Value::Int, i64)
-│       │   └── ArbitraryInteger   heap arbitrary-precision (Value::LargeInt, BigInt)   [name OPEN — see §3]
-│       └── Float          (Value::Float, f64)
+├── Number             arithmetic + coercion: + - * / , adaptTo…:andSend:   (uses: Ordered)
+│   ├── Integer        gcd:, factorial, //, \\, even, odd, bit ops, isPrime …
+│   │   ├── MachineInteger     fixed machine word (Value::Int, i64)
+│   │   └── ArbitraryInteger   heap arbitrary-precision (Value::LargeInt, BigInt)
+│   └── Float          (Value::Float, f64)
 ├── Boolean ── True / False    (already in kernel.smol under Value)
-├── String                     (Value::Str)    — direct Value leaf, NOT Magnitude
+├── String                     (Value::Str)    — direct Value leaf         (uses: Ordered)
 └── Symbol                     (Value::Symbol) — direct Value leaf
 ```
 
 Rationale:
-- `Magnitude` = "comparable"; comparison protocol is written **once** in terms of
-  `<` and `=`, inherited by every comparable. (`Character`, when §6 of the string
-  plan lands, joins here.)
 - `Number` = arithmetic + the **coercion protocol**; fixes the asymmetric-coercion
-  bug generically rather than per-arm.
+  bug generically rather than per-arm. `Number uses: Ordered`.
 - `Integer` holds integer-only behavior shared by both leaves.
 - The two leaves differ **only** in representation/performance
   (`MachineInteger` = one word, `ArbitraryInteger` = heap, unbounded). Both answer
   `isKindOf: Integer` → true; `class` distinguishes them. Overflow promotes a
   `MachineInteger` result to `ArbitraryInteger`; underflow (a big result that fits a
   word) demotes back (current `normalize_bigint`).
-- `String`/`Symbol` are **not** Magnitudes (Smalltalk keeps strings in the
-  collection world). They stay direct `Value` leaves; their reparenting/method
-  build-out is tracked in `string_representation_plan.md` §3.
+- `String` is **Ordered** (lexicographic `<`) but is **not** a Number and has no
+  magnitude; it stays a direct `Value` leaf and `uses: Ordered`. `Symbol` reparenting
+  is tracked in `string_representation_plan.md` §3.
+
+## 2a. Comparability & magnitude are traits, not classes (DECIDED 2026-08-01)
+
+The former `Magnitude` **class** is dissolved: its entire content was the comparison
+protocol derived from `<`/`=` — no state, no representation — which is the textbook
+definition of a trait, not a superclass. Per §4d (algebra lives on the trait axis),
+comparability is a *capability*, not a representation, so it belongs on `uses:`.
+
+Two layered traits, only the first built now:
+
+- **`Ordered` (BUILD in S2).** The base comparability capability. *Requires* `<` and
+  `=`; *provides* `<= > >= max: min: between:and:` (self-sends of `<`/`=`, so they are
+  derived requirements). Members: `Number`, `String`, and later `Character`, `Symbol`,
+  enums — anything with a total order. This is what "sortable / totally ordered" means,
+  nothing more.
+- **`Magnitude` (RECORD, defer).** A *richer* trait, `uses: Ordered`, adding **affine/
+  metric structure**: a meaningful `-` between two values yielding a *difference/
+  interval*, and usually a **zero/origin** ("how much"). Members: `Number`, `Duration`,
+  `Measurement`/`Quantity`, `Date`/`Time`. **`String` is excluded** — `"cat" - "cab"`
+  is nonsense; a string is Ordered but has no magnitude. Deferred because it is
+  vacuous without an interval type to return (`Number - Number` is a Number, but the
+  payoff members `Duration`/`Measurement` do not exist yet). This is the affine
+  point-vs-vector distinction Smalltalk's flat `Magnitude` class conflated with mere
+  orderability; splitting `Ordered` (base) from `Magnitude` (metric) separates them.
+  Cross-ref: Rust `Ord` vs `Sub`/`Zero`; Haskell `Ord` vs `Num`.
 
 The two Integer leaves being distinct enum variants (`Value::Int` vs
 `Value::LargeInt`) means the representation **can** carry this one class
@@ -90,13 +114,16 @@ shrink from "the implementation" to "a thin primitive layer."
 
 **Stays in Rust (irreducible primitives, `_prim…`):**
 - Arithmetic that needs machine/BigInt ops with overflow→promotion:
-  `_primAdd:`/`_primSub:`/`_primMul:`/`_primQuo:`/`_primRem:`. **OPEN (S2):**
-  whether these split per-representation (`_primMachineAdd:`/`_primLargeAdd:`) or a
-  **single** `_prim…` branches internally on the `Value::` variant of the receiver
-  (Int vs LargeInt vs Float). Leaning **single-selector, internal branch** — the
-  Rust primitive already has the receiver value and can dispatch on its variant, so
-  per-rep selectors are likely needless ceremony. Decide when S2 lands.
-- Same-representation comparison: `_primLt:` (+ `=`), same single-vs-split question.
+  `_primAdd:`/`_primSub:`/`_primMul:`/`_primQuo:`/`_primRem:`. **RESOLVED (S2):**
+  **single selector, internal `Value::` branch** (not per-representation
+  `_primMachineAdd:`/`_primLargeAdd:`). S2's `_primLt:` set the precedent — the Rust
+  primitive already holds the receiver value and branches on its variant, promoting
+  cross-type; per-rep selectors were needless ceremony. S3 arithmetic follows suit.
+  Note the grounding is sent to `self` on the **leaf** (self-only rule), with the
+  argument projected (`aNumber value`) — see §4e.
+- Cross-representation comparison: `_primLt:` — implemented in S2 as `numeric_lt`
+  (single selector; any-Float ⇒ f64, else any-LargeInt ⇒ BigInt, else i64). Plus
+  `_primStrLt:` for lexicographic String order.
 - Float ops that need libm/host: `sqrt`, `sin`, `ln`, `truncated`, `rounded`,
   `asFloat`.
 - Conversion feeding coercion: `asFloat`, `largeFitsWord`/`_primNormalize`
@@ -108,8 +135,9 @@ Most of this **reuses arithmetic already written** inside `dispatch_int`/
 and deletes the broad fallback arms (S5 prune), not new math.
 
 **Moves to Smol (`kernel.smol`, on the tower):**
-- All of `Magnitude` (`<=`, `>`, `>=`, `max:`, `min:`, `between:and:`) in terms of
-  `<`/`=`.
+- The comparison protocol (`<=`, `>`, `>=`, `max:`, `min:`, `between:and:`) in terms
+  of `<`/`=` — now the **`Ordered` trait** (§2a), not a `Magnitude` class. `Number
+  uses: Ordered`; the leaves supply the required `<`.
 - **`Number` coercion via double-dispatch (DECIDED — Squeak/Pharo `adaptTo…`
   school, NOT a central `generality` table).** Public `+ - * / < …` on a leaf: if
   the arg is the same kind, call the same-rep primitive; otherwise
@@ -145,7 +173,7 @@ defined*:
   supply a native representation. Encoded leaves: `MachineInteger`,
   `ArbitraryInteger`, `Float`, `String`, `Symbol`, `True`, `False`.
 - **Abstract tower classes are *ordinary* classes** defined with plain `subclass:`,
-  exactly like `Boolean` today (`Value subclass: #Boolean`). `Magnitude`, `Number`,
+  exactly like `Boolean` today (`Value subclass: #Boolean`). `Number` and
   `Integer` carry **no encoding of their own** and are **fully open** to user
   subclassing — this is what lets users add `Fraction`, `Complex`, a domain `Money`
   under `Number`, or a (representable, if arguably poor) `ModularInteger` under
@@ -189,13 +217,14 @@ Therefore (classic Smalltalk template-method / subclass-responsibility split):
 `self`-is-a-raw-value and `self`-is-a-boxed-object coexist because dispatch already
 handles both (encoded values via `lookup_user_method` arms → primitive `self`;
 `ValueObject`s via their class); shared abstract code never depends on which.
-**Design constraint for S2–S4:** every method promoted onto `Magnitude`/`Number`/
-`Integer` must be encoding-agnostic — either pure protocol self-sends, or routed
-through the §4e seam pair (`self withValue: (self value _prim…: arg value)`), which
-is itself encoding-agnostic because both halves are overridable. It must never name
-a `Value` variant or assume `self` *is* a leaf. (§4e supersedes the stricter
-"protocol self-sends only" reading of this paragraph: Story A methods do reach
-`_prim`s, but only via the seam.)
+**Design constraint for S2–S4:** every method promoted onto the `Ordered` trait or
+onto `Number`/`Integer` must be encoding-agnostic — either pure protocol self-sends,
+or the project-then-redispatch/reconstruct seam of §4e (`Number >> < aNumber [ ^self
+value < aNumber ]`, `Integer >> + aNumber [ ^self withValue: (self value + aNumber
+value) ]`). It must never name a `Value` variant, assume `self` *is* a leaf, or send
+a `_prim` to anything but literal `self` (self-only rule). The `_prim` grounding lives
+on the leaves; abstract code reaches it only by projecting with `value` and
+re-dispatching a public selector.
 
 ## 4d. Two axes: representation (`is-a`) vs algebra (traits) — DECIDED
 
@@ -205,10 +234,21 @@ lives). **Algebraic structure** is orthogonal and belongs on the **trait** axis
 (`can-act-as`), reusing the trait MVP (stateless, requirement-keyed, derived from
 self-sends):
 
+- `Ordered` trait (§2a) — requires `< =`; provides `<= > >= max: min: between:and:`.
+  The base comparability capability; `String uses: Ordered` with **no false
+  `is-a Number`/`is-a Magnitude`**.
+- `Magnitude` trait — `uses: Ordered` + metric structure (`-` → interval, zero);
+  members are quantities (`Number`, `Duration`, `Measurement`), not `String`.
+  Recorded, deferred (§2a).
 - `Ring` trait — requires `+ - * zero one`; provides derived behavior.
 - `Field` trait — `uses: Ring` + requires `/ reciprocal`.
 - `Integer uses: Ring`, `Float`/`Fraction uses: Field`; a user `Matrix uses: Ring`
   gets ring behavior with **no false `is-a Number`**.
+
+Comparability (`Ordered`) is the first concrete instance of this principle to be
+built: it was originally drawn as a `Magnitude` **class** on the is-a spine, which
+contradicted this very section (ordering is structure/capability, not
+representation). §2a corrects it.
 
 This is why `Integer` stays usefully open (the `value` seam) *and* algebraic reuse
 needs no inheritance: representation and algebra are different questions answered by
@@ -240,18 +280,19 @@ authoritative.
 
 ### Placement
 
-- **`Magnitude`'s seam is `<` (plus `=`), NOT `value`.** Its members include
-  non-numeric comparables — `Character`, later `Date`, version tuples, compound keys
-  — for which "the underlying encoded scalar" is meaningless or a lie (a `Date` is
-  several ivars; projecting to one silently picks an axis). `<=`, `>`, `>=`, `max:`,
-  `min:`, `between:and:` need only `<`, so `Magnitude >> <` is
-  `subclassResponsibility` and nothing else is required.
-- **The seam pair lives on `Number`, not `Integer`.** Uniform placement lets the
-  coercion protocol (§4) and every same-representation `_prim` call be written once
-  against `value`, and gives wrappers of *any* numeric representation (a `Money`
-  over `Float`, an `AuditedInteger` over `MachineInteger`) the same freebie. Putting
-  it on `Integer` only would cost `Number`'s coercion code its uniform way to reach a
-  raw operand. The price — `Fraction`/`Complex` inherit a `value` they cannot honor —
+- **The `Ordered` trait's seam is `<` (plus `=`), NOT `value`.** Its members include
+  non-numeric comparables — `String`, `Character`, later `Date`, version tuples,
+  compound keys — for which "the underlying encoded scalar" is meaningless or a lie
+  (a `Date` is several ivars; projecting to one silently picks an axis). `<=`, `>`,
+  `>=`, `max:`, `min:`, `between:and:` need only `<`/`=` (the trait's requirements),
+  which each member supplies for its own representation.
+- **The `subclassResponsibility` override lives on `Number`, not `Integer`** (the
+  `^self` *default* itself was later scope-lifted to `Value` — see Contract below).
+  Placing the "must project" demand on `Number` lets the coercion protocol (§4) and
+  every same-representation `_prim` call be written once against `value`, and gives
+  wrappers of *any* numeric representation (a `Money` over `Float`, an
+  `AuditedInteger` over `MachineInteger`) the same freebie. Putting it on `Integer`
+  only would cost `Number`'s coercion code its uniform way to reach a raw operand. The price — `Fraction`/`Complex` inherit a `value` they cannot honor —
   is paid in a `subclassResponsibility` error they would have hit anyway under Story
   B, which is what that mechanism is for.
 
@@ -270,16 +311,27 @@ own domain meaning has a conflict — narrow, since it only reaches classes unde
 ### Contract
 
 ```
-Number >> value              [ ^self subclassResponsibility ]
-Number >> withValue: aValue  [ ^aValue ]              "default: escape to the leaf"
-MachineInteger >> value      [ ^self ]
-MachineInteger >> withValue: aValue [ ^aValue ]       "inherited; identity"
+Value  >> value              [ ^self ]                 "default: a value reduces to itself (§ scope-lift 2026-08-01)"
+Value  >> withValue: aValue  [ ^aValue ]              "default: escape to the leaf"
+Number >> value              [ ^self subclassResponsibility ]   "override: open class ⇒ must project"
+MachineInteger >> value      [ ^self ]                "leaf override back to identity"
 ```
+
+**Scope lift (DECIDED 2026-08-01).** The `value`/`withValue:` *defaults* live on
+`Value`, not `Number`. `value`'s default `^self` is the block-or-value idiom (a value
+reduces to itself), so `String`/`Symbol`/`Bool` answer it too — they are not `closed`.
+`Number` *overrides* `value` to `subclassResponsibility` because it is **open** to
+subclassing and `^self` is wrong for a boxed wrapper whose `self` is not a leaf — that
+override is the price of openness. A closed `vmSubclass:` leaf (String) safely inherits
+`^self`. This resolves the apparent inconsistency ("why does Number project but String
+not?") — the override tracks open-vs-closed, and it also completes the block-or-value
+idiom (`x value` now works on any value). Consequence: no value DNUs `value`, which
+retired the `as_block_type_error` test (it asserted an accident) — a non-block loop
+body now evaluates to itself.
 
 `value` — *Requires:* nothing. *Ensures:* answers an **encoded leaf**
 (`MachineInteger`/`ArbitraryInteger`/`Float`), never merely "a Number" — so a
-wrapper-of-a-wrapper answers `^inner value` and recurses to ground. This is what
-lets abstract methods hand the result straight to a `_prim`.
+wrapper-of-a-wrapper answers `^inner value` and recurses to ground.
 
 `withValue:` — the **reconstruction** half, without which arithmetic on a wrapper
 would answer a bare leaf and silently discard the receiver's identity. *Requires:*
@@ -288,9 +340,23 @@ receiver's other state, or a leaf if the operation escapes the wrapper. Written 
 the receiver (not `self class new:`) precisely so it can carry sibling ivars forward
 and normalize: `ModularInteger >> withValue: n [ ^self class value: n \\ modulus ]`.
 
-Abstract arithmetic is then the template
-`Integer >> + aNumber [ ^self withValue: (self value _primAdd: aNumber value) ]`,
-and a wrapper implements **two** methods to get closed arithmetic.
+**The seam→prim grounding lives on the LEAF, not the abstract method (CORRECTED
+S2, 2026-08-01).** A `_prim` may only be sent to `self` (eval.rs self-only check), so
+an abstract method CANNOT write `self value _primOp: …` — that sends `_prim` to a
+*projection* of self. Instead:
+- each **leaf** grounds the public operator by sending the `_prim` to `self` (which
+  *is* the raw encoding), projecting only the argument:
+  `MachineInteger >> < aNumber [ ^self _primLt: aNumber value ]`;
+- the **abstract** class projects self with `value` and **re-dispatches the public
+  operator** (comparison) or **reconstructs** (arithmetic):
+  `Number >> < aNumber [ ^self value < aNumber ]`
+  `Integer >> + aNumber [ ^self withValue: (self value + aNumber value) ]`.
+
+So the arithmetic template is `self withValue: (self value + aNumber value)` — the
+inner `+` re-dispatches to the leaf, whose `+` sends `_primAdd:` to self. A wrapper
+implements **two** methods (`value` + `withValue:`) to get closed arithmetic; the
+`_prim`s stay on the leaves. (Earlier drafts wrote `self value _primAdd: aNumber
+value`; that form is illegal under the self-only rule and is superseded here.)
 
 **Immutability wrinkle (confirmed S2.0).** A user `Number` subclass is a `Value`,
 so its instances are **frozen** after construction — ivars can be mutated *only*
@@ -346,26 +412,42 @@ are meaningless and should error or be absent.
   tower level. **No behavior change to arithmetic yet** — `dispatch_int` etc. stay
   as-is, now reachable as the primitive layer. This is the smallest shippable
   increment and closes the observed correctness bugs (`class`, `isKindOf: Value`).
+  **Note (2026-08-01):** S1a introduced a `Magnitude` *class* on the spine; §2a
+  later revised comparability to the `Ordered` trait, so **S2 dissolves that class**
+  (`Number` reparents directly under `Value`).
 - **S2.0 — seam pair `value`/`withValue:` (foundation for S2/S3).** Before any
   protocol moves to Smol, establish the seam that lets comparison (S2) and coercion
   (S3) be written against a representation-agnostic hook. Placement and naming are
   DECIDED — see §4e:
   ```
-  Number >> value             [ ^self subclassResponsibility ]
-  Number >> withValue: aValue [ ^aValue ]
+  Value  >> value             [ ^self ]                          "default (scope-lifted 2026-08-01)"
+  Value  >> withValue: aValue [ ^aValue ]
+  Number >> value             [ ^self subclassResponsibility ]   "override: open ⇒ project"
   MachineInteger >> value     [ ^self ]
   ArbitraryInteger >> value   [ ^self ]
   Float >> value              [ ^self ]
   ```
-  (leaves inherit `withValue:` unchanged). `Magnitude >> <` is declared
-  `subclassResponsibility` here as Magnitude's own seam. Ground the
-  same-representation `_prim` operations on the leaves here too (see §4: single
-  `_primLt:`/`_primAdd:` branching internally on the `Value::` variant is the leaning
-  choice over per-representation selectors).
-- **S2 — Comparison protocol.** Move `Magnitude` comparisons (`<=`, `>`, `>=`,
-  `max:`, `min:`, `between:and:`) to Smol in terms of `<`/`=`; leaf `<` routes
-  `^self value _primLt: aNumber value` for same-kind, else double-dispatch; fix
-  cross-type `<`. Tests incl. `2 < 3.5`.
+  **DONE 2026-08-01** (seam-pair committed `6fa4f7c`; scope-lifted to `Value` in S2 so
+  String/Symbol answer `value`). The `<`-grounding (leaf `_primLt:`) was deferred to S2
+  so it lands atomically with the leaf `<` methods and the `Ordered` trait. `_primLt:`
+  is a single selector branching internally on the `Value::` variant (chosen over
+  per-representation selectors).
+- **S2 — Comparison protocol (`Ordered` trait). DONE 2026-08-01.** Dissolved the S1a
+  `Magnitude` class (`Number` reparented directly under `Value`); defined `Ordered` as
+  a trait (§2a) requiring `<` and providing `<= > >= max: min: between:and:` (derived
+  from `<` alone via total-order negation). `Number uses: Ordered`; `String uses:
+  Ordered`. The `<` grounding follows the corrected seam→prim pattern (§4e): each
+  **leaf** sends `_primLt:` to `self` projecting only the arg
+  (`MachineInteger >> < aNumber [ ^self _primLt: aNumber value ]`); abstract `Number`
+  projects self and re-dispatches (`Number >> < aNumber [ ^self value < aNumber ]`).
+  Added the `_primLt:` primitive (`numeric_lt`, single selector, internal variant
+  branch, all Int/LargeInt/Float cross-types promoted in Rust — no Smol double-dispatch
+  needed; that is S3 for user structured numbers) and `_primStrLt:` for lexicographic
+  String order. Fixed cross-type `<` (`2 < 3.5` symmetric). Tests: same/cross-type
+  numeric compare, derived protocol, `'a' < 'b'`, value-seam lift, membership without
+  Magnitude. Two behavior changes recorded: comparing to an incomparable operand now
+  surfaces as a `_primLt:` TypeError (Int receiver) or a MessageNotUnderstood signal
+  (flipped `>` / non-Value arg like `nil`); `as_block_type_error` retired.
 - **S3 — Coercion protocol.** Double-dispatch `adaptToInteger:andSend:` /
   `adaptToFloat:andSend:` (§4 — NOT a central `generality` table); rewrite public
   `+ - * /` in Smol over the same-rep primitives + `adaptTo…` fallback; fix
@@ -380,11 +462,32 @@ Each step is independently committable; S1 alone fixes the reported bugs.
 
 ## 7. Open questions / deferred
 
+- **OPEN — `_prim` self-only rule is broader than its justification (noted S2,
+  2026-08-01).** The self-only restriction (chunk 21) is justified by *entity* data
+  thread-ownership: mutable entity state is touched only by its owning thread, so no
+  lock is needed. That argument does **not** apply to `Value`s — they are immutable and
+  shareable, so a `_prim` sent to a *non-self Value* has no data-race concern. So the
+  rule is stricter than it strictly needs to be for the Value case. Two *other* reasons
+  still favor keeping it strict: (1) **encapsulation** — primitives should stay behind
+  public protocol (the tower's leaf-grounding relies on this); (2) **static
+  checkability** — the check is a cheap syntactic `is_self_or_super`; "self or any
+  Value" is not decidable at method-install time, so relaxing trades a compile-time
+  guarantee for a runtime one. **Consequence for the tower:** none — leaf-grounding
+  (`_prim` on the leaf's `self`, abstract code projects+re-dispatches) is the right
+  design either way. Recorded because the rule's scope vs. its rationale is a genuine
+  latent gap worth revisiting if it resurfaces (e.g. a future Value protocol that wants
+  a primitive on a projected receiver). Cross-ref: memory `chunk21_actor_decisions`.
 - **RESOLVED (§3):** arbitrary-precision leaf named `ArbitraryInteger`; bare `Int`
   retired in favour of abstract `Integer` (landed S1a, `82e8c13`).
-- **RESOLVED (§4e):** seam placement, naming, and shape — `value`/`withValue:` pair
-  on `Number` (not `Integer`); `Magnitude`'s seam is `<`, it gets no `value`;
-  `value` kept over `primitiveValue`/`encodedValue`.
+- **RESOLVED (§4e):** seam placement, naming, and shape — `value`/`withValue:`
+  *defaults* on `Value` (scope-lifted S2 so String/Symbol answer `value`), with
+  `Number` overriding `value` to `subclassResponsibility` (open-class demand, not on
+  `Integer`); the `Ordered` trait's seam is `<`, it gets no `value`; `value` kept over
+  `primitiveValue`/`encodedValue`. The `_prim` grounding lives on the leaves
+  (self-only rule); abstract code projects with `value` and re-dispatches.
+- **RESOLVED (§2a):** comparability is the `Ordered` trait (requires `<`/`=`), not a
+  `Magnitude` class; `String uses: Ordered` (not a Number/Magnitude). `Magnitude` =
+  future richer trait (`uses: Ordered` + metric `-`/zero), recorded, deferred.
 - **RESOLVED (§4b):** closedness mechanism — `vmSubclass:` + representational-block
   rule; no user-facing modifier; abstract classes (incl. `Integer`) open.
 - **`_prim` naming/rework** — kept a **separate thread** (2026-07-12); co-design

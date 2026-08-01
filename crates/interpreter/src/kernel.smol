@@ -818,18 +818,32 @@ All are encodings of Value instances, reparented under Value so `isKindOf: Value
 holds. Representation runs down the is-a spine: MachineInteger = Value::Int(i64),
 ArbitraryInteger = Value::LargeInt(BigInt), Float = Value::Float(f64). Integer is the
 abstract shared class (bare `Int` retired); integer literals produce MachineInteger,
-promoting to ArbitraryInteger on overflow. String/Symbol are direct Value leaves (not
-Magnitudes). Reflection is routed via lookup_user_method arms + value_to_class_handle.
-S1a: ordinary subclass:; the encoded leaves become vmSubclass: (closed) in S1b.
-Arithmetic still lives in the Rust primitive layer (dispatch_int/dispatch_float);
-S2–S4 move the protocol into Smol on these classes."
+promoting to ArbitraryInteger on overflow. String/Symbol are direct Value leaves;
+comparability is the `Ordered` trait (§2a), not a class, so String `uses: Ordered`
+without being a Number. Reflection is routed via lookup_user_method arms +
+value_to_class_handle. S1a: ordinary subclass:; the encoded leaves become vmSubclass:
+(closed) in S1b. S2 moved the comparison protocol into Smol (Ordered trait + leaf
+`_primLt:`); arithmetic still lives in the Rust primitive layer (dispatch_int/
+dispatch_float) pending S3–S4."
 
-Value subclass: #Magnitude
-    instanceVariableNames: ''
-    classVariableNames: ''
-    indexedSlots: #none.
+"Ordered — the base comparability trait (docs/numeric_tower_plan.md §2a). Comparability
+is a *capability*, not a representation, so it lives on the trait axis (§4d), NOT as a
+`Magnitude` class on the is-a spine (that class is dissolved here). Requires `<` (and
+`=`, universally available on values); provides the rest of the comparison protocol
+derived from `<` alone via total-order negation. Members `use:` it — `Number`,
+`String`, later `Character` — with no false `is-a Number`/`is-a Magnitude`. A richer
+`Magnitude` trait (`uses: Ordered` + metric `-`/zero, for quantities like Duration/
+Measurement) is recorded but deferred (§2a)."
+Trait named: #Ordered.
+Ordered >> <= other            [ ^(other < self) not ]
+Ordered >> >  other            [ ^other < self ]
+Ordered >> >= other            [ ^(self < other) not ]
+Ordered >> max: other          [ ^(self < other) ifTrue: [other] ifFalse: [self] ]
+Ordered >> min: other          [ ^(self < other) ifTrue: [self] ifFalse: [other] ]
+Ordered >> between: lo and: hi  [ ^(self < lo) not and: [(hi < self) not] ]
 
-Magnitude subclass: #Number
+Value subclass: #Number
+    uses: Ordered
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
@@ -841,7 +855,7 @@ Number subclass: #Integer
 
 "The encoded leaves (fixed native Value representation) are defined with
 vmSubclass:, marking them closed — `subclass:` on them is rejected. The abstract
-tower classes above (Magnitude/Number/Integer) stay open ordinary subclasses."
+tower classes above (Number/Integer) stay open ordinary subclasses."
 
 Integer vmSubclass: #MachineInteger
     instanceVariableNames: ''
@@ -858,40 +872,62 @@ Number vmSubclass: #Float
     classVariableNames: ''
     indexedSlots: #none.
 
-"S2.0 — the seams the abstract tower is written against (plan §4e).
+"The value / withValue: seam (plan §4e; scope lifted to Value 2026-08-01).
 
-Magnitude's seam is `<` alone: every other comparison is derived from it, and
-nothing about a comparable implies it projects to a single scalar (a Date, a
-version tuple, a compound key do not). It is NOT declared here, though: a user
-method shadows the Rust builtin (dispatch step 1 beats builtin dispatch), so
-declaring `<` abstract before the leaves implement it would break every numeric
-comparison. It lands in S2 alongside the leaf `<` implementations.
+  value       reduces the receiver to its encoded value. The default `^self` is the
+              block-or-value idiom in full generality (a value reduces to itself) and
+              lives on Value, so String/Symbol/Bool answer it too — they are not
+              `closed`. For the numeric tower it doubles as the projection seam:
+              `self value` hands abstract arithmetic an encoded leaf to feed a _prim.
+  withValue:  reconstructs the receiver's kind around a computed value; the default
+              answers the bare value (identity for a leaf; the escape hatch for a
+              wrapper whose op leaves its domain, e.g. `/` may answer a Float).
 
-Number's seam is the PAIR `value` / `withValue:`:
-  value       projects the receiver onto its encoded leaf (MachineInteger /
-              ArbitraryInteger / Float) so abstract code can hand it to a _prim.
-              A wrapper answers its ivar; a wrapper-of-a-wrapper answers
-              `^inner value` and recurses to ground.
-  withValue:  reconstructs the receiver's kind around a computed leaf, carrying
-              the receiver's other state. The inherited default answers the bare
-              leaf — which is both the leaves' own (identity) behavior and the
-              deliberate escape hatch for operations that leave a wrapper's
-              domain (`/` may answer a Float).
-Together they let a wrapper implement TWO methods and inherit closed arithmetic.
-Structured numbers (Fraction, Complex) have no single underlying scalar; they
-override the arithmetic itself and never reach the seam."
+`Number >> value` OVERRIDES the Value default with `subclassResponsibility`: Number
+is *open* to subclassing and the `^self` default is wrong for a boxed wrapper, whose
+`self` is not a leaf — so a Number subclass MUST project. That override is the price
+of openness; the closed leaves answer `^self` (identity) and String, being a closed
+vmSubclass: leaf with no open subclass, safely inherits the Value default. A wrapper
+implements `value` (+ `withValue:` when it wants closed arithmetic) and inherits the
+tower. Structured numbers (Fraction, Complex) have no single leaf; they override the
+arithmetic itself and never reach the seam."
+
+Value  >> value             [ ^self ]
+Value  >> withValue: aValue [ ^aValue ]
 
 Number >> value             [ ^self subclassResponsibility ]
-Number >> withValue: aValue [ ^aValue ]
 
 MachineInteger   >> value [ ^self ]
 ArbitraryInteger >> value [ ^self ]
 Float            >> value [ ^self ]
 
+"The tower's `<` (plan §2a, S2). The `_primLt:` grounding lives on the LEAVES, where
+`self` IS the raw encoding — a `_prim` may only be sent to `self` (eval.rs self-only
+check), so the abstract seam canNOT do `self value _primLt: ...` (that sends _prim to
+a projection). Instead:
+  - each leaf sends `_primLt:` to self, projecting only the ARG (`aNumber value`), so
+    a wrapper argument grounds too;
+  - abstract `Number` (for a user wrapper whose self is a boxed object) projects self
+    with `value` and RE-DISPATCHES `<` to the resulting leaf.
+`_primLt:` compares any two numeric leaf encodings (Int/LargeInt/Float) with
+promotion, so cross-type comparison (`2 < 3.5`) is fixed entirely in Rust; Smol
+double-dispatch is only for user structured numbers that override `<` (S3). This
+project-then-redispatch shape is the general seam→prim pattern (S3 arithmetic does
+`self withValue: (self value op: aNumber value)` the same way)."
+Number           >> < aNumber [ ^self value < aNumber ]
+MachineInteger   >> < aNumber [ ^self _primLt: aNumber value ]
+ArbitraryInteger >> < aNumber [ ^self _primLt: aNumber value ]
+Float            >> < aNumber [ ^self _primLt: aNumber value ]
+
 Value vmSubclass: #String
+    uses: Ordered
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
+
+"Lexicographic order (plan §2a). String is Ordered but NOT a Number/Magnitude —
+`'cat' - 'cab'` is meaningless. Grounds to the `_primStrLt:` primitive."
+String >> < aString [ ^self _primStrLt: aString ]
 
 Value vmSubclass: #Symbol
     instanceVariableNames: ''
@@ -949,7 +985,13 @@ Boolean >> ~= other                 [ ^(self = other) not ]
 TCO in the iterative evaluator. The _prim* builtins in builtins.rs remain as
 direct fallbacks for the old (recursive) evaluator, which reaches them via the
 aliased 'whileTrue:'/'_primWhileTrue:' match arms without going through these
-Smol methods."
+Smol methods.
+
+The body is run via `aBlock value`, which is deliberately NOT type-checked (C29.6).
+Since `Value >> value [^self]` (§4e), a non-block body is legal and simply evaluates
+to itself each pass — e.g. `[cond] whileTrue: 42` uses 42 as the body result (a
+harmless no-op that never mutates state) rather than raising. This is the
+block-or-value idiom applied uniformly, not an error path."
 
 Block >> whileTrue: aBlock [
     self value ifFalse: [ ^nil ].

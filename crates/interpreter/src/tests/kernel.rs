@@ -207,17 +207,33 @@ fn timer_fires_in_entity() {
             ev.eval_program(&prog.stmts, &mut env).unwrap(),
         )
         .unwrap();
-        // Give the 50 ms timer ample time to fire
-        may::coroutine::sleep(std::time::Duration::from_millis(300));
-        // Query result — cross-entity send returns a Future chain
-        let result = crate::builtins_iterative::force_value(
-            &ev,
-            crate::builtins::dispatch(&ev, actor, Arc::from("getResult"), vec![], &mut env)
+        // Poll for the 50 ms timer to fire rather than sleeping a single fixed span:
+        // under parallel test load the timer/entity coroutine can be starved well
+        // past any fixed budget, which made a blind 300 ms sleep flaky. Retry the
+        // (cross-entity) getResult until it reads 99 or a generous ~5 s deadline
+        // elapses — fast in the common case, robust under contention.
+        let mut final_result = Value::Nil;
+        for _ in 0..100 {
+            may::coroutine::sleep(std::time::Duration::from_millis(50));
+            // getResult is cross-entity (Future chain); ValueHolder::get is too, so
+            // the reply may be a nested Future — force twice.
+            let result = crate::builtins_iterative::force_value(
+                &ev,
+                crate::builtins::dispatch(
+                    &ev,
+                    actor.clone(),
+                    Arc::from("getResult"),
+                    vec![],
+                    &mut env,
+                )
                 .unwrap(),
-        )
-        .unwrap();
-        // ValueHolder::get is also cross-entity, so result may be a nested Future
-        let final_result = crate::builtins_iterative::force_value(&ev, result).unwrap();
+            )
+            .unwrap();
+            final_result = crate::builtins_iterative::force_value(&ev, result).unwrap();
+            if final_result == Value::Int(99) {
+                break;
+            }
+        }
         ev.shutdown();
         tx.send(final_result).unwrap();
     });

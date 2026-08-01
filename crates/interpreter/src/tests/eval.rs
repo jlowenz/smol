@@ -2902,10 +2902,11 @@ fn scalars_are_kind_of_value() {
 
 #[test]
 fn integer_tower_membership() {
-    // MachineInteger < Integer < Number < Magnitude < Value < Object.
+    // MachineInteger < Integer < Number < Value < Object. (Magnitude is no longer a
+    // class — comparability is the Ordered trait, §2a.)
     assert_eq!(eval("42 isKindOf: Integer"), Value::Bool(true));
     assert_eq!(eval("42 isKindOf: Number"), Value::Bool(true));
-    assert_eq!(eval("42 isKindOf: Magnitude"), Value::Bool(true));
+    assert_eq!(eval("42 isKindOf: Value"), Value::Bool(true));
     assert_eq!(eval("42 isKindOf: Object"), Value::Bool(true));
     // ArbitraryInteger is also an Integer.
     assert_eq!(
@@ -2917,16 +2918,16 @@ fn integer_tower_membership() {
 #[test]
 fn float_is_number_not_integer() {
     assert_eq!(eval("3.5 isKindOf: Number"), Value::Bool(true));
-    assert_eq!(eval("3.5 isKindOf: Magnitude"), Value::Bool(true));
     assert_eq!(eval("3.5 isKindOf: Integer"), Value::Bool(false));
 }
 
 #[test]
-fn string_symbol_are_value_leaves_not_magnitudes() {
-    // String/Symbol are direct Value leaves, deliberately NOT under Magnitude.
-    assert_eq!(eval("'hi' isKindOf: Magnitude"), Value::Bool(false));
-    assert_eq!(eval("#foo isKindOf: Magnitude"), Value::Bool(false));
+fn string_is_value_leaf_not_number() {
+    // String/Symbol are direct Value leaves, NOT Numbers. Comparability is a trait
+    // (Ordered), so a String is comparable without any `is-a Number`/`Magnitude`.
     assert_eq!(eval("'hi' isKindOf: Number"), Value::Bool(false));
+    assert_eq!(eval("#foo isKindOf: Number"), Value::Bool(false));
+    assert_eq!(eval("'hi' isKindOf: Value"), Value::Bool(true));
 }
 
 #[test]
@@ -3016,11 +3017,79 @@ fn leaves_project_to_self_via_value() {
 
 #[test]
 fn number_withvalue_default_answers_the_leaf() {
-    // The inherited Number>>withValue: reconstruction default answers the bare leaf
+    // The inherited Value>>withValue: reconstruction default answers the bare leaf
     // (identity for a leaf receiver; the escape hatch for a wrapper). A leaf sending
     // it to another leaf simply yields that leaf.
     assert_eq!(eval("42 withValue: 7"), Value::Int(7));
     assert_eq!(eval("3.5 withValue: 9"), Value::Int(9));
+}
+
+#[test]
+fn value_seam_lifted_to_value_leaves() {
+    // §4e (2026-08-01): the value/withValue: default lives on Value, so String,
+    // Symbol, and Bool answer `value` with themselves (the block-or-value idiom) —
+    // they are no longer "closed". Only Number overrides value to subclassResponsibility.
+    assert_eq!(eval("'hi' value"), Value::Str("hi".into()));
+    assert_eq!(eval("#foo value"), Value::Symbol("foo".into()));
+    assert_eq!(eval("true value"), Value::Bool(true));
+    assert_eq!(eval("'hi' withValue: 'bye'"), Value::Str("bye".into()));
+}
+
+// ── S2: comparison protocol (Ordered trait + _primLt:, §2a) ──────────────────
+
+#[test]
+fn same_type_numeric_comparison() {
+    assert_eq!(eval("2 < 3"), Value::Bool(true));
+    assert_eq!(eval("3 < 2"), Value::Bool(false));
+    assert_eq!(eval("3.5 < 4.0"), Value::Bool(true));
+    // ArbitraryInteger vs ArbitraryInteger.
+    assert_eq!(
+        eval("(1000000000000 * 1000000000000) < (1000000000000 * 1000000000001)"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn cross_type_numeric_comparison_is_symmetric() {
+    // The bug the tower fixes: Int vs Float in BOTH directions (was asymmetric).
+    assert_eq!(eval("2 < 3.5"), Value::Bool(true));
+    assert_eq!(eval("3.5 < 2"), Value::Bool(false));
+    // Int vs ArbitraryInteger.
+    assert_eq!(
+        eval("2 < (1000000000000 * 1000000000000)"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval("(1000000000000 * 1000000000000) < 2"),
+        Value::Bool(false)
+    );
+    // Float vs ArbitraryInteger.
+    assert_eq!(
+        eval("3.5 < (1000000000000 * 1000000000000)"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn derived_comparison_protocol_from_ordered_trait() {
+    // <= > >= max: min: between:and: are provided by the Ordered trait, derived from
+    // `<` alone — and they work cross-type via _primLt: promotion.
+    assert_eq!(eval("2 <= 2"), Value::Bool(true));
+    assert_eq!(eval("3 > 2.5"), Value::Bool(true));
+    assert_eq!(eval("3 >= 3"), Value::Bool(true));
+    assert_eq!(eval("2 max: 5"), Value::Int(5));
+    assert_eq!(eval("2 min: 5.0"), Value::Int(2));
+    assert_eq!(eval("5 between: 1 and: 10"), Value::Bool(true));
+    assert_eq!(eval("5 between: 6 and: 10"), Value::Bool(false));
+}
+
+#[test]
+fn string_is_ordered_lexicographically() {
+    // String uses: Ordered — comparable without being a Number.
+    assert_eq!(eval("'a' < 'b'"), Value::Bool(true));
+    assert_eq!(eval("'b' < 'a'"), Value::Bool(false));
+    assert_eq!(eval("'abc' <= 'abc'"), Value::Bool(true));
+    assert_eq!(eval("'cat' max: 'dog'"), Value::Str("dog".into()));
 }
 
 #[test]
