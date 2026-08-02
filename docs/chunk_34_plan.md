@@ -78,6 +78,11 @@ Rules carried from the tower:
 
 ## 5. Proposed sequencing
 
+**The split is PROVISIONAL (noted 2026-08-02).** Both the phase boundaries below and the
+34/35 division (OQ-6) are a starting point, not a decision — we begin here and revisit as
+the work reveals what actually clusters. Expect to re-cut it; do not treat a phase
+boundary as a commitment, and re-plan rather than forcing work into the wrong phase.
+
 Each phase is independently committable and leaves the suite green.
 
 - **S0 — Baseline.** Record current benchmark numbers and a selector-frequency profile
