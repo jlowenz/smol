@@ -269,6 +269,39 @@ One practical consequence: `cargo bench -p interpreter` now takes ~15 minutes, d
 by the three loop benches at 100k. S6 may want to shrink them, but not before the
 before/after pair above is recorded — that comparability is the point of S0.
 
+## 5d. Selector-frequency profile — where the 30× goes (S0 deliverable, taken after S1b)
+
+Counting every dispatch during `0 to: 20000 do: [:i | i]` gives **13 message sends per
+iteration** (200,000 sends / 15,382 iterations), against one Rust loop step before:
+
+```
+  30763  value          2× — block evaluation inside ifFalse: / ifTrue:ifFalse:
+  15382  <  <=  _primLt:  ifFalse:  not  to:do:
+  15381  +  _primAdd:  ifTrue:ifFalse:  isEncodedNumber  value:
+```
+
+**`to:do:` itself is 1 of the 13.** `self <= stop` costs **5** (`<=` → `Ordered`'s
+`(other < self) not` → `<` → `value` projecting the argument → `_primLt:` → `not`) and
+`self + 1` costs **4** (`+` → `isEncodedNumber` → `ifTrue:ifFalse:` → `_primAdd:`). Nine
+of thirteen are the **numeric tower's** abstraction cost, which every piece of Smol
+arithmetic was already paying; S1b merely put it in a loop that runs it 100k times.
+
+Dividing out: **≈1.2 µs per message send**. That is the figure worth attacking, and it
+is universal rather than loop-specific. For the queued performance review, in order of
+expected leverage:
+
+1. **Per-send cost.** A tree-walking interpreter is usually 50–200 ns/send, so this looks
+   ~10× off. HYPOTHESIS, not yet measured: every method activation allocates a fresh
+   `Arc<Mutex<HashMap>>` env frame (`push_frame`) plus a `Vec` (`global_scope`) and hashes
+   `self` and each parameter into it — ~3–4 heap allocations and several string hashes per
+   send — and every `Cont` carries an `Env`, cloning that `Vec` again. The conventional fix
+   is resolving names to integer slots at parse time and using a flat `Vec` frame, which
+   removes the allocation and the hashing together. S1a is the precedent for how much a
+   single structural fix in this area is worth (11× on dispatch).
+2. **Sends per operation.** OQ-1 already records the answer — inline the compiled fast
+   path when the method has not been overridden — and it applies to `<` and `+` on the
+   leaves at least as much as to `to:do:`.
+
 ## 6. Open questions
 
 All settled as of 2026-08-02 except **OQ-2** (minor, statable during implementation) and
