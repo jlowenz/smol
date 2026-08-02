@@ -1,12 +1,9 @@
 # Smol primitive inventory (`_prim*`)
 
 Running list of interpreter primitives exposed to `kernel.smol`, for review and
-optimization. Scope: the **iterative** evaluator path (`builtins_iterative.rs` +
-`eval_iterative.rs`), which is the live path. The recursive evaluator
-(`builtins_recursive.rs`, slated for retirement) has parallel `_prim*` arms plus
-legacy loop prims (`_primWhileTrue:`, `_primTimesRepeat:`, `_primAt:put:`) that
-the iterative path does **not** use — the iterative kernel does loops in pure Smol
-via TCO. Those are intentionally omitted here.
+optimization. Scope: `builtins_iterative.rs` + `eval_iterative.rs` — the single
+evaluator path. (The recursive evaluator was retired 2026-07; an earlier version of
+this note described it as merely "slated for retirement".)
 
 Columns: **Selector** · **Receiver** (kind the prim expects) · **Args** ·
 **Semantics** · **Handler** (`file:line`) · **Notes / optimize?**
@@ -15,9 +12,44 @@ Columns: **Selector** · **Receiver** (kind the prim expects) · **Args** ·
 
 | Selector | Receiver | Args | Semantics | Handler | Notes |
 |---|---|---|---|---|---|
-| `_primHash` | any Value | 0 | Content/identity hash | builtins_iterative.rs:56 | |
-| `_primClass` | any Value | 0 | Class of the receiver | builtins_iterative.rs:62 | |
-| `_primIsKindOf:` | any Value | 1 (class) | Bool ancestry test | builtins_iterative.rs:70 | |
+| `_primHash` | any Value | 0 | Content/identity hash | builtins_iterative.rs:68 | Whole-valued Floats hash as the equal Integer (S6) |
+| `_primClass` | any Value | 0 | Class of the receiver | builtins_iterative.rs:74 | |
+| `_primIsKindOf:` | any Value | 1 (class) | Bool ancestry test | builtins_iterative.rs:82 | |
+
+## Numeric tower (S2–S7)
+
+Grounding for the tower's public protocol. Each is sent to `self` on an **encoded
+leaf** — a `_prim` may only be sent to `self` (self-only rule), so abstract `Number`
+code reaches these by projecting with `value` and re-dispatching a public selector
+(`docs/numeric_tower_plan.md` §4e). Every one is a *single* selector that branches
+internally on the `Value::` variant and promotes across encodings (any `Float` ⇒ f64,
+else any `LargeInt` ⇒ BigInt, else i64 with overflow promoting and results demoting via
+`normalize_bigint`), rather than a per-representation family.
+
+| Selector | Receiver | Args | Semantics | Handler | Notes |
+|---|---|---|---|---|---|
+| `_primAdd:` `_primSub:` `_primMul:` `_primDiv:` `_primQuo:` `_primRem:` | numeric leaf | 1 | Promoting arithmetic | builtins_iterative.rs:814 (`arith_prim_op` → `numeric_binop`) | `_primQuo:`/`_primRem:` are integer-only |
+| `_primLt:` | numeric leaf | 1 | Promoting `<` | builtins_iterative.rs:1182 (`numeric_lt`) | Errors on a non-numeric operand |
+| `_primEq:` | numeric leaf | 1 | Promoting `=` | builtins_iterative.rs:1191 (`numeric_eq`) | **Total** — answers false rather than erroring (S6) |
+| `_primStrLt:` | String | 1 | Lexicographic `<` | builtins_iterative.rs:1440 | |
+
+**Irreducibility audit (S7).** The non-`_prim` arms surviving on the numeric
+dispatchers are host-representation operations with no Smol expression:
+`asFloat` (i64/BigInt → f64), `asString`/`printString` (host number formatting), and
+Float's `truncated` `rounded` `ceiling` `floor` `asInt` (libm/host). `to:do:` and
+`to:by:do:` remain on `dispatch_int` but are **not** numeric primitives — they are
+iteration primitives of the iterative evaluator (C29.5/C31.5), kept so loops run on the
+heap `Cont` stack.
+
+`printString`/`asString` are the one arguable case: digit extraction is expressible in
+Smol now that `//` and `\\` exist, so they are reducible in principle and retained for
+cost, not necessity. Recorded rather than resolved.
+
+**Pruned in S7:** 39 arms across `dispatch_int` / `dispatch_largeint` /
+`dispatch_float` (`+ - * / // \\ < <= > >= = ~= abs negated max: min:`), plus the
+orphaned `as_float_coerce` helper. All were shadowed by kernel Smol methods — user
+lookup runs first (`eval_iterative.rs:1844`) and walks the full superclass chain — and
+instrumenting the three dispatchers confirmed none was reached across the whole suite.
 
 ## Value / instance slot & string ops
 

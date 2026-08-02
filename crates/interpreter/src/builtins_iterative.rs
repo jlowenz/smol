@@ -1179,118 +1179,6 @@ fn dispatch_int(
     // Note: user-defined Int methods are now routed via lookup_user_method in the
     // iterative evaluator. The old (recursive) evaluator reaches builtins directly.
     match sel.as_ref() {
-        "+" => {
-            expect_arity(sel, 1, args.len())?;
-            let arg = force_value(ev, args.remove(0))?;
-            match arg {
-                Value::Int(m) => match n.checked_add(m) {
-                    Some(r) => Ok(Value::Int(r)),
-                    None => Ok(normalize_bigint(BigInt::from(n) + BigInt::from(m))),
-                },
-                Value::LargeInt(m) => Ok(normalize_bigint(BigInt::from(n) + (*m).clone())),
-                _ => Err(EvalError::TypeError(
-                    "+: argument must be Int or LargeInt".into(),
-                )),
-            }
-        }
-        "-" => {
-            expect_arity(sel, 1, args.len())?;
-            let arg = force_value(ev, args.remove(0))?;
-            match arg {
-                Value::Int(m) => match n.checked_sub(m) {
-                    Some(r) => Ok(Value::Int(r)),
-                    None => Ok(normalize_bigint(BigInt::from(n) - BigInt::from(m))),
-                },
-                Value::LargeInt(m) => Ok(normalize_bigint(BigInt::from(n) - (*m).clone())),
-                _ => Err(EvalError::TypeError(
-                    "-: argument must be Int or LargeInt".into(),
-                )),
-            }
-        }
-        "*" => {
-            expect_arity(sel, 1, args.len())?;
-            let arg = force_value(ev, args.remove(0))?;
-            match arg {
-                Value::Int(m) => match n.checked_mul(m) {
-                    Some(r) => Ok(Value::Int(r)),
-                    None => Ok(normalize_bigint(BigInt::from(n) * BigInt::from(m))),
-                },
-                Value::LargeInt(m) => Ok(normalize_bigint(BigInt::from(n) * (*m).clone())),
-                _ => Err(EvalError::TypeError(
-                    "*: argument must be Int or LargeInt".into(),
-                )),
-            }
-        }
-        "/" => {
-            expect_arity(sel, 1, args.len())?;
-            match force_value(ev, args.remove(0))? {
-                Value::Int(d) => {
-                    if d == 0 {
-                        return Err(EvalError::TypeError("division by zero".into()));
-                    }
-                    Ok(Value::Int(n / d))
-                }
-                Value::LargeInt(d) => {
-                    if d.is_zero() {
-                        return Err(EvalError::TypeError("division by zero".into()));
-                    }
-                    Ok(normalize_bigint(BigInt::from(n) / (*d).clone()))
-                }
-                _ => Err(EvalError::TypeError(
-                    "/: argument must be Int or LargeInt".into(),
-                )),
-            }
-        }
-        "//" => {
-            expect_arity(sel, 1, args.len())?;
-            match force_value(ev, args.remove(0))? {
-                Value::Int(d) => {
-                    if d == 0 {
-                        return Err(EvalError::TypeError("division by zero".into()));
-                    }
-                    let r = n % d;
-                    Ok(Value::Int(if r != 0 && (r < 0) != (d < 0) {
-                        n / d - 1
-                    } else {
-                        n / d
-                    }))
-                }
-                Value::LargeInt(d) => {
-                    if d.is_zero() {
-                        return Err(EvalError::TypeError("division by zero".into()));
-                    }
-                    Ok(normalize_bigint(bigint_floor_div(BigInt::from(n), &d)))
-                }
-                _ => Err(EvalError::TypeError(
-                    "//: argument must be Int or LargeInt".into(),
-                )),
-            }
-        }
-        "\\\\" => {
-            expect_arity(sel, 1, args.len())?;
-            match force_value(ev, args.remove(0))? {
-                Value::Int(d) => {
-                    if d == 0 {
-                        return Err(EvalError::TypeError("division by zero".into()));
-                    }
-                    let r = n % d;
-                    Ok(Value::Int(if r != 0 && (r < 0) != (d < 0) {
-                        r + d
-                    } else {
-                        r
-                    }))
-                }
-                Value::LargeInt(d) => {
-                    if d.is_zero() {
-                        return Err(EvalError::TypeError("division by zero".into()));
-                    }
-                    Ok(normalize_bigint(bigint_floor_rem(BigInt::from(n), &d)))
-                }
-                _ => Err(EvalError::TypeError(
-                    "\\\\: argument must be Int or LargeInt".into(),
-                )),
-            }
-        }
         "_primLt:" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(numeric_lt(
@@ -1313,60 +1201,6 @@ fn dispatch_int(
             expect_arity(sel, 1, args.len())?;
             let op = arith_prim_op(sel).expect("guarded by the match arm");
             numeric_binop(ev, op, Value::Int(n), args.remove(0), sel)
-        }
-        "<" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(n < as_int(ev, args.remove(0), sel)?))
-        }
-        ">" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(n > as_int(ev, args.remove(0), sel)?))
-        }
-        "<=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(n <= as_int(ev, args.remove(0), sel)?))
-        }
-        ">=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(n >= as_int(ev, args.remove(0), sel)?))
-        }
-        "=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::Int(n) == force_value(ev, args.remove(0))?,
-            ))
-        }
-        "~=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::Int(n) != force_value(ev, args.remove(0))?,
-            ))
-        }
-        "negated" => {
-            expect_arity(sel, 0, args.len())?;
-            match n.checked_neg() {
-                Some(r) => Ok(Value::Int(r)),
-                None => Ok(normalize_bigint(-BigInt::from(n))),
-            }
-        }
-        "abs" => {
-            expect_arity(sel, 0, args.len())?;
-            match n.checked_abs() {
-                Some(r) => Ok(Value::Int(r)),
-                None => {
-                    // i64::MIN has no positive i64 representation; promote to BigInt.
-                    use num_traits::Signed;
-                    Ok(normalize_bigint(BigInt::from(n).abs()))
-                }
-            }
-        }
-        "max:" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Int(n.max(as_int(ev, args.remove(0), sel)?)))
-        }
-        "min:" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Int(n.min(as_int(ev, args.remove(0), sel)?)))
         }
         "asString" => {
             expect_arity(sel, 0, args.len())?;
@@ -1436,30 +1270,6 @@ fn dispatch_largeint(
             };
             Ok(normalize_bigint(result))
         }
-        "/" => {
-            expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
-            if rhs.is_zero() {
-                return Err(EvalError::TypeError("division by zero".into()));
-            }
-            Ok(normalize_bigint((*n).clone() / rhs))
-        }
-        "//" => {
-            expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
-            if rhs.is_zero() {
-                return Err(EvalError::TypeError("division by zero".into()));
-            }
-            Ok(normalize_bigint(bigint_floor_div((*n).clone(), &rhs)))
-        }
-        "\\\\" => {
-            expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
-            if rhs.is_zero() {
-                return Err(EvalError::TypeError("division by zero".into()));
-            }
-            Ok(normalize_bigint(bigint_floor_rem((*n).clone(), &rhs)))
-        }
         "_primLt:" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(numeric_lt(
@@ -1483,47 +1293,6 @@ fn dispatch_largeint(
             let op = arith_prim_op(sel).expect("guarded by the match arm");
             numeric_binop(ev, op, Value::LargeInt(n), args.remove(0), sel)
         }
-        "<" => {
-            expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
-            Ok(Value::Bool(*n < rhs))
-        }
-        ">" => {
-            expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
-            Ok(Value::Bool(*n > rhs))
-        }
-        "<=" => {
-            expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
-            Ok(Value::Bool(*n <= rhs))
-        }
-        ">=" => {
-            expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
-            Ok(Value::Bool(*n >= rhs))
-        }
-        "=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::LargeInt(n) == force_value(ev, args.remove(0))?,
-            ))
-        }
-        "~=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::LargeInt(n) != force_value(ev, args.remove(0))?,
-            ))
-        }
-        "negated" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(normalize_bigint(-(*n).clone()))
-        }
-        "abs" => {
-            expect_arity(sel, 0, args.len())?;
-            use num_traits::Signed;
-            Ok(normalize_bigint(n.abs()))
-        }
         "asString" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from(n.to_string())))
@@ -1543,16 +1312,6 @@ fn dispatch_largeint(
 
 // ── Float ────────────────────────────────────────────────────────────────────
 
-fn as_float_coerce(ev: &Evaluator, v: Value, sel: &Arc<str>) -> Result<f64, EvalError> {
-    match force_value(ev, v)? {
-        Value::Float(f) => Ok(f),
-        Value::Int(n) => Ok(n as f64),
-        _ => Err(EvalError::TypeError(format!(
-            "{sel}: argument must be Float or Int"
-        ))),
-    }
-}
-
 fn dispatch_float(
     ev: &Evaluator,
     f: f64,
@@ -1561,22 +1320,6 @@ fn dispatch_float(
     _env: &mut Env,
 ) -> Result<Value, EvalError> {
     match sel.as_ref() {
-        "+" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Float(f + as_float_coerce(ev, args.remove(0), sel)?))
-        }
-        "-" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Float(f - as_float_coerce(ev, args.remove(0), sel)?))
-        }
-        "*" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Float(f * as_float_coerce(ev, args.remove(0), sel)?))
-        }
-        "/" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Float(f / as_float_coerce(ev, args.remove(0), sel)?))
-        }
         "_primLt:" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(numeric_lt(
@@ -1599,42 +1342,6 @@ fn dispatch_float(
             expect_arity(sel, 1, args.len())?;
             let op = arith_prim_op(sel).expect("guarded by the match arm");
             numeric_binop(ev, op, Value::Float(f), args.remove(0), sel)
-        }
-        "<" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(f < as_float_coerce(ev, args.remove(0), sel)?))
-        }
-        ">" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(f > as_float_coerce(ev, args.remove(0), sel)?))
-        }
-        "<=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(f <= as_float_coerce(ev, args.remove(0), sel)?))
-        }
-        ">=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(f >= as_float_coerce(ev, args.remove(0), sel)?))
-        }
-        "=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::Float(f) == force_value(ev, args.remove(0))?,
-            ))
-        }
-        "~=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::Float(f) != force_value(ev, args.remove(0))?,
-            ))
-        }
-        "negated" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Float(-f))
-        }
-        "abs" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Float(f.abs()))
         }
         "truncated" => {
             expect_arity(sel, 0, args.len())?;

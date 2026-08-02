@@ -812,9 +812,32 @@ are meaningless and should error or be absent.
   Kept a separate step from S5: it is a semantic change touching collections.
   Watch for: the Rust `"="`/`"~="` arms for `Int`/`LargeInt`/`Float` go dead once the
   kernel shadows them, and any test asserting `2 = 2.0` is false will flip.
-- **S7 — Prune** now-dead Rust arms in `dispatch_int`/`dispatch_float` that Smol
-  fully supersedes; audit that every remaining `_prim` is irreducible. Update
-  `docs/primitives.md`.
+- **S7 — Prune. DONE 2026-08-02.** Removed **39 arms** across `dispatch_int` /
+  `dispatch_largeint` / `dispatch_float` (`+ - * / // \\ < <= > >= = ~= abs negated
+  max: min:`) plus the orphaned `as_float_coerce` helper that deleting them exposed.
+  810 tests unchanged.
+
+  **Deadness was verified, not assumed** — two independent ways, because a Smol method
+  shadows a Rust arm silently and a wrong guess here deletes live behavior:
+  1. *Static* — user-method lookup runs before builtin dispatch
+     (`eval_iterative.rs:1844`) and `lookup_user_method` walks the full superclass
+     chain, so a kernel method on `MachineInteger`/`Integer`/`Number`/`Value`/`Object`
+     (plus flattened `Ordered`) makes the same-named arm unreachable. Each dispatcher
+     has exactly one call site, from `dispatch`, downstream of that check.
+  2. *Empirical* — instrumented all three dispatchers to log every arriving selector
+     and ran the whole suite. Only `_prim*`, `printString`/`asString`/`asFloat`,
+     Float's host conversions, `to:do:`/`to:by:do:`, and genuine MNU probes appeared.
+     No pruned selector was ever reached.
+
+  Remaining arms audited as irreducible (host representation: `asFloat`, number
+  formatting, libm) except `printString`/`asString`, which are reducible in principle
+  now that `//` and `\\` exist and are retained for cost — recorded in
+  `docs/primitives.md`, not resolved. `to:do:`/`to:by:do:` stay on `dispatch_int` but
+  are iteration primitives of the iterative evaluator (C29.5/C31.5), not numeric ones.
+
+  `docs/primitives.md` gained a numeric-tower section (it predated S2) and its header
+  no longer describes the recursive evaluator as "slated for retirement" — it was
+  retired in 2026-07.
 
 Each step is independently committable; S1 alone fixes the reported bugs.
 
