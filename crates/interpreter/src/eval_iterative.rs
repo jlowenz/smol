@@ -349,21 +349,6 @@ pub(crate) enum Cont {
         sync: bool,
     },
 
-    /// Drives a `to:do:` / `to:by:do:` numeric loop on the heap `Cont` stack so
-    /// that nested iteration (and thus all collection iteration, which bottoms
-    /// out in `to:do:`) does not grow the Rust stack per nesting level.
-    ///
-    /// Each fire runs `blk` with the current index `next` (discarding its result)
-    /// and re-pushes itself advanced by `step`, until `next` passes `stop`. A
-    /// `^`-return or signal from the body unwinds past this `Cont` (it is not a
-    /// frame), stopping the loop. Answers `nil` when the range is exhausted.
-    ToDoStep {
-        blk: Arc<crate::value::Block>,
-        next: i64,
-        stop: i64,
-        step: i64,
-    },
-
     /// Sits below a signal handler's block frame (flattened `_primSignalCondition:`
     /// / `error:`). The handler runs on the heap `Cont` stack with itself and all
     /// inner handlers removed from `handler_chain` (Common-Lisp handler-scoping);
@@ -946,30 +931,6 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
             Cont::NamespaceGuard { saved_ns } => {
                 // Restore the active namespace; acc (block result) passes through.
                 *ev.active_namespace.borrow_mut() = saved_ns;
-            }
-
-            // ── ToDoStep (numeric loop iteration) ─────────────────────────
-            Cont::ToDoStep {
-                blk,
-                next,
-                stop,
-                step,
-            } => {
-                let cont = if step > 0 { next <= stop } else { next >= stop };
-                if cont {
-                    bump_reductions(&mut reductions);
-                    stack.push(Cont::ToDoStep {
-                        blk: blk.clone(),
-                        next: next + step,
-                        stop,
-                        step,
-                    });
-                    // Per-iteration result is discarded; the next ToDoStep (or the
-                    // final acc=nil) overwrites it.
-                    push_block_frame(ev, &blk, vec![Value::Int(next)], false, &mut stack)?;
-                } else {
-                    acc = Value::Nil; // to:do: / to:by:do: answer nil
-                }
             }
 
             // ── ContinueUnwind ────────────────────────────────────────────
@@ -1876,56 +1837,6 @@ fn dispatch_to_stack(
         });
         push_block_frame(ev, &body, vec![], false, stack)?;
         return Ok(());
-    }
-
-    // (1c) `to:do:` / `to:by:do:` flattened: drive the numeric loop on the heap
-    // `Cont` stack (ToDoStep) instead of recursing `step_loop` via `eval_block`
-    // per iteration. All collection iteration bottoms out here, so this makes
-    // nested iteration O(1) in Rust stack.
-    if let Value::Int(n) = receiver {
-        match selector.as_ref() {
-            "to:do:" => {
-                if args.len() != 2 {
-                    return Err(EvalError::ArityMismatch {
-                        expected: 2,
-                        got: args.len(),
-                    });
-                }
-                let stop = crate::builtins_iterative::as_int(ev, args.remove(0), &selector)?;
-                let blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
-                stack.push(Cont::ToDoStep {
-                    blk,
-                    next: n,
-                    stop,
-                    step: 1,
-                });
-                return Ok(());
-            }
-            "to:by:do:" => {
-                if args.len() != 3 {
-                    return Err(EvalError::ArityMismatch {
-                        expected: 3,
-                        got: args.len(),
-                    });
-                }
-                let stop = crate::builtins_iterative::as_int(ev, args.remove(0), &selector)?;
-                let step = crate::builtins_iterative::as_int(ev, args.remove(0), &selector)?;
-                if step == 0 {
-                    return Err(EvalError::TypeError(
-                        "to:by:do: step must be non-zero".into(),
-                    ));
-                }
-                let blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
-                stack.push(Cont::ToDoStep {
-                    blk,
-                    next: n,
-                    stop,
-                    step,
-                });
-                return Ok(());
-            }
-            _ => {}
-        }
     }
 
     // (1d) Signal dispatch flattened: run the matching handler on the heap `Cont`

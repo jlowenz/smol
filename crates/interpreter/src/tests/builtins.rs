@@ -171,10 +171,24 @@ fn int_to_by_do() {
 
 #[test]
 fn int_to_by_do_zero_step_errors() {
-    assert!(matches!(
-        eval_err_diff("1 to: 5 by: 0 do: [:i | i]"),
-        crate::eval::EvalError::TypeError(_)
-    ));
+    // C34 S1b: `to:by:do:` is kernel Smol now, so a zero step raises a CONDITION
+    // (`self error:`) rather than the Rust `EvalError::TypeError` the evaluator
+    // special-case raised. That is the migration working as intended — a
+    // condition is catchable and inspectable from Smol, and `Integer >> factorial`
+    // already set the precedent for signalling a domain error this way.
+    assert_signal_contains(
+        &eval_err_diff("1 to: 5 by: 0 do: [:i | i]"),
+        "step must be non-zero",
+    );
+}
+
+#[test]
+fn to_by_do_zero_step_error_is_catchable_from_smol() {
+    // The practical payoff of raising a condition instead of a Rust error.
+    assert_eq!(
+        eval("[1 to: 5 by: 0 do: [:i | i]] on: Error do: [:e | e messageText]"),
+        Value::Str("to:by:do: step must be non-zero".into())
+    );
 }
 
 #[test]

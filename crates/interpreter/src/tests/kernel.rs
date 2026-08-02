@@ -239,3 +239,177 @@ fn timer_fires_in_entity() {
     });
     assert_eq!(rx.recv().unwrap(), Value::Int(99));
 }
+
+// ── C34 S1b: to:do: / to:by:do: are Smol methods on Number ────────────────────
+//
+// Before S1b these were not methods at all: `dispatch_to_stack` step (1c) matched
+// the SELECTOR against a `Value::Int` receiver and pushed a `Cont::ToDoStep`
+// continuation. Both the special-case and the continuation variant were deleted
+// in the same commit as these methods, so nothing can silently fall back to them.
+
+#[test]
+fn to_do_iterates_ascending() {
+    assert_eq!(
+        eval(
+            "| h | h := ValueHolder initialValue: 0.
+        1 to: 4 do: [:i | h update: [:a | a + i]]. h get value"
+        ),
+        Value::Int(10)
+    );
+}
+
+#[test]
+fn to_do_answers_nil_and_skips_an_empty_range() {
+    assert_eq!(eval("5 to: 1 do: [:i | i]"), Value::Nil);
+    assert_eq!(
+        eval(
+            "| h | h := ValueHolder initialValue: 0.
+        5 to: 1 do: [:i | h update: [:a | a + 1]]. h get value"
+        ),
+        Value::Int(0)
+    );
+}
+
+#[test]
+fn to_by_do_handles_both_directions() {
+    assert_eq!(
+        eval(
+            "| h | h := ValueHolder initialValue: 0.
+        0 to: 6 by: 2 do: [:i | h update: [:a | a + i]]. h get value"
+        ),
+        Value::Int(12)
+    );
+    assert_eq!(
+        eval(
+            "| h | h := ValueHolder initialValue: 0.
+        10 to: 0 by: -3 do: [:i | h update: [:a | a + i]]. h get value"
+        ),
+        Value::Int(22)
+    );
+}
+
+#[test]
+fn to_do_is_now_visible_to_reflection() {
+    // The Q14 observability complaint in its purest form: as an evaluator
+    // special-case, `to:do:` answered false here.
+    assert_eq!(eval("3 respondsTo: #to:do:"), Value::Bool(true));
+    assert_eq!(eval("3 respondsTo: #to:by:do:"), Value::Bool(true));
+}
+
+#[test]
+fn to_do_works_for_every_numeric_leaf() {
+    // Defining on Number rather than on one encoding fixes the Float and
+    // ArbitraryInteger gap for free: both used to answer doesNotUnderstand.
+    assert_eq!(
+        eval(
+            "| h | h := ValueHolder initialValue: 0.
+        1.5 to: 3 do: [:i | h update: [:a | a + 1]]. h get value"
+        ),
+        Value::Int(2)
+    );
+    assert_eq!(
+        eval(
+            "| h | h := ValueHolder initialValue: 0.
+        (100 factorial) to: (100 factorial) do: [:i | h update: [:a | a + 1]].
+        h get value"
+        ),
+        Value::Int(1)
+    );
+}
+
+#[test]
+fn to_do_can_be_overridden() {
+    // Not because overriding iteration is common, but because the construct is
+    // now describable in the language rather than privileged by the evaluator.
+    let src = "
+        Number subclass: #Countdown instanceVariableNames: ''
+            classVariableNames: '' indexedSlots: #none.
+        Countdown >> to: stop do: aBlock [ ^#overridden ]
+        Countdown new to: 3 do: [:i | i]
+    ";
+    assert_eq!(eval(src), Value::Symbol(Arc::from("overridden")));
+}
+
+#[test]
+fn to_do_awaits_futures_in_every_position() {
+    // OQ-1b. Step (1c) called Rust `as_int` on the bound, which REJECTED a Future
+    // rather than awaiting it — contradicting asynchronous-everywhere. A Smol
+    // to:do: compares bounds with ordinary sends, which force futures.
+    let limit = "| h | h := ValueHolder initialValue: 3.
+        | c | c := ValueHolder initialValue: 0.
+        1 to: h get do: [:i | c update: [:a | a + 1]]. c get value";
+    assert_eq!(eval(limit), Value::Int(3));
+
+    let receiver = "| h | h := ValueHolder initialValue: 1.
+        | c | c := ValueHolder initialValue: 0.
+        h get to: 3 do: [:i | c update: [:a | a + 1]]. c get value";
+    assert_eq!(eval(receiver), Value::Int(3));
+
+    let step = "| h | h := ValueHolder initialValue: 2.
+        | c | c := ValueHolder initialValue: 0.
+        0 to: 6 by: h get do: [:i | c update: [:a | a + 1]]. c get value";
+    assert_eq!(eval(step), Value::Int(4));
+}
+
+#[test]
+fn deep_to_do_is_o1_stack_and_linear() {
+    // Acceptance criteria 1 and 3 (plan §6 OQ-1). 100k iterations exhaust the
+    // 64 KB release coroutine stack if any per-iteration Rust frame survives,
+    // and hang rather than fail subtly if the loop is not linear in time. The
+    // body is deliberately PURE: the criteria are about stack depth and time
+    // complexity, and a cross-entity `update:` per iteration would dominate both
+    // the measurement and the runtime. Iteration COUNT is covered separately by
+    // `to_do_iterates_ascending`.
+    assert_eq!(eval("1 to: 100000 do: [:i | i]"), Value::Nil);
+}
+
+#[test]
+fn nested_to_do_does_not_grow_the_stack() {
+    // Nesting is the case Cont::ToDoStep existed for; TCO plus push_block_frame
+    // carry it now. See also step_probe_nested_loops, which measures depth = 1.
+    assert_eq!(
+        eval("1 to: 300 do: [:i | 1 to: 300 do: [:j | j]]"),
+        Value::Nil
+    );
+}
+
+#[test]
+fn nested_to_do_runs_the_inner_loop() {
+    // Separated from the stack test above so the effect is verified without
+    // paying 90k entity sends for it.
+    assert_eq!(
+        eval(
+            "| h | h := ValueHolder initialValue: 0.
+        1 to: 10 do: [:i | 1 to: 10 do: [:j | h update: [:a | a + 1]]].
+        h get value"
+        ),
+        Value::Int(100)
+    );
+}
+
+#[test]
+fn to_do_works_for_a_number_wrapper() {
+    // Defining on Number rather than on the leaves means a user wrapper inherits
+    // iteration through the tower's value/withValue: seam (numeric_tower_plan §4e),
+    // in both receiver and limit position, with no leaf edited.
+    let boxed = "Number subclass: #Boxed instanceVariableNames: 'x'
+            classVariableNames: '' indexedSlots: #none.
+        Boxed class >> of: v [ ^self _primNewValue: [:w | w setX: v] ]
+        Boxed >> setX: v [ x := v ]
+        Boxed >> value [ ^x ]
+        Boxed >> withValue: v [ ^Boxed of: v ]
+        | h | h := ValueHolder initialValue: 0. ";
+
+    assert_eq!(
+        eval(&format!(
+            "{boxed} (Boxed of: 1) to: 3 do: [:i | h update: [:a | a + 1]]. h get value"
+        )),
+        Value::Int(3)
+    );
+    assert_eq!(
+        eval(&format!(
+            "{boxed} 1 to: (Boxed of: 3) do: [:i | h update: [:a | a + 1]]. h get value"
+        )),
+        Value::Int(3)
+    );
+}

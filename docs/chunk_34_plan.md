@@ -46,7 +46,7 @@ arithmetic over `_primAdd:` and friends, and S7 then deleted 39 superseded arms.
 |---|---|---|
 | String | 10 | `, at: copyFrom:to: includesSubString: reversed size asSymbol = ~= printString` |
 | Float | 6 | `asInt ceiling floor rounded truncated printString` |
-| Int | 5 | `asFloat asString printString to:do: to:by:do:` |
+| Int | 5 → **3** | `asFloat asString printString` (~~`to:do: to:by:do:`~~ — the dead arms went in S1; the evaluator special-case went in S1b) |
 | LargeInt | 3 | `asFloat asString printString` |
 | Symbol | 5 | `= ~= asString asSymbol printString` |
 | Nil | 3 | `= ~= printString` |
@@ -104,11 +104,10 @@ Each phase is independently committable and leaves the suite green.
   fallback), and fix the future-in-loop-bounds bug (OQ-1b). Gated on the O(1) acceptance
   criteria above. This is the largest behavioral step in the chunk; everything after it is
   mechanical by comparison.
-  Docs to revisit in this step: `Smol_Patterns.md` Pattern 1 calls `to:do:` "a built-in"
-  (true until S1b, false after), and its Pattern-3 note claims recursion at collection
-  scale "exhausts the coroutine stack" — unverified as of S1a, where non-tail recursion
-  ran to depth 16000 with no exhaustion and roughly linear cost. Measure at collection
-  scale before rewriting either.
+  **DONE 2026-08-02** — see §5c. `Smol_Patterns.md` Pattern 1 is updated. Its Pattern-3
+  note (recursion at collection scale "exhausts the coroutine stack") is left ALONE and
+  still unverified: non-tail recursion ran to depth 16000 with no exhaustion and roughly
+  linear cost, but that is not collection scale. Measure before rewriting it.
 - **S2 — Identity + simple families:** introduce `==` / `_primIdentical:` and
   `Object >> =`/`~=` in terms of it (OQ-3), then Nil, Symbol, Namespace, Class (15 arms).
   Settling identity first is what lets the per-variant `=`/`~=` arms go, and it makes S6's
@@ -188,13 +187,95 @@ loop was quadratic in time and linear in memory. S1b therefore adds a third crit
 **measured linear scaling** across at least three doublings of the trip count, since
 stack flatness alone does not imply the loop is usable.
 
+## 5c. S1b — `to:do:` / `to:by:do:` are methods now (DONE 2026-08-02)
+
+Three methods on `Number` (`kernel.smol`), and the evaluator special-case is gone:
+step (1c) of `dispatch_to_stack` **and** the `Cont::ToDoStep` variant with its
+`step_loop` arm were deleted in the same commit, so nothing can silently fall back.
+
+```smalltalk
+Number >> to: stop do: aBlock
+Number >> to: stop by: step do: aBlock         "validates step, picks a worker"
+Number >> pvtUpTo: stop by: step do: aBlock    "ascending worker"
+Number >> pvtDownTo: stop by: step do: aBlock  "descending worker"
+```
+
+Two workers rather than one branching on `step > 0` per iteration: the sign is
+loop-invariant, so deciding once at entry hoists two sends and a block evaluation out of
+every iteration (2.33 s → 1.42 s at 100k, bringing `to:by:do:` level with `to:do:`) and
+leaves each worker in exactly the `to:do:` shape.
+
+**What it bought** (each covered by a test in `tests/kernel.rs`):
+- `3 respondsTo: #to:do:` → `true` (was `false`). This is what closes Q14 for the
+  construct: the method dictionary is the answer, no builtin-selector registry needed.
+- `Float` and `ArbitraryInteger` receivers iterate. Both previously answered
+  `doesNotUnderstand` on the tower's most-used iteration construct, because (1c)
+  matched only `Value::Int`. Defining on `Number` fixed both at once.
+- It can be overridden by a `Number` subclass.
+- **OQ-1b is fixed**: a `Future` in the receiver, limit *or* step position of either
+  selector now resolves. (1c) called Rust `as_int` on the bound and rejected a Future
+  outright. The Smol version compares bounds with ordinary sends, which force futures —
+  so this dissolved rather than needing a separate fix, as OQ-1b anticipated. Tested in
+  all three positions anyway, per that entry.
+
+**Acceptance criteria — all three met.**
+1. Deep iteration: 100k iterations and nested loops, no stack exhaustion.
+2. `step_probe_nested_loops`: 5-deep nesting measures `depth = 1, per-level delta = 0 B`
+   (it allowed ≤2 under `ToDoStep`).
+3. Linear scaling, release: 0.35 / 0.68 / 1.36 / 2.69 s at 25k / 50k / 100k / 200k —
+   ×2 per doubling across three doublings.
+
+**Behaviour change, deliberate.** A zero step raised `EvalError::TypeError` from Rust;
+it now raises a **condition**, which is catchable and inspectable from Smol. One test
+was updated to encode the new contract and one added to demonstrate the catch.
+
+**Note the method signals via `Error signal:`, not `self error:`.** `error:` sent to a
+*primitive* receiver is uncatchable — dispatch step (1d) gates flattened signal dispatch
+on an `Instance` receiver, so a Number leaf falls through to
+`dispatch_primitive_fallback`'s bare `EvalError::Signal`, bypassing the handler chain.
+`[3 error: 'x'] on: Error do: [...]` does not catch; `[Error signal: 'x'] on: Error do:
+[...]` does. **This is a pre-existing defect, not introduced here**, and it affects other
+kernel methods whose `self` may be a leaf — `Integer >> factorial` raises an uncatchable
+error today for the same reason. `error:` is the `fallback` row of §3's inventory and is
+S6's to resolve; the fix should make `error:` on a primitive route through the same
+signal machinery as on an instance, after which kernel code can go back to `self error:`.
+
+**Cost, recorded not vetoed** (§1). `to:do:` was the only linear loop in the language
+*because* it was a special-case; it is now ordinary sends. The loop family pays for it;
+nothing else moves.
+
+| bench | after S1a | after S1b | |
+|---|---|---|---|
+| `to:do: 100000` | 51.2 ms | 1.56 s | 30× slower |
+| `to:by:do: 100000` | 51.0 ms | 1.42 s | 28× slower |
+| `nested to:do: 300x300` | 47.4 ms | 1.27 s | 27× slower |
+| `array do: 10000` | 12.3 ms | 134 ms | 11× slower |
+| `timesRepeat 1000` | 16.87 ms | 16.76 ms | unchanged |
+| `fibonacci 20 iterative` | 361 µs | 355 µs | unchanged |
+| `valueholder accumulate 1000` | 17.37 ms | 18.01 ms | unchanged |
+| `object new 1000` | 16.95 ms | 15.52 ms | unchanged |
+| `method send increment 1000` | 16.94 ms | 15.95 ms | unchanged |
+
+Test suite 10.4 s → 26.3 s, of which ~10 s is the two ≥100k acceptance tests themselves.
+Note the whole-suite figure is still *below* the 14.9 s it stood at before S1a, because
+S1a's 11× on method dispatch more than paid for S1b.
+
+Per §1 this is information for the queued performance review, not an approval gate. The
+recorded long-term answer is OQ-1's: implement in Smol first, then inline the compiled
+fast path when the method has not been overridden — which is why `to_do_can_be_overridden`
+exists as a test, since that inlining must fall back to a real send when it has.
+
+One practical consequence: `cargo bench -p interpreter` now takes ~15 minutes, dominated
+by the three loop benches at 100k. S6 may want to shrink them, but not before the
+before/after pair above is recorded — that comparability is the point of S0.
+
 ## 6. Open questions
 
 All settled as of 2026-08-02 except **OQ-2** (minor, statable during implementation) and
 **OQ-4** (deferred by design, sequenced last). Decisions are recorded inline below with
 the reasoning, including options rejected.
 
-### OQ-1 — `to:do:` is an evaluator special-case, not a method *(needs discussion)*
+### OQ-1 — `to:do:` is an evaluator special-case, not a method — RESOLVED (S1b, 2026-08-02)
 
 **Finding (verified 2026-08-02).** There is **no `to:do:` method anywhere** — not in
 `kernel.smol`, not in Rust dispatch. `0 to: 5 do: […]` parses as an ordinary message
@@ -297,7 +378,7 @@ construct is **inspectable and modifiable in a live image** like everything else
 than being a privileged form the language cannot describe. A domain `Number` subclass
 wanting different iteration is the secondary benefit.
 
-### OQ-1b — futures are not awaited in loop bounds *(BUG — in scope, see S1b)*
+### OQ-1b — futures are not awaited in loop bounds — RESOLVED (S1b, 2026-08-02)
 
 ```
 1 to: aResolvedFuture do: [:i | i]   →   TypeError("to:do:: argument must be Int")
@@ -314,7 +395,7 @@ either way: a future in the receiver, bound, and step positions of both `to:do:`
 is the evaluator making an incorrect assumption about futures (`CLAUDE.md`) and is fixed
 at the seam, not by resolving the future early.
 
-### OQ-1c — stale kernel comments about the retired recursive evaluator *(cleanup)*
+### OQ-1c — stale kernel comments about the retired recursive evaluator — RESOLVED (S1b)
 
 `kernel.smol:1284` and `:1395` still describe `_primWhileTrue:` / `_primTimesRepeat:`
 Rust arms as "direct fallbacks for the old (recursive) evaluator". Doubly stale: the

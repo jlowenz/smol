@@ -1279,10 +1279,10 @@ False >> | other                    [ ^other ]
 Boolean >> ~= other                 [ ^(self = other) not ]
 
 "Loop — pure Smol recursive implementations enabled by inline block dispatch and
-TCO in the iterative evaluator. The _prim* builtins in builtins.rs remain as
-direct fallbacks for the old (recursive) evaluator, which reaches them via the
-aliased 'whileTrue:'/'_primWhileTrue:' match arms without going through these
-Smol methods.
+TCO in the iterative evaluator. There is no Rust fallback: the `_primWhileTrue:` /
+`_primTimesRepeat:` arms these methods once shadowed were removed with the recursive
+evaluator (retired 2026-07), so these bodies ARE the implementation. (C34 OQ-1c: the
+note that used to sit here described those arms as live.)
 
 The body is run via `aBlock value`, which is deliberately NOT type-checked (C29.6).
 Since `Value >> value [^self]` (§4e), a non-block body is legal and simply evaluates
@@ -1390,9 +1390,76 @@ Integer >> pvtHasNoOddFactorFrom: k [
     ^self pvtHasNoOddFactorFrom: k + 2
 ]
 
+"Numeric iteration (plan chunk_34 §6 OQ-1, S1b). Before S1b these were not methods at
+all: `dispatch_to_stack` step (1c) matched the SELECTOR against a `Value::Int` receiver
+and pushed a `Cont::ToDoStep` continuation. That made `to:do:` a syntactic form wearing
+a message send's clothing — invisible to `respondsTo:`, impossible to override or
+inspect, and silently available only for MachineInteger, so `1.5 to: 3 do: [...]` and
+`aLargeInt to: 3 do: [...]` answered doesNotUnderstand on the tower's most-used
+iteration construct. Defining them on Number fixes that gap for every leaf at once.
+
+The shape is `Block >> whileTrue:`'s, and for the same reason: an early `^` inside a
+guard block, then the recursive send in method STATEMENT position, which is the form
+the evaluator's TCO recognises. The classic counter form
+(`i := self. [i <= stop] whileTrue: [... i := i + 1]`) is unavailable — a method temp
+cannot be assigned from inside a block (Smol_Patterns pattern 1) — so recursion is the
+idiom here exactly as it is for `gcd:` and `factorial`.
+
+Bounds are compared with ordinary sends (`<=`, `>=`), which force a Future argument
+like any other send, so a future in the receiver, limit or step position resolves
+instead of raising. Step (1c) called Rust `as_int` on the bound and rejected a Future
+outright, contradicting the asynchronous-everywhere rule (OQ-1b).
+
+`to:by:do:` splits into a public method that validates the step ONCE and a recursive
+worker, rather than re-testing `step isZero` every iteration. A zero step must be
+rejected explicitly: `step > 0` would be false and `self >= stop` would decide, so
+`1 to: 5 by: 0 do: [...]` would answer nil immediately — silently wrong rather than
+loudly wrong."
+
+Number >> to: stop do: aBlock [
+    (self <= stop) ifFalse: [ ^nil ].
+    aBlock value: self.
+    ^(self + 1) to: stop do: aBlock
+]
+
+"`Error signal:` rather than `self error:` deliberately. `error:` sent to a PRIMITIVE
+receiver is uncatchable: dispatch step (1d) gates flattened signal dispatch on an
+Instance receiver, so a Number leaf falls through to `dispatch_primitive_fallback`,
+which returns a bare `EvalError::Signal` that bypasses the handler chain — `[3 error:
+'x'] on: Error do: [...]` does not catch, while `[Error signal: 'x'] on: Error do:
+[...]` does. That asymmetry is a pre-existing defect in `error:` (a Rust fallback arm,
+see §3's `fallback` row); until it is resolved, kernel code whose `self` may be an
+encoded leaf must signal the condition directly."
+Number >> to: stop by: step do: aBlock [
+    step isZero ifTrue: [ ^Error signal: 'to:by:do: step must be non-zero' ].
+    ^step > 0
+        ifTrue:  [ self pvtUpTo:   stop by: step do: aBlock ]
+        ifFalse: [ self pvtDownTo: stop by: step do: aBlock ]
+]
+
+"Two workers rather than one testing `step > 0` per iteration. The step's sign is
+loop-INVARIANT, so deciding it once at entry hoists two sends and a block evaluation
+out of every iteration — measured at 2.33 s → 1.42 s for 100k iterations, which brings
+`to:by:do:` level with `to:do:` instead of half again as slow. It also
+leaves each worker in exactly the `to:do:` shape, which is the point: the termination
+guard is a single comparison, not a conditional over one."
+Number >> pvtUpTo: stop by: step do: aBlock [
+    (self <= stop) ifFalse: [ ^nil ].
+    aBlock value: self.
+    ^(self + step) pvtUpTo: stop by: step do: aBlock
+]
+
+Number >> pvtDownTo: stop by: step do: aBlock [
+    (self >= stop) ifFalse: [ ^nil ].
+    aBlock value: self.
+    ^(self + step) pvtDownTo: stop by: step do: aBlock
+]
+
 "timesRepeat: recurses on (self - 1) instead of mutating a counter variable,
-avoiding NonLocalBlockAssignment. The iterative evaluator handles this O(1) via
-TCO; the old evaluator uses the _primTimesRepeat: alias in dispatch_int directly."
+avoiding NonLocalBlockAssignment. TCO makes this O(1) in Rust stack, and since C34
+S1a the env no longer grows per call either, so it is O(1) in memory and linear in
+time. (C34 OQ-1c: this note used to claim `_primTimesRepeat:` in dispatch_int as a
+live fallback for the recursive evaluator; both were retired in 2026-07.)"
 Integer >> timesRepeat: aBlock [
     self > 0 ifFalse: [ ^nil ].
     aBlock value.

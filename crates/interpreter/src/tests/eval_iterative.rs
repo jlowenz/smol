@@ -27,8 +27,12 @@ outer run: [
 }
 
 /// C31.5 S4: nested numeric iteration must NOT grow the Rust stack per nesting
-/// level — `to:do:` runs on the heap `Cont` stack (ToDoStep), so depth stays a
-/// small constant regardless of how deeply loops nest.
+/// level, so depth stays a small constant regardless of how deeply loops nest.
+///
+/// C34 S1b changed what carries this without changing the guarantee: `to:do:` was
+/// an evaluator special-case driving a `Cont::ToDoStep` continuation, and is now
+/// an ordinary tail-recursive Smol method on `Number`. TCO drains its frames and
+/// the body runs via `push_block_frame`, so nesting still costs no Rust stack.
 #[cfg(feature = "step_probe")]
 #[test]
 fn step_probe_nested_loops() {

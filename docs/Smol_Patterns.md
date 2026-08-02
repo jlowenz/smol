@@ -108,9 +108,16 @@ i := 0.
 ]
 ```
 
-`to:do:` is a built-in that provides the index as a block parameter. The
-block parameter `i` belongs to the block's own scope — assignment is legal.
-Use `to:by:do:` for step increments other than 1.
+`to:do:` provides the index as a block parameter. The block parameter `i`
+belongs to the block's own scope — assignment is legal. Use `to:by:do:` for
+step increments other than 1.
+
+`to:do:` and `to:by:do:` are ordinary Smol methods on `Number` (`kernel.smol`),
+not built-ins — chunk 34 S1b replaced the evaluator special-case that used to
+implement them. Consequences worth knowing: they answer `respondsTo:`, they can
+be overridden by a `Number` subclass, they work for every numeric leaf (`Float`
+and `ArbitraryInteger` receivers previously answered `doesNotUnderstand`), and a
+`Future` in the receiver, limit or step position resolves rather than raising.
 
 ---
 
