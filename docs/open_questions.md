@@ -378,3 +378,95 @@ conflicts/unmet requirements eagerly.
 **Also deferred (traits_plan §8):** per-class provenance/requirements side tables for
 reflection/tooling (not stored on `Class` in the MVP to avoid touching every class
 constructor); public-protocol markers; class-side trait methods; `super` in traits.
+
+---
+
+## Q13: Standalone `uses:` — applying a trait to an already-defined class
+
+**Status**: Open — needs design session
+**Raised**: numeric tower §4f (2026-08-01), extracted here 2026-08-02
+
+`uses:` is currently **definition-time only**: it exists solely as a keyword clause of
+`subclass:`/`vmSubclass:` (`define_subclass` in `builtins_iterative.rs`), and the trait
+MVP is stateless and *flattened* — the trait's methods are copied into the class's
+method dictionary when the class is defined, with no live link retained afterward.
+
+A standalone `SomeClass uses: SomeTrait.` statement is independently valuable — adding
+a capability to an existing class is exactly the live-image manipulation this project
+exists for — but it is a trait-system step with its own design questions.
+
+**Immediate motivation (numeric tower).** The tower's coercion fallbacks
+(`isEncodedNumber`, `adaptTo…andSend:` refusing defaults) currently sit on `Object`,
+which is domain leakage: "can be asked to participate as a number in an arithmetic
+operation" is a *capability*, so by the numeric plan's §4d it belongs on the trait axis
+as a `NumberCoercion` trait. That placement is blocked here: `Object` is bootstrapped
+in Rust and never passes through `define_subclass`, so `Object uses: NumberCoercion` is
+currently inexpressible. The `Object` placement stands as explicitly provisional until
+this question is resolved.
+
+**Tensions to resolve:**
+
+- **Collision with existing methods.** Definition-time `uses:` flattens into a fresh
+  method dictionary. Applying to a *populated* class must decide: does a trait method
+  overwrite a same-named existing method, lose to it, or raise a conflict sentinel (the
+  mechanism the trait MVP already uses for trait/trait conflicts)?
+- **Ordering against later `>>` definitions.** After `C uses: T`, a subsequent
+  `C >> foo` plainly wins (it is a later definition). But the reverse order gives a
+  different result for the same pair of statements, so the rule must be *stated* rather
+  than left to file order.
+- **Subclasses already defined.** Flattening copies into `C` only; classes inheriting
+  from `C` see the new methods through normal lookup, but any class that had already
+  flattened a *conflicting* trait does not change. Whether that is acceptable or needs
+  propagation is unresolved.
+- **Bootstrapped classes.** Whether `Object`/`Value`/the encoded leaves may be targets
+  at all, given their Rust-side construction and the `is_encoded_leaf_name` allowlist.
+- **Observability.** Flattening loses the fact that a method came from a trait. If
+  `uses:` becomes a live operation, being able to ask a class *which* traits it uses
+  (and re-apply an edited trait) becomes materially more valuable than it is today.
+
+Related: Q12 (trait composition fail-fast), Q8 (code as facts — cross-file method
+extension interacts with both).
+
+---
+
+## Q14: `respondsTo:` is blind to builtin selectors
+
+**Status**: Open — needs a decision on scope
+**Raised**: numeric tower S5 (2026-08-02)
+
+`respondsTo:` resolves by **class-dictionary lookup**, so it sees only Smol-defined
+methods. Builtin selectors are Rust `match` arms with no enumerable registry, so they
+are invisible to it:
+
+```smalltalk
+'s' size                "works"
+'s' respondsTo: #size   "false"
+nil respondsTo: #isEmpty   "true — Nil >> isEmpty is Smol-defined"
+```
+
+The predicate is therefore **unsound as a general capability test**: a false answer does
+not mean the send would fail. This is pre-existing — it has always been true of the
+`Value::Instance` arm — and S5 merely made it reachable from every value kind (it
+previously MNU'd on scalars, which was worse).
+
+**Why it matters now.** S5's coercion edge asks an arbitrary operand whether it
+implements the receiver's adapt selector (`docs/numeric_tower_plan.md` §4g). That use is
+sound, because adapt selectors are always Smol-defined — but it is the first *load-bearing*
+caller, so the gap is no longer purely cosmetic.
+
+**Tensions to resolve:**
+
+- **Is a registry wanted?** Making it complete needs an enumerable set of builtin
+  selectors per value kind. The arms are currently a hand-written `match` per variant;
+  deriving a registry from them (macro, or a static table consulted by both) is real work
+  and touches every dispatch function.
+- **Or should builtins move into Smol?** The tower's direction is the opposite one:
+  behavior migrates *out* of Rust arms into kernel Smol (S7 prunes superseded arms). If
+  that continues, the gap shrinks on its own and a registry may be wasted effort.
+- **Related inconsistency.** "Object protocol" is universal in Rust only where each
+  variant's arm list happens to include it — `=`/`~=`/`printString` are duplicated per
+  variant, `respondsTo:`/`hash` are handled once in `dispatch`. There is no single place
+  that defines what every value responds to.
+
+Related: numeric tower plan §4g and S7 (prune superseded Rust arms).
+

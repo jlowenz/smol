@@ -203,16 +203,25 @@ never assume an encoding. `self`-is-the-raw-encoded-value holds **only for the
 encoded leaves**; a user subclass's `self` is a boxed `ValueObject` with ivars.
 Therefore (classic Smalltalk template-method / subclass-responsibility split):
 
-- **Abstract `Number`** owns the coercion machinery — `generality`, `coerce:`,
-  `retrySumCoercing:`, `retryRelationalOp:coercing:` — all written purely as
-  self-sends of protocol; they never touch a `_prim` or an encoding.
+- **Abstract `Number`** owns the coercion machinery, written purely as self-sends of
+  protocol; it never touches a `_prim` or an encoding.
+  > **SUPERSEDED (S3, §4f).** This bullet originally named `generality`, `coerce:`,
+  > `retrySumCoercing:`, `retryRelationalOp:coercing:` — the Smalltalk-80 central
+  > generality table, which §4f **rejected** in favour of `adaptTo…andSend:` double
+  > dispatch precisely because a global total order is the thing that makes a tower
+  > closed. §4g then generalized the edge to domain-named dispatch. Those four
+  > selectors do not exist and will not.
 - **Abstract `Integer`** owns integer behavior via protocol: `even` = `(self \\ 2)
   = 0`, `gcd:`, `factorial`, expressed with `\\`/`<`/`+`, never `_prim…`.
-- **Each concrete class supplies the primitives for its own representation**
-  (the "subclass responsibilities"): the leaves implement `+`/`<`/`\\` via their
-  `_prim`s plus a coercion fallback; a user `ModularInteger` implements the same
-  selectors over its ivars. Fast-path `_prim` methods live on the **leaves**, not on
-  abstract `Integer`.
+- **The encoded leaves supply the primitives for their own representation**: they
+  implement `+`/`<`/`\\` via their `_prim`s plus the coercion edge. Fast-path `_prim`
+  methods live on the **leaves**, not on abstract `Integer`.
+  > **SUPERSEDED (S2.0/§4e).** This bullet originally required a *user* subclass to
+  > implement the same selectors over its ivars. The `value`/`withValue:` seam removed
+  > that burden: a wrapper implements **two** methods and inherits the whole tower.
+  > Re-implementing the operators is now the exception — for a **structured** number
+  > (Fraction, Complex) that has no single encoded leaf to project onto, and which
+  > therefore overrides the arithmetic itself and never reaches the seam.
 
 `self`-is-a-raw-value and `self`-is-a-boxed-object coexist because dispatch already
 handles both (encoded values via `lookup_user_method` arms → primitive `self`;
@@ -402,23 +411,30 @@ questions and live at different levels:
   tower required editing the leaves, the tower's openness would be fiction. (This also
   rules out deferring the edge to a later step "once Fraction exists": deferral is
   precisely what would force the retrofit.)
-- **The branch mechanism behind that edge is a private implementation detail of the
-  leaves.** Predicate, sentinel, or attempt-and-fail all sit *behind* `adaptTo…`, none
-  is visible to an extender, and swapping one for another changes no public protocol
-  and breaks no test.
+- **The branch mechanism behind that edge is an implementation detail** — predicate,
+  sentinel, or attempt-and-fail all sit *behind* `adaptTo…`, none is visible to an
+  extender, and swapping one for another changes no public protocol.
 
-Implemented as a leaf-private predicate: `Object >> pvtIsEncodedNumber [ ^false ]`,
-overridden `true` on the three encoded leaves. Named for §4b's unifier —
-*has-a-VM-encoding* — not "leaf": a user `ModularInteger` is objectively a leaf but is
-definitively not encoded, so `isNumberLeaf` would be non-discriminative. The `pvt`
-prefix marks it as leaf-internal, which also answers the §4d objection that a
-representation test has no business on the capability axis: it makes no public
-capability claim and a new number type inherits the correct `false` without knowing it
-exists.
+Implemented as the predicate `Object >> isEncodedNumber [ ^false ]`, overridden
+`true` on the three encoded leaves. Named for §4b's unifier — *has-a-VM-encoding* —
+not "leaf": a user `ModularInteger` is objectively a leaf but is definitively not
+encoded, so `isNumberLeaf` would be non-discriminative.
+
+**SUPERSEDED in part by §4g (2026-08-02): the predicate is no longer leaf-private, and
+was RENAMED `pvtIsEncodedNumber` → `isEncodedNumber` to match.** S3 described it as
+leaf-internal and named it with the `pvt` prefix accordingly, which also answered the
+§4d objection that a representation test has no business on the capability axis. §4g's
+specificity rule requires the *abstract* layer to ask the same question — "is this
+operand a bare encoding or a domain-carrying type?" — and S6's `=` asks it too, so the
+predicate is deliberately promoted out of leaf-private. Keeping the `pvt` prefix on a
+selector sent from abstract code would have made the name contradict the design.
+
+It remains a *representation* test, not a capability claim, and a new number type still
+inherits the correct `false` without knowing it exists.
 
 ### `NumberCoercion` trait — intended shape, DEFERRED (2026-08-01)
 
-S3 ships the three fallbacks (`pvtIsEncodedNumber`, `adaptToInteger:andSend:`,
+S3 ships the three fallbacks (`isEncodedNumber`, `adaptToInteger:andSend:`,
 `adaptToFloat:andSend:`) as plain methods on **`Object`**. That placement is
 provisional and is *not* the intended end state: numeric-tower vocabulary accreting
 on the root class is domain leakage, and "can be asked to participate as a number in
@@ -427,59 +443,42 @@ The intended shape:
 
 ```
 Trait named: #NumberCoercion.
-NumberCoercion >> pvtIsEncodedNumber [ ^false ]
-NumberCoercion >> adaptToInteger: anInteger andSend: aSymbol [ ^self error: … ]
-NumberCoercion >> adaptToFloat: aFloat andSend: aSymbol      [ ^self error: … ]
+NumberCoercion >> isEncodedNumber [ ^false ]
+NumberCoercion >> adaptToInteger: anInteger andSend: aSymbol [ ^(NoCoercion …) signal ]
+NumberCoercion >> adaptToFloat: aFloat andSend: aSymbol      [ ^(NoCoercion …) signal ]
 ```
 
+The refusals signal the **typed `NoCoercion` condition** (§4g), not `self error:` — a
+handler must be able to distinguish "cannot coerce" from any other error and inspect
+the operands. That change is made in §4g's step and is independent of where the
+methods eventually live.
+
 This also gives the three methods one named home, which is the real answer to "does
-`Object` need `pvtIsEncodedNumber`?" — see the next paragraph for why simply *dropping*
+`Object` need `isEncodedNumber`?" — see the next paragraph for why simply *dropping*
 the root default is not that answer.
 
 **Why a root default is needed at all (considered and kept, 2026-08-01).** Defining
 the fallbacks only on `Number` is structurally reasonable — a non-Number would just
 not understand them — but diagnostically poor, and on the most common arithmetic
 mistake there is: `3 + 'bad'` would report *"String does not understand
-pvtIsEncodedNumber"*, leaking a `pvt`-prefixed internal selector and naming the wrong
-problem (the issue is that `'bad'` is not a number, not that String lacks a private
-predicate). Same for `3 + nil`, `3 + aBlock`, `3 + anEntity`. So the universal
+isEncodedNumber"*, naming the wrong problem (the issue is that `'bad'` is not a number,
+not that String lacks a predicate). Same for `3 + nil`, `3 + aBlock`, `3 + anEntity`.
+That diagnostic argument is unchanged by the rename, and is now reinforced by S6: `=`
+sends `isEncodedNumber` to *any* operand, so the root default is load-bearing for
+equality as well as arithmetic. So the universal
 fallback stays; the open question is only *where it is written*, not *whether it
 exists*.
 
-**Blocker: `uses:` is definition-time only.** The trait MVP is stateless and
-*flattened* — `uses:` copies the trait's methods into the class's method dictionary
-when the class is defined, with no live link retained afterward — and it exists only
-as a keyword clause of `subclass:`/`vmSubclass:` (`builtins_iterative.rs`,
-`define_subclass`). `Object` is bootstrapped in Rust and never passes through that
-path, so `Object uses: NumberCoercion` is currently inexpressible.
+**Blocked on a standalone `SomeClass uses: SomeTrait.` statement**, applying a trait to
+an already-defined class. `uses:` is currently definition-time only and `Object` is
+bootstrapped in Rust, so `Object uses: NumberCoercion` is inexpressible today. That is a
+trait-system question with its own design tensions and is deliberately NOT bundled into
+the numeric tower — **see `docs/open_questions.md` Q13**, which records the motivation
+and the five tensions (collision with existing methods, ordering against later `>>`
+definitions, already-defined subclasses, bootstrapped classes, observability).
 
-**Prerequisite: a standalone `SomeClass uses: SomeTrait.` statement**, applying a
-trait to an already-defined class. Independently valuable — adding a capability to an
-existing class is exactly the live-image manipulation this project is for — but it is
-a trait-system step with its own design questions, deliberately NOT bundled into the
-numeric tower:
-
-1. **Collision with existing methods.** Definition-time `uses:` flattens into a fresh
-   method dictionary. Applying to a populated class must decide: does a trait method
-   overwrite a same-named existing method, lose to it, or raise a conflict sentinel
-   (the mechanism the trait MVP already uses for trait/trait conflicts)?
-2. **Ordering against later `>>` definitions.** After `C uses: T`, a subsequent
-   `C >> foo` plainly wins (it is a later definition). But the reverse order gives a
-   different result for the same pair of statements, so the rule must be stated
-   rather than left to file order.
-3. **Subclasses already defined.** Flattening copies into `C` only; classes that
-   inherit from `C` see the new methods through normal lookup, but any class that had
-   already flattened a *conflicting* trait does not change. Whether that is acceptable
-   or needs propagation is unresolved.
-4. **Bootstrapped classes.** Whether `Object`/`Value`/the encoded leaves may be
-   targets at all, given their Rust-side construction and the `is_encoded_leaf_name`
-   allowlist.
-5. **Observability.** Flattening loses the fact that a method came from a trait. If
-   `uses:` becomes a live operation, being able to ask a class *which* traits it uses
-   (and re-apply an edited trait) becomes materially more valuable than it is today.
-
-Until that step lands, the `Object` placement stands and is marked here as
-provisional so it is not mistaken for a considered end state.
+Until that lands, the `Object` placement stands and is marked here as provisional so it
+is not mistaken for a considered end state.
 
 Rejected alternatives, recorded: a **`nil` sentinel** returned by a failing primitive
 (authentic to Smalltalk's primitive-failure fallthrough and marginally cheaper, but
@@ -505,9 +504,176 @@ only blocks forwarding a `_prim` back to the original receiver.
 2. **Two different wrappers.** `audited + money` — receiver-wins reconstruction
    silently breaks type symmetry. This is the job of the `adaptTo…:andSend:` double
    dispatch (§4): a wrapper participates in coercion like any other number rather
-   than getting a free wrap.
+   than getting a free wrap. *(How that dispatch reaches the argument **without first
+   erasing the receiver** is settled in §4g: the adapt selector names the receiver's
+   domain, so `money` receives `audited` intact.)*
 3. **Leaves.** The leaves inherit `withValue: [^aValue]` unchanged, which keeps the
    same template correct at the bottom of the tower with no leaf-specific code.
+
+## 4g. Mixed-mode arithmetic — the specificity rule (DECIDED 2026-08-02)
+
+S4 shipped `Number`/`Integer` protocol that fails whenever the receiver reaches
+**argument position**: `squared` (`self * self`), `factorial`, `gcd:`, `lcm:`. The
+proximate cause is that §4e's "project SELF ONLY" correction lets a leaf receive a
+non-leaf operand it cannot ground. The root cause is deeper, and this section states
+it, the contract that was missing, and the rule that replaces it.
+
+### Root cause — two reconstruction mechanisms, and a missing contract
+
+The tower has **two** places that can decide a result's type: `withValue:` at the
+abstract layer (§4e) and `adaptTo…andSend:` at the leaf layer (§4f). Squeak, Python
+(`__rop__`) and Julia (`promote_rule`) each have exactly **one**, and the operator
+returns its answer directly without post-processing. S3 layered an *unconditional*
+`self withValue: (…)` on top of a mechanism that already answers finished values, so a
+wrapper argument that reconstructs gets wrapped twice — violating `withValue:`'s own
+*Requires: `aValue` is an encoded leaf*.
+
+Compounding it, **`adaptToInteger:andSend:` was never given a contract.** §4f states
+why the edge must exist but no `Requires:`/`Ensures:`, and the lone implementation
+(`Float >> adaptToInteger:andSend:`) is ambiguous where it matters: it answers a
+`Float`, which is *both* "an encoded leaf" *and* "a number of the adapter's own kind".
+Those readings coincide for `Float` and diverge for every wrapper.
+
+### Why mixed mode must be handled, not outlawed (the Haskell option, REJECTED)
+
+OCaml/SML/Haskell refuse mixed operands outright: `(+) :: Num a => a -> a -> a` requires
+both sides to already be the same type, with extension via `instance Num MyType`. Worth
+recording because it shows **extensibility and implicit coercion are independent axes** —
+Haskell is fully open *because* it refuses mixed mode. Unavailable to us: we are
+dynamically typed, so a mixed send cannot be *prevented*, only given a runtime meaning;
+requiring explicit conversion (`float_of_int`) is unenforceable for the same reason; and
+wrappers cannot be forbidden without forfeiting the §4c openness the tower exists to
+provide.
+
+### The rule — specificity, not position
+
+An encoded leaf carries **no domain**; a wrapper carries one. The wrapper's domain wins
+**regardless of operand position**, so `3 * boxed` and `boxed * 3` agree. (Discriminating
+on *same class* instead does not achieve this: it answers a leaf for `boxed * 3` and a
+wrapper for `3 * boxed`, losing the wrapper in exactly the case where it is the
+receiver.)
+
+| receiver | argument | mechanism | result |
+|---|---|---|---|
+| wrapper | leaf | project arg, op on leaves, rewrap | wrapper |
+| leaf | wrapper | leaf declines → `adaptTo…` → wrapper rewraps | wrapper |
+| wrapper | same wrapper | project both, rewrap | wrapper |
+| wrapper | *different* wrapper | domain-named double dispatch (below) | argument's choice, else `NoCoercion` |
+| leaf | leaf | primitive | leaf |
+
+The first three rows collapse into one branch — the **original pre-S3 form**,
+restricted to "the argument is not a different domain":
+
+```smalltalk
+Number >> * aNumber [
+    ^(aNumber isEncodedNumber or: [aNumber class == self class])
+        ifTrue:  [ self withValue: (self value * aNumber value) ]
+        ifFalse: [ self pvtAdapt: aNumber send: #* ] ]
+```
+
+`withValue:`'s *Requires: an encoded leaf* now holds **by construction** — the only
+branch that calls it has already established that both operands project to leaves.
+
+This closes all four S4 failures: `boxed squared` is `boxed * boxed` (same class →
+rewrap); `boxed factorial` is `self - 1` (encoded arg → rewrap) then `boxed * boxed`;
+`gcd:`/`lcm:` flip operands within one class. Comparison and `=` are unaffected — they
+answer a `Bool` and never reconstruct.
+
+**`isEncodedNumber` is promoted out of leaf-private — amends §4f**, which had
+declared the branch mechanism a private detail of the leaves. "Is this operand a bare
+encoding or a domain-carrying type?" is a genuine question at the abstract layer, and
+is precisely the specificity test the rule needs.
+
+### Domain-named double dispatch — generalizing `adaptTo…`
+
+For two different wrappers, projecting the receiver to a leaf before consulting the
+argument would **erase the receiver's type**, silently reducing to Python `__radd__`
+semantics. Instead the adapt selector names the **receiver's domain** and the argument
+implements it — which is what `adaptToInteger:`/`adaptToFloat:` already are; the idea
+simply was never extended past the two leaf domains, which is why `Number` had nothing
+to send. (Squeak has the same shape at larger N: `adaptToFraction:`, `adaptToComplex:`,
+`adaptToPoint:`, ….)
+
+```smalltalk
+"The adapt selector names the receiver's DOMAIN, not its encoding — all three integer
+ leaves present as #adaptToInteger:andSend: because they share one domain.
+ The pins go on the LEAVES: pinning abstract Integer would make every user
+ `Integer subclass:` inherit the claim and ask for the wrong coercion method."
+Number           >> pvtAdaptSelector [ ^('adaptTo', self class name, ':andSend:') asSymbol ]
+MachineInteger   >> pvtAdaptSelector [ ^#adaptToInteger:andSend: ]
+ArbitraryInteger >> pvtAdaptSelector [ ^#adaptToInteger:andSend: ]
+Float            >> pvtAdaptSelector [ ^#adaptToFloat:andSend: ]
+
+Number >> pvtAdapt: aNumber send: aSymbol [
+    | sel |
+    sel := self pvtAdaptSelector.
+    ^(aNumber respondsTo: sel)
+        ifTrue:  [ aNumber perform: sel withArguments:
+                     (Cons with: self rest: (Cons with: aSymbol rest: nil)) ]
+        ifFalse: [ (NoCoercion receiver: self argument: aNumber selector: aSymbol) signal ] ]
+```
+
+`audited + money` now sends `money adaptToAudited: audited andSend: #+` with the
+receiver **intact** — no projection, no erasure. This retroactively *explains* the
+leaf selector naming (domain, not encoding) rather than contradicting it, and the
+closed `vmSubclass:` leaves keep their existing hardcoded sends unchanged: only
+`Number` gains the general path, so §4f's "no edit to the leaves" criterion holds.
+
+**`Number` also carries default `adaptTo…` implementations (added S5).** They project
+self to a leaf, let the leaf perform the operation with the **original operand order**
+preserved (`anInteger` stays on the left, since the send was `anInteger op self`), and
+reconstruct via `withValue:`. This is what makes §4c's "a wrapper implements *two*
+methods and inherits the tower" literally true: `value` + `withValue:` is now sufficient
+for full participation in *both* operand positions, with no `adaptTo…` of its own.
+
+These defaults were **unsafe before S5 and are safe now**: under S3's unconditional
+`self withValue: (…)` the wrapper they reconstruct would have been wrapped a second time
+by the calling abstract op. The specificity guard removes that path entirely — when the
+argument is an encoded leaf the guard takes the project-both branch and never reaches
+coercion — so `withValue:`'s Requires holds. Structured numbers (Fraction, Complex) have
+no single leaf to project onto and override these with real domain arithmetic.
+
+**Contract, finally stated.**
+
+`adaptTo<Domain>: aNumber andSend: aSymbol` — *Requires:* `aNumber` is a Number of the
+domain named in the selector, and `aSymbol` is a binary arithmetic selector.
+*Ensures:* answers the **finished result** of `aNumber aSymbol self`, reconstructed in
+whichever domain the implementor judges correct. The caller must **not** post-process
+the answer — this is the single point that decides the result's type, matching Squeak/
+Python/Julia. `Object`'s default refuses (see below) rather than answering.
+
+**Detection: `respondsTo:` guard, not DNU interception.** Asking before sending keeps
+both operands intact at the refusal site and avoids condition-handling-as-control-flow
+(which `docs/condition_system_guide.md` steers away from). DNU interception was
+considered; recognising an adapt-shaped selector needs string predicates that do not
+exist (no `startsWith:`/`endsWith:`), so it would have to match loosely on `Message`
+shape.
+
+*Implementation note:* `respondsTo:` is **not** universally available today despite
+`Object` being the root class. It lives in `obj_prim_core` (`builtins_iterative.rs`),
+reached only from the `Value::Instance` dispatch path; scalars (`Str`, `Symbol`, `Int`,
+`Float`, `Bool`, `Nil`, `Block`) each have their own per-variant arm list and none
+includes it — the tell is `=`, duplicated across every variant's arms. So
+`3 respondsTo: #foo` currently MNUs, and this step must lift it to the shared value
+paths. Instance of a broader latent inconsistency: "Object protocol" is universal in
+Rust only where each variant happens to include it.
+
+### `NoCoercion` — a typed condition
+
+The refusing defaults call `self error:`, which signals a real `Error` but an
+**untyped** one: the message is a string, so a handler cannot distinguish "cannot
+coerce" from any other error, cannot inspect the operands, and cannot offer a restart.
+Replaced by an `Error` subclass following the existing `TraitConflict` idiom (ivars +
+class-side factory):
+
+```smalltalk
+Error subclass: #NoCoercion
+    instanceVariableNames: 'receiver argument selector' …
+```
+
+Non-resumable in this step; a `use-value`-style restart is a natural later addition once
+there is a caller that wants one. §4f's deferred `NumberCoercion` trait adopts this
+condition wherever the refusing defaults eventually live.
 
 ## 5. Construction contract (unchanged from string plan §4)
 
@@ -587,9 +753,57 @@ are meaningless and should error or be absent.
   and operator (previously a Rust `TypeError`), because the operand reaches the
   coercion edge whose refusing default sits on `Object`; and `Float` no longer
   answers `//`/`\\` via a hidden path — they are Integer protocol and Float MNUs.
-- **S4 — Integer protocol build-out in Smol** (`gcd:`, `factorial`, `even`, …),
-  demonstrating the payoff: real numeric behavior authored in the language.
-- **S5 — Prune** now-dead Rust arms in `dispatch_int`/`dispatch_float` that Smol
+- **S4 — Integer protocol build-out in Smol. DONE 2026-08-01** (committed `7b80331`).
+  `Number >> negated abs squared reciprocal isZero sign`; `Integer >> even odd gcd:
+  lcm: factorial isPrime` (+ helper `pvtHasNoOddFactorFrom:`). All encoding-agnostic
+  per §4c — pure protocol self-sends, no `_prim`, no named `Value` variant. `negated`
+  is `self * -1` (NOT `0 - self`) so the receiver stays on the LEFT and enters via
+  `Number >> *`; `isPrime` uses `k * k > self` tail recursion because the tower has no
+  float `sqrt`; recursion throughout rather than loop accumulation (method temps can't
+  be assigned inside blocks, and a `ValueHolder` would drag an entity into value
+  arithmetic). Demonstrates the payoff: real numeric behavior authored in the language.
+  **Shipped with two known gaps, addressed by S5 and S6 below** — the S4 wrapper test
+  documents the limit rather than asserting the fix.
+- **S5 — Mixed-mode arithmetic: the specificity rule (§4g). DONE 2026-08-02.** Fixes the
+  S4 gap where a wrapper in *argument* position is not carried. **Closed `squared` and
+  `factorial`; `gcd:`/`lcm:` remain blocked on S6** — they terminate on `anInteger
+  isZero`, which is `^self = 0`, and with no `Number >> =` a wrapper's `Boxed(0) = 0` is
+  false, so the base case never fires and the recursion divides by zero. **S6 is
+  therefore a prerequisite for §4c's encoding-agnostic claim, not merely a correctness
+  fix.** Also added: default `Number >> adaptToInteger:/adaptToFloat:andSend:` (§4g), so
+  the seam really is two methods. Order as executed:
+  1. Lift `respondsTo:` from `obj_prim_core` to the shared value dispatch paths so
+     scalars answer it (§4g implementation note); it MNU'd on `3` before. Surfaced a
+     pre-existing gap — it resolves by class-dictionary lookup and is blind to builtin
+     selectors, so `'s' respondsTo: #size` is false. Sound for the coercion edge (adapt
+     selectors are Smol-defined) but unsound generally; recorded as
+     `docs/open_questions.md` **Q14** and pinned by a test.
+  2. `Error subclass: #NoCoercion` (ivars `receiver argument selector`, class-side
+     factory, `TraitConflict` idiom), replacing `self error:` in the two refusing
+     defaults on `Object`.
+  3. `Number >> pvtAdaptSelector` (+ `Integer`/`Float` overrides to the two existing
+     leaf selectors) and `Number >> pvtAdapt:send:`.
+  4. Rewrite the six abstract ops (`+ - * /` on `Number`, `// \\` on `Integer`) with
+     the specificity guard. The closed `vmSubclass:` leaves are **not** touched.
+  5. Tests: the five-case table of §4g, incl. `3 * boxed` ≡ `boxed * 3`, two distinct
+     wrappers reaching `adaptTo<Domain>:`, and `NoCoercion` carrying both operands.
+- **S6 — Numeric equality and hash.** Fixes the second S4 gap: there is no `Number >>
+  =`, so `2 = 2.0` is false while `2 < 2.0` promotes — and the `Ordered` trait
+  *requires* `=` and derives `<=`/`>=` assuming a consistent total order, so its
+  contract is unmet. For a wrapper, `Boxed(0) = 0` is false, making `isZero`/`even`/
+  `odd` answer silently WRONG and `isPrime` call composites prime. Mirrors `<`
+  exactly: `numeric_eq` in Rust with `numeric_lt`'s promotion policy, exposed as
+  `_primEq:` on the three leaf arms; `<leaf> >> = aNumber [ ^self _primEq: aNumber
+  value ]`; `Number >> = aNumber [ ^self value = aNumber ]`; plus `~=`.
+  **DECIDED: `hash` is aligned in the same step** — making `2 = 2.0` true otherwise
+  breaks equal-implies-same-hash (`hash_value` gives `Int(2)` → 2 but `Float(2.0)` →
+  its bit pattern), corrupting `Dictionary`. So `hash_value`'s `Value::Float` arm must
+  hash a whole-valued float as the corresponding integer (Pharo's choice). `Dictionary`
+  itself needs no change — `pvtSlotFor:` already routes through Smol `hash` and `=`.
+  Kept a separate step from S5: it is a semantic change touching collections.
+  Watch for: the Rust `"="`/`"~="` arms for `Int`/`LargeInt`/`Float` go dead once the
+  kernel shadows them, and any test asserting `2 = 2.0` is false will flip.
+- **S7 — Prune** now-dead Rust arms in `dispatch_int`/`dispatch_float` that Smol
   fully supersedes; audit that every remaining `_prim` is irreducible. Update
   `docs/primitives.md`.
 

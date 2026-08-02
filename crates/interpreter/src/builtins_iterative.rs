@@ -93,6 +93,32 @@ pub fn dispatch(
         };
         return Ok(Value::Bool(is_kind_of(&recv_class, &arg_class)));
     }
+    // `respondsTo:` is universal for non-object types, mirroring `hash` below: scalars
+    // do not route through Object method lookup, so without this arm `3 respondsTo:
+    // #foo` would MNU even though `Object` is the root class. `Value::Instance` is
+    // excluded so `obj_prim_core`'s arm keeps handling entities/value objects.
+    // Answers false for a non-Symbol argument and for a receiver with no kernel class.
+    // Required by the numeric tower's coercion edge, which asks an arbitrary operand
+    // whether it implements the receiver's adapt selector (plan §4g).
+    //
+    // KNOWN GAP (pre-existing, shared with the `obj_prim_core` arm this mirrors):
+    // resolution is by class-dictionary lookup, so only Smol-defined methods are
+    // visible — builtin selectors are Rust match arms with no enumerable registry, and
+    // `'s' respondsTo: #size` answers false even though `'s' size` works. Sound for the
+    // coercion edge (adapt selectors are always Smol-defined) but not in general.
+    // See `docs/open_questions.md` Q14.
+    if selector.as_ref() == "respondsTo:" && !matches!(recv, Value::Instance(_)) {
+        expect_arity(&selector, 1, args.len())?;
+        let recv = force_value(ev, recv)?;
+        let arg = force_value(ev, args.into_iter().next().unwrap())?;
+        let Value::Symbol(s) = arg else {
+            return Ok(Value::Bool(false));
+        };
+        return Ok(Value::Bool(match value_to_class_handle(ev, &recv) {
+            Some(h) => h.0.class.lookup(&s).is_some(),
+            None => false,
+        }));
+    }
     // `hash` is universal for non-object types (primitive values don't route through
     // Object method lookup). For Value::Instance with Entity/ValueObject kind, the
     // type-specific dispatch runs instead to find any user-defined `hash` override.

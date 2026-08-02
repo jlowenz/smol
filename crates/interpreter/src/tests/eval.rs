@@ -3309,19 +3309,19 @@ fn s3_encoded_number_predicate_is_leaf_private() {
     // The branch mechanism is an implementation detail of the leaves: encoded
     // numbers answer true, everything else inherits false from Object — including a
     // user Number subclass, which is exactly what routes it to the coercion edge.
-    assert_eq!(eval("3 pvtIsEncodedNumber"), Value::Bool(true));
-    assert_eq!(eval("3.5 pvtIsEncodedNumber"), Value::Bool(true));
+    assert_eq!(eval("3 isEncodedNumber"), Value::Bool(true));
+    assert_eq!(eval("3.5 isEncodedNumber"), Value::Bool(true));
     assert_eq!(
-        eval("99999999999999999999 pvtIsEncodedNumber"),
+        eval("99999999999999999999 isEncodedNumber"),
         Value::Bool(true)
     );
-    assert_eq!(eval("'x' pvtIsEncodedNumber"), Value::Bool(false));
+    assert_eq!(eval("'x' isEncodedNumber"), Value::Bool(false));
     assert_eq!(
         eval(
             "Number subclass: #Wrapped instanceVariableNames: '' classVariableNames: '' \
                  indexedSlots: #none. \
              Wrapped class >> make [ ^self _primNewValue: [:x | x] ]. \
-             Wrapped make pvtIsEncodedNumber"
+             Wrapped make isEncodedNumber"
         ),
         Value::Bool(false)
     );
@@ -3468,13 +3468,10 @@ fn s4_integer_is_prime() {
 
 #[test]
 fn s4_protocol_is_encoding_agnostic_for_a_wrapper() {
-    // The §4c payoff, and its CURRENT LIMIT. A wrapper implementing only the seam
-    // (`value` + `withValue:`) inherits every method whose self-sends keep the
-    // wrapper in RECEIVER position with leaf arguments. Methods that put the
-    // receiver into an ARGUMENT position (`squared` = self * self, `factorial`,
-    // `gcd:`, `lcm:`) do NOT yet work: the leaf sees a non-encoded operand and hits
-    // the coercion edge, whose refusing default declines. See §4g — a seam-based
-    // default for `adaptTo…andSend:` would close this.
+    // The §4c payoff. A wrapper implementing only the seam (`value` + `withValue:`)
+    // inherits the tower. This test covers the receiver-position cases; S5 closed the
+    // argument-position ones (`squared`, `factorial`, `gcd:`, `lcm:`) — see
+    // `s5_receiver_in_argument_position_is_carried`.
     let src = "Integer subclass: #Boxed instanceVariableNames: 'n' \
                    classVariableNames: '' indexedSlots: #none. \
                Boxed class >> of: x [ ^self _primNewValue: [:b | b setN: x] ]. \
@@ -3505,4 +3502,218 @@ fn s4_protocol_is_encoding_agnostic_for_a_wrapper() {
     // works in either position.
     assert_eq!(eval(&format!("{src} (Boxed of: 3) < 5")), Value::Bool(true));
     assert_eq!(eval(&format!("{src} 5 < (Boxed of: 7)")), Value::Bool(true));
+}
+
+/// A wrapper implementing ONLY the seam (`value` + `withValue:`) — deliberately no
+/// `adaptTo…`, to prove §4c's "two methods" claim is now literally true.
+const S5_BOXED: &str = "Integer subclass: #Boxed instanceVariableNames: 'n' \
+                        classVariableNames: '' indexedSlots: #none. \
+                        Boxed class >> of: x [ ^self _primNewValue: [:b | b setN: x] ]. \
+                        Boxed >> setN: x [ n := x ]. \
+                        Boxed >> value [ ^n ]. \
+                        Boxed >> withValue: v [ ^Boxed of: v ]. ";
+
+#[test]
+fn s5_wrapper_domain_wins_in_either_operand_position() {
+    // The specificity rule (§4g): a leaf carries no domain, a wrapper does, so the
+    // wrapper's domain wins regardless of POSITION. This is the property the
+    // same-class discriminator failed to provide — it answered a leaf for
+    // `boxed * 3` and a wrapper for `3 * boxed`.
+    for expr in ["(Boxed of: 3) * 8", "8 * (Boxed of: 3)"] {
+        assert_eq!(
+            eval(&format!("{S5_BOXED} ({expr}) class printString")),
+            Value::Str("Boxed".into()),
+            "{expr} should answer a Boxed"
+        );
+        assert_eq!(
+            eval(&format!("{S5_BOXED} ({expr}) value")),
+            Value::Int(24),
+            "{expr} should answer 24"
+        );
+    }
+}
+
+#[test]
+fn s5_argument_position_preserves_operand_order() {
+    // The `Number >> adaptTo…` default must keep the ORIGINAL operand order — the
+    // send was `aLeaf op self`, so the leaf stays on the LEFT. Commutative ops hide
+    // a reversal here, so every non-commutative operator is checked in both
+    // positions. (`/` between integer leaves truncates, hence 3 and 0.)
+    let cases = [
+        ("(Boxed of: 3) - 8", -5),
+        ("8 - (Boxed of: 3)", 5),
+        ("(Boxed of: 24) / 8", 3),
+        ("8 / (Boxed of: 24)", 0),
+        ("(Boxed of: 17) // 5", 3),
+        ("17 // (Boxed of: 5)", 3),
+        ("(Boxed of: 17) \\\\ 5", 2),
+        ("17 \\\\ (Boxed of: 5)", 2),
+    ];
+    for (expr, want) in cases {
+        assert_eq!(
+            eval(&format!("{S5_BOXED} ({expr}) value")),
+            Value::Int(want),
+            "{expr}"
+        );
+    }
+}
+
+#[test]
+fn s5_receiver_in_argument_position_is_carried() {
+    // Two of the four S4 failures. Each puts the receiver into argument position:
+    // `squared` = self * self; `factorial` = self * (self - 1) factorial. Both stay
+    // in the wrapper's domain.
+    //
+    // `gcd:`/`lcm:` are NOT here: they terminate on `anInteger isZero`, which is
+    // `^self = 0`, and a wrapper has no `=` of its own — so `Boxed(0) = 0` is false,
+    // the base case never fires, and the recursion divides by zero. That is Gap A,
+    // fixed in S6; see `s6_` tests once it lands.
+    let cases = [
+        ("(Boxed of: 9) squared", 81),
+        ("(Boxed of: 5) factorial", 120),
+    ];
+    for (expr, want) in cases {
+        assert_eq!(
+            eval(&format!("{S5_BOXED} ({expr}) value")),
+            Value::Int(want),
+            "{expr}"
+        );
+        assert_eq!(
+            eval(&format!("{S5_BOXED} ({expr}) class printString")),
+            Value::Str("Boxed".into()),
+            "{expr} should stay in the wrapper's domain"
+        );
+    }
+}
+
+#[test]
+fn s5_two_different_wrappers_reach_domain_named_dispatch() {
+    // §4e case 2 / §4g last row. Neither operand may unilaterally claim the result,
+    // so the receiver is handed to the argument INTACT via a selector naming the
+    // RECEIVER's domain — #adaptToBoxed:andSend: here, derived from the class name.
+    // The receiver arrives un-projected: Money asserts it can send `value` to it.
+    let src = format!(
+        "{S5_BOXED} \
+         Integer subclass: #Money instanceVariableNames: 'm' \
+             classVariableNames: '' indexedSlots: #none. \
+         Money class >> of: x [ ^self _primNewValue: [:b | b setM: x] ]. \
+         Money >> setM: x [ m := x ]. \
+         Money >> value [ ^m ]. \
+         Money >> withValue: v [ ^Money of: v ]. \
+         Money >> adaptToBoxed: aBoxed andSend: aSymbol [ \
+             ^Money of: (aBoxed value perform: aSymbol \
+                          withArguments: (Cons singleton: m)) ]. "
+    );
+    // Argument's domain wins, because the argument is what got asked.
+    assert_eq!(
+        eval(&format!(
+            "{src} ((Boxed of: 5) + (Money of: 3)) class printString"
+        )),
+        Value::Str("Money".into())
+    );
+    assert_eq!(
+        eval(&format!("{src} ((Boxed of: 5) + (Money of: 3)) value")),
+        Value::Int(8)
+    );
+    // Operand order is preserved through the hand-off: 5 - 3, not 3 - 5.
+    assert_eq!(
+        eval(&format!("{src} ((Boxed of: 5) - (Money of: 3)) value")),
+        Value::Int(2)
+    );
+    // Same class on both sides does NOT take this path — it projects both and
+    // reconstructs once, so Boxed stays Boxed.
+    assert_eq!(
+        eval(&format!(
+            "{src} ((Boxed of: 5) + (Boxed of: 3)) class printString"
+        )),
+        Value::Str("Boxed".into())
+    );
+}
+
+#[test]
+fn s5_no_coercion_carries_both_operands_unprojected() {
+    // Asking `respondsTo:` before sending is what makes this possible: at the refusal
+    // site neither operand has been projected away, so the condition can name both.
+    let src = format!(
+        "{S5_BOXED} \
+         Integer subclass: #Money instanceVariableNames: 'm' \
+             classVariableNames: '' indexedSlots: #none. \
+         Money class >> of: x [ ^self _primNewValue: [:b | b setM: x] ]. \
+         Money >> setM: x [ m := x ]. \
+         Money >> value [ ^m ]. "
+    );
+    // Money implements no adaptToBoxed:andSend:, so the coercion refuses.
+    assert_eq!(
+        eval(&format!(
+            "{src} [(Boxed of: 5) + (Money of: 3)] \
+             on: NoCoercion do: [:e | e receiver class printString]"
+        )),
+        Value::Str("Boxed".into()),
+        "receiver must arrive un-projected, still a Boxed"
+    );
+    assert_eq!(
+        eval(&format!(
+            "{src} [(Boxed of: 5) + (Money of: 3)] \
+             on: NoCoercion do: [:e | e argument class printString]"
+        )),
+        Value::Str("Money".into())
+    );
+    assert_eq!(
+        eval(&format!(
+            "{src} [(Boxed of: 5) + (Money of: 3)] \
+             on: NoCoercion do: [:e | e selector]"
+        )),
+        Value::Symbol("+".into())
+    );
+    // NoCoercion is an Error, so a generic handler still catches it.
+    assert_eq!(
+        eval(&format!(
+            "{src} [(Boxed of: 5) + (Money of: 3)] on: Error do: [:e | 'caught']"
+        )),
+        Value::Str("caught".into())
+    );
+}
+
+#[test]
+fn s5_non_numeric_operand_signals_no_coercion_from_a_leaf() {
+    // The refusing defaults on Object, now typed. A leaf receiver reaches them via
+    // its own hardcoded adaptToInteger:/adaptToFloat: send.
+    assert_eq!(
+        eval("[3 + 'bad'] on: NoCoercion do: [:e | e argument]"),
+        Value::Str("bad".into())
+    );
+    assert_eq!(
+        eval("[3 + 'bad'] on: NoCoercion do: [:e | e receiver]"),
+        Value::Int(3)
+    );
+    assert_eq!(
+        eval("[2.5 * nil] on: NoCoercion do: [:e | e selector]"),
+        Value::Symbol("*".into())
+    );
+}
+
+#[test]
+fn s5_responds_to_is_universal_across_value_kinds() {
+    // `respondsTo:` used to live only on the Value::Instance dispatch path, so it
+    // MNU'd on every scalar despite Object being the root class. The coercion edge
+    // asks it of an arbitrary operand, so it must answer everywhere.
+    //
+    // KNOWN LIMITATION (pre-existing, not introduced by the lift): it answers from
+    // the class method dictionary only, so it sees Smol-defined methods and is blind
+    // to Rust builtins — `'s' respondsTo: #size` is false even though `'s' size`
+    // works. S5 is unaffected because adapt selectors are always Smol-defined, but
+    // the predicate is unsound in general. Asserted here so the gap is visible rather
+    // than latent.
+    assert_eq!(eval("3 respondsTo: #abs"), Value::Bool(true));
+    assert_eq!(eval("3 respondsTo: #noSuchThing"), Value::Bool(false));
+    assert_eq!(eval("2.5 respondsTo: #sign"), Value::Bool(true));
+    assert_eq!(eval("nil respondsTo: #isEmpty"), Value::Bool(true));
+    assert_eq!(
+        eval("3 respondsTo: #adaptToInteger:andSend:"),
+        Value::Bool(true)
+    );
+    // A non-Symbol argument answers false rather than erroring.
+    assert_eq!(eval("3 respondsTo: 'abs'"), Value::Bool(false));
+    // The builtin blind spot, pinned:
+    assert_eq!(eval("'s' respondsTo: #size"), Value::Bool(false));
 }

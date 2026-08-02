@@ -1945,3 +1945,23 @@ fn subclass_unknown_keyword_silently_ignored() {
         Value::Str(Arc::from("FooUnknown"))
     );
 }
+
+#[test]
+fn boxed_number_squared() {
+    let prog = r#"
+    Number subclass: #Boxed
+        instanceVariableNames: 'v'
+        classVariableNames: ''
+        indexedSlots: #none.
+    Boxed class >> with: aNum [ 
+        ^self _primNewValue: [:b | b pvtV: aNum].
+    ]
+    Boxed >> pvtV: aNum [ v := aNum. ]
+    Boxed >> value [ ^v ]
+    Boxed >> withValue: aNum [ ^self class with: aNum ]
+    | b |
+    b := Boxed with: 8.
+    ((b * 8) isKindOf: Boxed) & ((8 * b) isKindOf: Boxed) & ((b * 8) value = (8 * b) value) & (b * 8) value = 64 & (b squared value = 64)
+    "#;
+    assert_eq!(eval(prog), Value::Bool(true));
+}

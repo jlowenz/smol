@@ -772,6 +772,36 @@ TraitConflict >> pvtSetSelector: sel [
 ]
 TraitConflict >> selector [ ^selector ]
 
+"Signaled when an arithmetic operation cannot bridge two numeric domains: the argument
+does not implement the receiver's adapt selector, so neither operand can express the
+operation (docs/numeric_tower_plan.md §4g). Carries BOTH operands intact plus the
+arithmetic selector — the whole point of asking before sending is that neither side has
+been projected away by the time this is raised, so a handler can inspect what actually
+failed to coerce. Replaces the untyped `self error:` the refusing defaults used, which
+a handler could not distinguish from any other Error.
+
+Non-resumable (an Error). A `use-value`-style restart letting a handler supply the
+coerced result is a natural later addition, deferred until a caller wants one."
+Error subclass: #NoCoercion
+    instanceVariableNames: 'receiver argument selector'
+    classVariableNames: ''
+    indexedSlots: #none.
+
+NoCoercion class >> receiver: r argument: a selector: sel [
+    ^self _primNewValue: [:c | c pvtSetReceiver: r argument: a selector: sel]
+]
+
+NoCoercion >> pvtSetReceiver: r argument: a selector: sel [
+    receiver := r.
+    argument := a.
+    selector := sel.
+    self pvtSetMessage: 'cannot coerce ', a printString, ' to a number for ', sel asString
+]
+
+NoCoercion >> receiver [ ^receiver ]
+NoCoercion >> argument [ ^argument ]
+NoCoercion >> selector [ ^selector ]
+
 "Sentinel entry point installed for an unresolved trait conflict; raises when sent."
 Object >> pvtTraitConflictFor: sel [ ^(TraitConflict selector: sel) signal ]
 
@@ -932,7 +962,7 @@ cannot reach the primitive, so the leaf hands the operation to the ARGUMENT via
 `adaptToInteger:andSend:` / `adaptToFloat:andSend:` — double dispatch, so a new
 number type integrates by implementing two methods ON ITSELF, with no central
 generality table to edit and NO change to these closed vmSubclass: leaves. That
-extension edge is the committed design; `pvtIsEncodedNumber` is merely how the
+extension edge is the committed design; `isEncodedNumber` is merely how the
 leaves detect the case internally (private, swappable, invisible to an extender).
 
 `//` and `\\` are integer protocol and are deliberately absent from Float.
@@ -943,83 +973,156 @@ primitive while a second wrapper still reaches double dispatch. Projecting the
 argument here would silently receiver-wins-wrap `wrapperA + wrapperB` (plan §4e
 case 2). `withValue:` then reconstructs the receiver's kind around the result."
 
-Object           >> pvtIsEncodedNumber [ ^false ]
-MachineInteger   >> pvtIsEncodedNumber [ ^true ]
-ArbitraryInteger >> pvtIsEncodedNumber [ ^true ]
-Float            >> pvtIsEncodedNumber [ ^true ]
+Object           >> isEncodedNumber [ ^false ]
+MachineInteger   >> isEncodedNumber [ ^true ]
+ArbitraryInteger >> isEncodedNumber [ ^true ]
+Float            >> isEncodedNumber [ ^true ]
 
-Number >> + aNumber  [ ^self withValue: (self value + aNumber) ]
-Number >> - aNumber  [ ^self withValue: (self value - aNumber) ]
-Number >> * aNumber  [ ^self withValue: (self value * aNumber) ]
-Number >> / aNumber  [ ^self withValue: (self value / aNumber) ]
+"Abstract arithmetic — the SPECIFICITY RULE (plan §4g, S5). An encoded leaf carries no
+domain; a wrapper carries one. So the wrapper's domain wins regardless of operand
+POSITION, which is what makes `3 * boxed` and `boxed * 3` agree. (S3 projected self only
+and let the leaf handle the rest; that put the receiver into ARGUMENT position for
+`squared`/`factorial`/`gcd:`/`lcm:`, where the leaf could not ground it. Discriminating
+on same-class alone does not work either: it answers a leaf for `boxed * 3` but a
+wrapper for `3 * boxed`, losing the wrapper exactly where it is the receiver.)
 
-Integer >> // aNumber  [ ^self withValue: (self value // aNumber) ]
-Integer >> \\ aNumber  [ ^self withValue: (self value \\ aNumber) ]
+The guard splits two cases:
+  - argument is an encoded leaf, OR is the same class as the receiver ⇒ both operands
+    project to leaves, so compute on the leaves and reconstruct once. This is the
+    original pre-S3 form, and the guard is precisely what makes `withValue:`'s
+    `Requires: aValue is an encoded leaf` hold BY CONSTRUCTION.
+  - a DIFFERENT wrapper ⇒ neither side may unilaterally claim the result, so hand off to
+    domain-named double dispatch with the receiver INTACT (pvtAdapt:send: below).
+
+Comparison and `=` need no such guard: they answer a Bool and never reconstruct."
+Number >> pvtCoercible: aNumber [
+    ^aNumber isEncodedNumber or: [aNumber class = self class]
+]
+
+Number >> + aNumber [
+    ^(self pvtCoercible: aNumber)
+        ifTrue:  [ self withValue: (self value + aNumber value) ]
+        ifFalse: [ self pvtAdapt: aNumber send: #+ ] ]
+Number >> - aNumber [
+    ^(self pvtCoercible: aNumber)
+        ifTrue:  [ self withValue: (self value - aNumber value) ]
+        ifFalse: [ self pvtAdapt: aNumber send: #- ] ]
+Number >> * aNumber [
+    ^(self pvtCoercible: aNumber)
+        ifTrue:  [ self withValue: (self value * aNumber value) ]
+        ifFalse: [ self pvtAdapt: aNumber send: #* ] ]
+Number >> / aNumber [
+    ^(self pvtCoercible: aNumber)
+        ifTrue:  [ self withValue: (self value / aNumber value) ]
+        ifFalse: [ self pvtAdapt: aNumber send: #/ ] ]
+
+Integer >> // aNumber [
+    ^(self pvtCoercible: aNumber)
+        ifTrue:  [ self withValue: (self value // aNumber value) ]
+        ifFalse: [ self pvtAdapt: aNumber send: #// ] ]
+Integer >> \\ aNumber [
+    ^(self pvtCoercible: aNumber)
+        ifTrue:  [ self withValue: (self value \\ aNumber value) ]
+        ifFalse: [ self pvtAdapt: aNumber send: #\\ ] ]
+
+"Domain-named double dispatch (plan §4g). The adapt selector names the RECEIVER's
+DOMAIN, not its encoding — which is why all three integer leaves present as
+#adaptToInteger:andSend:, sharing one domain — and the ARGUMENT implements it. This is
+what adaptToInteger:/adaptToFloat: already were; S5 merely extends the idea past the two
+leaf domains, so `Number` finally has something to send. A wrapper class Audited is
+asked for #adaptToAudited:andSend: and receives the receiver INTACT: projecting the
+receiver to a leaf first (as the leaves must, having nothing else to send) would erase
+its type and silently reduce to Python __radd__ semantics.
+
+The closed vmSubclass: leaves keep their own hardcoded sends and are NOT touched, so
+§4f's decisive criterion — extending the tower never requires editing a leaf — holds.
+
+`respondsTo:` is asked BEFORE sending so NoCoercion can carry both operands
+un-projected; the alternative (send blindly, intercept the DNU) would need string
+predicates on selectors that do not exist, and would use condition handling for control
+flow, which docs/condition_system_guide.md steers away from."
+"The pins belong on the LEAVES, not on abstract Integer/Float: the domain claim is
+`this encoding presents as the Integer domain`, which is true of the two integer leaves
+and false of a user `Integer subclass: #Boxed`. Pinning abstract `Integer` would make
+every user subclass inherit the claim and ask for #adaptToInteger:andSend: instead of
+its own #adaptToBoxed:andSend: — silently routing to the wrong coercion method."
+Number           >> pvtAdaptSelector [ ^('adaptTo', self class name, ':andSend:') asSymbol ]
+MachineInteger   >> pvtAdaptSelector [ ^#adaptToInteger:andSend: ]
+ArbitraryInteger >> pvtAdaptSelector [ ^#adaptToInteger:andSend: ]
+Float            >> pvtAdaptSelector [ ^#adaptToFloat:andSend: ]
+
+Number >> pvtAdapt: aNumber send: aSymbol [
+    | sel |
+    sel := self pvtAdaptSelector.
+    ^(aNumber respondsTo: sel)
+        ifTrue:  [ aNumber perform: sel
+                     withArguments: (Cons with: self rest: (Cons with: aSymbol rest: nil)) ]
+        ifFalse: [ (NoCoercion receiver: self argument: aNumber selector: aSymbol) signal ] ]
 
 MachineInteger >> + aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primAdd: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #+ ] ]
 MachineInteger >> - aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primSub: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #- ] ]
 MachineInteger >> * aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primMul: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #* ] ]
 MachineInteger >> / aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primDiv: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #/ ] ]
 MachineInteger >> // aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primQuo: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #// ] ]
 MachineInteger >> \\ aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primRem: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #\\ ] ]
 
 ArbitraryInteger >> + aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primAdd: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #+ ] ]
 ArbitraryInteger >> - aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primSub: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #- ] ]
 ArbitraryInteger >> * aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primMul: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #* ] ]
 ArbitraryInteger >> / aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primDiv: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #/ ] ]
 ArbitraryInteger >> // aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primQuo: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #// ] ]
 ArbitraryInteger >> \\ aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primRem: aNumber ]
         ifFalse: [ aNumber adaptToInteger: self andSend: #\\ ] ]
 
 Float >> + aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primAdd: aNumber ]
         ifFalse: [ aNumber adaptToFloat: self andSend: #+ ] ]
 Float >> - aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primSub: aNumber ]
         ifFalse: [ aNumber adaptToFloat: self andSend: #- ] ]
 Float >> * aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primMul: aNumber ]
         ifFalse: [ aNumber adaptToFloat: self andSend: #* ] ]
 Float >> / aNumber [
-    ^aNumber pvtIsEncodedNumber
+    ^aNumber isEncodedNumber
         ifTrue:  [ self _primDiv: aNumber ]
         ifFalse: [ aNumber adaptToFloat: self andSend: #/ ] ]
 
@@ -1029,7 +1132,7 @@ symbol, promotes the receiver into its own domain, and performs the operation.
 
 The refusing defaults sit on Object, not Number, so that `3 + 'bad'` reports a clear
 coercion error rather than a MessageNotUnderstood naming an internal selector — the
-same reason `pvtIsEncodedNumber` defaults at the root.
+same reason `isEncodedNumber` defaults at the root.
 
 PROVISIONAL PLACEMENT: these three fallbacks belong on a `NumberCoercion` TRAIT
 (capability axis, §4d) rather than accreting numeric vocabulary on Object. That needs
@@ -1043,12 +1146,36 @@ shape and keeps Float a well-behaved participant if an integer-like user class e
 delegates to it."
 
 Object >> adaptToInteger: anInteger andSend: aSymbol [
-    ^self error: 'cannot coerce ', self printString, ' to a number for ', aSymbol asString ]
+    ^(NoCoercion receiver: anInteger argument: self selector: aSymbol) signal ]
 Object >> adaptToFloat: aFloat andSend: aSymbol [
-    ^self error: 'cannot coerce ', self printString, ' to a number for ', aSymbol asString ]
+    ^(NoCoercion receiver: aFloat argument: self selector: aSymbol) signal ]
 
 Float >> adaptToInteger: anInteger andSend: aSymbol [
     ^anInteger asFloat perform: aSymbol withArguments: (Cons with: self rest: nil) ]
+
+"Default coercion for a SEAM-HAVING wrapper (plan §4g, S5). Reached only when a LEAF is
+the receiver and the wrapper is the argument (`3 * boxed`) — the specificity guard above
+handles every case where the wrapper is the receiver, and never calls these. Project
+self to a leaf, let the leaf perform the operation with the ORIGINAL OPERAND ORDER
+preserved (anInteger stays on the left, since the send was `anInteger op self`), then
+reconstruct in the wrapper's own domain.
+
+This is what makes §4c's `a wrapper implements TWO methods and inherits the tower` true
+rather than aspirational: with these defaults, `value` + `withValue:` is genuinely
+sufficient for full participation in BOTH operand positions.
+
+Note this was UNSAFE before S5 and is safe now: under S3's unconditional
+`self withValue: (…)` the reconstructed wrapper returned here was wrapped a SECOND time
+by the calling abstract op. The specificity guard removes that call path entirely — when
+the argument is an encoded leaf the guard takes the project-both branch and never
+reaches coercion — so the §4e contract `withValue: Requires an encoded leaf` holds.
+
+Structured numbers (Fraction, Complex) have no single leaf to project onto; they
+override these to do real domain arithmetic and never reach the seam."
+Number >> adaptToInteger: anInteger andSend: aSymbol [
+    ^self withValue: (anInteger perform: aSymbol withArguments: (Cons singleton: self value)) ]
+Number >> adaptToFloat: aFloat andSend: aSymbol [
+    ^self withValue: (aFloat perform: aSymbol withArguments: (Cons singleton: self value)) ]
 
 Value vmSubclass: #String
     uses: Ordered
