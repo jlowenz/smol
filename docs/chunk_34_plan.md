@@ -89,18 +89,24 @@ Each phase is independently committable and leaves the suite green.
   fallback), and fix the future-in-loop-bounds bug (OQ-1b). Gated on the O(1) acceptance
   criteria above. This is the largest behavioral step in the chunk; everything after it is
   mechanical by comparison.
-- **S2 — Simple families:** Nil, Symbol, Namespace, Class (15 arms). Mostly `=`/`~=`/
-  `printString`/`name`. Smallest risk, establishes the pattern and the `=`/identity
-  question (OQ-3).
+- **S2 — Identity + simple families:** introduce `==` / `_primIdentical:` and
+  `Object >> =`/`~=` in terms of it (OQ-3), then Nil, Symbol, Namespace, Class (15 arms).
+  Settling identity first is what lets the per-variant `=`/`~=` arms go, and it makes S6's
+  numeric `=` bounce rest on one uniform root rather than scattered Rust arms.
 - **S3 — Numeric conversions:** Float's `asInt ceiling floor rounded truncated`, Int/
   LargeInt's `asFloat asString` (11 arms). Pure `_prim` grounding, no protocol design.
-- **S4 — String** (10 arms), superseding the string plan's migration mechanics.
+- **S4 — String** (10 arms). Also folds in and retires `string_representation_plan.md`
+  entirely, per OQ-5.
 - **S5 — `printString` / `asString`** across all families, pending the naming decision
   (OQ-4) — deliberately last, because it may rename the selector.
 - **S6 — Prune + audit**, mirroring tower S7: delete superseded arms, verify irreducibility
   of what remains, update `docs/primitives.md`.
 
-## 6. Open questions — need resolution before/while starting
+## 6. Open questions
+
+All settled as of 2026-08-02 except **OQ-2** (minor, statable during implementation) and
+**OQ-4** (deferred by design, sequenced last). Decisions are recorded inline below with
+the reasoning, including options rejected.
 
 ### OQ-1 — `to:do:` is an evaluator special-case, not a method *(needs discussion)*
 
@@ -179,8 +185,11 @@ until both hold:
    showing `step_loop` depth and per-level Rust-stack delta stay constant as iteration
    count and nesting grow.
 
-If either fails, fall back to (a) and record why — do **not** ship a loop whose stack cost
-grows with trip count.
+If either fails, **we fix the situation — we do not fall back to (a)** (decided
+2026-08-02). A loop whose Rust stack grows with trip count is a defect in the evaluator's
+flattening, not a reason to retreat to a special-case: the machinery already carries
+`whileTrue:` iteratively, so a failure here means something specific is wrong and
+diagnosable. Ship neither the regression nor the retreat — fix it.
 
 **Pharo precedent, and the future optimization (RECORDED, not built).** Pharo has
 `to:do:` as a real method but notes it is "normally compiled inline, and therefore not
@@ -229,13 +238,41 @@ After migration, `respondsTo:` answers accurately for public protocol. `_prim*` 
 remain invisible (they are Rust arms by construction). Probably fine — they are internal
 grounding, not protocol — but it should be stated, since Q14 is closed on the strength of it.
 
-### OQ-3 — `=` / `~=` and identity *(needs a small decision)*
+### OQ-3 — `=` / `~=` and identity — DECIDED (2026-08-02)
 
-Moving `=`/`~=` to Smol for Nil/Symbol/String/Class requires a primitive for *identity*
-(`_primIdentical:` or similar), since the Rust arms currently compare `Value` variants
-directly. Questions: one universal `Value >> =` grounded on identity, with content-equality
-overrides per class? And does this interact with S6's numeric `=`, which deliberately
-delegates rather than compares variants? Adjacent to Q15.
+**Follow Pharo's shape:** `==` is an identity **primitive**, and `Object >> =` is defined
+in terms of it. Placement is **`Object`**, not `Value` — Values inherit it, and any class
+needing domain equality overrides `=` with content equality.
+
+```smalltalk
+Object >> == other [ ^self _primIdentical: other ]
+Object >> =  other [ ^self == other ]
+Object >> ~= other [ ^(self = other) not ]
+```
+
+`==` does not exist in the language today (verified) — this chunk introduces it. That is a
+language-level addition, not a refactor, and it is worth doing on its own merits: identity
+is currently inexpressible from Smol.
+
+**Fits what S6 already built.** The numeric `=` bounce (tower §4g) relies on "a non-number
+answers with identity `=`" — which today comes from scattered per-variant Rust arms.
+Routing that through one `Object >> =` makes the story uniform instead of coincidental.
+`Number` keeps its overriding `=` (promoting, delegating), so `2 = 2.0` is unaffected.
+
+**Sub-question to settle during implementation: what does `==` mean for an encoded
+Value?** The existing `Value` `PartialEq` (`value.rs:71`) is a hybrid — pointer identity
+for `Instance`/`Block`/`Future`/`Namespace`/`Handle`, but **structural** for
+`Int`/`Float`/`Bool`/`Nil`/`Symbol`/`Str`/`LargeInt` (`Str` compares contents, and
+`Int`↔`LargeInt` cross-compare numerically). So grounding `_primIdentical:` on it gives
+`'abc' == 'abc'` → **true**, where Pharo answers false for two distinct String instances.
+
+Recommendation: **keep the structural behavior and state it as the rule** — `==` is
+"indistinguishable value" for Values and "same object" for Objects. That is not a
+compromise, it is the project's Value/Object split applied honestly: an immutable,
+shareable Value *has* no identity separate from its content, so asking whether two 2s are
+"the same 2" is a question about the encoding, not the value. Pharo's answer is an
+artifact of everything being a heap object. Decide explicitly rather than inheriting it
+from `PartialEq` by accident.
 
 ### OQ-4 — `printString` is misnamed *(deferred, but scheduled)*
 
@@ -245,19 +282,22 @@ channel. Renaming, and separating "render to string" from "write to console", wa
 console support first. S5 above is sequenced last so this decision can land or be deferred
 without blocking the rest.
 
-### OQ-5 — scope of the string-plan supersession *(confirm)*
+### OQ-5 — string plan — DECIDED (2026-08-02): fold in and retire
 
-This chunk claims the *migration mechanics* for String/Symbol and leaves the reparenting
-decisions in `string_representation_plan.md`. Confirm that split, or fold the string plan
-in entirely and retire it.
+`string_representation_plan.md` is small. Fold its remaining content into this chunk
+(migration mechanics **and** the reparenting decisions) and retire the old plan with a
+pointer here, rather than maintaining a split that has already caused one stale
+cross-reference. Do this as part of S4.
 
-### OQ-6 — object/entity/class-side surfaces *(scope question)*
+### OQ-6 — object/entity/class-side surfaces — DECIDED (2026-08-02): next chunk
 
 `dispatch_object_primitive`'s chunks and `dispatch_class_builtin` hold a much larger arm
-count (construction, traits, tx, futures). Are they in scope for this chunk, a later one,
-or permanently VM substrate? Some are clearly substrate (`_primNew`, tx enrollment); others
-(`name`, `printString`, `respondsTo:`) are ordinary protocol. Needs an inventory pass before
-committing to a scope.
+count (construction, traits, tx, futures, reflection). This work **is wanted** — the same
+observability argument applies — but it is separated into a **following chunk (35)** to
+keep this one reviewable. It needs its own inventory pass first, and its own judgement
+about which arms are genuine VM substrate (`_primNew`, tx enrollment, coroutine handling)
+versus ordinary protocol that happens to live in Rust (`name`, `printString`,
+`respondsTo:`).
 
 ## 7. Cross-references
 
