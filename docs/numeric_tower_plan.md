@@ -787,8 +787,17 @@ are meaningless and should error or be absent.
      the specificity guard. The closed `vmSubclass:` leaves are **not** touched.
   5. Tests: the five-case table of §4g, incl. `3 * boxed` ≡ `boxed * 3`, two distinct
      wrappers reaching `adaptTo<Domain>:`, and `NoCoercion` carrying both operands.
-- **S6 — Numeric equality and hash.** Fixes the second S4 gap: there is no `Number >>
-  =`, so `2 = 2.0` is false while `2 < 2.0` promotes — and the `Ordered` trait
+- **S6 — Numeric equality and hash. DONE 2026-08-02.** Fixed the second S4 gap, and with
+  it the `gcd:`/`lcm:` cases S5 could not close, completing §4c's claim that a
+  seam-implementing wrapper inherits the whole tower. One behavior change beyond the
+  plan: `=` had to be made **total** where `<` is not. `3 < nil` may signal, but
+  `3 = nil` must answer `false`, so the leaves decline a non-`Number` argument *before*
+  projecting it — `aNumber value` would MNU on a plain Object, which does not implement
+  the seam. `~=` is derived once on `Number` (the leaves inherit it); defining it was
+  required, since the Rust `~=` arms would otherwise still answer raw variant
+  inequality and contradict the new `=`. Original statement of the gap follows: there is
+  no `Number >> =`, so `2 = 2.0` is false while `2 < 2.0` promotes — and the `Ordered`
+  trait
   *requires* `=` and derives `<=`/`>=` assuming a consistent total order, so its
   contract is unmet. For a wrapper, `Boxed(0) = 0` is false, making `isZero`/`even`/
   `odd` answer silently WRONG and `isPrime` call composites prime. Mirrors `<`

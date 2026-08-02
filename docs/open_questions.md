@@ -470,3 +470,52 @@ caller, so the gap is no longer purely cosmetic.
 
 Related: numeric tower plan §4g and S7 (prune superseded Rust arms).
 
+---
+
+## Q15: Should `2 = 2.0` be true? (cross-encoding numeric equality)
+
+**Status**: Open — implemented as TRUE in S6, explicitly flagged for re-weighing
+**Raised**: numeric tower S6 (2026-08-02)
+
+S6 made numeric `=` promote across encodings, so `2 = 2.0` is true and `hash` was
+aligned to match. This question records the case *against*, which was raised after
+implementation and is not settled.
+
+**For promotion (the status quo):**
+
+- **Consistency with everything else in the tower.** Arithmetic already promotes
+  (`2 + 3.5` ⇒ Float) and `<` already promotes (`2 < 2.5`). If `=` alone were strict,
+  `a < b`, `a = b`, `a > b` would not partition, and the `Ordered` trait — which
+  *requires* `=` and derives `<=`/`>=` from `<` — would have an unmet contract. Strict
+  `=` therefore forces strict `<`, which breaks `2 < 3.5`.
+- **They conceptually are the same value.** The tower's whole premise (§4b) is that
+  `MachineInteger`/`ArbitraryInteger`/`Float` are *encodings*, not distinct
+  mathematical kinds. `2` and `2.0` denote the same number; treating them as unequal
+  elevates a representation detail to a semantic one.
+- Precedent: Smalltalk-80, Pharo, Python, Ruby, Julia all answer true.
+
+**Against (the safety argument):**
+
+- **Float/integer confusion is a known source of catastrophic defects.** Silent
+  cross-encoding equality can mask a unit or representation error that a strict
+  comparison would have surfaced.
+- **Float equality is unreliable in its own right**, independent of mixing:
+  `0.1 + 0.2 = 0.3` is false. Making `=` promote invites `=` to be used on floats at
+  all, where a tolerance-based comparison is usually what is meant. Arguably the deeper
+  hazard, and one promotion neither causes nor cures.
+- A language aiming to be *observable* might prefer the encoding to be visible at the
+  point of comparison rather than silently bridged.
+
+**Options if revisited:**
+
+1. Keep promotion (status quo), and add a distinct exact/identity comparison for when
+   encoding matters.
+2. Keep promotion, and add tooling — a lint or a `Warning` — for `=` between a Float
+   and an Integer literal, or for `=` on floats generally.
+3. Strict `=`, and accept that `Ordered`'s `=` requirement must be dropped or redefined
+   (see §2a), plus the trichotomy loss above.
+
+Note that Option 3 is a substantially larger change than reverting S6: `hash` alignment,
+`Dictionary` key unification, and the `Ordered` contract all follow from the choice.
+
+Related: numeric tower plan §2a (Ordered requires `=`), §4g/S6.

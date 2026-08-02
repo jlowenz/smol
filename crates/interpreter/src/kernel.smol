@@ -950,6 +950,45 @@ MachineInteger   >> < aNumber [ ^self _primLt: aNumber value ]
 ArbitraryInteger >> < aNumber [ ^self _primLt: aNumber value ]
 Float            >> < aNumber [ ^self _primLt: aNumber value ]
 
+"The tower's `=` (plan §4g, S6). Same seam→prim shape as `<`, and grounded by the SAME
+promotion policy (`numeric_eq` mirrors `numeric_lt`), so `<`, `=` and `>` agree with one
+another. Before S6 there was no `Number >> =` at all: equality fell through to Rust
+variant equality for the leaves and to IDENTITY for a wrapper, so `2 = 2.0` was false
+while `2 < 2.0` promoted — leaving the `Ordered` trait's requirement that `=` agree with
+the order unmet — and `Boxed(0) = 0` was false, which silently broke `isZero`, `even`,
+`odd`, and made `gcd:`/`lcm:` recurse past their base case into division by zero.
+
+`=` differs from `<` in TWO respects.
+
+First, it must be TOTAL: `3 < nil` may signal, but `3 = nil` must answer false. So a
+leaf must never project an argument it knows nothing about — `aNumber value` MNUs on a
+plain Object (no seam) and raises subclassResponsibility on a STRUCTURED number such as
+Fraction (a Number with no single encoding to project onto).
+
+Second, `=` is SYMMETRIC, and unlike arithmetic it needs no coercion edge of its own to
+exploit that: `=` is already the universal public selector, so a leaf that cannot ground
+the comparison simply HANDS THE OPERANDS BACK the other way round. No private
+double-dispatch selector, no new protocol:
+  - a seam wrapper bounces into `Number >> =`, which projects self and re-dispatches;
+  - a structured number answers with its own `=`;
+  - a non-number answers with identity `=`, i.e. false.
+
+TERMINATION: `Number >> =` projects self to a leaf BEFORE re-dispatching, so each bounce
+strictly reduces the number of non-encoded operands — at most two. (The usual
+double-dispatch caveat applies: a user `=` that hands back without projecting can loop.)
+
+`~=` is derived once on Number rather than per leaf; the leaves inherit it. Defining it
+is required because the Rust `~=` arms would otherwise still answer raw variant
+inequality and contradict the new `=`."
+Number           >> =  aNumber [ ^self value = aNumber ]
+Number           >> ~= aNumber [ ^(self = aNumber) not ]
+MachineInteger   >> =  aNumber [
+    ^aNumber isEncodedNumber ifTrue: [ self _primEq: aNumber ] ifFalse: [ aNumber = self ] ]
+ArbitraryInteger >> =  aNumber [
+    ^aNumber isEncodedNumber ifTrue: [ self _primEq: aNumber ] ifFalse: [ aNumber = self ] ]
+Float            >> =  aNumber [
+    ^aNumber isEncodedNumber ifTrue: [ self _primEq: aNumber ] ifFalse: [ aNumber = self ] ]
+
 "Arithmetic (plan §4, S3). Same seam→prim shape as `<`: the `_prim` grounding lives
 on the LEAVES (where self IS the encoding), abstract Number projects self and
 reconstructs. `_primAdd:` and friends promote across all three leaf encodings in

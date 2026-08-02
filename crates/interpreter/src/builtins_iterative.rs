@@ -5,7 +5,7 @@ use std::sync::Arc;
 /// Matches the step-loop constant in eval_iterative so loop primitives and the
 /// iterative evaluator yield at the same granularity.
 use num_bigint::BigInt;
-use num_traits::Zero;
+use num_traits::{FromPrimitive, Zero};
 use parking_lot::RwLock;
 
 use crate::class::{Class, IndexedSlotKind};
@@ -641,6 +641,40 @@ fn leaf_to_bigint(v: &Value, sel: &Arc<str>) -> Result<BigInt, EvalError> {
     }
 }
 
+/// Numeric equality over the leaf encodings, using the SAME promotion policy as
+/// [`numeric_lt`] so that `<`, `=` and `>` stay mutually consistent: any `Float`
+/// operand ⇒ `f64`; else any `LargeInt` ⇒ `BigInt`; else `i64`. This is the single
+/// Rust grounding the tower's `=` routes to via `_primEq:`
+/// (docs/numeric_tower_plan.md §4g/S6), making `2 = 2.0` true and satisfying the
+/// `Ordered` trait's requirement that `=` agree with the order `<` induces.
+///
+/// Unlike `<`, equality is **total**: a non-numeric operand is not an error, it is
+/// simply not equal. The Smol side already declines non-`Number` arguments before
+/// reaching here, so this arm covers a hand-sent primitive.
+///
+/// Requires: nothing. Ensures: `true` iff both operands are numeric leaves equal
+/// under the promoted comparison; `false` otherwise. Never errors.
+fn numeric_eq(ev: &Evaluator, a: Value, b: Value, sel: &Arc<str>) -> Result<bool, EvalError> {
+    let a = force_value(ev, a)?;
+    let b = force_value(ev, b)?;
+    Ok(match (&a, &b) {
+        (Value::Float(_), _) | (_, Value::Float(_)) => {
+            match (leaf_to_f64(&a, sel), leaf_to_f64(&b, sel)) {
+                (Ok(x), Ok(y)) => x == y,
+                _ => false,
+            }
+        }
+        (Value::LargeInt(_), _) | (_, Value::LargeInt(_)) => {
+            match (leaf_to_bigint(&a, sel), leaf_to_bigint(&b, sel)) {
+                (Ok(x), Ok(y)) => x == y,
+                _ => false,
+            }
+        }
+        (Value::Int(x), Value::Int(y)) => x == y,
+        _ => false,
+    })
+}
+
 /// Total-order `<` over the numeric leaf encodings, promoting as needed: any `Float`
 /// operand ⇒ `f64` compare; else any `LargeInt` ⇒ `BigInt` compare; else `i64`. This
 /// is the single Rust grounding the tower's `<` routes to via `_primLt:`
@@ -845,7 +879,26 @@ pub(crate) fn fnv1a_hash(s: &str) -> i64 {
 pub(crate) fn hash_value(v: &Value) -> i64 {
     match v {
         Value::Int(n) => *n,
-        Value::Float(f) => f.to_bits() as i64,
+        // A whole-valued Float hashes as the integer it equals, because S6 made
+        // `2 = 2.0` true and equal values MUST hash equally or `Dictionary` breaks
+        // (`pvtSlotFor:` probes by `hash` then confirms by `=`). Non-whole floats keep
+        // the bit pattern — no integer can equal them, so no agreement is required.
+        // The out-of-i64-range case routes through `hash_bigint` so it agrees with an
+        // `ArbitraryInteger` of the same value, not merely with `Int`.
+        Value::Float(f) => {
+            if f.is_finite() && f.fract() == 0.0 {
+                if *f >= -(2f64.powi(63)) && *f < 2f64.powi(63) {
+                    *f as i64
+                } else {
+                    match BigInt::from_f64(*f) {
+                        Some(b) => hash_bigint(&b),
+                        None => f.to_bits() as i64,
+                    }
+                }
+            } else {
+                f.to_bits() as i64
+            }
+        }
         Value::Str(s) => fnv1a_hash(s),
         Value::Symbol(s) => fnv1a_hash(s),
         Value::Bool(b) => {
@@ -856,18 +909,7 @@ pub(crate) fn hash_value(v: &Value) -> i64 {
             }
         }
         Value::Nil => 0,
-        Value::LargeInt(n) => {
-            use num_bigint::Sign;
-            let (sign, bytes) = n.to_bytes_le();
-            let mut h: u64 = 0;
-            for (i, &b) in bytes.iter().take(8).enumerate() {
-                h |= (b as u64) << (i * 8);
-            }
-            if sign == Sign::Minus {
-                h = h.wrapping_neg();
-            }
-            h as i64
-        }
+        Value::LargeInt(n) => hash_bigint(n),
         Value::Instance(h) => fmix64(Arc::as_ptr(&h.0) as usize as u64) as i64,
         // Futures are resolved by force_value before hash_value is called.
         Value::Future(_) => unreachable!("hash_value called on unresolved Future"),
@@ -875,6 +917,25 @@ pub(crate) fn hash_value(v: &Value) -> i64 {
         Value::Namespace(ns) => fnv1a_hash(&ns.name),
         Value::Handle(h) => fmix64(Arc::as_ptr(h) as *const () as usize as u64) as i64,
     }
+}
+
+/// Hash a `BigInt` by its low 64 bits, negating for a negative sign.
+///
+/// Shared by the `LargeInt` and whole-valued-`Float` arms of [`hash_value`] so that
+/// numerically equal values hash equally across encodings (S6).
+///
+/// Requires: nothing. Ensures: equal `BigInt`s hash equally.
+fn hash_bigint(n: &BigInt) -> i64 {
+    use num_bigint::Sign;
+    let (sign, bytes) = n.to_bytes_le();
+    let mut h: u64 = 0;
+    for (i, &b) in bytes.iter().take(8).enumerate() {
+        h |= (b as u64) << (i * 8);
+    }
+    if sign == Sign::Minus {
+        h = h.wrapping_neg();
+    }
+    h as i64
 }
 
 /// Construct a bare `Error` instance without calling kernel methods (`initialize`, `pvtInit`).
@@ -1239,6 +1300,15 @@ fn dispatch_int(
                 sel,
             )?))
         }
+        "_primEq:" => {
+            expect_arity(sel, 1, args.len())?;
+            Ok(Value::Bool(numeric_eq(
+                ev,
+                Value::Int(n),
+                args.remove(0),
+                sel,
+            )?))
+        }
         _ if arith_prim_op(sel).is_some() => {
             expect_arity(sel, 1, args.len())?;
             let op = arith_prim_op(sel).expect("guarded by the match arm");
@@ -1399,6 +1469,15 @@ fn dispatch_largeint(
                 sel,
             )?))
         }
+        "_primEq:" => {
+            expect_arity(sel, 1, args.len())?;
+            Ok(Value::Bool(numeric_eq(
+                ev,
+                Value::LargeInt(n),
+                args.remove(0),
+                sel,
+            )?))
+        }
         _ if arith_prim_op(sel).is_some() => {
             expect_arity(sel, 1, args.len())?;
             let op = arith_prim_op(sel).expect("guarded by the match arm");
@@ -1501,6 +1580,15 @@ fn dispatch_float(
         "_primLt:" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(numeric_lt(
+                ev,
+                Value::Float(f),
+                args.remove(0),
+                sel,
+            )?))
+        }
+        "_primEq:" => {
+            expect_arity(sel, 1, args.len())?;
+            Ok(Value::Bool(numeric_eq(
                 ev,
                 Value::Float(f),
                 args.remove(0),

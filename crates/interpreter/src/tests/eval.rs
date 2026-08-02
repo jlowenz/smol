@@ -3717,3 +3717,269 @@ fn s5_responds_to_is_universal_across_value_kinds() {
     // The builtin blind spot, pinned:
     assert_eq!(eval("'s' respondsTo: #size"), Value::Bool(false));
 }
+
+#[test]
+fn s6_equality_promotes_across_encodings() {
+    // Before S6 equality was raw variant equality, so `2 = 2.0` was false while
+    // `2 < 2.0` promoted. `numeric_eq` shares `numeric_lt`'s promotion policy, so the
+    // two now agree.
+    assert_eq!(eval("2 = 2.0"), Value::Bool(true));
+    assert_eq!(eval("2.0 = 2"), Value::Bool(true));
+    assert_eq!(eval("2 ~= 2.0"), Value::Bool(false));
+    assert_eq!(eval("2 = 3.0"), Value::Bool(false));
+    assert_eq!(eval("2.5 = 2"), Value::Bool(false));
+    // Across the machine-word boundary: 2^70 as an ArbitraryInteger and as a Float
+    // (exact, being a power of two).
+    assert_eq!(
+        eval("1180591620717411303424 = 1180591620717411303424.0"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn s6_equality_is_total_where_comparison_is_not() {
+    // `<` may signal on an incomparable operand, but `=` must always answer. The
+    // leaves decline a non-Number BEFORE projecting, because `aNumber value` would
+    // MNU on a plain Object, which does not implement the seam.
+    assert_eq!(eval("3 = 'x'"), Value::Bool(false));
+    assert_eq!(eval("3 = nil"), Value::Bool(false));
+    assert_eq!(eval("3 ~= 'x'"), Value::Bool(true));
+    assert_eq!(eval("2.5 = 'x'"), Value::Bool(false));
+    assert_eq!(
+        eval(
+            "Object subclass: #Thing instanceVariableNames: '' \
+              classVariableNames: '' indexedSlots: #none. 3 = Thing new"
+        ),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn s6_equality_agrees_with_the_order() {
+    // The `Ordered` trait requires `=` and derives `<=`/`>=` from `<` assuming a
+    // consistent total order. Exactly one of `<`, `=`, `>` must hold for any pair.
+    let pairs = ["2 and: 2.0", "2 and: 3", "3.5 and: 2", "2 and: 2"];
+    for p in pairs {
+        let src = p.replace(" and: ", " ");
+        let (a, b) = src.split_once(' ').unwrap();
+        let trichotomy = format!(
+            "((({a}) < ({b})) ifTrue: [1] ifFalse: [0]) \
+             + ((({a}) = ({b})) ifTrue: [1] ifFalse: [0]) \
+             + ((({a}) > ({b})) ifTrue: [1] ifFalse: [0])"
+        );
+        assert_eq!(
+            eval(&trichotomy),
+            Value::Int(1),
+            "trichotomy for {a} vs {b}"
+        );
+        // `<=` is derived as `(other < self) not`; it must agree with `<` or `=`.
+        assert_eq!(
+            eval(&format!("({a} <= {b}) = (({a} < {b}) or: [{a} = {b}])")),
+            Value::Bool(true),
+            "<= consistency for {a} vs {b}"
+        );
+    }
+}
+
+#[test]
+fn s6_hash_agrees_with_equality() {
+    // equal-implies-same-hash. A whole-valued Float must hash as the integer it
+    // equals, or `Dictionary` (which probes by `hash` then confirms by `=`) breaks.
+    assert_eq!(eval("2 hash = 2.0 hash"), Value::Bool(true));
+    assert_eq!(eval("(0 - 7) hash = (0.0 - 7.0) hash"), Value::Bool(true));
+    assert_eq!(
+        eval("1180591620717411303424 hash = 1180591620717411303424.0 hash"),
+        Value::Bool(true)
+    );
+    // Non-whole floats need no agreement with any integer and keep the bit pattern.
+    assert_eq!(eval("2.5 hash = 2 hash"), Value::Bool(false));
+}
+
+#[test]
+fn s6_dictionary_unifies_numerically_equal_keys() {
+    // The consequence that made aligning `hash` non-optional: with `=` promoting but
+    // `hash` not, these two keys would probe different slots and the Dictionary would
+    // hold two entries for one number.
+    let src = "| d | d := Dictionary new. d at: 2 put: 'int'. ";
+    assert_eq!(
+        eval(&format!("{src} d at: 2.0")),
+        Value::Str("int".into()),
+        "a Float key must find the Int entry"
+    );
+    assert_eq!(
+        eval(&format!("{src} d at: 2.0 put: 'float'. d size")),
+        Value::Int(1),
+        "storing 2.0 must overwrite 2, not add a second entry"
+    );
+    assert_eq!(
+        eval(&format!("{src} d at: 2.0 put: 'float'. d at: 2")),
+        Value::Str("float".into())
+    );
+}
+
+#[test]
+fn s6_wrapper_equality_through_the_seam() {
+    // The wrapper failure Gap A predicted: with equality falling back to identity,
+    // `Boxed(0) = 0` was false, so `isZero` lied and every method built on it broke.
+    let src = format!("{S5_BOXED} ");
+    assert_eq!(eval(&format!("{src} (Boxed of: 0) = 0")), Value::Bool(true));
+    assert_eq!(eval(&format!("{src} 0 = (Boxed of: 0)")), Value::Bool(true));
+    assert_eq!(
+        eval(&format!("{src} (Boxed of: 3) = (Boxed of: 3)")),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval(&format!("{src} (Boxed of: 3) = (Boxed of: 4)")),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        eval(&format!("{src} (Boxed of: 0) isZero")),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval(&format!("{src} (Boxed of: 4) even")),
+        Value::Bool(true)
+    );
+    assert_eq!(eval(&format!("{src} (Boxed of: 3) odd")), Value::Bool(true));
+}
+
+#[test]
+fn s6_unblocks_gcd_and_lcm_on_a_wrapper() {
+    // The S5 leftovers. `gcd:` terminates on `anInteger isZero`; with `Boxed(0) = 0`
+    // false the base case never fired and the recursion divided by zero. Completes
+    // §4c's claim that a seam-implementing wrapper inherits the whole tower.
+    let src = format!("{S5_BOXED} ");
+    for (expr, want) in [
+        ("(Boxed of: 12) gcd: (Boxed of: 18)", 6),
+        ("(Boxed of: 4) lcm: (Boxed of: 6)", 12),
+        ("(Boxed of: 12) gcd: 18", 6),
+    ] {
+        assert_eq!(
+            eval(&format!("{src} ({expr}) value")),
+            Value::Int(want),
+            "{expr}"
+        );
+    }
+    // And the wrapper's domain still survives the round trip.
+    assert_eq!(
+        eval(&format!(
+            "{src} ((Boxed of: 12) gcd: (Boxed of: 18)) class printString"
+        )),
+        Value::Str("Boxed".into())
+    );
+}
+
+#[test]
+fn s6_equality_covers_every_operand_combination() {
+    // The seven cases equality must get right, with no private double-dispatch
+    // selector: `=` is already the universal symmetric operation, so a leaf that
+    // cannot ground the comparison hands the operands back the other way round.
+    //
+    // `Frac` is a STRUCTURED number: a Number with no single encoding, so no seam.
+    // It is the case that broke an earlier `isKindOf: Number` guard, which projected
+    // it and hit `Number >> value`'s subclassResponsibility instead of answering.
+    let src = "Object subclass: #Thing instanceVariableNames: '' \
+                   classVariableNames: '' indexedSlots: #none. \
+               Number subclass: #Frac instanceVariableNames: 'n d' \
+                   classVariableNames: '' indexedSlots: #none. \
+               Frac class >> n: a d: b [ ^self _primNewValue: [:f | f setN: a d: b] ]. \
+               Frac >> setN: a d: b [ n := a. d := b ]. \
+               Frac >> = other [ ^(other isKindOf: Frac) \
+                   ifTrue: [ (n = other numerator) and: [d = other denominator] ] \
+                   ifFalse: [ other * d = n ] ]. \
+               Frac >> numerator [ ^n ]. \
+               Frac >> denominator [ ^d ]. ";
+    let boxed = S5_BOXED;
+
+    // 1/2: leaf vs non-number, both directions.
+    assert_eq!(eval(&format!("{src} 3 = Thing new")), Value::Bool(false));
+    assert_eq!(eval(&format!("{src} Thing new = 3")), Value::Bool(false));
+    // 3: leaf vs leaf, including across encodings.
+    assert_eq!(eval("3 = 3"), Value::Bool(true));
+    assert_eq!(eval("3 = 4"), Value::Bool(false));
+    // 4/5: leaf vs seam-wrapper, both directions.
+    assert_eq!(
+        eval(&format!("{boxed} 3 = (Boxed of: 3)")),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval(&format!("{boxed} (Boxed of: 3) = 3")),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval(&format!("{boxed} 3 = (Boxed of: 4)")),
+        Value::Bool(false)
+    );
+    // 6: two wrappers of the SAME class.
+    assert_eq!(
+        eval(&format!("{boxed} (Boxed of: 3) = (Boxed of: 3)")),
+        Value::Bool(true)
+    );
+    // 7: two wrappers of DIFFERENT classes — terminates, and compares by value.
+    let two = format!(
+        "{boxed} Integer subclass: #Money instanceVariableNames: 'm' \
+             classVariableNames: '' indexedSlots: #none. \
+         Money class >> of: x [ ^self _primNewValue: [:b | b setM: x] ]. \
+         Money >> setM: x [ m := x ]. \
+         Money >> value [ ^m ]. "
+    );
+    assert_eq!(
+        eval(&format!("{two} (Boxed of: 3) = (Money of: 3)")),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval(&format!("{two} (Money of: 3) = (Boxed of: 4)")),
+        Value::Bool(false)
+    );
+    // A STRUCTURED number answers with its own `=` rather than being projected.
+    assert_eq!(
+        eval(&format!("{src} 3 = (Frac n: 6 d: 2)")),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval(&format!("{src} (Frac n: 6 d: 2) = 3")),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval(&format!("{src} 4 = (Frac n: 6 d: 2)")),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        eval(&format!("{src} (Frac n: 1 d: 2) = (Frac n: 1 d: 2)")),
+        Value::Bool(true)
+    );
+    // ~= must track `=` everywhere, or the Rust arms' variant inequality contradicts it.
+    assert_eq!(eval(&format!("{src} 3 ~= Thing new")), Value::Bool(true));
+    assert_eq!(
+        eval(&format!("{boxed} 3 ~= (Boxed of: 3)")),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn s6_equality_bounce_always_terminates() {
+    // Operand-swapping `=` must not loop. A passing suite does not prove this on its
+    // own — a loop HANGS rather than fails — so the hazard cases are pinned here.
+    //
+    // `Bad` is a Number subclass implementing NEITHER `value` NOR `=`: the user
+    // mistake most likely to bounce forever. It must report who owes the method.
+    let bad = "Number subclass: #Bad instanceVariableNames: '' \
+               classVariableNames: '' indexedSlots: #none. ";
+    for expr in ["3 = Bad new", "Bad new = 3", "Bad new = Bad new"] {
+        assert_eq!(
+            eval(&format!("{bad} [{expr}] on: Error do: [:e | e message]")),
+            Value::Str("Bad must implement this method (subclass responsibility)".into()),
+            "{expr} must error, not hang"
+        );
+    }
+    // A wrapper VIOLATING §4e's contract that `value` answers a leaf — it answers
+    // another wrapper. Still terminates, because each projection strips one layer.
+    let nested = "Number subclass: #W instanceVariableNames: 'x' \
+                  classVariableNames: '' indexedSlots: #none. \
+                  W class >> of: v [ ^self _primNewValue: [:w | w setX: v] ]. \
+                  W >> setX: v [ x := v ]. W >> value [ ^x ]. ";
+    assert_eq!(
+        eval(&format!("{nested} (W of: (W of: 3)) = 3")),
+        Value::Bool(true)
+    );
+}
