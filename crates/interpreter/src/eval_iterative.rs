@@ -2283,7 +2283,7 @@ pub(crate) fn push_method_call_frame(
                 });
             }
             let self_value = Value::Instance(handle.clone());
-            let mut method_env = env.clone();
+            let mut method_env = env.global_scope();
             method_env.push_frame();
             method_env.define(self_sym(), self_value.clone());
             for (param, val) in params.iter().zip(args.iter()) {
@@ -2328,7 +2328,7 @@ pub(crate) fn push_method_call_frame(
                     got: args.len(),
                 });
             }
-            let mut method_env = env.clone();
+            let mut method_env = env.global_scope();
             method_env.push_frame();
             method_env.define(self_sym(), self_value.clone());
             for (param, val) in params.iter().zip(args.iter()) {

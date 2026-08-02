@@ -38,6 +38,28 @@ impl Env {
         self.frames.push(Arc::new(Mutex::new(HashMap::new())));
     }
 
+    /// Answers an environment containing only the global (outermost) frame.
+    ///
+    /// This is the base scope of a **method** activation. A method body's
+    /// lexical scope is its own arguments and temporaries, its receiver's
+    /// instance/class variables, and the globals — never the *caller's* frames.
+    /// Rooting a method env here rather than cloning the caller's env is what
+    /// makes step 4 of `Evaluator::lookup_var` ("outer env (globals)") true as
+    /// documented, and it keeps env depth constant instead of growing with call
+    /// depth. Blocks are the opposite case: they capture their defining env and
+    /// must keep cloning it, which is genuine closure capture.
+    ///
+    /// Requires: at least one frame is live (`new` establishes the root frame
+    ///   and `pop_frame` never removes it).
+    /// Ensures: the result has exactly one frame, sharing the same `Arc` as
+    ///   `self`'s outermost frame — so a global defined through either handle is
+    ///   visible through the other.
+    pub fn global_scope(&self) -> Env {
+        Env {
+            frames: vec![self.frames.first().expect("no frames").clone()],
+        }
+    }
+
     /// Requires: at least two frames are live (the root frame is never popped).
     /// Ensures: the innermost frame is removed.
     pub fn pop_frame(&mut self) {

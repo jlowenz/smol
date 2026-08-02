@@ -87,13 +87,28 @@ Each phase is independently committable and leaves the suite green.
 
 - **S0 — Baseline.** Record current benchmark numbers and a selector-frequency profile
   (the S7 instrumentation technique). Information only; does not gate anything.
+  **DONE 2026-08-02**, and it surfaced the S1a defect below. Note the bench file had been
+  broken since C26 (two benches used the pre-C26 mutable-counter form and failed to
+  *parse*), so there were no historical numbers to preserve; it now also carries loop
+  coverage and a Pattern-3 `ValueHolder` bench. Baseline/after numbers are in §5a.
 - **S1 — Dead code first.** Prune `to:do:`/`to:by:do:` from `dispatch_int` — they are
   already unreachable (§6 OQ-1). Zero behavior change; shrinks the surface before adding.
+  **DONE 2026-08-02**: deadness re-verified by replacing both bodies with `panic!`
+  (full suite still green), then deleted; `env` became unused in `dispatch_int`.
+- **S1a — Method scope is lexical, not dynamic** (inserted 2026-08-02; not in the
+  original plan). See §5b. Prerequisite to S1b: without it every tail-recursive Smol
+  loop is O(n²) in time and O(n) in memory, so migrating `to:do:` off its evaluator
+  special-case would have traded the one linear loop construct for a quadratic one.
 - **S1b — `to:do:`/`to:by:do:` in Smol** (OQ-1, decided): write the methods on
   `Number`/`Integer`, delete step 1c **in the same commit** (never leave it as a silent
   fallback), and fix the future-in-loop-bounds bug (OQ-1b). Gated on the O(1) acceptance
   criteria above. This is the largest behavioral step in the chunk; everything after it is
   mechanical by comparison.
+  Docs to revisit in this step: `Smol_Patterns.md` Pattern 1 calls `to:do:` "a built-in"
+  (true until S1b, false after), and its Pattern-3 note claims recursion at collection
+  scale "exhausts the coroutine stack" — unverified as of S1a, where non-tail recursion
+  ran to depth 16000 with no exhaustion and roughly linear cost. Measure at collection
+  scale before rewriting either.
 - **S2 — Identity + simple families:** introduce `==` / `_primIdentical:` and
   `Object >> =`/`~=` in terms of it (OQ-3), then Nil, Symbol, Namespace, Class (15 arms).
   Settling identity first is what lets the per-variant `=`/`~=` arms go, and it makes S6's
@@ -106,6 +121,72 @@ Each phase is independently committable and leaves the suite green.
   (OQ-4) — deliberately last, because it may rename the selector.
 - **S6 — Prune + audit**, mirroring tower S7: delete superseded arms, verify irreducibility
   of what remains, update `docs/primitives.md`.
+
+## 5a. Measurements (release, this machine)
+
+`before` = `7a2702c` + S1; `after` = + S1a. The `to:do:` family is untouched by S1a
+(it is the `Cont::ToDoStep` special-case, not a method) and is the S1b before-number.
+
+| bench | before | after | |
+|---|---|---|---|
+| `timesRepeat 1000` | 189.7 ms | 16.87 ms | **11.2×** |
+| `valueholder accumulate 1000` | 189.7 ms | 17.37 ms | **10.9×** |
+| `object new 1000` | 187.5 ms | 16.95 ms | **11.1×** |
+| `method send increment 1000` | 187.5 ms | 16.94 ms | **11.1×** |
+| `fibonacci 20 iterative` | 480 µs | 361 µs | 1.33× |
+| `to:do: 100000` | 50.7 ms | 51.2 ms | unchanged |
+| `to:by:do: 100000` | 50.7 ms | 51.0 ms | unchanged |
+| `nested to:do: 300x300` | 47.4 ms | 47.4 ms | unchanged |
+| `array do: 10000` | 12.5 ms | 12.3 ms | unchanged |
+
+The four ~188 ms entries were not measuring their nominal subjects at all — each was
+dominated by the `1000 timesRepeat:` driving it. Test-suite side effects: whole suite
+14.9 s → 10.4 s, `entity_stress_100x1000` 10.1 s → 4.1 s, `user_recursive_count_down`
+4.10 s → 0.28 s, `times_repeat_1000` 4.08 s → 0.53 s.
+
+## 5b. S1a — method scope is lexical, not dynamic (DONE 2026-08-02)
+
+**Symptom.** Every tail-recursive Smol loop was O(n²) in time and O(n) in memory:
+`^self loopA: n - 1` measured 0.21 / 0.86 / 3.60 / 20.58 s at n = 1000 / 2000 / 4000 /
+8000 (×4 per doubling). `to:do:` was the sole linear loop in the language, precisely
+*because* it is an evaluator special-case rather than a method.
+
+**Not TCO.** Instrumenting `step_loop` over 2000 tail calls showed the `Cont` stack flat
+at ≤8, `method_stack` flat at 3, `method_depth` flat at 3. TCO works correctly. What grew
+was the **environment**: `env_frames` climbed 8 → 16 → … → 1024+.
+
+**Root cause.** `push_method_call_frame` built a method activation's env as
+`env.clone()` + `push_frame()` — the *caller's* env plus one frame — so method scope
+nested into the caller's **dynamic** chain. `Env::get` walks that vec and every
+`Env::clone` copies it, so each call cost O(depth). Ordinary returns were unaffected
+(2000 sequential calls never exceeded 8 frames); it only compounded under TCO, where each
+iteration's env is cloned from the previous iteration's rather than from a common base.
+
+**It was a correctness bug too, not merely a performance one.** `eval.rs` already
+documented the intended contract — step 4 of `lookup_var` is commented
+`// 4. outer env (globals)` — but `lookup_outer_frames` walks every frame except the
+innermost, which included all callers. So a callee could read its caller's temporaries:
+
+```smalltalk
+Integer >> callee [ ^hidden ]
+Integer >> caller [ | hidden | hidden := 42. ^self callee ]
+1 caller      "answered 42; now: undefined variable: hidden"
+```
+
+**Fix.** `Env::global_scope()` answers an env holding only the outermost frame (sharing
+the same `Arc`, so globals stay live and writable). The three method-activation sites —
+`push_method_call_frame`'s `Instance` and `Primitive` arms and `Evaluator::
+invoke_class_method` — root there instead of cloning the caller. Blocks are the opposite
+case and were deliberately left alone: `push_block_frame` clones `block.env`, which is
+genuine closure capture, verified by tests that a block invoked inside an unrelated
+method still sees its defining method's temps and arguments.
+
+**Lesson for OQ-1's acceptance criteria.** Those criteria are stated in terms of *stack*
+(a deep-iteration test plus a `step_probe` measurement). Both would have **passed** on a
+Smol `to:do:` built over this defect — the `Cont` stack really does stay O(1) — while the
+loop was quadratic in time and linear in memory. S1b therefore adds a third criterion:
+**measured linear scaling** across at least three doublings of the trip count, since
+stack flatness alone does not imply the loop is usable.
 
 ## 6. Open questions
 
@@ -182,13 +263,17 @@ Defining it on `Number`/`Integer` rather than one encoding **fixes the Float/Lar
 for free**.
 
 **O(1) stack is the acceptance criterion, not an expectation.** The step does not land
-until both hold:
+until all three hold:
 1. A **deep-iteration test** that exhausts the Rust stack if the loop is not O(1) —
    ≥100k iterations, plus nested loops (the release coroutine stack is 64 KB, so a
    per-iteration Rust frame fails fast and unambiguously).
 2. A **`step_probe` measurement** (the debug-only Cargo feature built for exactly this)
    showing `step_loop` depth and per-level Rust-stack delta stay constant as iteration
    count and nesting grow.
+3. **Measured linear time scaling** across at least three doublings of the trip count.
+   Added after S1a (§5b): criteria 1–2 would both have passed while the loop was
+   quadratic, because the growth was in the *environment*, not the stack. Stack flatness
+   does not imply the loop is usable.
 
 If either fails, **we fix the situation — we do not fall back to (a)** (decided
 2026-08-02). A loop whose Rust stack grows with trip count is a defect in the evaluator's

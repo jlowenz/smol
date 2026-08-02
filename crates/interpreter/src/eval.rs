@@ -726,7 +726,7 @@ impl Evaluator {
             });
         }
         let self_val = Value::Instance(handle.clone());
-        let mut method_env = env.clone();
+        let mut method_env = env.global_scope();
         method_env.push_frame();
         method_env.define(self_sym(), self_val.clone());
         for (param, val) in params.iter().zip(args.iter()) {

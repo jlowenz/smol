@@ -125,3 +125,30 @@ fn clone_shares_frames() {
     assert!(snapshot.set("x", int(99)));
     assert_eq!(env.get("x"), Some(int(99)));
 }
+
+#[test]
+fn global_scope_keeps_only_the_outermost_frame() {
+    let mut env = Env::new();
+    env.define(s("g"), int(1));
+    env.push_frame();
+    env.define(s("caller_local"), int(2));
+    env.push_frame();
+    env.define(s("inner_local"), int(3));
+
+    let base = env.global_scope();
+    assert_eq!(base.get("g"), Some(int(1)));
+    assert_eq!(base.get("caller_local"), None);
+    assert_eq!(base.get("inner_local"), None);
+}
+
+#[test]
+fn global_scope_shares_the_global_frame() {
+    let mut env = Env::new();
+    env.define(s("g"), int(1));
+    let mut base = env.global_scope();
+    // The shared Arc means a definition through either handle is visible to both.
+    base.define(s("later"), int(7));
+    assert_eq!(env.get("later"), Some(int(7)));
+    assert!(base.set("g", int(99)));
+    assert_eq!(env.get("g"), Some(int(99)));
+}

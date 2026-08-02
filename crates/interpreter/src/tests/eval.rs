@@ -3983,3 +3983,101 @@ fn s6_equality_bounce_always_terminates() {
         Value::Bool(true)
     );
 }
+
+// ── Method scope is lexical, not dynamic (C34 S1a) ───────────────────────────
+//
+// A method activation's env is rooted at the GLOBAL frame plus one frame of its
+// own (`Env::global_scope` + `push_frame` in `push_method_call_frame`), never at
+// the caller's env. Before S1a it was `caller_env.clone()`, which made step 4 of
+// `lookup_var` ("outer env (globals)") reach the whole dynamic call chain: a
+// callee could read its caller's temporaries, and env depth — hence the cost of
+// every variable lookup and every `Env::clone` — grew with call depth, making
+// each tail-recursive loop O(n^2) in time and O(n) in memory.
+
+#[test]
+fn method_cannot_see_callers_temp() {
+    let src = "
+        Integer >> callee [ ^hidden ]
+        Integer >> caller [ | hidden | hidden := 42. ^self callee ]
+        1 caller
+    ";
+    assert!(matches!(eval_err(src), EvalError::UndefinedVariable(n) if &*n == "hidden"));
+}
+
+#[test]
+fn method_cannot_see_callers_argument() {
+    let src = "
+        Integer >> callee [ ^arg ]
+        Integer >> caller: arg [ ^self callee ]
+        1 caller: 42
+    ";
+    assert!(matches!(eval_err(src), EvalError::UndefinedVariable(n) if &*n == "arg"));
+}
+
+#[test]
+fn method_still_sees_globals() {
+    // Rooting at the global frame must keep class names (and other globals)
+    // reachable from a method body.
+    let src = "
+        Integer >> arrayClass [ ^Array ]
+        1 arrayClass = Array
+    ";
+    assert_eq!(eval(src), Value::Bool(true));
+}
+
+#[test]
+fn block_still_captures_defining_method_scope_across_a_call() {
+    // The closure case is the OPPOSITE of the method case: `push_block_frame`
+    // clones `block.env`, so a block invoked inside an unrelated method still
+    // sees the temps and arguments of the method that DEFINED it.
+    let temp = "
+        Integer >> apply: aBlock [ ^aBlock value ]
+        Integer >> test [ | x | x := 5. ^self apply: [ x + 1 ] ]
+        1 test
+    ";
+    assert_eq!(eval(temp), Value::Int(6));
+
+    let arg = "
+        Integer >> apply: aBlock [ ^aBlock value ]
+        Integer >> double: n [ ^self apply: [ n * 2 ] ]
+        1 double: 21
+    ";
+    assert_eq!(eval(arg), Value::Int(42));
+}
+
+#[test]
+fn non_local_return_through_a_foreign_method_still_works() {
+    let src = "
+        Integer >> apply: aBlock [ aBlock value. ^999 ]
+        Integer >> test [ self apply: [ ^42 ]. ^0 ]
+        1 test
+    ";
+    assert_eq!(eval(src), Value::Int(42));
+}
+
+#[test]
+fn deep_tail_recursion_is_not_quadratic() {
+    // Guards the complexity class, not a wall-clock budget. `times_repeat_1000`
+    // took 4.1s in debug before S1a, so quadratic growth puts 10k iterations near
+    // seven MINUTES; linear it is about a second. Any return of per-call O(depth)
+    // work therefore makes this test hang rather than fail subtly, which is the
+    // intended failure mode.
+    let src = "
+        Integer >> countFrom: n [
+            n = 0 ifTrue: [ ^0 ].
+            ^self countFrom: n - 1
+        ]
+        1 countFrom: 10000
+    ";
+    assert_eq!(eval(src), Value::Int(0));
+}
+
+#[test]
+fn deep_times_repeat_is_not_quadratic() {
+    // Same guard one protocol layer up: `timesRepeat:` is kernel Smol built on
+    // the same tail recursion, and all of `whileTrue:`/`gcd:`/`isPrime` share it.
+    assert_eq!(
+        eval("| n | n := 10000. n timesRepeat: [ 1 + 1 ]. n"),
+        Value::Int(10000)
+    );
+}
