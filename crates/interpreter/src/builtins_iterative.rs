@@ -1174,10 +1174,11 @@ fn dispatch_int(
     n: i64,
     sel: &Arc<str>,
     mut args: Vec<Value>,
-    env: &mut Env,
+    _env: &mut Env,
 ) -> Result<Value, EvalError> {
-    // Note: user-defined Int methods are now routed via lookup_user_method in the
-    // iterative evaluator. The old (recursive) evaluator reaches builtins directly.
+    // Note: user-defined Int methods are routed via lookup_user_method in the
+    // evaluator; this dispatcher only grounds `_prim` selectors and the remaining
+    // conversion protocol.
     match sel.as_ref() {
         "_primLt:" => {
             expect_arity(sel, 1, args.len())?;
@@ -1215,34 +1216,6 @@ fn dispatch_int(
         "asFloat" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Float(n as f64))
-        }
-        "to:do:" => {
-            expect_arity(sel, 2, args.len())?;
-            let stop = as_int(ev, args.remove(0), sel)?;
-            let blk = as_block(ev, args.remove(0), sel)?;
-            let mut i = n;
-            while i <= stop {
-                ev.eval_block(&blk, vec![Value::Int(i)], env)?;
-                i += 1;
-            }
-            Ok(Value::Nil)
-        }
-        "to:by:do:" => {
-            expect_arity(sel, 3, args.len())?;
-            let stop = as_int(ev, args.remove(0), sel)?;
-            let step = as_int(ev, args.remove(0), sel)?;
-            let blk = as_block(ev, args.remove(0), sel)?;
-            if step == 0 {
-                return Err(EvalError::TypeError(
-                    "to:by:do: step must be non-zero".into(),
-                ));
-            }
-            let mut i = n;
-            while if step > 0 { i <= stop } else { i >= stop } {
-                ev.eval_block(&blk, vec![Value::Int(i)], env)?;
-                i += step;
-            }
-            Ok(Value::Nil)
         }
         _ => dispatch_primitive_fallback(ev, "MachineInteger", sel, args),
     }
