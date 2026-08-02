@@ -1,17 +1,51 @@
 # Numeric tower & primitive rework plan
 
-**Status:** planning. Supersedes the "reparent scalars" portion of
-`string_representation_plan.md` §2 for the *numeric* classes (String/Symbol
-reparenting still tracked there). Depends on: traits landed (2026-07-11).
+**Status: COMPLETE through S7 (2026-08-02).** All steps landed; see §6 for the record.
+Supersedes the "reparent scalars" portion of `string_representation_plan.md` §2 for the
+*numeric* classes (String/Symbol reparenting still tracked there).
 
-**Goal.** Replace the flat, VM-hidden scalar numerics with a real, observable,
-extensible **numeric tower** expressed *in the language*, backed by a **minimal**
-set of irreducible leaf primitives in Rust. This directly serves the project's
-"observable and manipulable in the language" goal: today the small/large integer
-split and all arithmetic live in hardcoded Rust (`dispatch_int`/`dispatch_float`)
-and can never be seen or extended from Smol. After this chunk, the *concepts*
-(`Ordered`, Number, Integer, coercion) live in `kernel.smol`; Rust provides only
-the operations that genuinely require machine/host support.
+**Goal (achieved).** Replace the flat, VM-hidden scalar numerics with a real,
+observable, extensible **numeric tower** expressed *in the language*, backed by a
+minimal set of irreducible leaf primitives in Rust. The *concepts* (`Ordered`, `Number`,
+`Integer`, coercion, equality) now live in `kernel.smol`; Rust provides only what needs
+machine or host support.
+
+### Where things ended up
+
+```
+Value
+├── Number                   uses: Ordered   + - * /, coercion, =, the value/withValue: seam
+│   ├── Integer              // \\ gcd: lcm: factorial even odd isPrime
+│   │   ├── MachineInteger   Value::Int      ┐
+│   │   └── ArbitraryInteger Value::LargeInt ├─ closed vmSubclass: leaves; _prim grounding
+│   └── Float                Value::Float    ┘
+├── Boolean ── True / False
+├── String   uses: Ordered
+└── Symbol
+```
+
+A user number joins by implementing **two** methods (`value` + `withValue:`) and
+inherits the whole tower, in either operand position. A *structured* number (Fraction,
+Complex) instead overrides the arithmetic and `=` directly. Neither requires editing a
+leaf or a central generality table.
+
+### Reading guide
+
+Sections are decision records, kept even when later superseded — superseded passages say
+so inline rather than being deleted.
+
+| Section | Holds |
+|---|---|
+| §2, §2a, §3 | Hierarchy, `Ordered`/`Magnitude` as traits, naming |
+| §4b, §4d | Closedness (`vmSubclass:`); representation vs algebra axes |
+| §4e | **The seam** `value`/`withValue:` — authoritative over §4/§4c where they conflict |
+| §4f | The coercion edge (`adaptTo…andSend:`) and why not a generality table |
+| §4g | **Mixed-mode arithmetic, equality, `NoCoercion`** — the final shape (S5/S6) |
+| §6 | Step-by-step record of what shipped, including surprises |
+| §7 | Open/deferred, with pointers into `open_questions.md` |
+
+§4 and §4c are the earliest drafts and contain the most superseded material; where they
+disagree with §4e/§4g, the later sections win.
 
 ---
 
@@ -73,7 +107,7 @@ comparability is a *capability*, not a representation, so it belongs on `uses:`.
 
 Two layered traits, only the first built now:
 
-- **`Ordered` (BUILD in S2).** The base comparability capability. *Requires* `<` and
+- **`Ordered` (BUILT in S2).** The base comparability capability. *Requires* `<` and
   `=`; *provides* `<= > >= max: min: between:and:` (self-sends of `<`/`=`, so they are
   derived requirements). Members: `Number`, `String`, and later `Character`, `Symbol`,
   enums — anything with a total order. This is what "sortable / totally ordered" means,
@@ -112,27 +146,29 @@ machine arithmetic, host representation, or overflow detection. Everything
 composable is written in Smol on the tower classes. `dispatch_int`/`dispatch_float`
 shrink from "the implementation" to "a thin primitive layer."
 
-**Stays in Rust (irreducible primitives, `_prim…`):**
-- Arithmetic that needs machine/BigInt ops with overflow→promotion:
-  `_primAdd:`/`_primSub:`/`_primMul:`/`_primQuo:`/`_primRem:`. **RESOLVED (S2):**
-  **single selector, internal `Value::` branch** (not per-representation
-  `_primMachineAdd:`/`_primLargeAdd:`). S2's `_primLt:` set the precedent — the Rust
-  primitive already holds the receiver value and branches on its variant, promoting
-  cross-type; per-rep selectors were needless ceremony. S3 arithmetic follows suit.
-  Note the grounding is sent to `self` on the **leaf** (self-only rule), with the
-  argument projected (`aNumber value`) — see §4e.
-- Cross-representation comparison: `_primLt:` — implemented in S2 as `numeric_lt`
-  (single selector; any-Float ⇒ f64, else any-LargeInt ⇒ BigInt, else i64). Plus
-  `_primStrLt:` for lexicographic String order.
-- Float ops that need libm/host: `sqrt`, `sin`, `ln`, `truncated`, `rounded`,
-  `asFloat`.
-- Conversion feeding coercion: `asFloat`, `largeFitsWord`/`_primNormalize`
-  (demote-if-fits), `machine→large`.
-- Radix/parse/print primitives as needed.
+**What stayed in Rust (as shipped).** `docs/primitives.md` is the authoritative
+inventory; the shape decided here and confirmed by the S7 audit:
 
-Most of this **reuses arithmetic already written** inside `dispatch_int`/
-`dispatch_float` — S2–S4 mostly **relocates** that logic behind `_prim…` selectors
-and deletes the broad fallback arms (S5 prune), not new math.
+- **Arithmetic** `_primAdd:` `_primSub:` `_primMul:` `_primDiv:` `_primQuo:` `_primRem:`
+  and **comparison** `_primLt:`, **equality** `_primEq:` (S6), plus `_primStrLt:` for
+  lexicographic String order.
+- **Host representation**: `asFloat`, number formatting (`asString`/`printString`), and
+  Float's libm conversions (`truncated` `rounded` `ceiling` `floor` `asInt`).
+
+**RESOLVED (S2): one selector per operation, branching internally on the `Value::`
+variant** — not per-representation `_primMachineAdd:`/`_primLargeAdd:`. The primitive
+already holds the receiver and can promote across encodings, so per-rep selectors were
+needless ceremony. `_primLt:` set the precedent; S3 arithmetic and S6 equality follow it.
+All promote identically (any `Float` ⇒ f64, else any `LargeInt` ⇒ BigInt, else i64 with
+overflow promoting and results demoting), which is what makes `<`, `=` and the operators
+mutually consistent.
+
+The grounding is sent to `self` on the **leaf** (self-only rule); abstract code projects
+with `value` and re-dispatches a public selector — see §4e.
+
+S2–S6 mostly **relocated** existing Rust arithmetic behind `_prim…` selectors rather
+than writing new math; **S7** then deleted the 39 broad fallback arms the kernel had
+come to shadow.
 
 **Moves to Smol (`kernel.smol`, on the tower):**
 - The comparison protocol (`<=`, `>`, `>=`, `max:`, `min:`, `between:and:`) in terms
@@ -261,7 +297,11 @@ representation). §2a corrects it.
 
 This is why `Integer` stays usefully open (the `value` seam) *and* algebraic reuse
 needs no inheritance: representation and algebra are different questions answered by
-different mechanisms. **Deferred past S1** (traits exist; these bundles are S4+).
+different mechanisms.
+
+**Status:** `Ordered` was built (S2). `Magnitude`, `Ring` and `Field` are **recorded,
+not built** — they stayed unnecessary through S7, and `Ring`/`Field` in particular want
+the trait-laws idea below to earn their keep.
 
 **Future capability — trait laws (RECORDED, NOT built).** A trait already declares
 requirements; it could also carry **laws** — property blocks over its required
@@ -599,14 +639,14 @@ to send. (Squeak has the same shape at larger N: `adaptToFraction:`, `adaptToCom
  leaves present as #adaptToInteger:andSend: because they share one domain.
  The pins go on the LEAVES: pinning abstract Integer would make every user
  `Integer subclass:` inherit the claim and ask for the wrong coercion method."
-Number           >> pvtAdaptSelector [ ^('adaptTo', self class name, ':andSend:') asSymbol ]
-MachineInteger   >> pvtAdaptSelector [ ^#adaptToInteger:andSend: ]
-ArbitraryInteger >> pvtAdaptSelector [ ^#adaptToInteger:andSend: ]
-Float            >> pvtAdaptSelector [ ^#adaptToFloat:andSend: ]
+Number           >> adaptSelector [ ^('adaptTo', self class name, ':andSend:') asSymbol ]
+MachineInteger   >> adaptSelector [ ^#adaptToInteger:andSend: ]
+ArbitraryInteger >> adaptSelector [ ^#adaptToInteger:andSend: ]
+Float            >> adaptSelector [ ^#adaptToFloat:andSend: ]
 
 Number >> pvtAdapt: aNumber send: aSymbol [
     | sel |
-    sel := self pvtAdaptSelector.
+    sel := self adaptSelector.
     ^(aNumber respondsTo: sel)
         ifTrue:  [ aNumber perform: sel withArguments:
                      (Cons with: self rest: (Cons with: aSymbol rest: nil)) ]
@@ -683,7 +723,7 @@ primitives, and arithmetic results. `MachineInteger`/`ArbitraryInteger`/`Float`
 are abstract-to-instantiate from Smol (no public `new`); `Integer new` / `Number new`
 are meaningless and should error or be absent.
 
-## 6. Step breakdown (proposed; refine when starting)
+## 6. Step breakdown — record of what shipped
 
 - **S1 — Hierarchy + reflection (correctness fix). DONE 2026-07-21** (S1a =
   hierarchy+reflection, committed `82e8c13`; S1b = `vmSubclass:` + leaf closedness).
@@ -764,82 +804,65 @@ are meaningless and should error or be absent.
   arithmetic). Demonstrates the payoff: real numeric behavior authored in the language.
   **Shipped with two known gaps, addressed by S5 and S6 below** — the S4 wrapper test
   documents the limit rather than asserting the fix.
-- **S5 — Mixed-mode arithmetic: the specificity rule (§4g). DONE 2026-08-02.** Fixes the
-  S4 gap where a wrapper in *argument* position is not carried. **Closed `squared` and
-  `factorial`; `gcd:`/`lcm:` remain blocked on S6** — they terminate on `anInteger
-  isZero`, which is `^self = 0`, and with no `Number >> =` a wrapper's `Boxed(0) = 0` is
-  false, so the base case never fires and the recursion divides by zero. **S6 is
-  therefore a prerequisite for §4c's encoding-agnostic claim, not merely a correctness
-  fix.** Also added: default `Number >> adaptToInteger:/adaptToFloat:andSend:` (§4g), so
-  the seam really is two methods. Order as executed:
-  1. Lift `respondsTo:` from `obj_prim_core` to the shared value dispatch paths so
-     scalars answer it (§4g implementation note); it MNU'd on `3` before. Surfaced a
-     pre-existing gap — it resolves by class-dictionary lookup and is blind to builtin
-     selectors, so `'s' respondsTo: #size` is false. Sound for the coercion edge (adapt
-     selectors are Smol-defined) but unsound generally; recorded as
-     `docs/open_questions.md` **Q14** and pinned by a test.
-  2. `Error subclass: #NoCoercion` (ivars `receiver argument selector`, class-side
-     factory, `TraitConflict` idiom), replacing `self error:` in the two refusing
-     defaults on `Object`.
-  3. `Number >> pvtAdaptSelector` (+ `Integer`/`Float` overrides to the two existing
-     leaf selectors) and `Number >> pvtAdapt:send:`.
-  4. Rewrite the six abstract ops (`+ - * /` on `Number`, `// \\` on `Integer`) with
-     the specificity guard. The closed `vmSubclass:` leaves are **not** touched.
-  5. Tests: the five-case table of §4g, incl. `3 * boxed` ≡ `boxed * 3`, two distinct
-     wrappers reaching `adaptTo<Domain>:`, and `NoCoercion` carrying both operands.
-- **S6 — Numeric equality and hash. DONE 2026-08-02.** Fixed the second S4 gap, and with
-  it the `gcd:`/`lcm:` cases S5 could not close, completing §4c's claim that a
-  seam-implementing wrapper inherits the whole tower. One behavior change beyond the
-  plan: `=` had to be made **total** where `<` is not. `3 < nil` may signal, but
-  `3 = nil` must answer `false`, so the leaves decline a non-`Number` argument *before*
-  projecting it — `aNumber value` would MNU on a plain Object, which does not implement
-  the seam. `~=` is derived once on `Number` (the leaves inherit it); defining it was
-  required, since the Rust `~=` arms would otherwise still answer raw variant
-  inequality and contradict the new `=`. Original statement of the gap follows: there is
-  no `Number >> =`, so `2 = 2.0` is false while `2 < 2.0` promotes — and the `Ordered`
-  trait
-  *requires* `=` and derives `<=`/`>=` assuming a consistent total order, so its
-  contract is unmet. For a wrapper, `Boxed(0) = 0` is false, making `isZero`/`even`/
-  `odd` answer silently WRONG and `isPrime` call composites prime. Mirrors `<`
-  exactly: `numeric_eq` in Rust with `numeric_lt`'s promotion policy, exposed as
-  `_primEq:` on the three leaf arms; `<leaf> >> = aNumber [ ^self _primEq: aNumber
-  value ]`; `Number >> = aNumber [ ^self value = aNumber ]`; plus `~=`.
-  **DECIDED: `hash` is aligned in the same step** — making `2 = 2.0` true otherwise
-  breaks equal-implies-same-hash (`hash_value` gives `Int(2)` → 2 but `Float(2.0)` →
-  its bit pattern), corrupting `Dictionary`. So `hash_value`'s `Value::Float` arm must
-  hash a whole-valued float as the corresponding integer (Pharo's choice). `Dictionary`
-  itself needs no change — `pvtSlotFor:` already routes through Smol `hash` and `=`.
-  Kept a separate step from S5: it is a semantic change touching collections.
-  Watch for: the Rust `"="`/`"~="` arms for `Int`/`LargeInt`/`Float` go dead once the
-  kernel shadows them, and any test asserting `2 = 2.0` is false will flip.
-- **S7 — Prune. DONE 2026-08-02.** Removed **39 arms** across `dispatch_int` /
+- **S5 — Mixed-mode arithmetic: the specificity rule. DONE 2026-08-02** (`53f9026`).
+  Design and rationale in **§4g**; not restated here. Shipped: the specificity guard on
+  the six abstract ops, domain-named double dispatch (`adaptSelector` + `pvtAdapt:send:`),
+  default `Number >> adaptTo…andSend:` so the seam really is two methods, `NoCoercion`
+  replacing the untyped `self error:`, and `respondsTo:` lifted to the universal dispatch
+  block (it MNU'd on `3` before).
+
+  Closed `squared` and `factorial`. **`gcd:`/`lcm:` remained blocked on S6** — they
+  terminate on `isZero`, i.e. `self = 0`, which a wrapper could not answer — so S6 turned
+  out to be a *prerequisite* for §4c's encoding-agnostic claim, not merely a correctness
+  fix.
+
+  Two things learned: the domain pins belong on the **leaves**, not abstract
+  `Integer` (pinning `Integer` makes every user `Integer subclass:` inherit the claim and
+  ask for the wrong coercion method); and `respondsTo:` is blind to builtin selectors —
+  pre-existing, sound for the coercion edge since adapt selectors are Smol-defined, but
+  unsound generally. Recorded as `open_questions.md` **Q14** and pinned by a test.
+- **S6 — Numeric equality and hash. DONE 2026-08-02** (`e52f97b`). Design in **§4g**.
+  `numeric_eq` shares `numeric_lt`'s promotion policy, grounded as `_primEq:` on the
+  leaves, so `<`, `=` and `>` partition. Unblocked `gcd:`/`lcm:` on wrappers, completing
+  §4c's claim.
+
+  **`hash` was aligned in the same commit because it is not separable:** making
+  `2 = 2.0` true otherwise breaks equal-implies-same-hash (`Int(2)` hashes 2,
+  `Float(2.0)` its bit pattern), corrupting `Dictionary`, whose `pvtSlotFor:` probes by
+  `hash` then confirms by `=`. A whole-valued Float now hashes as the integer it equals.
+  `Dictionary` itself needed no change.
+
+  Three things the plan did not anticipate:
+  1. **`=` must be TOTAL where `<` is not.** `3 < nil` may signal; `3 = nil` must answer
+     false. An `isKindOf: Number` guard was tried and was wrong: a *structured* number
+     passes it but has no seam, so projecting it raises `subclassResponsibility`.
+  2. **Equality needs no coercion edge of its own.** `=` is already the universal
+     symmetric selector, so a leaf that cannot ground the comparison hands the operands
+     back the other way (`aNumber = self`). No private double-dispatch selector.
+     Termination holds because `Number >> =` projects self to a leaf *before*
+     re-dispatching — pinned by a test, since a loop hangs rather than fails.
+  3. **`~=` had to be defined too**, or the Rust `~=` arms keep answering raw variant
+     inequality and contradict the new `=`.
+
+  Whether `2 = 2.0` *should* be true is deliberately left open — `open_questions.md`
+  **Q15**.
+- **S7 — Prune. DONE 2026-08-02** (`6c16fd9`). Removed **39 arms** across `dispatch_int` /
   `dispatch_largeint` / `dispatch_float` (`+ - * / // \\ < <= > >= = ~= abs negated
-  max: min:`) plus the orphaned `as_float_coerce` helper that deleting them exposed.
-  810 tests unchanged.
+  max: min:`) plus the `as_float_coerce` helper they orphaned. 810 tests unchanged.
 
-  **Deadness was verified, not assumed** — two independent ways, because a Smol method
-  shadows a Rust arm silently and a wrong guess here deletes live behavior:
-  1. *Static* — user-method lookup runs before builtin dispatch
-     (`eval_iterative.rs:1844`) and `lookup_user_method` walks the full superclass
-     chain, so a kernel method on `MachineInteger`/`Integer`/`Number`/`Value`/`Object`
-     (plus flattened `Ordered`) makes the same-named arm unreachable. Each dispatcher
-     has exactly one call site, from `dispatch`, downstream of that check.
-  2. *Empirical* — instrumented all three dispatchers to log every arriving selector
-     and ran the whole suite. Only `_prim*`, `printString`/`asString`/`asFloat`,
-     Float's host conversions, `to:do:`/`to:by:do:`, and genuine MNU probes appeared.
-     No pruned selector was ever reached.
+  **Deadness was verified two ways, not assumed** — a Smol method shadows a Rust arm
+  *silently*, so a wrong guess deletes live behavior. *Statically*: user-method lookup
+  runs before builtin dispatch and walks the full superclass chain, and each dispatcher
+  has one call site downstream of that check. *Empirically*: instrumented all three
+  dispatchers to log every arriving selector across the whole suite — no pruned selector
+  was ever reached.
 
-  Remaining arms audited as irreducible (host representation: `asFloat`, number
-  formatting, libm) except `printString`/`asString`, which are reducible in principle
-  now that `//` and `\\` exist and are retained for cost — recorded in
-  `docs/primitives.md`, not resolved. `to:do:`/`to:by:do:` stay on `dispatch_int` but
-  are iteration primitives of the iterative evaluator (C29.5/C31.5), not numeric ones.
+  Remaining arms audited as irreducible (host representation and libm), except
+  `printString`/`asString`, which are reducible in principle now that `//` and `\\`
+  exist and are kept for cost — recorded in `docs/primitives.md`, not resolved.
+  `to:do:`/`to:by:do:` stay on `dispatch_int` but are iteration primitives of the
+  iterative evaluator (C29.5/C31.5), not numeric ones.
 
-  `docs/primitives.md` gained a numeric-tower section (it predated S2) and its header
-  no longer describes the recursive evaluator as "slated for retirement" — it was
-  retired in 2026-07.
-
-Each step is independently committable; S1 alone fixes the reported bugs.
 
 ## 7. Open questions / deferred
 
@@ -889,18 +912,25 @@ Each step is independently committable; S1 alone fixes the reported bugs.
   open, deliberately: whether `withArguments:` should accept any sequenceable
   collection rather than `Cons` alone — that is collection-protocol design, not a
   numeric-tower question.
-- **Float subtyping under Number only** — Float is a `Number` but not an `Integer`;
-  confirm no code assumes Number == Integer.
-- **RESOLVED — `Int` name retirement** — done in S1a: `Integer` is the abstract
-  shared class, literals produce `MachineInteger`, bare `Int` is gone.
-- **Performance** — moving arithmetic dispatch into Smol adds message sends on the
-  hot path. Mitigation: keep same-type fast path as a single primitive call;
-  measure before/after (ties into the queued performance review).
+- **OPEN — performance not yet measured.** Moving arithmetic into Smol adds message
+  sends on the hot path and this was never benchmarked; S7's instrumentation showed
+  ~104k `_primAdd:` calls in the test suite alone, so the dispatch cost is real. Ties
+  into the queued performance review. No fast path was added.
 - **`value.rs::kind()`** bootstrap tags vs class names — keep `kind()` as the
   error-message tag; class names come from the tower.
-- Whether `String`/`Symbol` reparenting rides along in S1 or stays in the string
-  plan's own step (they need no numeric tower; can be done together for one
-  "all scalars answer `class`" milestone).
+- **String/Symbol reparenting** — String landed as a `Value` leaf `uses: Ordered`;
+  Symbol's remaining reparenting stays in `string_representation_plan.md` §3.
+
+### Raised by this work, tracked in `docs/open_questions.md`
+
+- **Q13** — standalone `SomeClass uses: SomeTrait.`, which blocks moving the coercion
+  fallbacks off `Object` onto the intended `NumberCoercion` trait (§4f). Needs its own
+  trait-system round.
+- **Q14** — `respondsTo:` is blind to builtin selectors. Preferred direction: move
+  builtins into Smol rather than build a selector registry, which would also shrink the
+  Rust/Smol shadowing hazard generally.
+- **Q15** — whether `2 = 2.0` should be true at all. Implemented as true (S6); left open
+  deliberately.
 
 ## 8. Cross-references
 

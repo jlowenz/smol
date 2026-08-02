@@ -1085,14 +1085,14 @@ flow, which docs/condition_system_guide.md steers away from."
 and false of a user `Integer subclass: #Boxed`. Pinning abstract `Integer` would make
 every user subclass inherit the claim and ask for #adaptToInteger:andSend: instead of
 its own #adaptToBoxed:andSend: — silently routing to the wrong coercion method."
-Number           >> pvtAdaptSelector [ ^('adaptTo', self class name, ':andSend:') asSymbol ]
-MachineInteger   >> pvtAdaptSelector [ ^#adaptToInteger:andSend: ]
-ArbitraryInteger >> pvtAdaptSelector [ ^#adaptToInteger:andSend: ]
-Float            >> pvtAdaptSelector [ ^#adaptToFloat:andSend: ]
+Number           >> adaptSelector [ ^('adaptTo', self class name, ':andSend:') asSymbol ]
+MachineInteger   >> adaptSelector [ ^#adaptToInteger:andSend: ]
+ArbitraryInteger >> adaptSelector [ ^#adaptToInteger:andSend: ]
+Float            >> adaptSelector [ ^#adaptToFloat:andSend: ]
 
 Number >> pvtAdapt: aNumber send: aSymbol [
     | sel |
-    sel := self pvtAdaptSelector.
+    sel := self adaptSelector.
     ^(aNumber respondsTo: sel)
         ifTrue:  [ aNumber perform: sel
                      withArguments: (Cons with: self rest: (Cons with: aSymbol rest: nil)) ]
