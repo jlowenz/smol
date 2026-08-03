@@ -553,7 +553,7 @@ without blocking the rest.
 pointer here, rather than maintaining a split that has already caused one stale
 cross-reference. Do this as part of S4.
 
-### OQ-6 — object/entity/class-side surfaces — DECIDED (2026-08-02): next chunk
+### OQ-6 — routing-bound surfaces: object/entity, class-side, **and Namespace** — DECIDED (2026-08-02): next chunk
 
 `dispatch_object_primitive`'s chunks and `dispatch_class_builtin` hold a much larger arm
 count (construction, traits, tx, futures, reflection). This work **is wanted** — the same
@@ -562,6 +562,46 @@ keep this one reviewable. It needs its own inventory pass first, and its own jud
 about which arms are genuine VM substrate (`_primNew`, tx enrollment, coroutine handling)
 versus ordinary protocol that happens to live in Rust (`name`, `printString`,
 `respondsTo:`).
+
+**Scope widened after S2 (2026-08-02): the Namespace and Class arms join this question.**
+They were originally scheduled in S2 as "simple families", which was wrong — what unites
+this chunk's remaining families (Nil, Symbol, String, the numeric leaves) is that
+`lookup_user_method` already routes them to a kernel class, so migrating is purely a
+matter of writing methods. Namespace and Class are not routed that way, so each needs a
+dispatch change *before* any method can be written. That is the same precondition the
+object/class-side arms have, which is why they belong together.
+
+**Class — 4 arms (`= ~= name printString`).** A class receiver never reaches
+`Object >> =`: `dispatch_class` resolves against CLASS-side methods
+(`lookup_class_method`), so the migration target is `Object class >> =` / `== ` / `name`,
+not instance-side methods. Open sub-questions: can a class-side method send a `_prim` to
+`self` (the self-only rule vs. a `ClassEntity` receiver, which may or may not be a
+self-send depending on `current_entity_id`), and does the synchronous-selector list in
+`dispatch_class` need to grow for every migrated selector, or should class-side dispatch
+of pure-function selectors be synchronous by default? Note S2 already had to add
+`==`/`~~` to that list; each further migration risks the same
+"answers a Future where a Bool was expected" trap.
+
+**Namespace — 3 arms (`do: name printString`), and it is not a class at all.** There is
+no `Namespace` class in `kernel.smol`, and `lookup_user_method` answers `None` for
+`Value::Namespace`. Migrating requires:
+1. deciding what a `Namespace` class *is* in the hierarchy — presumably a
+   `Value vmSubclass:` encoded leaf like `String`/`Symbol`, which pulls in
+   `is_encoded_leaf_name` and `value_to_class_handle` (so `aNamespace class` answers
+   something sensible) and a decision on whether it is subclassable;
+2. a `Value::Namespace` arm in `lookup_user_method`;
+3. `_primNamespaceName` grounding for `name`.
+4. **`do:` is an evaluator special-case — step (1g)** in `dispatch_to_stack`, which swaps
+   the active namespace and pushes `Cont::NamespaceGuard`. As with `to:do:` before S1b,
+   the arm in `dispatch_namespace` behind it is therefore **dead**, and should be
+   verified-and-pruned the way S1 did. Unlike `to:do:`, though, the operation is
+   genuinely irreducible — it manipulates evaluator state — so the honest target is
+   `Namespace >> do: aBlock [ ^self _primNamespaceDo: aBlock ]`. That is OQ-1's rejected
+   option (c) — reflection without modifiability — and it is the RIGHT answer here
+   precisely because the body cannot be written in Smol, which was not true of `to:do:`.
+
+Until then all seven arms stay in place and correct; nothing is half-migrated. §3's
+inventory still counts them.
 
 ## 7. Cross-references
 
