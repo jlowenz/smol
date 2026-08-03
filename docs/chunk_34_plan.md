@@ -122,9 +122,12 @@ Each phase is independently committable and leaves the suite green.
 - **S3 — Numeric conversions:** Float's `asInt ceiling floor rounded truncated`, Int/
   LargeInt's `asFloat asString` (11 arms). Pure `_prim` grounding, no protocol design.
   **DONE 2026-08-02** — see §5f.
+- **S3a — `to:`/`until:` range duality** (inserted 2026-08-02; not in the original plan).
+  Settles the `copyFrom:to:` convention found during S3 and completes the
+  inclusive/exclusive pair across both the iteration and copy protocols. **DONE** — §5g.
 - **S4 — String** (10 arms). Also folds in and retires `string_representation_plan.md`
-  entirely, per OQ-5. **Must also settle the `copyFrom:to:` inconsistency found in S3 —
-  see §5g; it is a semantics decision, not a mechanical migration.**
+  entirely, per OQ-5. `copyFrom:to:`'s convention is already settled by S3a, so its
+  migration is now mechanical.
 - **S5 — `printString` / `asString`** across all families, pending the naming decision
   (OQ-4) — deliberately last, because it may rename the selector.
 - **S6 — Prune + audit**, mirroring tower S7: delete superseded arms, verify irreducibility
@@ -395,27 +398,55 @@ sign-blind — a huge negative would answer `+inf` — but it is defensive-only,
 `to_f64` answers `Some(±inf)` out of range. Flagged for S6; a migration step should not
 quietly change behaviour.
 
-## 5g. `String >> copyFrom:to:` disagrees with the collections (found in S3, owned by S4)
+## 5g. S3a — the `to:` / `until:` range duality (DONE 2026-08-02)
 
-Found while writing an S3 test, so it is incidental to this step but must not be lost.
+**Correction first.** This section originally recorded String's `copyFrom:to:` as
+"1-based and exclusive". That was wrong. The Rust arm did `chars[(from-1)..to]`, and
+because the slice's exclusive upper bound cancels the decremented lower bound, the net
+semantics were **1-based INCLUSIVE** — the standard Smalltalk-80/Pharo convention.
+`'abcdef' copyFrom: 1 to: 3` → `'abc'` was correct *for that convention*. The mistake was
+reading the Rust slice mechanics as the Smol-level contract.
 
+So the real disagreement was narrower: `String` was 1-based inclusive while `Array`,
+`ByteArray` and `OrderedCollection` are 0-based inclusive. Both inclusive; different base.
+One genuine bug came with it — `saturating_sub(1)` made `copyFrom: 0` indistinguishable
+from `copyFrom: 1`, silently accepting an out-of-convention index.
+
+**Decision: 0-based, inclusive**, and String now matches. The argument is not taste — the
+language's own vocabulary already means exactly this:
+
+- `at:` is 0-based (`Array >> first [ ^self _primAt: 0 ]`).
+- **`to:` is already inclusive**: `0 to: 5 do: […]` runs six times. So `copyFrom:to:`
+  being inclusive is what makes it agree with `to:do:` rather than contradict it.
+
+**And the exclusive reading gets its own name rather than losing.** Dijkstra's
+[EWD831](https://www.cs.utexas.edu/users/EWD/transcriptions/EWD08xx/EWD831.html) makes a
+real case for half-open ranges — trip count is `stop - start` with no `+ 1`, an empty
+range is `start = stop` rather than `stop < start`, and adjacent ranges share a bound.
+Rather than pick a winner, `until:` names it, which is what Ruby (`a..b` / `a...b`) and
+Swift (`a...b` / `a..<b`) did with syntax; keyword selectors are the natural equivalent
+here. The duality is completed across **both** the iteration and the copy protocol, so
+there is no corner where only one reading is available:
+
+```smalltalk
+0 to: 10 do: [...]              0 until: 10 do: [...]
+0 to: 10 by: 3 do: [...]        0 until: 10 by: 3 do: [...]
+coll copyFrom: 1 to: 3          coll copyFrom: 1 until: 4
 ```
-'abcdef' copyFrom: 0 to: 3   →  'abc'
-'abcdef' copyFrom: 1 to: 3   →  'abc'      ← same answer, different arguments
-```
 
-The Rust arm does `let from = (as_int(..) as usize).saturating_sub(1); let to = as_int(..)`
-and slices `chars[from..to]`, so it treats **`from` as 1-based and `to` as exclusive**.
-`Array >> copyFrom:to:` and `OrderedCollection >> copyFrom:to:` (both kernel Smol) are
-**0-based and inclusive**. So the same selector means two different things depending on
-the receiver, and on String `copyFrom: 0` is indistinguishable from `copyFrom: 1`.
+`Number >> until:do:` / `until:by:do:` are the `to:` methods with `<` for `<=` (and `>`
+for `>=` on a negative step), so the TCO-recognised shape, the once-at-entry zero-step
+validation and the acceptance criteria all carry over unchanged. `copyFrom:until:` is
+defined in terms of `copyFrom:to:` on each collection, so there is one implementation per
+collection rather than two.
 
-This is a semantics decision for S4, not a mechanical migration: either String adopts the
-collections' 0-based-inclusive convention (fixing the language's consistency, changing
-String behaviour and any caller relying on it), or the collections are wrong and the
-convention should be revisited wholesale. Migrating the arm as-is would freeze the
-inconsistency into `kernel.smol`, which is worse than leaving it in Rust. Check callers in
-`kernel.smol` and the test suite before choosing.
+**Blast radius was small**: no caller of `copyFrom:to:` inside `kernel.smol` at all, and
+exactly one test asserted the old String behaviour (`'hello' copyFrom: 2 to: 4` → `'ell'`,
+now `'llo'`). Out-of-range still answers `''` rather than erroring, as before.
+
+Still Rust: `String >> copyFrom:to:` itself. S4 migrates it; the convention is now correct
+so that migration is mechanical. `String >> copyFrom:until:` is already Smol, since it
+just re-dispatches.
 
 ## 6. Open questions
 

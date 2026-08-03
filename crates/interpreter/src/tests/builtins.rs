@@ -362,9 +362,71 @@ fn string_reversed() {
 
 #[test]
 fn string_copy_from_to() {
+    // C34 S3a: 0-based and inclusive, matching Array/ByteArray/OrderedCollection
+    // and the `to:` of `to:do:`. This asserted "ell" while the arm was 1-based.
     assert_eq!(
         eval_diff("'hello' copyFrom: 2 to: 4"),
+        Value::Str(Arc::from("llo"))
+    );
+    assert_eq!(
+        eval_diff("'hello' copyFrom: 0 to: 0"),
+        Value::Str(Arc::from("h"))
+    );
+    // 0 and 1 are now distinguishable; before, `saturating_sub(1)` merged them.
+    assert_eq!(
+        eval_diff("'hello' copyFrom: 1 to: 3"),
         Value::Str(Arc::from("ell"))
+    );
+    // Empty range, and out-of-range still answers '' rather than erroring.
+    assert_eq!(
+        eval_diff("'hello' copyFrom: 2 to: 1"),
+        Value::Str(Arc::from(""))
+    );
+    assert_eq!(
+        eval_diff("'hello' copyFrom: 9 to: 20"),
+        Value::Str(Arc::from(""))
+    );
+}
+
+#[test]
+fn copy_from_until_is_the_exclusive_dual() {
+    // Same elements, two readings. `until:` gives size = stop - start with no +1,
+    // and an empty copy is start = stop.
+    assert_eq!(
+        eval("'hello' copyFrom: 1 until: 4"),
+        Value::Str(Arc::from("ell"))
+    );
+    assert_eq!(
+        eval("'hello' copyFrom: 2 until: 2"),
+        Value::Str(Arc::from(""))
+    );
+    assert_eq!(
+        eval(
+            "| a | a := Array new: 5. 0 to: 4 do: [:i | a at: i put: i]. (a copyFrom: 1 until: 4) size"
+        ),
+        Value::Int(3)
+    );
+    assert_eq!(
+        eval(
+            "| a | a := Array new: 5. 0 to: 4 do: [:i | a at: i put: i]. (a copyFrom: 1 until: 4) at: 0"
+        ),
+        Value::Int(1)
+    );
+    assert_eq!(
+        eval("| a | a := Array new: 5. (a copyFrom: 2 until: 2) size"),
+        Value::Int(0)
+    );
+    assert_eq!(
+        eval(
+            "| oc | oc := OrderedCollection new. oc add: 10. oc add: 20. oc add: 30. (oc copyFrom: 0 until: 2) size"
+        ),
+        Value::Int(2)
+    );
+    assert_eq!(
+        eval(
+            "| b | b := ByteArray new: 5. 0 to: 4 do: [:i | b at: i put: i * 2]. (b copyFrom: 1 until: 4) size"
+        ),
+        Value::Int(3)
     );
 }
 

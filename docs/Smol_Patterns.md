@@ -112,6 +112,13 @@ i := 0.
 belongs to the block's own scope — assignment is legal. Use `to:by:do:` for
 step increments other than 1.
 
+**`to:` includes its bound; `until:` stops before it.** `0 to: 5 do: [...]` runs
+six times, `0 until: 5 do: [...]` five. Both come in a `by:` form. Reach for
+`until:` when the bound is a size — `0 until: coll size do: [...]` needs no
+`- 1`, an empty range is `start = stop`, and adjacent ranges share a bound.
+The same pair exists for copying: `copyFrom: 1 to: 3` and `copyFrom: 1 until: 4`
+answer the same elements. Indices are 0-based throughout.
+
 `to:do:` and `to:by:do:` are ordinary Smol methods on `Number` (`kernel.smol`),
 not built-ins — chunk 34 S1b replaced the evaluator special-case that used to
 implement them. Consequences worth knowing: they answer `respondsTo:`, they can

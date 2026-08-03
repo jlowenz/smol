@@ -1,5 +1,5 @@
 use crate::eval::EvalError;
-use crate::test_helpers::{eval, eval_diff, eval_err_diff};
+use crate::test_helpers::{assert_signal_contains, eval, eval_diff, eval_err, eval_err_diff};
 use crate::value::Value;
 use std::sync::Arc;
 
@@ -589,4 +589,94 @@ fn numeric_conversions_are_visible_to_reflection() {
         eval("(100 factorial) respondsTo: #asFloat"),
         Value::Bool(true)
     );
+}
+
+// ── C34 S3a: to: / until: — the inclusive/exclusive range duality ────────────
+//
+// `to:` includes its bound, `until:` stops before it. Both readings are named
+// rather than one being a convention you must remember — the same resolution
+// Ruby (`a..b` / `a...b`) and Swift (`a...b` / `a..<b`) reached with syntax.
+
+#[test]
+fn until_do_excludes_its_bound() {
+    let count = |src: &str| {
+        eval(&format!(
+            "| h | h := ValueHolder initialValue: 0. {src} h get value"
+        ))
+    };
+    assert_eq!(
+        count("0 until: 10 do: [:i | h update: [:a | a + 1]]."),
+        Value::Int(10)
+    );
+    assert_eq!(
+        count("0 to: 10 do: [:i | h update: [:a | a + 1]]."),
+        Value::Int(11)
+    );
+    // The payoff (EWD831): an empty range is start = stop, needing no stop < start.
+    assert_eq!(
+        count("5 until: 5 do: [:i | h update: [:a | a + 1]]."),
+        Value::Int(0)
+    );
+    // Adjacent ranges share a bound and cover exactly once.
+    assert_eq!(
+        count(
+            "0 until: 5 do: [:i | h update: [:a | a + 1]]. 5 until: 10 do: [:i | h update: [:a | a + 1]]."
+        ),
+        Value::Int(10)
+    );
+}
+
+#[test]
+fn until_by_do_handles_both_directions() {
+    let sum = |src: &str| {
+        eval(&format!(
+            "| h | h := ValueHolder initialValue: 0. {src} h get value"
+        ))
+    };
+    // 0, 3, 6, 9 — stops before 10.
+    assert_eq!(
+        sum("0 until: 10 by: 3 do: [:i | h update: [:a | a + i]]."),
+        Value::Int(18)
+    );
+    // 10, 7, 4, 1 — stops before 0.
+    assert_eq!(
+        sum("10 until: 0 by: -3 do: [:i | h update: [:a | a + i]]."),
+        Value::Int(22)
+    );
+    // Contrast the inclusive form, which reaches its bound.
+    assert_eq!(
+        sum("0 until: 9 by: 3 do: [:i | h update: [:a | a + i]]."),
+        Value::Int(9)
+    );
+    assert_eq!(
+        sum("0 to: 9 by: 3 do: [:i | h update: [:a | a + i]]."),
+        Value::Int(18)
+    );
+}
+
+#[test]
+fn until_by_do_rejects_a_zero_step() {
+    assert_signal_contains(
+        &eval_err("0 until: 5 by: 0 do: [:i | i]"),
+        "step must be non-zero",
+    );
+}
+
+#[test]
+fn until_do_works_for_every_numeric_leaf_and_reflection() {
+    assert_eq!(eval("3 respondsTo: #until:do:"), Value::Bool(true));
+    assert_eq!(eval("3 respondsTo: #until:by:do:"), Value::Bool(true));
+    assert_eq!(
+        eval(
+            "| h | h := ValueHolder initialValue: 0.
+            1.5 until: 3 do: [:i | h update: [:a | a + 1]]. h get value"
+        ),
+        Value::Int(2)
+    );
+}
+
+#[test]
+fn deep_until_do_is_o1_stack_and_linear() {
+    // Same acceptance criterion as to:do: — it is the same shape with `<` for `<=`.
+    assert_eq!(eval("1 until: 100000 do: [:i | i]"), Value::Nil);
 }

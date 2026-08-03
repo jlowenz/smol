@@ -1460,12 +1460,25 @@ fn dispatch_str(
                 s.chars().rev().collect::<String>().as_str(),
             )))
         }
+        // 0-based, INCLUSIVE of `to` — matching `Array`/`ByteArray`/
+        // `OrderedCollection` and the `to:` of `to:do:` (C34 S3a). Until then this
+        // arm did `saturating_sub(1)` on `from`, making it 1-based (the Smalltalk-80
+        // convention) while every collection was 0-based, so the same selector meant
+        // two different things by receiver — and `copyFrom: 0` was indistinguishable
+        // from `copyFrom: 1`. Out-of-range still answers an empty string rather than
+        // erroring, as before.
         "copyFrom:to:" => {
             expect_arity(sel, 2, args.len())?;
-            let from = (as_int(ev, args.remove(0), sel)? as usize).saturating_sub(1);
-            let to = as_int(ev, args.remove(0), sel)? as usize;
+            let from = as_int(ev, args.remove(0), sel)?;
+            let to = as_int(ev, args.remove(0), sel)?;
             let chars: Vec<char> = s.chars().collect();
-            let slice: String = chars.get(from..to).unwrap_or(&[]).iter().collect();
+            let slice: String = if from < 0 || to < from {
+                String::new()
+            } else {
+                let lo = from as usize;
+                let hi = (to as usize).saturating_add(1).min(chars.len());
+                chars.get(lo..hi).unwrap_or(&[]).iter().collect()
+            };
             Ok(Value::Str(Arc::from(slice.as_str())))
         }
         "includesSubString:" => {

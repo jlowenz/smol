@@ -85,6 +85,11 @@ Array >> copyFrom: start to: stop [
     ^result
 ]
 
+"The exclusive dual (C34 S3a): `copyFrom: i until: j` takes j - i elements, so an
+empty copy is `i = j` and adjacent slices share a bound. Defined in terms of the
+inclusive form so there is one implementation per collection, not two."
+Array >> copyFrom: start until: stop [ ^self copyFrom: start to: stop - 1 ]
+
 Array >> = other [
     | n |
     self class = other class ifFalse: [^false].
@@ -132,6 +137,7 @@ ByteArray >> copyFrom: start to: stop [
     ].
     ^result
 ]
+ByteArray >> copyFrom: start until: stop [ ^self copyFrom: start to: stop - 1 ]
 
 ByteArray >> asString [ ^self _primAsString ]
 
@@ -285,6 +291,7 @@ OrderedCollection >> copyFrom: start to: stop [
     ].
     ^result
 ]
+OrderedCollection >> copyFrom: start until: stop [ ^self copyFrom: start to: stop - 1 ]
 
 OrderedCollection >> = other [
     self class = other class ifFalse: [^false].
@@ -1266,6 +1273,11 @@ Value vmSubclass: #String
 `'cat' - 'cab'` is meaningless. Grounds to the `_primStrLt:` primitive."
 String >> < aString [ ^self _primStrLt: aString ]
 
+"The exclusive dual (C34 S3a). `copyFrom:to:` itself is still a Rust arm — S4 migrates
+the String protocol — but it is now 0-based inclusive like every collection, so this
+delegation is correct and needs no primitive of its own."
+String >> copyFrom: start until: stop [ ^self copyFrom: start to: stop - 1 ]
+
 Value vmSubclass: #Symbol
     instanceVariableNames: ''
     classVariableNames: ''
@@ -1528,6 +1540,49 @@ Number >> pvtDownTo: stop by: step do: aBlock [
     (self >= stop) ifFalse: [ ^nil ].
     aBlock value: self.
     ^(self + step) pvtDownTo: stop by: step do: aBlock
+]
+
+"The EXCLUSIVE dual (C34 S3a). `to:` and `until:` name the two readings of a range
+rather than making one convention something you have to remember — the trick Ruby
+(`a..b` / `a...b`) and Swift (`a...b` / `a..<b`) use, expressed as keyword selectors
+instead of syntax. `to:` includes its bound, `until:` stops before it:
+
+    0 to: 10 do: [...]      11 iterations, 0 through 10
+    0 until: 10 do: [...]   10 iterations, 0 through 9
+
+`until:` is what makes Dijkstra's argument (EWD831) available where it pays: the trip
+count is `stop - start` with no `+ 1`, an empty range is `start = stop` rather than
+`stop < start`, and adjacent ranges share a bound (`0 until: n`, `n until: m`). `to:`
+stays the default because it reads the way the word does, and because every existing
+loop and `copyFrom:to:` already means it.
+
+The only difference from `to:do:` is `<` in place of `<=` (and `>` for `>=` when the
+step is negative), so the shape, the TCO-recognised tail call, and the once-at-entry
+step validation are all identical — see the `to:do:` commentary above."
+
+Number >> until: stop do: aBlock [
+    (self < stop) ifFalse: [ ^nil ].
+    aBlock value: self.
+    ^(self + 1) until: stop do: aBlock
+]
+
+Number >> until: stop by: step do: aBlock [
+    step isZero ifTrue: [ ^Error signal: 'until:by:do: step must be non-zero' ].
+    ^step > 0
+        ifTrue:  [ self pvtUpUntil:   stop by: step do: aBlock ]
+        ifFalse: [ self pvtDownUntil: stop by: step do: aBlock ]
+]
+
+Number >> pvtUpUntil: stop by: step do: aBlock [
+    (self < stop) ifFalse: [ ^nil ].
+    aBlock value: self.
+    ^(self + step) pvtUpUntil: stop by: step do: aBlock
+]
+
+Number >> pvtDownUntil: stop by: step do: aBlock [
+    (self > stop) ifFalse: [ ^nil ].
+    aBlock value: self.
+    ^(self + step) pvtDownUntil: stop by: step do: aBlock
 ]
 
 "timesRepeat: recurses on (self - 1) instead of mutating a counter variable,
