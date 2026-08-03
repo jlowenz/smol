@@ -45,9 +45,9 @@ arithmetic over `_primAdd:` and friends, and S7 then deleted 39 superseded arms.
 | Family | Arms | Selectors |
 |---|---|---|
 | String | 10 → **8** | `, at: copyFrom:to: includesSubString: reversed size asSymbol printString` (~~`= ~=`~~ → `Object >> =`, S2) |
-| Float | 6 | `asInt ceiling floor rounded truncated printString` |
-| Int | 5 → **3** | `asFloat asString printString` (~~`to:do: to:by:do:`~~ — the dead arms went in S1; the evaluator special-case went in S1b) |
-| LargeInt | 3 | `asFloat asString printString` |
+| Float | 6 → **1** | `printString` (~~`asInt ceiling floor rounded truncated`~~ → Smol, S3) |
+| Int | 5 → **1** | `printString` (~~`to:do: to:by:do:`~~ S1/S1b; ~~`asFloat asString`~~ → Smol, S3) |
+| LargeInt | 3 → **1** | `printString` (~~`asFloat asString`~~ → Smol, S3) |
 | Symbol | 5 → **1** | `printString` (~~`= ~=`~~ → `Object >> =`; ~~`asString asSymbol`~~ → Smol, S2) |
 | Nil | 3 → **1** | `printString` (~~`= ~=`~~ → `Object >> =`, S2) |
 | Namespace | 3 | `do: name printString` |
@@ -121,8 +121,10 @@ Each phase is independently committable and leaves the suite green.
   definitions, which is the same category of work OQ-6 defers.
 - **S3 — Numeric conversions:** Float's `asInt ceiling floor rounded truncated`, Int/
   LargeInt's `asFloat asString` (11 arms). Pure `_prim` grounding, no protocol design.
+  **DONE 2026-08-02** — see §5f.
 - **S4 — String** (10 arms). Also folds in and retires `string_representation_plan.md`
-  entirely, per OQ-5.
+  entirely, per OQ-5. **Must also settle the `copyFrom:to:` inconsistency found in S3 —
+  see §5g; it is a semantics decision, not a mechanical migration.**
 - **S5 — `printString` / `asString`** across all families, pending the naming decision
   (OQ-4) — deliberately last, because it may rename the selector.
 - **S6 — Prune + audit**, mirroring tower S7: delete superseded arms, verify irreducibility
@@ -361,6 +363,59 @@ matter of writing a method:
 
 So both belong with the routing/class-side work rather than with "simple families". Their
 arms are left in place and correct; nothing is half-migrated.
+
+## 5f. S3 — numeric conversions (DONE 2026-08-02)
+
+Nine arms out, four `_prim`s in, and one arm that turned out to need no primitive:
+
+```smalltalk
+MachineInteger   >> asFloat  [ ^self _primAsFloat ]      ArbitraryInteger likewise
+MachineInteger   >> asString [ ^self _primAsString ]     ArbitraryInteger likewise
+Float >> truncated [ ^self _primTruncated ]   Float >> ceiling [ ^self _primCeiling ]
+Float >> rounded   [ ^self _primRounded ]     Float >> floor   [ ^self _primFloor ]
+Float >> asInt     [ ^self truncated ]
+```
+
+`asInt` was a fifth Rust arm performing the same `as i64` cast as `truncated`; it is
+now one line of Smol saying exactly that. `_primAsString`/`_primAsFloat` live in the
+shared `dispatch_primitive_fallback` and branch on the encoding (§4's one-prim-per-
+operation rule) — `Symbol >> asString` and `MachineInteger >> asString` are one
+operation over two encodings. The binary numeric prims (`_primLt:`, `_primAdd:`, …)
+deliberately stay in the per-leaf dispatchers: those promote across two operands.
+
+**Held to "no protocol design", deliberately.** Grounding sits on the LEAVES only, so a
+`Number` wrapper still answers doesNotUnderstand to `asFloat` — exactly as before this
+step. The §4e projecting forms (`Number >> asFloat [^self value asFloat]`,
+`Integer >> rounded [^self]`, `Float >> asFloat [^self]`) are real additions and are
+left for a later step rather than smuggled in here. Recorded so they are not forgotten.
+
+`ArbitraryInteger >> asFloat` preserves the replaced arm's saturating behaviour
+(`to_f64().unwrap_or(INFINITY)`) verbatim rather than erroring. Note that fallback is
+sign-blind — a huge negative would answer `+inf` — but it is defensive-only, since
+`to_f64` answers `Some(±inf)` out of range. Flagged for S6; a migration step should not
+quietly change behaviour.
+
+## 5g. `String >> copyFrom:to:` disagrees with the collections (found in S3, owned by S4)
+
+Found while writing an S3 test, so it is incidental to this step but must not be lost.
+
+```
+'abcdef' copyFrom: 0 to: 3   →  'abc'
+'abcdef' copyFrom: 1 to: 3   →  'abc'      ← same answer, different arguments
+```
+
+The Rust arm does `let from = (as_int(..) as usize).saturating_sub(1); let to = as_int(..)`
+and slices `chars[from..to]`, so it treats **`from` as 1-based and `to` as exclusive**.
+`Array >> copyFrom:to:` and `OrderedCollection >> copyFrom:to:` (both kernel Smol) are
+**0-based and inclusive**. So the same selector means two different things depending on
+the receiver, and on String `copyFrom: 0` is indistinguishable from `copyFrom: 1`.
+
+This is a semantics decision for S4, not a mechanical migration: either String adopts the
+collections' 0-based-inclusive convention (fixing the language's consistency, changing
+String behaviour and any caller relying on it), or the collections are wrong and the
+convention should be revisited wholesale. Migrating the arm as-is would freeze the
+inconsistency into `kernel.smol`, which is worse than leaving it in Rust. Check callers in
+`kernel.smol` and the test suite before choosing.
 
 ## 6. Open questions
 

@@ -1168,16 +1168,66 @@ fn dispatch_primitive_fallback(
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(self_val == force_value(ev, args.remove(0))?))
         }
-        // Rendering an encoded value as a String. One `_prim` per operation
-        // branching on the variant (§4), rather than a per-family selector.
-        // S2 grounds Symbol; S3 extends the match to the numeric encodings when
-        // it migrates their `asString`.
+        // ── Encoding conversions (C34 S2/S3) ─────────────────────────────
+        //
+        // One `_prim` per OPERATION, branching internally on the variant (§4),
+        // rather than a selector per representation family. They live here, in
+        // the shared tail, for the same reason: `Symbol >> asString` and
+        // `MachineInteger >> asString` are one operation over two encodings.
+        //
+        // Contrast the binary numeric prims (`_primLt:`, `_primAdd:`, …), which
+        // stay in the per-leaf dispatchers: those promote across two operands and
+        // are genuinely per-leaf grounding of a shared abstract method.
         "_primAsString" => {
             expect_arity(sel, 0, args.len())?;
             match self_val {
                 Value::Symbol(s) => Ok(Value::Str(s)),
+                Value::Int(n) => Ok(Value::Str(Arc::from(n.to_string().as_str()))),
+                Value::LargeInt(n) => Ok(Value::Str(Arc::from(n.to_string().as_str()))),
                 other => Err(EvalError::TypeError(format!(
                     "{sel}: no string encoding for {}",
+                    other.kind()
+                ))),
+            }
+        }
+        "_primAsFloat" => {
+            expect_arity(sel, 0, args.len())?;
+            match self_val {
+                Value::Int(n) => Ok(Value::Float(n as f64)),
+                // Behaviour preserved verbatim from the arm this replaces: a
+                // BigInt too large for f64 saturates rather than erroring. Note
+                // the fallback is sign-BLIND (a huge negative would answer +inf),
+                // which is latent either way — `to_f64` answers `Some(±inf)` for
+                // out-of-range values, so the `unwrap_or` is defensive only.
+                // Flagged for S6 rather than changed here; a migration step should
+                // not quietly alter behaviour.
+                Value::LargeInt(n) => {
+                    use num_traits::ToPrimitive;
+                    Ok(Value::Float(n.to_f64().unwrap_or(f64::INFINITY)))
+                }
+                other => Err(EvalError::TypeError(format!(
+                    "{sel}: no float encoding for {}",
+                    other.kind()
+                ))),
+            }
+        }
+        // Float -> Integer rounding modes. Each is a distinct operation, so each
+        // gets its own selector rather than one prim taking a mode symbol.
+        // `asInt` is deliberately absent: it is truncation, and says so in Smol.
+        "_primTruncated" | "_primRounded" | "_primCeiling" | "_primFloor" => {
+            expect_arity(sel, 0, args.len())?;
+            match self_val {
+                Value::Float(f) => {
+                    let r = match sel.as_ref() {
+                        "_primTruncated" => f.trunc(),
+                        "_primRounded" => f.round(),
+                        "_primCeiling" => f.ceil(),
+                        _ => f.floor(),
+                    };
+                    Ok(Value::Int(r as i64))
+                }
+                other => Err(EvalError::TypeError(format!(
+                    "{sel}: not a Float: {}",
                     other.kind()
                 ))),
             }
@@ -1230,19 +1280,11 @@ fn dispatch_int(
             let op = arith_prim_op(sel).expect("guarded by the match arm");
             numeric_binop(ev, op, Value::Int(n), args.remove(0), sel)
         }
-        "asString" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(Arc::from(n.to_string())))
-        }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
             let s = n.to_string();
             println!("{:?}", s);
             Ok(Value::Str(Arc::from(s)))
-        }
-        "asFloat" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Float(n as f64))
         }
         _ => dispatch_primitive_fallback(ev, Value::Int(n), "MachineInteger", sel, args),
     }
@@ -1257,7 +1299,6 @@ fn dispatch_largeint(
     mut args: Vec<Value>,
     _env: &mut Env,
 ) -> Result<Value, EvalError> {
-    use num_traits::ToPrimitive;
     match sel.as_ref() {
         "+" | "-" | "*" => {
             expect_arity(sel, 1, args.len())?;
@@ -1293,18 +1334,9 @@ fn dispatch_largeint(
             let op = arith_prim_op(sel).expect("guarded by the match arm");
             numeric_binop(ev, op, Value::LargeInt(n), args.remove(0), sel)
         }
-        "asString" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(Arc::from(n.to_string())))
-        }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from(n.to_string().as_str())))
-        }
-        "asFloat" => {
-            expect_arity(sel, 0, args.len())?;
-            let f = n.to_f64().unwrap_or(f64::INFINITY);
-            Ok(Value::Float(f))
         }
         _ => dispatch_primitive_fallback(ev, Value::LargeInt(n), "ArbitraryInteger", sel, args),
     }
@@ -1342,26 +1374,6 @@ fn dispatch_float(
             expect_arity(sel, 1, args.len())?;
             let op = arith_prim_op(sel).expect("guarded by the match arm");
             numeric_binop(ev, op, Value::Float(f), args.remove(0), sel)
-        }
-        "truncated" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Int(f.trunc() as i64))
-        }
-        "rounded" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Int(f.round() as i64))
-        }
-        "ceiling" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Int(f.ceil() as i64))
-        }
-        "floor" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Int(f.floor() as i64))
-        }
-        "asInt" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Int(f as i64))
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;

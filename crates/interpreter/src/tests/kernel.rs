@@ -523,3 +523,70 @@ fn user_class_can_override_equality_without_touching_identity() {
         Value::Bool(true)
     );
 }
+
+// ── C34 S3: numeric conversions ──────────────────────────────────────────────
+
+#[test]
+fn integer_conversions_are_smol() {
+    assert_eq!(eval("3 asFloat"), Value::Float(3.0));
+    assert_eq!(eval("3 asString"), Value::Str(Arc::from("3")));
+    assert_eq!(eval("-7 asString"), Value::Str(Arc::from("-7")));
+    // ArbitraryInteger shares the same two methods, grounded on the same prims.
+    // 21! is the first factorial past i64, so this is genuinely the LargeInt path.
+    assert_eq!(
+        eval("(21 factorial) class printString"),
+        Value::Str(Arc::from("ArbitraryInteger"))
+    );
+    assert_eq!(
+        eval("(21 factorial) asString"),
+        Value::Str(Arc::from("51090942171709440000"))
+    );
+    assert_eq!(eval("(100 factorial) asString size"), Value::Int(158));
+}
+
+#[test]
+fn large_integer_as_float_saturates_rather_than_erroring() {
+    // Behaviour preserved from the arm this replaced.
+    assert_eq!(eval("(100 factorial) asFloat > 1.0e150"), Value::Bool(true));
+    assert_eq!(
+        eval("(1000 factorial) asFloat > 1.0e300"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn float_rounding_modes_differ_on_negatives() {
+    // Positive values agree often enough to hide a mistake; negatives separate
+    // truncation (toward zero) from floor (toward -inf) and ceiling.
+    assert_eq!(eval("2.7 truncated"), Value::Int(2));
+    assert_eq!(eval("2.7 rounded"), Value::Int(3));
+    assert_eq!(eval("2.2 ceiling"), Value::Int(3));
+    assert_eq!(eval("2.7 floor"), Value::Int(2));
+
+    assert_eq!(eval("-2.7 truncated"), Value::Int(-2));
+    assert_eq!(eval("-2.7 rounded"), Value::Int(-3));
+    assert_eq!(eval("-2.2 ceiling"), Value::Int(-2));
+    assert_eq!(eval("-2.7 floor"), Value::Int(-3));
+}
+
+#[test]
+fn as_int_is_truncation_and_needs_no_primitive() {
+    // `asInt` was a fifth Rust arm doing the same `as i64` cast as `truncated`;
+    // it is now one line of Smol saying so.
+    assert_eq!(eval("2.7 asInt"), Value::Int(2));
+    assert_eq!(eval("-2.7 asInt"), Value::Int(-2));
+    assert_eq!(eval("2.7 asInt = 2.7 truncated"), Value::Bool(true));
+    assert_eq!(eval("-2.7 asInt = -2.7 truncated"), Value::Bool(true));
+}
+
+#[test]
+fn numeric_conversions_are_visible_to_reflection() {
+    assert_eq!(eval("3 respondsTo: #asFloat"), Value::Bool(true));
+    assert_eq!(eval("3 respondsTo: #asString"), Value::Bool(true));
+    assert_eq!(eval("2.5 respondsTo: #rounded"), Value::Bool(true));
+    assert_eq!(eval("2.5 respondsTo: #asInt"), Value::Bool(true));
+    assert_eq!(
+        eval("(100 factorial) respondsTo: #asFloat"),
+        Value::Bool(true)
+    );
+}

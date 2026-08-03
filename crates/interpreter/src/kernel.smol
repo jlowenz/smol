@@ -1365,6 +1365,28 @@ Block >> whileFalse [
     ^self whileFalse
 ]
 
+"Numeric conversions (plan chunk_34 §5, S3). Pure `_prim` grounding — no protocol
+design, which is why these sit on the LEAVES rather than on abstract Number/Integer.
+A `_prim` may only be sent to `self` (self-only rule) and only a leaf IS the encoding,
+so grounding lives here; the abstract projecting form (`Number >> asFloat
+[^self value asFloat]`, the §4e seam) would be a genuine protocol ADDITION — a wrapper
+answers doesNotUnderstand to `asFloat` today, exactly as it did before this step — and
+is left for a later step rather than smuggled in here. Same for `Integer >> rounded`
+and friends (identity on an integer) and `Float >> asFloat`.
+
+`asInt` needs no primitive: it IS truncation, and now says so in Smol instead of
+being a fifth Rust arm that happened to do the same `as i64` cast."
+MachineInteger   >> asFloat  [ ^self _primAsFloat ]
+ArbitraryInteger >> asFloat  [ ^self _primAsFloat ]
+MachineInteger   >> asString [ ^self _primAsString ]
+ArbitraryInteger >> asString [ ^self _primAsString ]
+
+Float >> truncated [ ^self _primTruncated ]
+Float >> rounded   [ ^self _primRounded ]
+Float >> ceiling   [ ^self _primCeiling ]
+Float >> floor     [ ^self _primFloor ]
+Float >> asInt     [ ^self truncated ]
+
 "── Number and Integer protocol (plan §4c, S4) ───────────────────────────────
 
 Authored in Smol on the ABSTRACT classes, which is the payoff of the tower: this is
