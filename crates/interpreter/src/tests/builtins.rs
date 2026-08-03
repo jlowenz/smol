@@ -332,8 +332,55 @@ fn string_size() {
 
 #[test]
 fn string_at() {
-    assert_eq!(eval_diff("'abc' at: 1"), Value::Str(Arc::from("a")));
-    assert_eq!(eval_diff("'abc' at: 3"), Value::Str(Arc::from("c")));
+    // C34 S4: 0-based, matching every collection. This asserted at:1 -> "a" while
+    // the arm was 1-based, which left String incoherent with itself after S3a made
+    // copyFrom:to: 0-based.
+    assert_eq!(eval_diff("'abc' at: 0"), Value::Str(Arc::from("a")));
+    assert_eq!(eval_diff("'abc' at: 1"), Value::Str(Arc::from("b")));
+    assert_eq!(eval_diff("'abc' at: 2"), Value::Str(Arc::from("c")));
+    // `at: 0` used to be out of bounds; `at: size` now is.
+    assert!(matches!(
+        eval_err_diff("'abc' at: 3"),
+        crate::eval::EvalError::TypeError(_)
+    ));
+    assert!(matches!(
+        eval_err_diff("'abc' at: -1"),
+        crate::eval::EvalError::TypeError(_)
+    ));
+    // at: and copyFrom: now agree about what index 0 means.
+    assert_eq!(eval("'abc' at: 0"), eval("'abc' copyFrom: 0 to: 0"));
+}
+
+#[test]
+fn string_is_empty_is_no_longer_object_default() {
+    // Before S4, String had no method dictionary to define this in, so the send
+    // fell through to `Object >> isEmpty [^false]` and `'' isEmpty` answered FALSE.
+    assert_eq!(eval("'' isEmpty"), Value::Bool(true));
+    assert_eq!(eval("'abc' isEmpty"), Value::Bool(false));
+    assert_eq!(eval("'' notEmpty"), Value::Bool(false));
+    assert_eq!(eval("'abc' notEmpty"), Value::Bool(true));
+}
+
+#[test]
+fn string_protocol_is_visible_to_reflection() {
+    // The Q14 payoff: these were Rust arms, invisible to respondsTo:.
+    for sel in [
+        "#size",
+        "#at:",
+        "#,",
+        "#reversed",
+        "#asSymbol",
+        "#includesSubString:",
+        "#copyFrom:to:",
+        "#copyFrom:until:",
+        "#isEmpty",
+    ] {
+        assert_eq!(
+            eval(&format!("'abc' respondsTo: {sel}")),
+            Value::Bool(true),
+            "String should respondTo: {sel}"
+        );
+    }
 }
 
 #[test]

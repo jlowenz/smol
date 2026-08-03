@@ -1283,11 +1283,41 @@ Value vmSubclass: #String
 `'cat' - 'cab'` is meaningless. Grounds to the `_primStrLt:` primitive."
 String >> < aString [ ^self _primStrLt: aString ]
 
-"String is the one place the derivation still runs the other way, because
-`copyFrom:to:` is still a Rust arm — S4 migrates the String protocol. When it does,
-the primitive should be grounded HALF-OPEN so String matches the collections above
-and this `- 1` disappears."
-String >> copyFrom: start until: stop [ ^self copyFrom: start to: stop - 1 ]
+"The String protocol (C34 S4). Every one of these was a Rust `match` arm; what
+remains in `dispatch_str` is only the `_prim` grounding they send to, which is
+irreducible — indexing into UTF-8, concatenating, and interning a Symbol all need
+host support. The payoff is that String now answers `respondsTo:` accurately, can
+be read and extended from Smol, and that new operations (`split`, `trimmed`,
+`startsWith:`, `asUppercase`, …) are ordinary Smol methods rather than new Rust.
+
+INDEXING IS 0-BASED, which changes `at:`. It was 1-based (`chars().nth(i - 1)`,
+the Smalltalk-80 convention) while every collection was 0-based — the same
+inconsistency S3a settled for `copyFrom:to:`. Leaving it would have made String
+incoherent with ITSELF after S3a: `'hello' copyFrom: 0 to: 0` answered `'h'` while
+`'hello' at: 0` was out of bounds and `at: 1` answered `'h'`. Same class, two bases.
+`docs/string_representation_plan.md` §3 specified 1-based; this chunk supersedes it.
+
+`copyFrom:until:` is the primitive and `copyFrom:to:` derives (S3a), matching the
+collections — the half-open form needs no adjustment arithmetic.
+
+`at:` answers a one-character String; it becomes a `Character` when that class
+lands (old plan §6, still wanted)."
+String >> size                   [ ^self _primSize ]
+String >> at: index              [ ^self _primAt: index ]
+String >> , aString              [ ^self _primConcat: aString ]
+String >> reversed               [ ^self _primReversed ]
+String >> asSymbol               [ ^self _primAsSymbol ]
+String >> includesSubString: sub [ ^self _primIncludesSubString: sub ]
+
+String >> copyFrom: start until: stop [ ^self _primCopyFrom: start until: stop ]
+String >> copyFrom: start to: stop    [ ^self copyFrom: start until: stop + 1 ]
+
+"`isEmpty` answered FALSE for `''` before S4, because String had no method
+dictionary to define it in and the send fell through to `Object >> isEmpty [^false]`.
+That is a wrong answer rather than a missing feature, and having a real String class
+is exactly what makes it fixable — Array and OrderedCollection both define it."
+String >> isEmpty  [ ^self size = 0 ]
+String >> notEmpty [ ^self isEmpty not ]
 
 Value vmSubclass: #Symbol
     instanceVariableNames: ''

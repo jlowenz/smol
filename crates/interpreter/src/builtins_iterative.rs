@@ -1411,21 +1411,24 @@ fn dispatch_str(
     mut args: Vec<Value>,
     _env: &mut Env,
 ) -> Result<Value, EvalError> {
+    // The public String protocol lives in `kernel.smol` (C34 S4); what remains here
+    // is the irreducible grounding it sends to. Indexing is 0-based and char-based
+    // (Unicode scalar), matching every other collection.
     match sel.as_ref() {
-        "size" => {
+        "_primSize" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Int(s.chars().count() as i64))
         }
-        "at:" => {
+        "_primAt:" => {
             expect_arity(sel, 1, args.len())?;
-            let idx = as_int(ev, args.remove(0), sel)? as usize;
-            // 1-based index (Smalltalk convention).
-            s.chars()
-                .nth(idx.wrapping_sub(1))
+            let idx = as_int(ev, args.remove(0), sel)?;
+            usize::try_from(idx)
+                .ok()
+                .and_then(|i| s.chars().nth(i))
                 .map(|c| Value::Str(Arc::from(c.to_string().as_str())))
                 .ok_or_else(|| EvalError::TypeError(format!("{sel}: index {idx} out of bounds")))
         }
-        "," => {
+        "_primConcat:" => {
             expect_arity(sel, 1, args.len())?;
             match force_value(ev, args.remove(0))? {
                 Value::Str(other) => Ok(Value::Str(Arc::from(format!("{s}{other}").as_str()))),
@@ -1444,44 +1447,35 @@ fn dispatch_str(
                 ))),
             }
         }
-        "printString" => {
-            expect_arity(sel, 0, args.len())?;
-            let s: Arc<str> = Arc::from(format!("'{s}'").as_str());
-            println!("{:?}", s);
-            Ok(Value::Str(s))
-        }
-        "asSymbol" => {
+        "_primAsSymbol" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Symbol(s))
         }
-        "reversed" => {
+        "_primReversed" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from(
                 s.chars().rev().collect::<String>().as_str(),
             )))
         }
-        // 0-based, INCLUSIVE of `to` — matching `Array`/`ByteArray`/
-        // `OrderedCollection` and the `to:` of `to:do:` (C34 S3a). Until then this
-        // arm did `saturating_sub(1)` on `from`, making it 1-based (the Smalltalk-80
-        // convention) while every collection was 0-based, so the same selector meant
-        // two different things by receiver — and `copyFrom: 0` was indistinguishable
-        // from `copyFrom: 1`. Out-of-range still answers an empty string rather than
-        // erroring, as before.
-        "copyFrom:to:" => {
+        // HALF-OPEN and 0-based, so it is the same primitive shape the collections
+        // use (C34 S3a): the length is `until - from` with no adjustment, and
+        // `String >> copyFrom:to:` derives from it in Smol. Out-of-range answers an
+        // empty string rather than erroring, as the arm this replaced did.
+        "_primCopyFrom:until:" => {
             expect_arity(sel, 2, args.len())?;
             let from = as_int(ev, args.remove(0), sel)?;
-            let to = as_int(ev, args.remove(0), sel)?;
+            let until = as_int(ev, args.remove(0), sel)?;
             let chars: Vec<char> = s.chars().collect();
-            let slice: String = if from < 0 || to < from {
+            let slice: String = if from < 0 || until <= from {
                 String::new()
             } else {
                 let lo = from as usize;
-                let hi = (to as usize).saturating_add(1).min(chars.len());
+                let hi = (until as usize).min(chars.len());
                 chars.get(lo..hi).unwrap_or(&[]).iter().collect()
             };
             Ok(Value::Str(Arc::from(slice.as_str())))
         }
-        "includesSubString:" => {
+        "_primIncludesSubString:" => {
             expect_arity(sel, 1, args.len())?;
             match force_value(ev, args.remove(0))? {
                 Value::Str(sub) => Ok(Value::Bool(s.contains(sub.as_ref()))),
@@ -1489,6 +1483,12 @@ fn dispatch_str(
                     "{sel}: argument must be String"
                 ))),
             }
+        }
+        "printString" => {
+            expect_arity(sel, 0, args.len())?;
+            let s: Arc<str> = Arc::from(format!("'{s}'").as_str());
+            println!("{:?}", s);
+            Ok(Value::Str(s))
         }
         _ => dispatch_primitive_fallback(ev, Value::Str(s), "String", sel, args),
     }

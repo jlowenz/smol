@@ -3698,12 +3698,12 @@ fn s5_responds_to_is_universal_across_value_kinds() {
     // MNU'd on every scalar despite Object being the root class. The coercion edge
     // asks it of an arbitrary operand, so it must answer everywhere.
     //
-    // KNOWN LIMITATION (pre-existing, not introduced by the lift): it answers from
-    // the class method dictionary only, so it sees Smol-defined methods and is blind
-    // to Rust builtins — `'s' respondsTo: #size` is false even though `'s' size`
-    // works. S5 is unaffected because adapt selectors are always Smol-defined, but
-    // the predicate is unsound in general. Asserted here so the gap is visible rather
-    // than latent.
+    // The predicate answers from the class method dictionary only, so it sees
+    // Smol-defined methods and is blind to whatever is still a Rust arm. That gap is
+    // what open_questions Q14 is about, and C34 closes it family by family rather
+    // than by building a builtin-selector registry: as each family's protocol moves
+    // into kernel.smol, `respondsTo:` becomes accurate for it BY CONSTRUCTION.
+    // `'s' respondsTo: #size` was false here until S4 migrated the String protocol.
     assert_eq!(eval("3 respondsTo: #abs"), Value::Bool(true));
     assert_eq!(eval("3 respondsTo: #noSuchThing"), Value::Bool(false));
     assert_eq!(eval("2.5 respondsTo: #sign"), Value::Bool(true));
@@ -3714,8 +3714,16 @@ fn s5_responds_to_is_universal_across_value_kinds() {
     );
     // A non-Symbol argument answers false rather than erroring.
     assert_eq!(eval("3 respondsTo: 'abs'"), Value::Bool(false));
-    // The builtin blind spot, pinned:
-    assert_eq!(eval("'s' respondsTo: #size"), Value::Bool(false));
+
+    // Closed by C34 S4 — String's protocol is a method dictionary now.
+    assert_eq!(eval("'s' respondsTo: #size"), Value::Bool(true));
+    assert_eq!(eval("'s' respondsTo: #asSymbol"), Value::Bool(true));
+
+    // The remaining blind spot, pinned: `printString` is still a Rust arm on every
+    // family (C34 S5 owns it, gated on the OQ-4 naming decision). When S5 lands,
+    // these flip to true and this pin moves to whatever is still in Rust.
+    assert_eq!(eval("'s' respondsTo: #printString"), Value::Bool(false));
+    assert_eq!(eval("3 respondsTo: #printString"), Value::Bool(false));
 }
 
 #[test]

@@ -44,7 +44,7 @@ arithmetic over `_primAdd:` and friends, and S7 then deleted 39 superseded arms.
 
 | Family | Arms | Selectors |
 |---|---|---|
-| String | 10 → **8** | `, at: copyFrom:to: includesSubString: reversed size asSymbol printString` (~~`= ~=`~~ → `Object >> =`, S2) |
+| String | 10 → **1** | `printString` (~~`= ~=`~~ → `Object >> =`, S2; ~~`, at: copyFrom:to: includesSubString: reversed size asSymbol`~~ → Smol, S4) |
 | Float | 6 → **1** | `printString` (~~`asInt ceiling floor rounded truncated`~~ → Smol, S3) |
 | Int | 5 → **1** | `printString` (~~`to:do: to:by:do:`~~ S1/S1b; ~~`asFloat asString`~~ → Smol, S3) |
 | LargeInt | 3 → **1** | `printString` (~~`asFloat asString`~~ → Smol, S3) |
@@ -127,7 +127,7 @@ Each phase is independently committable and leaves the suite green.
   inclusive/exclusive pair across both the iteration and copy protocols. **DONE** — §5g.
 - **S4 — String** (10 arms). Also folds in and retires `string_representation_plan.md`
   entirely, per OQ-5. `copyFrom:to:`'s convention is already settled by S3a, so its
-  migration is now mechanical.
+  migration is now mechanical. **DONE 2026-08-02** — see §5h.
 - **S5 — `printString` / `asString`** across all families, pending the naming decision
   (OQ-4) — deliberately last, because it may rename the selector.
 - **S6 — Prune + audit**, mirroring tower S7: delete superseded arms, verify irreducibility
@@ -467,6 +467,52 @@ now `'llo'`). Out-of-range still answers `''` rather than erroring, as before.
 Still Rust: `String >> copyFrom:to:` itself. S4 migrates it; the convention is now correct
 so that migration is mechanical. `String >> copyFrom:until:` is already Smol, since it
 just re-dispatches.
+
+## 5h. S4 — the String protocol (DONE 2026-08-02)
+
+Seven arms out; `dispatch_str` now holds only `_prim` grounding plus `printString`
+(S5's). The grounding is genuinely irreducible — indexing into UTF-8, concatenating,
+interning a Symbol all need host support:
+
+```smalltalk
+String >> size  at:  ,  reversed  asSymbol  includesSubString:
+String >> copyFrom: start until: stop [ ^self _primCopyFrom: start until: stop ]
+String >> copyFrom: start to: stop    [ ^self copyFrom: start until: stop + 1 ]
+String >> isEmpty / notEmpty
+```
+
+**`at:` is now 0-based**, which is a behaviour change. It was 1-based
+(`chars().nth(i - 1)`, the Smalltalk-80 convention) while every collection was
+0-based. Leaving it would have made String incoherent with **itself** after S3a:
+`'hello' copyFrom: 0 to: 0` answered `'h'` while `'hello' at: 0` was out of bounds and
+`at: 1` answered `'h'` — one class, two bases. The retired plan's §3 specified 1-based
+"as today"; this chunk supersedes it. One test asserted the old behaviour.
+
+**`copyFrom:until:` is the primitive** (`_primCopyFrom:until:`), with `copyFrom:to:`
+deriving, so String now matches the collections after S3a and the `- 1` that stood in
+for it is gone.
+
+**`isEmpty` was answering the wrong thing.** `'' isEmpty` was **false**: String had no
+method dictionary to define it in, so the send fell through to
+`Object >> isEmpty [^false]`. A wrong answer rather than a missing feature, and having
+a real String class is exactly what makes it fixable.
+
+**Q14 moves visibly.** The pinned assertion in `s5_responds_to_is_universal_across_value_kinds`
+was `'s' respondsTo: #size` → **false**; it is now true, along with the rest of the
+String protocol. The pin moved to `printString`, which is still Rust on every family
+(S5). This is Q14 being closed family-by-family by construction, exactly as §2 claimed,
+rather than by building a builtin-selector registry.
+
+**OQ-5 discharged, but not by deleting.** `string_representation_plan.md` is marked
+RETIRED with a per-section status table rather than removed, because three of its
+sections are live design work chunk 34 does not cover: §4 construction contract, §5
+immutability/`StringBuilder`, §6 `Character`.
+
+**§4's hazard is real and still open** (verified while retiring the plan, pre-existing —
+not introduced by S4): `String new` answers a generic `ValueObject` of class String, not
+a `Value::Str`. So `String new size` fails with "receiver has no indexed storage" and
+`String new = ''` is false; `Symbol new` is the same. The fix is the per-encoded-class
+`new`/`new:` overrides that section describes, and it is NOT in this chunk.
 
 ## 6. Open questions
 

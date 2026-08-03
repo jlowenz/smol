@@ -1,8 +1,24 @@
 # Scalar value representation & String plan
 
-**Status:** design largely settled; implementation deferred to a later session.
-One naming question open (§7) and one sequencing dependency: **traits should land
-before or alongside this** (§8). Character is a follow-up (§6).
+> **RETIRED 2026-08-02 — superseded by `docs/chunk_34_plan.md`** (that plan's OQ-5).
+> Kept rather than deleted because several sections are still live design work that
+> chunk 34 does NOT cover. Do not plan new work from this file without reading the
+> status markers below; where it and chunk 34 disagree, **chunk 34 wins**.
+>
+> | § | status |
+> |---|---|
+> | §1 encodings-not-things | **DONE** — the governing principle throughout C34 |
+> | §2 reparent scalars under `Value` | **DONE** (numeric tower S1a). All scalars answer `isKindOf: Value`; `lookup_user_method` arms exist for `Str`/`Float`/`Symbol`/`LargeInt`. Parentage of `Nil`/`Block`/`Future`/`Namespace` is still **OPEN** — and C34 §6 OQ-6 now owns the `Namespace` part, since it needs a routing arm before it can be a class at all. |
+> | §3 `String` surface | **DONE by C34 S4**, with one reversal: §3 specified **1-based** indexing "as today"; C34 S3a/S4 made indexing **0-based** throughout, so `at:` and `copyFrom:to:` agree with every collection. The "new operations in Smol" payoff is now available — `String` has a real method dictionary. |
+> | §4 construction contract | **OPEN, and the hazard is REAL.** `String new` today answers a generic `ValueObject` of class String, not a `Value::Str` — so `String new size` fails with "receiver has no indexed storage" and `String new = ''` is false. `Symbol new` is the same. Fixing it needs the per-encoded-class `new`/`new:` overrides this section describes. |
+> | §5 immutability / `StringBuilder` | **OPEN** — unchanged, and still wanted. |
+> | §6 `Character` | **OPEN** — unchanged. `String >> at:` still answers a one-character String. |
+> | §7 non-subclassable scalars | **DONE** — `vmSubclass:` implements it; `String subclass: #Foo` is rejected. |
+> | §8 sequencing (traits first) | **DONE** — traits landed 2026-07-11. |
+
+**Original status (historical):** design largely settled; implementation deferred to a
+later session. One naming question open (§7) and one sequencing dependency: **traits
+should land before or alongside this** (§8). Character is a follow-up (§6).
 
 ---
 
