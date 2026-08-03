@@ -44,15 +44,19 @@ arithmetic over `_primAdd:` and friends, and S7 then deleted 39 superseded arms.
 
 | Family | Arms | Selectors |
 |---|---|---|
-| String | 10 | `, at: copyFrom:to: includesSubString: reversed size asSymbol = ~= printString` |
+| String | 10 → **8** | `, at: copyFrom:to: includesSubString: reversed size asSymbol printString` (~~`= ~=`~~ → `Object >> =`, S2) |
 | Float | 6 | `asInt ceiling floor rounded truncated printString` |
 | Int | 5 → **3** | `asFloat asString printString` (~~`to:do: to:by:do:`~~ — the dead arms went in S1; the evaluator special-case went in S1b) |
 | LargeInt | 3 | `asFloat asString printString` |
-| Symbol | 5 | `= ~= asString asSymbol printString` |
-| Nil | 3 | `= ~= printString` |
+| Symbol | 5 → **1** | `printString` (~~`= ~=`~~ → `Object >> =`; ~~`asString asSymbol`~~ → Smol, S2) |
+| Nil | 3 → **1** | `printString` (~~`= ~=`~~ → `Object >> =`, S2) |
 | Namespace | 3 | `do: name printString` |
 | Class | 4 | `= ~= name printString` |
-| fallback | 1 | `error:` |
+| fallback | 1 | `error:` (+ `_primIdentical:`/`_primAsString` grounding added in S2) |
+
+Also removed in S2 but not in the table above (it counts only scalar/namespace/class
+dispatchers): `obj_prim_core`'s `=`/`~=` for instance receivers, replaced by the same
+`Object >> =`.
 
 Not counted: the `dispatch_object_primitive` chunks (`obj_prim_core`, `obj_prim_traits`,
 …), which serve instances/entities and need their own inventory pass — see §6 OQ-6.
@@ -112,6 +116,9 @@ Each phase is independently committable and leaves the suite green.
   `Object >> =`/`~=` in terms of it (OQ-3), then Nil, Symbol, Namespace, Class (15 arms).
   Settling identity first is what lets the per-variant `=`/`~=` arms go, and it makes S6's
   numeric `=` bounce rest on one uniform root rather than scattered Rust arms.
+  **Identity + Nil + Symbol DONE 2026-08-02** (see §5e). **Namespace and Class are NOT
+  done** — see §5e's re-cut note; they need dispatch *routing* changes rather than method
+  definitions, which is the same category of work OQ-6 defers.
 - **S3 — Numeric conversions:** Float's `asInt ceiling floor rounded truncated`, Int/
   LargeInt's `asFloat asString` (11 arms). Pure `_prim` grounding, no protocol design.
 - **S4 — String** (10 arms). Also folds in and retires `string_representation_plan.md`
@@ -301,6 +308,59 @@ expected leverage:
 2. **Sends per operation.** OQ-1 already records the answer — inline the compiled fast
    path when the method has not been overridden — and it applies to `<` and `+` on the
    leaves at least as much as to `to:do:`.
+
+## 5e. S2 — identity, and why Namespace/Class did not follow (2026-08-02)
+
+```smalltalk
+Object >> == other [ ^self _primIdentical: other ]
+Object >> ~~ other [ ^(self == other) not ]
+Object >> =  other [ ^self == other ]
+Object >> ~= other [ ^(self = other) not ]
+```
+
+Grounded twice, not per family: `_primIdentical:` lives in
+`dispatch_primitive_fallback` (which now takes the receiver, so every primitive kind
+shares one implementation) and in `obj_prim_core` (instances). Eight arms went:
+`=`/`~=` for Nil, Symbol, String and instances. Symbol's `asString`/`asSymbol` went too —
+`asSymbol` needed no primitive at all, since a Symbol already is one.
+
+**`==` required a lexer change.** `('=', '=')` was missing from the two-char operator
+table, so `a == b` lexed as two `=` tokens and `kernel.smol` failed to *parse*. `('~','~')`
+was already there, but nothing implemented `~~`, so it could only answer
+doesNotUnderstand — S2 defines it as the negation of `==`, completing the pair.
+
+**Class identity had to join the synchronous list.** A class object is an entity, so a
+behavioural send answers a Future; `=`/`~=` were already special-cased as synchronous in
+`dispatch_class`. Introducing `==` without adding it there made `Array == Array` answer a
+**Future** while `Array = Array` answered a Bool. `==`/`~~` now sit alongside.
+
+**The `==` semantics decision** (OQ-3's open sub-question) is recorded in full in the
+`kernel.smol` comment above `Object >> ==`. In short: structural for encoded scalars
+(`'abc' == 'abc'` is true, unlike Pharo), same-allocation for anything heap-allocated
+**including ValueObjects** (two equal Associations are not `==`; that is `=`'s job, and
+keeping `==` non-recursive is what keeps it O(1)). `2 == 2.0` is false while `2 = 2.0` is
+true — the clearest illustration of why both selectors exist.
+
+**Re-cut: Namespace and Class move out of S2.** Both were listed here, but neither is a
+matter of writing a method:
+
+- **Namespace** is not routed at all — `lookup_user_method` answers `None` for
+  `Value::Namespace`, and there is no `Namespace` class in the kernel. Migrating it means
+  making Namespace a first-class kernel class (with the `value_to_class_handle` /
+  `is_encoded_leaf_name` reflection consequences, and a decision about whether it is
+  subclassable), adding a routing arm, and grounding `name`. Its `do:` is *also* an
+  evaluator special-case — step **(1g)**, with a correspondingly dead arm in
+  `dispatch_namespace`, exactly the shape S1 and S1b found for `to:do:`. Unlike `to:do:`
+  the operation is genuinely irreducible (it swaps evaluator state), so the honest target
+  is `Namespace >> do: aBlock [ ^self _primNamespaceDo: aBlock ]` — reflection and a real
+  method, without pretending the body can be written in Smol.
+- **Class** does not reach `Object >> =` at all: `dispatch_class` resolves against
+  CLASS-side methods via `lookup_class_method`, so migrating `=`/`~=`/`name` needs
+  `Object class >>` definitions plus a decision about `_prim` self-sends from class-side
+  methods. That is precisely the class-side surface OQ-6 defers to chunk 35.
+
+So both belong with the routing/class-side work rather than with "simple families". Their
+arms are left in place and correct; nothing is half-migrated.
 
 ## 6. Open questions
 

@@ -413,3 +413,113 @@ fn to_do_works_for_a_number_wrapper() {
         Value::Int(3)
     );
 }
+
+// ── C34 S2: identity (== / ~~) and Object >> = / ~= ──────────────────────────
+//
+// `==` is the identity primitive and `=` is defined in terms of it, replacing a
+// per-variant Rust `=`/`~=` pair for Nil, Symbol, String and instances.
+
+#[test]
+fn identity_is_structural_for_encoded_scalars() {
+    // An encoded scalar has no identity apart from its content, so `==` is
+    // structural. Pharo answers false for two distinct String objects; that is an
+    // artifact of everything being a heap object, not something to copy.
+    assert_eq!(eval("'abc' == 'abc'"), Value::Bool(true));
+    assert_eq!(eval("3 == 3"), Value::Bool(true));
+    assert_eq!(eval("#foo == #foo"), Value::Bool(true));
+    assert_eq!(eval("nil == nil"), Value::Bool(true));
+    assert_eq!(eval("true == true"), Value::Bool(true));
+    // The two integer encodings are one value.
+    assert_eq!(
+        eval("(100 factorial) == (100 factorial)"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn identity_and_equality_part_company_on_float() {
+    // The reason both selectors exist: `==` asks whether these are the same value,
+    // `Number >> =` promotes across encodings. 2 and 2.0 are different values.
+    assert_eq!(eval("2 == 2.0"), Value::Bool(false));
+    assert_eq!(eval("2 = 2.0"), Value::Bool(true));
+}
+
+#[test]
+fn identity_is_by_allocation_for_value_objects() {
+    // A ValueObject is semantically a Value but HAS a distinct allocation, so `==`
+    // stays O(1) and does not recurse. Content equality is `=`'s job, which is
+    // exactly why Association overrides it.
+    assert_eq!(
+        eval("(Association key: 1 value: 2) == (Association key: 1 value: 2)"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        eval("(Association key: 1 value: 2) = (Association key: 1 value: 2)"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval("| a | a := Association key: 1 value: 2. a == a"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn tilde_tilde_is_the_negation_of_identity() {
+    // `~~` lexed before S2 but nothing implemented it, so it could only ever
+    // answer doesNotUnderstand.
+    assert_eq!(eval("3 ~~ 4"), Value::Bool(true));
+    assert_eq!(eval("3 ~~ 3"), Value::Bool(false));
+    assert_eq!(eval("'a' ~~ 'a'"), Value::Bool(false));
+}
+
+#[test]
+fn default_equality_reaches_object_for_every_receiver_kind() {
+    // The point of the migration: one implementation instead of one Rust arm per
+    // Value variant. Each of these used to be its own arm.
+    assert_eq!(eval("nil = nil"), Value::Bool(true));
+    assert_eq!(eval("nil = 3"), Value::Bool(false));
+    assert_eq!(eval("#a = #a"), Value::Bool(true));
+    assert_eq!(eval("#a = 'a'"), Value::Bool(false));
+    assert_eq!(eval("'a' = 'a'"), Value::Bool(true));
+    assert_eq!(eval("nil ~= 3"), Value::Bool(true));
+    assert_eq!(eval("'a' ~= 'b'"), Value::Bool(true));
+}
+
+#[test]
+fn class_identity_is_synchronous_not_a_future() {
+    // A class object is an entity, so a behavioural send to it answers a Future.
+    // `=`/`~=` were already special-cased as synchronous; S2 added `==`/`~~`
+    // alongside them, since a Bool is expected where identity is asked.
+    assert_eq!(eval("Array == Array"), Value::Bool(true));
+    assert_eq!(eval("Array ~~ OrderedCollection"), Value::Bool(true));
+    assert_eq!(eval("Array = Array"), Value::Bool(true));
+    assert_eq!(eval("Array = OrderedCollection"), Value::Bool(false));
+}
+
+#[test]
+fn symbol_conversions_are_smol() {
+    assert_eq!(eval("#foo asString"), Value::Str(Arc::from("foo")));
+    assert_eq!(eval("#foo asSymbol"), Value::Symbol(Arc::from("foo")));
+    // asSymbol on a Symbol is the identity, so it needs no primitive at all.
+    assert_eq!(eval("#foo asString asSymbol == #foo"), Value::Bool(true));
+    assert_eq!(eval("#foo respondsTo: #asString"), Value::Bool(true));
+}
+
+#[test]
+fn user_class_can_override_equality_without_touching_identity() {
+    let src = "
+        Value subclass: #Pt instanceVariableNames: 'x'
+            classVariableNames: '' indexedSlots: #none.
+        Pt class >> of: v [ ^self _primNewValue: [:p | p setX: v] ]
+        Pt >> setX: v [ x := v ]
+        Pt >> x [ ^x ]
+        Pt >> = other [ ^(other isKindOf: Pt) and: [ other x = x ] ]
+        | a b | a := Pt of: 1. b := Pt of: 1.
+        Array new: 2
+    ";
+    // `=` is overridden to content equality; `==` still answers allocation identity.
+    assert_eq!(
+        eval(&src.replace("Array new: 2", "(a = b) and: [ (a == b) not ]")),
+        Value::Bool(true)
+    );
+}

@@ -269,7 +269,9 @@ impl<'src> Lexer<'src> {
     fn read_binop(&mut self, first: char) -> Token {
         let mut s = String::new();
         s.push(first);
-        // Multi-char operators: `<=`, `>=`, `>>`, `~=`, `//`, `\\`, `~~`, `->`.
+        // Multi-char operators: `<=`, `>=`, `>>`, `~=`, `==`, `//`, `\\`, `~~`, `->`.
+        // `==`/`~~` are the identity pair introduced in C34 S2; without the
+        // `('=', '=')` entry `a == b` lexes as two `=` tokens and fails to parse.
         if let Some(next) = self.peek_char() {
             let two = matches!(
                 (first, next),
@@ -277,6 +279,7 @@ impl<'src> Lexer<'src> {
                     | ('>', '=')
                     | ('>', '>')
                     | ('~', '=')
+                    | ('=', '=')
                     | ('/', '/')
                     | ('\\', '\\')
                     | ('-', '>')

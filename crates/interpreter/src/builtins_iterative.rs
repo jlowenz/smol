@@ -164,7 +164,7 @@ pub fn dispatch(
     match recv {
         Value::Int(n) => dispatch_int(ev, n, &selector, args, env),
         Value::Float(f) => dispatch_float(ev, f, &selector, args, env),
-        Value::Bool(_) => dispatch_primitive_fallback(ev, "Bool", &selector, args),
+        Value::Bool(b) => dispatch_primitive_fallback(ev, Value::Bool(b), "Bool", &selector, args),
         Value::Nil => dispatch_nil(ev, &selector, args, env),
         Value::Str(s) => dispatch_str(ev, s, &selector, args, env),
         Value::Symbol(s) => dispatch_symbol(ev, s, &selector, args, env),
@@ -1146,8 +1146,14 @@ pub(crate) fn build_message(
 /// enough to bypass user-defined method lookup (unlike the pre-checks in
 /// `dispatch()`). Object/ValueObject instances never reach this function —
 /// they have their own fallback in `dispatch_object_primitive`.
+/// Shared tail for every primitive dispatcher: the selectors that are grounded
+/// identically for *all* primitive receivers.
+///
+/// Requires: `self_val` is the receiver the caller dispatched on.
+/// Ensures: answers the grounded value, or `MessageNotUnderstood` naming `kind`.
 fn dispatch_primitive_fallback(
     ev: &Evaluator,
+    self_val: Value,
     kind: &'static str,
     sel: &Arc<str>,
     mut args: Vec<Value>,
@@ -1155,6 +1161,27 @@ fn dispatch_primitive_fallback(
     // NOTE: primitive types (Int, Float, etc.) don't carry an Env — handler_chain
     // checking is skipped here. Use dispatch_object_primitive for Condition instances.
     match sel.as_ref() {
+        // Grounding for `Object >> ==` (C34 S2). Lives here rather than in each
+        // per-variant dispatcher so there is exactly ONE identity implementation
+        // for primitive receivers; `obj_prim_core` grounds the instance case.
+        "_primIdentical:" => {
+            expect_arity(sel, 1, args.len())?;
+            Ok(Value::Bool(self_val == force_value(ev, args.remove(0))?))
+        }
+        // Rendering an encoded value as a String. One `_prim` per operation
+        // branching on the variant (§4), rather than a per-family selector.
+        // S2 grounds Symbol; S3 extends the match to the numeric encodings when
+        // it migrates their `asString`.
+        "_primAsString" => {
+            expect_arity(sel, 0, args.len())?;
+            match self_val {
+                Value::Symbol(s) => Ok(Value::Str(s)),
+                other => Err(EvalError::TypeError(format!(
+                    "{sel}: no string encoding for {}",
+                    other.kind()
+                ))),
+            }
+        }
         "error:" => {
             expect_arity(sel, 1, args.len())?;
             let msg = match args.remove(0) {
@@ -1217,7 +1244,7 @@ fn dispatch_int(
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Float(n as f64))
         }
-        _ => dispatch_primitive_fallback(ev, "MachineInteger", sel, args),
+        _ => dispatch_primitive_fallback(ev, Value::Int(n), "MachineInteger", sel, args),
     }
 }
 
@@ -1279,7 +1306,7 @@ fn dispatch_largeint(
             let f = n.to_f64().unwrap_or(f64::INFINITY);
             Ok(Value::Float(f))
         }
-        _ => dispatch_primitive_fallback(ev, "ArbitraryInteger", sel, args),
+        _ => dispatch_primitive_fallback(ev, Value::LargeInt(n), "ArbitraryInteger", sel, args),
     }
 }
 
@@ -1340,7 +1367,7 @@ fn dispatch_float(
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from(format!("{f:?}").as_str())))
         }
-        _ => dispatch_primitive_fallback(ev, "Float", sel, args),
+        _ => dispatch_primitive_fallback(ev, Value::Float(f), "Float", sel, args),
     }
 }
 
@@ -1349,31 +1376,17 @@ fn dispatch_float(
 fn dispatch_nil(
     ev: &Evaluator,
     sel: &Arc<str>,
-    mut args: Vec<Value>,
+    args: Vec<Value>,
     _env: &mut Env,
 ) -> Result<Value, EvalError> {
     // User-defined Nil methods (e.g. isEmpty, inject:into:) are intercepted by
     // lookup_user_method in dispatch_to_stack before dispatch() is called.
     match sel.as_ref() {
-        "=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(matches!(
-                force_value(ev, args.remove(0))?,
-                Value::Nil
-            )))
-        }
-        "~=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(!matches!(
-                force_value(ev, args.remove(0))?,
-                Value::Nil
-            )))
-        }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from("nil")))
         }
-        _ => dispatch_primitive_fallback(ev, "Nil", sel, args),
+        _ => dispatch_primitive_fallback(ev, Value::Nil, "Nil", sel, args),
     }
 }
 
@@ -1419,18 +1432,6 @@ fn dispatch_str(
                 ))),
             }
         }
-        "=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::Str(s) == force_value(ev, args.remove(0))?,
-            ))
-        }
-        "~=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::Str(s) != force_value(ev, args.remove(0))?,
-            ))
-        }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
             let s: Arc<str> = Arc::from(format!("'{s}'").as_str());
@@ -1464,7 +1465,7 @@ fn dispatch_str(
                 ))),
             }
         }
-        _ => dispatch_primitive_fallback(ev, "String", sel, args),
+        _ => dispatch_primitive_fallback(ev, Value::Str(s), "String", sel, args),
     }
 }
 
@@ -1474,35 +1475,15 @@ fn dispatch_symbol(
     ev: &Evaluator,
     s: Arc<str>,
     sel: &Arc<str>,
-    mut args: Vec<Value>,
+    args: Vec<Value>,
     _env: &mut Env,
 ) -> Result<Value, EvalError> {
     match sel.as_ref() {
-        "=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::Symbol(s) == force_value(ev, args.remove(0))?,
-            ))
-        }
-        "~=" => {
-            expect_arity(sel, 1, args.len())?;
-            Ok(Value::Bool(
-                Value::Symbol(s) != force_value(ev, args.remove(0))?,
-            ))
-        }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
             Ok(Value::Str(Arc::from(format!("#{s}").as_str())))
         }
-        "asString" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(s))
-        }
-        "asSymbol" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Symbol(s))
-        }
-        _ => dispatch_primitive_fallback(ev, "Symbol", sel, args),
+        _ => dispatch_primitive_fallback(ev, Value::Symbol(s), "Symbol", sel, args),
     }
 }
 
@@ -1518,8 +1499,7 @@ fn dispatch_block(
     // The iterative evaluator intercepts value/value:/whileTrue:/whileFalse:/etc. in
     // dispatch_to_stack (via push_block_frame or lookup_user_method + TCO) before
     // dispatch() is called, so only unknown selectors reach here.
-    drop(blk);
-    dispatch_primitive_fallback(ev, "Block", sel, args)
+    dispatch_primitive_fallback(ev, Value::Block(blk), "Block", sel, args)
 }
 
 // ── Object (user-defined instances) ──────────────────────────────────────────
@@ -1728,13 +1708,11 @@ fn obj_prim_core(
 ) -> Result<Option<Value>, EvalError> {
     let ev = cx.ev;
     Ok(Some(match sel.as_ref() {
-        "=" => {
+        // Grounding for `Object >> ==` (C34 S2) on an instance receiver;
+        // `dispatch_primitive_fallback` grounds every primitive receiver.
+        "_primIdentical:" => {
             expect_arity(sel, 1, args.len())?;
             Value::Bool(*cx.self_val == force_value(ev, args.remove(0))?)
-        }
-        "~=" => {
-            expect_arity(sel, 1, args.len())?;
-            Value::Bool(*cx.self_val != force_value(ev, args.remove(0))?)
         }
         "printString" => {
             expect_arity(sel, 0, args.len())?;
@@ -3027,14 +3005,17 @@ fn dispatch_class(
     // Value-class methods (classes whose instances are passive ValueObjects) are also
     // dispatched synchronously: they carry no actor-mailbox semantics, so
     // cross-entity dispatch would be wrong.
-    // `=` and `~=` on class objects are pure structural identity checks — they
-    // must be synchronous so callers don't receive a Future where a Bool is expected.
+    // `=`/`~=` and `==`/`~~` on class objects are pure identity checks — they must
+    // be synchronous so callers don't receive a Future where a Bool is expected.
+    // (`==`/`~~` joined the list in C34 S2, when the identity pair was introduced;
+    // without them `Array == Array` answered a Future while `Array = Array`
+    // answered a Bool.)
     let current = ev.current_entity_id.get();
     if current == Some(entity_id)
         || selector.starts_with("subclass:")
         || selector.starts_with("vmSubclass:")
         || handle.0.class.inherits_is_value()
-        || matches!(selector.as_ref(), "=" | "~=")
+        || matches!(selector.as_ref(), "=" | "~=" | "==" | "~~")
     {
         let class = handle.0.class.clone();
         if let Some((method, def_class)) = class.lookup_class_method(&selector) {
@@ -3077,11 +3058,17 @@ pub(crate) fn dispatch_class_builtin(
     let class = handle.0.class.clone();
     let self_val = Value::Instance(handle);
     match selector.as_ref() {
-        "=" => {
+        // A class object has no content beyond its allocation, so all four are the
+        // same identity test. `=`/`~=` stay Rust arms for now: unlike every other
+        // receiver kind, a class does NOT reach `Object >> =` — `dispatch_class`
+        // resolves against CLASS-side methods (`lookup_class_method`), so migrating
+        // these needs `Object class >>` definitions and belongs with the class-side
+        // work deferred to §6 OQ-6.
+        "=" | "==" => {
             expect_arity(&selector, 1, args.len())?;
             Ok(Value::Bool(self_val == force_value(ev, args[0].clone())?))
         }
-        "~=" => {
+        "~=" | "~~" => {
             expect_arity(&selector, 1, args.len())?;
             Ok(Value::Bool(self_val != force_value(ev, args.remove(0))?))
         }

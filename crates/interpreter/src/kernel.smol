@@ -315,6 +315,46 @@ OrderedCollection >> pvtGrow [
 ]
 
 
+"Identity and equality (plan chunk_34 §6 OQ-3, S2). Pharo's shape: `==` is the
+identity PRIMITIVE and `=` is defined in terms of it, so the default equality of
+every object has one implementation instead of a per-variant Rust arm each for
+Nil, Symbol, String, Class and instances. A class needing domain equality
+overrides `=` (Number, Array, OrderedCollection, Dictionary, Association, True,
+False all do); `==` is not meant to be overridden.
+
+WHAT `==` MEANS HERE — decided rather than inherited by accident. It is O(1)
+indistinguishability, and what that amounts to depends on how the receiver is
+represented:
+
+  - An ENCODED SCALAR (integers, Float, Bool, nil, Symbol, String) has no
+    identity apart from its content — the encoding IS the value — so `==` is
+    structural. `'abc' == 'abc'` is TRUE, where Pharo answers false because two
+    String objects are two allocations. Pharo's answer is an artifact of
+    everything being a heap object; ours follows from the Value/Object split.
+    The two integer encodings cross-compare (a MachineInteger and an
+    ArbitraryInteger denoting the same integer are `==`), because they are two
+    encodings of one value. Float does NOT cross-compare with the integers:
+    `2 == 2.0` is false — they are different values, one exact and one not.
+    (`2 = 2.0` is TRUE; `Number >> =` promotes. `=` and `==` part company here,
+    which is exactly why both exist.)
+
+  - Anything with a heap identity — an Object entity, a Block, a Future, a
+    Namespace, and ALSO a ValueObject — compares as the same allocation. Note
+    the ValueObject case: two structurally-equal Associations are NOT `==`,
+    even though an Association is semantically a Value. `==` stays constant
+    time and does not recurse; deep content equality is `=`'s job, which is
+    why Association overrides it.
+
+`~=` is derived once here so it can never contradict `=`, which is how the
+numeric `~=` arms nearly went wrong in the tower's S6.
+
+`~~` completes the pair. The lexer already produced a `~~` token before S2, but
+nothing implemented it, so `a ~~ b` could only ever answer doesNotUnderstand."
+Object >> == other [ ^self _primIdentical: other ]
+Object >> ~~ other [ ^(self == other) not ]
+Object >> =  other [ ^self == other ]
+Object >> ~= other [ ^(self = other) not ]
+
 "Default hash delegates to _primHash (identity-based pointer hash).
  Subclasses that override = for value equality must also override hash
  to maintain the invariant: a = b → a hash = b hash."
@@ -1230,6 +1270,19 @@ Value vmSubclass: #Symbol
     instanceVariableNames: ''
     classVariableNames: ''
     indexedSlots: #none.
+
+"Symbol conversions (C34 S2). `asSymbol` needs no primitive at all — a Symbol
+already IS one, so the conversion is the identity and says so in Smol rather
+than in a Rust arm that rebuilt the same value. `asString` hands back the
+symbol's characters and does need host support; `_primAsString` renders an
+encoded value and branches on the encoding internally, so S3 extends it to the
+numeric leaves rather than adding a selector per family.
+
+`=`, `~=`, `==` and `~~` are NOT defined here: Symbol inherits them from Object
+(§6 OQ-3), where `==` is structural for an encoded scalar — two occurrences of
+`#foo` are the same value, not two allocations."
+Symbol >> asString [ ^self _primAsString ]
+Symbol >> asSymbol [ ^self ]
 
 "Boolean hierarchy — True and False are singleton-style classes.
 Value::Bool(b) is the runtime representation; Bool is routed through
