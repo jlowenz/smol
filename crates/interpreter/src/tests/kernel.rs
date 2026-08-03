@@ -750,3 +750,50 @@ fn leaf_construction_refusals_are_catchable() {
         Value::Symbol(Arc::from("caught"))
     );
 }
+
+#[test]
+fn string_repeated_constructs_without_mutability() {
+    // Immutability forbids mutating a value after it exists, not constructing one:
+    // the repetition happens in a host buffer and the String is born complete.
+    assert_eq!(eval("'ab' repeated: 3"), Value::Str(Arc::from("ababab")));
+    assert_eq!(eval("'x' repeated: 0"), Value::Str(Arc::from("")));
+    assert_eq!(eval("'ab' repeated: 1"), Value::Str(Arc::from("ab")));
+    assert_eq!(
+        eval("('ab' repeated: 3) class == String"),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn string_new_with_all_is_smol_over_repeated() {
+    // Class-side cannot ground a _prim (self is the class, not the fill), so the
+    // factory delegates to the instance-side primitive.
+    assert_eq!(
+        eval("String new: 20 withAll: 'X'"),
+        Value::Str(Arc::from("XXXXXXXXXXXXXXXXXXXX"))
+    );
+    assert_eq!(eval("(String new: 5 withAll: '-') size"), Value::Int(5));
+    assert_eq!(
+        eval("String new: 0 withAll: 'z'"),
+        Value::Str(Arc::from(""))
+    );
+}
+
+#[test]
+fn filled_construction_is_allowed_where_empty_slots_are_refused() {
+    // The immutability principle stated precisely: n empty slots to fill in later
+    // is refused; n already-filled ones is not.
+    assert_signal_contains(
+        &eval_err("String new: 20"),
+        "an encoded scalar has no indexed slots",
+    );
+    assert_eq!(eval("(String new: 20 withAll: 'X') size"), Value::Int(20));
+}
+
+#[test]
+fn string_repeated_rejects_a_negative_count() {
+    assert!(matches!(
+        eval_err("'ab' repeated: -1"),
+        EvalError::TypeError(msg) if msg.contains("must not be negative")
+    ));
+}

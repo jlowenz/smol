@@ -1475,6 +1475,19 @@ fn dispatch_str(
             };
             Ok(Value::Str(Arc::from(slice.as_str())))
         }
+        // Programmatic construction WITHOUT mutability (C34 S4). The repetition
+        // happens in a host buffer and the Smol value is born complete, so this is
+        // not the allocate-then-poke construction the retired plan's §5 rejects.
+        // Instance-side because a `_prim` may only be sent to `self`: the
+        // class-side `new:withAll:` factory is pure Smol delegating to this.
+        "_primRepeated:" => {
+            expect_arity(sel, 1, args.len())?;
+            let n = as_int(ev, args.remove(0), sel)?;
+            let count = usize::try_from(n).map_err(|_| {
+                EvalError::TypeError(format!("{sel}: count must not be negative, got {n}"))
+            })?;
+            Ok(Value::Str(Arc::from(s.repeat(count).as_str())))
+        }
         "_primIncludesSubString:" => {
             expect_arity(sel, 1, args.len())?;
             match force_value(ev, args.remove(0))? {

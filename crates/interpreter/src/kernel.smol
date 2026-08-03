@@ -1319,6 +1319,34 @@ is exactly what makes it fixable — Array and OrderedCollection both define it.
 String >> isEmpty  [ ^self size = 0 ]
 String >> notEmpty [ ^self isEmpty not ]
 
+"Programmatic construction WITHOUT mutability (C34 S4). Immutability forbids
+mutating a value after it exists; it does not forbid CONSTRUCTING one. The
+repetition happens in a host buffer and the resulting String is born complete and
+frozen, which is categorically different from the allocate-then-poke construction
+the retired plan's §5 rejects. That distinction is exactly why `String new: 20` is
+refused while `String new: 20 withAll: 'X'` is not: you cannot get n empty slots to
+fill in later, but you can get n filled ones.
+
+The primitive is INSTANCE-side because a `_prim` may only be sent to `self`, and
+class-side `self` is the class, not the fill value — so `new:withAll:` cannot ground
+directly and delegates instead. That constraint pushed out the better factoring:
+`repeated:` also handles multi-character strings, which `new:withAll:` alone would
+not (`'ab' repeated: 3`). `repeated:` (not `repeat:`) follows the answers-a-copy
+convention `reversed` already sets.
+
+`withAll:` takes a ONE-CHARACTER STRING until `Character` exists (retired plan §6),
+which is consistent with `at:` already answering one-character Strings. Both change
+together when that class lands. Note it accepts any String, so it is really
+`new:withAll:`'s more general sibling — nothing breaks if the fill is longer, you
+simply get `n` copies of it.
+
+Open-ended accumulation — building a string in a loop, or conditionally — still
+wants a mutable `StringBuilder`/`WriteStream` (§5, still open). Factories cover
+fixed-shape construction; they do not replace the builder."
+String >> repeated: n [ ^self _primRepeated: n ]
+
+String class >> new: n withAll: aChar [ ^aChar repeated: n ]
+
 Value vmSubclass: #Symbol
     instanceVariableNames: ''
     classVariableNames: ''

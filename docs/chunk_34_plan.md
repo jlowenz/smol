@@ -531,11 +531,35 @@ None of the five needs a primitive: a literal already *is* the encoding. The two
 refusals are refusals because the constraint **fails**, not for lack of imagination.
 
 `new:` is refused for all seven. Indexed construction means `n` slots to fill, which
-presumes mutability, and the retired plan's §5 rejects mutable strings outright —
-incremental building belongs in a separate mutable Object (`StringBuilder` /
-`WriteStream`), which remains open design work. The previous error for `String new: 3`
-came from deep inside the generic path ("requires class to declare indexedSlots:") and
-explained none of that. Both refusals are ordinary catchable conditions.
+presumes mutability, and the retired plan's §5 rejects mutable strings outright. The
+previous error for `String new: 3` came from deep inside the generic path ("requires
+class to declare indexedSlots:") and explained none of that. Both refusals are ordinary
+catchable conditions.
+
+**Construction without mutability.** Refusing `new: n` would otherwise leave no way to
+build a String programmatically except repeated `,`, so §4's `new: n withAll: aChar`
+factory is absorbed too. Immutability forbids mutating a value after it exists; it does
+not forbid *constructing* one — the repetition happens in a host buffer and the String is
+born complete and frozen. That is precisely why `String new: 20` is refused while
+`String new: 20 withAll: 'X'` is not: **you cannot get n empty slots to fill in later,
+but you can get n filled ones.**
+
+```smalltalk
+String >> repeated: n             [ ^self _primRepeated: n ]   "one primitive"
+String class >> new: n withAll: c [ ^c repeated: n ]           "pure Smol"
+```
+
+The primitive is INSTANCE-side because a `_prim` may only be sent to `self`, and
+class-side `self` is the class rather than the fill value. That constraint forced the
+better factoring: `repeated:` also handles multi-character strings, which
+`new:withAll:` alone would not (`'ab' repeated: 3` → `'ababab'`). It follows the
+answers-a-copy naming `reversed` already sets.
+
+`withAll:` takes a **one-character String** until `Character` exists (§6), consistent
+with `at:` already answering one-character Strings; both change together when that class
+lands. Open-ended accumulation — building in a loop, or conditionally — still wants a
+mutable `StringBuilder`/`WriteStream` (§5, open). Factories cover fixed-shape
+construction; they do not replace the builder.
 
 ## 6. Open questions
 
