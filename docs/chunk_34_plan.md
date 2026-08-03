@@ -436,9 +436,29 @@ coll copyFrom: 1 to: 3          coll copyFrom: 1 until: 4
 
 `Number >> until:do:` / `until:by:do:` are the `to:` methods with `<` for `<=` (and `>`
 for `>=` on a negative step), so the TCO-recognised shape, the once-at-entry zero-step
-validation and the acceptance criteria all carry over unchanged. `copyFrom:until:` is
-defined in terms of `copyFrom:to:` on each collection, so there is one implementation per
-collection rather than two.
+validation and the acceptance criteria all carry over unchanged. **Iteration does not
+delegate in either direction** — neither form pays an adjustment.
+
+**For copying, the HALF-OPEN form is the implementation and the inclusive one derives**
+(`^self copyFrom: start until: stop + 1`). This is Dijkstra's argument made concrete
+rather than merely cited: a half-open copy needs no adjustment at all, since the length
+*is* `stop - start`, whereas writing the inclusive form directly forces a `+ 1` for the
+length and a `- 1` for the loop bound. The first cut had it backwards — `until:`
+delegating to `to:` with a `- 1` — which made the cheap form pay for the expensive one.
+Arithmetic sends per call, for `Array`:
+
+| | before S3a | S3a first cut | now |
+|---|---|---|---|
+| `copyFrom:to:` | 3 | 3 | **2** |
+| `copyFrom:until:` | — | 4 | **1** |
+
+`OrderedCollection` does better still: `start until: stop do:` is already exactly the
+range to copy, so its half-open form needs no adjustment arithmetic whatsoever. One
+implementation per collection either way.
+
+`String` is the one place the derivation still runs the other way, because
+`copyFrom:to:` is still a Rust arm. **S4 should ground that primitive HALF-OPEN**, after
+which String matches the collections and its `- 1` disappears.
 
 **Blast radius was small**: no caller of `copyFrom:to:` inside `kernel.smol` at all, and
 exactly one test asserted the old String behaviour (`'hello' copyFrom: 2 to: 4` → `'ell'`,

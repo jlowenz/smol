@@ -76,19 +76,26 @@ Array >> includes: v [
     ^false
 ]
 
-Array >> copyFrom: start to: stop [
-    | result |
-    result := Array new: stop - start + 1.
-    0 to: stop - start do: [:i |
+"The HALF-OPEN form is the implementation and the inclusive one derives from it
+(C34 S3a). That direction is Dijkstra's point (EWD831) made concrete: a half-open
+copy needs no adjustment at all — the length IS `stop - start` — whereas writing
+the inclusive form directly forces a `+ 1` for the length and a `- 1` for the loop
+bound. Deriving the cheap form from the expensive one would have made `until:` pay
+for `to:`; this way each form costs what it inherently needs (`until:` one
+subtraction, `to:` that plus one addition), and both are cheaper than the inclusive
+implementation this replaced. `copyFrom: i until: j` takes `j - i` elements, so an
+empty copy is `i = j` and adjacent slices share a bound."
+Array >> copyFrom: start until: stop [
+    | result n |
+    n := stop - start.
+    result := Array new: n.
+    0 until: n do: [:i |
         result at: i put: (self _primAt: start + i)
     ].
     ^result
 ]
 
-"The exclusive dual (C34 S3a): `copyFrom: i until: j` takes j - i elements, so an
-empty copy is `i = j` and adjacent slices share a bound. Defined in terms of the
-inclusive form so there is one implementation per collection, not two."
-Array >> copyFrom: start until: stop [ ^self copyFrom: start to: stop - 1 ]
+Array >> copyFrom: start to: stop [ ^self copyFrom: start until: stop + 1 ]
 
 Array >> = other [
     | n |
@@ -129,15 +136,16 @@ ByteArray >> do: aBlock [
     ]
 ]
 
-ByteArray >> copyFrom: start to: stop [
-    | result |
-    result := ByteArray new: stop - start + 1.
-    0 to: stop - start do: [:i |
+ByteArray >> copyFrom: start until: stop [
+    | result n |
+    n := stop - start.
+    result := ByteArray new: n.
+    0 until: n do: [:i |
         result at: i put: (self _primAt: start + i)
     ].
     ^result
 ]
-ByteArray >> copyFrom: start until: stop [ ^self copyFrom: start to: stop - 1 ]
+ByteArray >> copyFrom: start to: stop [ ^self copyFrom: start until: stop + 1 ]
 
 ByteArray >> asString [ ^self _primAsString ]
 
@@ -283,15 +291,17 @@ OrderedCollection >> includes: v [
     ^false
 ]
 
-OrderedCollection >> copyFrom: start to: stop [
+"Here the half-open form needs NO adjustment arithmetic whatsoever — `start until:
+stop do:` is already exactly the range to copy."
+OrderedCollection >> copyFrom: start until: stop [
     | result |
     result := OrderedCollection new.
-    start to: stop do: [:i |
+    start until: stop do: [:i |
         result add: (self at: i)
     ].
     ^result
 ]
-OrderedCollection >> copyFrom: start until: stop [ ^self copyFrom: start to: stop - 1 ]
+OrderedCollection >> copyFrom: start to: stop [ ^self copyFrom: start until: stop + 1 ]
 
 OrderedCollection >> = other [
     self class = other class ifFalse: [^false].
@@ -1273,9 +1283,10 @@ Value vmSubclass: #String
 `'cat' - 'cab'` is meaningless. Grounds to the `_primStrLt:` primitive."
 String >> < aString [ ^self _primStrLt: aString ]
 
-"The exclusive dual (C34 S3a). `copyFrom:to:` itself is still a Rust arm — S4 migrates
-the String protocol — but it is now 0-based inclusive like every collection, so this
-delegation is correct and needs no primitive of its own."
+"String is the one place the derivation still runs the other way, because
+`copyFrom:to:` is still a Rust arm — S4 migrates the String protocol. When it does,
+the primitive should be grounded HALF-OPEN so String matches the collections above
+and this `- 1` disappears."
 String >> copyFrom: start until: stop [ ^self copyFrom: start to: stop - 1 ]
 
 Value vmSubclass: #Symbol
