@@ -680,3 +680,73 @@ fn deep_until_do_is_o1_stack_and_linear() {
     // Same acceptance criterion as to:do: — it is the same shape with `<` for `<=`.
     assert_eq!(eval("1 until: 100000 do: [:i | i]"), Value::Nil);
 }
+
+// ── C34 S4: construction of the encoded leaves ───────────────────────────────
+//
+// Absorbed from the retired string plan §4. Before this, every encoded leaf
+// reached `Value class >> new` and answered a frozen ValueObject that CLAIMED to
+// be a String/Integer/Float but was not the encoding.
+
+#[test]
+fn encoded_leaf_new_answers_the_encoding_not_a_value_object() {
+    // The defect: `String new` answered `a String` whose `size` failed and for
+    // which `String new = ''` was false.
+    assert_eq!(eval("String new"), Value::Str(Arc::from("")));
+    assert_eq!(eval("String new = ''"), Value::Bool(true));
+    assert_eq!(eval("String new isEmpty"), Value::Bool(true));
+    assert_eq!(eval("String new size"), Value::Int(0));
+    assert_eq!(eval("MachineInteger new"), Value::Int(0));
+    assert_eq!(eval("Float new"), Value::Float(0.0));
+    assert_eq!(eval("True new"), Value::Bool(true));
+    assert_eq!(eval("False new"), Value::Bool(false));
+}
+
+#[test]
+fn encoded_leaf_new_satisfies_class_identity() {
+    // The rule that decides which leaves may answer a value at all.
+    for cls in ["String", "MachineInteger", "Float", "True", "False"] {
+        assert_eq!(
+            eval(&format!("{cls} new class == {cls}")),
+            Value::Bool(true),
+            "({cls} new) class must be {cls}"
+        );
+    }
+}
+
+#[test]
+fn leaves_without_an_honest_identity_value_refuse() {
+    // Refusals because the `(X new) class = X` constraint FAILS, not for lack of
+    // imagination: 0 is a MachineInteger, so there is no ArbitraryInteger zero;
+    // and a symbol is an interned name, so an "empty symbol" names nothing.
+    assert_signal_contains(&eval_err("Symbol new"), "symbols are interned names");
+    assert_signal_contains(&eval_err("ArbitraryInteger new"), "no zero of this class");
+}
+
+#[test]
+fn encoded_leaves_refuse_indexed_construction() {
+    // `new: n` presumes n mutable slots; the retired plan §5 rejects mutable
+    // strings outright. The old error came from deep in the generic path
+    // ("requires class to declare indexedSlots:") and explained none of this.
+    for cls in [
+        "String",
+        "Symbol",
+        "MachineInteger",
+        "ArbitraryInteger",
+        "Float",
+        "True",
+        "False",
+    ] {
+        assert_signal_contains(
+            &eval_err(&format!("{cls} new: 3")),
+            "an encoded scalar has no indexed slots",
+        );
+    }
+}
+
+#[test]
+fn leaf_construction_refusals_are_catchable() {
+    assert_eq!(
+        eval("[Symbol new] on: Error do: [:e | #caught]"),
+        Value::Symbol(Arc::from("caught"))
+    );
+}

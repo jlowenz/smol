@@ -508,11 +508,34 @@ RETIRED with a per-section status table rather than removed, because three of it
 sections are live design work chunk 34 does not cover: §4 construction contract, §5
 immutability/`StringBuilder`, §6 `Character`.
 
-**§4's hazard is real and still open** (verified while retiring the plan, pre-existing —
-not introduced by S4): `String new` answers a generic `ValueObject` of class String, not
-a `Value::Str`. So `String new size` fails with "receiver has no indexed storage" and
-`String new = ''` is false; `Symbol new` is the same. The fix is the per-encoded-class
-`new`/`new:` overrides that section describes, and it is NOT in this chunk.
+**§4 is absorbed, not merely noted** — the plan was to fold that document in, so a live
+defect it had already diagnosed does not get left behind. The hazard was real and wider
+than String: **all seven** encoded leaves reached `Value class >> new`, which builds a
+frozen `ValueObject` via `_primNewValue:`, so each answered something that *claimed* to
+be a String/Integer/Float but was not the encoding. `String new size` failed with
+"receiver has no indexed storage" and `String new = ''` was false.
+
+The rule now: **a leaf answers its identity value when one exists that is honestly an
+instance of that class, and refuses otherwise.** The test is `(X new) class = X`.
+
+| | `new` | why |
+|---|---|---|
+| `String` | `''` | identity for `,` |
+| `MachineInteger` | `0` | additive identity |
+| `Float` | `0.0` | additive identity |
+| `True` / `False` | `true` / `false` | the sole instance |
+| `Symbol` | **refuses** | symbols are interned names; an "empty symbol" names nothing |
+| `ArbitraryInteger` | **refuses** | `0 class` is `MachineInteger` — the two integer leaves are one domain and the small encoding wins, so there is no ArbitraryInteger zero to hand back |
+
+None of the five needs a primitive: a literal already *is* the encoding. The two
+refusals are refusals because the constraint **fails**, not for lack of imagination.
+
+`new:` is refused for all seven. Indexed construction means `n` slots to fill, which
+presumes mutability, and the retired plan's §5 rejects mutable strings outright —
+incremental building belongs in a separate mutable Object (`StringBuilder` /
+`WriteStream`), which remains open design work. The previous error for `String new: 3`
+came from deep inside the generic path ("requires class to declare indexedSlots:") and
+explained none of that. Both refusals are ordinary catchable conditions.
 
 ## 6. Open questions
 

@@ -1384,6 +1384,58 @@ False >> | other                    [ ^other ]
 
 Boolean >> ~= other                 [ ^(self = other) not ]
 
+"── Construction of the encoded leaves ───────────────────────────────────────
+
+Absorbed from `docs/string_representation_plan.md` §4 (retired; C34 S4). Its point
+was a real defect, not a nicety: an encoded leaf must NEVER reach generic
+construction. `Value class >> new` builds a frozen `ValueObject` via
+`_primNewValue:`, so before this every one of the seven leaves answered a
+ValueObject that CLAIMED to be a String/Integer/Float but was not the encoding —
+`String new` answered `a String` whose `size` failed with 'receiver has no indexed
+storage' and for which `String new = ''` was false. Same for `Symbol new`,
+`Float new`, `True new`, and the rest.
+
+THE RULE: a leaf answers its identity value when one exists that is honestly an
+instance of that class, and refuses otherwise. The test is `(X new) class = X`.
+`''`, `0`, `0.0`, `true`, `false` each satisfy it, and none needs a primitive —
+a literal already IS the encoding.
+
+The two refusals are refusals because the constraint FAILS, not for lack of
+imagination. `ArbitraryInteger new` would have to answer `0`, but `0 class` is
+MachineInteger — the leaves are two encodings of one domain and the small one
+wins for small values, so there is no ArbitraryInteger zero to hand back. A
+Symbol has no identity element at all: symbols are interned names, reached by
+`asSymbol`, and an 'empty symbol' names nothing.
+
+`new:` is refused for every leaf. Indexed construction means `n` slots to fill,
+which presumes mutability — and §5 of the retired plan rejects mutable strings
+outright: incremental building belongs in a separate mutable Object (a
+StringBuilder / WriteStream), which is still open design work. The old error for
+`String new: 3` came from deep inside the generic path ('requires class to declare
+indexedSlots:') and said nothing about any of this."
+
+String           class >> new [ ^'' ]
+MachineInteger   class >> new [ ^0 ]
+Float            class >> new [ ^0.0 ]
+True             class >> new [ ^true ]
+False            class >> new [ ^false ]
+
+Symbol class >> new [
+    ^Error signal: 'Symbol new: symbols are interned names — use #foo or aString asSymbol' ]
+ArbitraryInteger class >> new [
+    ^Error signal: 'ArbitraryInteger new: no zero of this class exists (0 is a MachineInteger)' ]
+
+String           class >> new: n [ ^self pvtRefuseIndexed ]
+Symbol           class >> new: n [ ^self pvtRefuseIndexed ]
+MachineInteger   class >> new: n [ ^self pvtRefuseIndexed ]
+ArbitraryInteger class >> new: n [ ^self pvtRefuseIndexed ]
+Float            class >> new: n [ ^self pvtRefuseIndexed ]
+True             class >> new: n [ ^self pvtRefuseIndexed ]
+False            class >> new: n [ ^self pvtRefuseIndexed ]
+
+Object class >> pvtRefuseIndexed [
+    ^Error signal: self name , ' new: an encoded scalar has no indexed slots' ]
+
 "Loop — pure Smol recursive implementations enabled by inline block dispatch and
 TCO in the iterative evaluator. There is no Rust fallback: the `_primWhileTrue:` /
 `_primTimesRepeat:` arms these methods once shadowed were removed with the recursive
