@@ -431,7 +431,14 @@ extension interacts with both).
 
 ## Q14: `respondsTo:` is blind to builtin selectors
 
-**Status**: Open — needs a decision on scope
+**Status**: CLOSED for all scalar protocol (chunk 34, 2026-08-04); open only for the
+seven routing-bound arms, which chunk 35 finishes. Resolved **by construction** rather
+than by building the builtin-selector registry this question contemplated: once a
+family's protocol lives in the class method dictionary, `respondsTo:` is accurate for it
+automatically. `'s' respondsTo: #size` was false before C34 S4; `3 respondsTo: #to:do:`
+was false before S1b. `_prim*` selectors stay invisible, which C34 §6 OQ-2 settled as
+correct — a `_prim` is grounding, not protocol. Remaining gap: `dispatch_namespace` and
+`dispatch_class_builtin` (see `next_steps_after_c34.md` §1).
 **Raised**: numeric tower S5 (2026-08-02)
 
 `respondsTo:` resolves by **class-dictionary lookup**, so it sees only Smol-defined
