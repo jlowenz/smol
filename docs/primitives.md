@@ -58,7 +58,7 @@ instrumenting the three dispatchers confirmed none was reached across the whole 
 | `_primAt:` | indexed value/instance | 1 (index) | Read indexed slot/element | builtins_iterative.rs:1384 | |
 | `_primAt:put:` | mutable indexed entity | 2 (index, val) | Write indexed slot | builtins_iterative.rs:1423 | Object (mutable) only |
 | `_primSize` | indexed value/instance | 0 | Element/slot count | builtins_iterative.rs:1510 | |
-| `_primAsString` | any Value | 0 | String representation | builtins_iterative.rs:1522 | |
+| `_primAsString` | any Value / instance | 0 | Bare String rendering, grounding `Object >> asString`. **One operation, TOTAL over all receivers** (C34 S5): scalars answer their text (builtins_iterative.rs:1173); a `ByteArray` decodes its bytes as UTF-8 (:1994) and **declines** when there is no byte storage; anything else falls through to the generic `a ClassName` at the end of `dispatch_object_primitive` (:1679) | :1173 / :1679 / :1994 | Ordering matters — the specific chunk must get first refusal |
 
 ## Condition system
 
@@ -106,6 +106,49 @@ instrumenting the three dispatchers confirmed none was reached across the whole 
 | `_primNewValueIndexed:init:` | class | 2 (size, init) | New indexed value object | builtins_iterative.rs:2494 / eval_iterative.rs:2035 | |
 | `_primInstancesOf:` | — | 1 (class) | All live instances of a class | builtins_iterative.rs:2570 | |
 
+## Chunk 34 (Rust → Smol protocol migration) — landed 2026-08-04
+
+Every public arm on the six scalar dispatchers is gone; what is listed here is the
+irreducible grounding the Smol protocol sends to. `dispatch_nil` and `dispatch_symbol`
+were deleted outright — their protocol is entirely Smol. See `chunk_34_plan.md`.
+
+| Selector | Receiver | Args | Semantics | Handler | Notes |
+|---|---|---|---|---|---|
+| `_primIdentical:` | any Value / instance | 1 | Identity, grounding `Object >> ==` | builtins_iterative.rs:1159, :1702 | Structural for encoded scalars, same-allocation otherwise (S2, OQ-3) |
+| `_primAsFloat` | Int / LargeInt | 0 | Float conversion | builtins_iterative.rs:1186 | Saturates to ±inf out of range (sign-correct since S6) |
+| `_primTruncated` `_primRounded` `_primCeiling` `_primFloor` | Float | 0 | Float → Integer rounding modes | builtins_iterative.rs:1212 | One selector per mode rather than a mode symbol. `asInt` needs none — it is `truncated` in Smol |
+| `_primSize` | String | 0 | Character count | builtins_iterative.rs:1363 | Distinct from the indexed `_primSize` (:1977) |
+| `_primAt:` | String | 1 (index) | One-character String at a **0-based** index | builtins_iterative.rs:1367 | 0-based since S4; becomes a `Character` when that class lands |
+| `_primConcat:` | String | 1 (String) | Concatenation, grounding `,` | builtins_iterative.rs:1376 | |
+| `_primAsSymbol` | String | 0 | Intern as a Symbol | builtins_iterative.rs:1395 | |
+| `_primReversed` | String | 0 | Reversed copy | builtins_iterative.rs:1399 | |
+| `_primCopyFrom:until:` | String | 2 | **Half-open** 0-based slice | builtins_iterative.rs:1409 | Half-open is the primitive; `copyFrom:to:` derives in Smol (S3a) |
+| `_primRepeated:` | String | 1 (count) | `n` copies, grounding `repeated:` and `new:withAll:` | builtins_iterative.rs:1428 | Construction without mutability — the buffer is host-side, the value is born frozen |
+| `_primIncludesSubString:` | String | 1 (String) | Substring test | builtins_iterative.rs:1452 | |
+| `_primWrite` | String | 0 | Write to stdout, no newline | builtins_iterative.rs:1440 | **The only console channel.** Grounds `print` |
+| `_primWriteLine` | String | 0 | Write to stdout with newline | builtins_iterative.rs:1447 | Grounds `printNl` |
+
+**Removed in C34**, with what replaced them:
+
+- `printString` — every arm. Rendering is `asString` / `asDebugString` in Smol; the
+  `println!` those arms carried became `print` / `printNl` over the two write prims
+  above. It was inconsistent (4 of 9 arms) and leaked compositionally (S5, OQ-4).
+- `error:` — all three implementations (`dispatch_primitive_fallback`,
+  `obj_prim_conditions`, and an evaluator special-case at step 1d). `Object >> error:`
+  is one Smol method over `Error signal:`. The primitive-receiver arm returned a bare
+  `EvalError::Signal` that **bypassed the handler chain**, so `[3 error: 'x'] on: Error
+  do: [...]` did not catch — which silently made `Integer >> factorial`'s domain error
+  uncatchable (S6).
+- `to:do:` / `to:by:do:` — dead arms in `dispatch_int` (S1) *and* the evaluator
+  special-case `Cont::ToDoStep` (S1b). Now Smol methods on `Number`, joined by the
+  half-open duals `until:do:` / `until:by:do:` (S3a).
+- LargeInt `+` `-` `*` and the `bigint_from_value` helper — superseded by the numeric
+  tower's `_primAdd:` family; verified dead by `panic!` probe (S6).
+- `=` / `~=` per variant (Nil, Symbol, String, instances) — one `Object >> =` over
+  `_primIdentical:` (S2).
+- Scalar conversions: Float `asInt ceiling floor rounded truncated`, Int/LargeInt
+  `asFloat asString`, Symbol `asString asSymbol`, and the String protocol (S3, S4).
+
 ## Chunk 33 (DNU/Message/perform) — landed, no new `_prim*`
 
 C33 added **no** new primitives. The pieces are interpreter-level, not `_prim`
@@ -124,4 +167,4 @@ selectors:
 
 ---
 _Maintenance: append a row when a `_prim*` is added; this doc is finalized as part
-of each chunk that touches the primitive surface. Last updated: 2026-07-01 (C33)._
+of each chunk that touches the primitive surface. Last updated: 2026-08-04 (C34)._

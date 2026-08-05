@@ -1841,43 +1841,28 @@ fn dispatch_to_stack(
 
     // (1d) Signal dispatch flattened: run the matching handler on the heap `Cont`
     // stack (SignalGuard) with Common-Lisp handler-scoping instead of recursing
-    // `step_loop` via `eval_block`. Covers the canonical `signal` →
-    // `self _primSignalCondition: self` path and object-receiver `error:`.
+    // `step_loop` via `eval_block`. This is the canonical `signal` →
+    // `self _primSignalCondition: self` path, and since C34 S6 it is the ONLY
+    // path — `error:` used to be special-cased here too, and separately in
+    // `dispatch_primitive_fallback` where it bypassed the handler chain entirely
+    // (so `[3 error: 'x'] on: Error do: [...]` did not catch). `Object >> error:`
+    // is one Smol method now, and reaches this via `Error signal:`.
     //
-    // Gated on an Instance receiver to preserve the primitive path exactly:
-    // `error:` on a primitive uses `dispatch_primitive_fallback` (a direct
-    // `EvalError::Signal` that bypasses the handler chain, with a different
-    // message). `_primSignalCondition:` is only ever sent to a condition instance.
-    if matches!(receiver, Value::Instance(_)) {
-        if selector.as_ref() == "_primSignalCondition:" {
-            if args.len() != 1 {
-                return Err(EvalError::ArityMismatch {
-                    expected: 1,
-                    got: args.len(),
-                });
-            }
-            let condition = force_value(ev, args.into_iter().next().unwrap())?;
-            if !matches!(&condition, Value::Instance(_)) {
-                return Err(EvalError::TypeError(
-                    "_primSignalCondition: requires a Condition instance".into(),
-                ));
-            }
-            return dispatch_signal(ev, condition, stack, acc);
+    // `_primSignalCondition:` is only ever sent to a condition instance.
+    if matches!(receiver, Value::Instance(_)) && selector.as_ref() == "_primSignalCondition:" {
+        if args.len() != 1 {
+            return Err(EvalError::ArityMismatch {
+                expected: 1,
+                got: args.len(),
+            });
         }
-        if selector.as_ref() == "error:" {
-            if args.len() != 1 {
-                return Err(EvalError::ArityMismatch {
-                    expected: 1,
-                    got: args.len(),
-                });
-            }
-            let msg = match force_value(ev, args.into_iter().next().unwrap())? {
-                Value::Str(s) => s,
-                other => Arc::from(format!("error: argument was {}", other.kind()).as_str()),
-            };
-            let condition = crate::builtins_iterative::make_error_value(&ev.registry, &msg);
-            return dispatch_signal(ev, condition, stack, acc);
+        let condition = force_value(ev, args.into_iter().next().unwrap())?;
+        if !matches!(&condition, Value::Instance(_)) {
+            return Err(EvalError::TypeError(
+                "_primSignalCondition: requires a Condition instance".into(),
+            ));
         }
+        return dispatch_signal(ev, condition, stack, acc);
     }
 
     // (1e) `_primNewValue:` / `_primNewValueIndexed:init:` flattened: run the init

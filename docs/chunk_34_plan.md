@@ -132,7 +132,7 @@ Each phase is independently committable and leaves the suite green.
   §5i. OQ-4 resolved: `printString` is gone, replaced by `asString`/`asDebugString`,
   and console output moved to `print`/`printNl` over a new write primitive.
 - **S6 — Prune + audit**, mirroring tower S7: delete superseded arms, verify irreducibility
-  of what remains, update `docs/primitives.md`.
+  of what remains, update `docs/primitives.md`. **DONE 2026-08-04** — see §5j.
 
 ## 5a. Measurements (release, this machine)
 
@@ -622,6 +622,50 @@ public arms (§3).
    list — the same trap S2 hit with `==`. Without it `'x: ' , Array asString` would
    concatenate a **Future**.
 
+## 5j. S6 — prune and audit (DONE 2026-08-04)
+
+**`error:` fixed — the defect S1b had to work around.** It had *three* Rust
+implementations: `dispatch_primitive_fallback`, `obj_prim_conditions`, and an evaluator
+special-case at step (1d). The first was broken — it returned a bare
+`EvalError::Signal` that bypassed the handler chain, so `[3 error: 'x'] on: Error do:
+[…]` did not catch while `[Error signal: 'x'] on: Error do: […]` did. The casualty was
+real: `Integer >> factorial`'s domain error was raised on an encoded leaf and so could
+not be caught at all.
+
+All three are gone, replaced by one Smol method:
+
+```smalltalk
+Object >> error: aMessage [ ^Error signal: aMessage ]
+```
+
+Every receiver kind now routes through the same condition machinery, and S1b's
+`to:by:do:` / `until:by:do:` are back to the idiomatic `self error:` rather than the
+`Error signal:` they needed while this was broken.
+
+**Dead arms pruned.** `dispatch_largeint` still carried public `+`/`-`/`*`, superseded
+by the tower's `ArbitraryInteger >> +` → `_primAdd:`. Verified dead by `panic!` probe
+(full suite green), then deleted along with its now-orphaned `bigint_from_value` helper —
+the same static-argument-plus-instrumentation method tower S7 used.
+
+**Sign-blind saturation fixed.** `ArbitraryInteger >> asFloat`'s `unwrap_or(INFINITY)`
+would have answered `+inf` for a huge *negative*. Verified unreachable (`to_f64` answers
+`Some(±inf)` out of range), but made sign-correct rather than left as a latent wrong
+answer.
+
+**Final audit.** Zero public arms remain on any scalar dispatcher. Ten remain overall,
+every one in a category §6 OQ-6 defers to chunk 35, none of them scalar:
+
+| dispatcher | public arms | why still Rust |
+|---|---|---|
+| `obj_prim_core` | `respondsTo:` | instance-side reflection |
+| `obj_prim_history` | `historyOf:` `historyOf:from:to:` | instance-side, store-backed |
+| `dispatch_namespace` | `do:` `name` `asString` | not routed by `lookup_user_method` |
+| `dispatch_class_builtin` | `=` `~=` `name` `asString` | class-side lookup, not `Object >>` |
+
+Against §3's original inventory of 40: **33 migrated, 7 deferred** with recorded
+reasons. 64 `_prim` grounding arms remain, which is the point — they are the
+irreducible host surface, inventoried in `docs/primitives.md`.
+
 ## 6. Open questions
 
 All settled as of 2026-08-02 except **OQ-2** (minor, statable during implementation) and
@@ -756,11 +800,22 @@ recursive evaluator was retired 2026-07, and those arms no longer exist anywhere
 `crates/interpreter/src/` (verified). Fix alongside S1b, since it is the same
 loop-machinery documentation.
 
-### OQ-2 — do `_prim` selectors need to be visible to `respondsTo:`? *(minor)*
+### OQ-2 — do `_prim` selectors need to be visible to `respondsTo:`? — ANSWERED (S6): no
 
 After migration, `respondsTo:` answers accurately for public protocol. `_prim*` selectors
-remain invisible (they are Rust arms by construction). Probably fine — they are internal
-grounding, not protocol — but it should be stated, since Q14 is closed on the strength of it.
+remain invisible (they are Rust arms by construction).
+
+**Stated and settled (S6): that is correct, not a gap.** A `_prim` is not protocol — it
+is the grounding a protocol method sends to, and it is deliberately not part of any
+class's public surface (the self-only rule already forbids sending one to anything but
+`self`). `respondsTo:` answering *false* for `_primAsString` is the honest answer to
+"is this part of what the receiver understands as protocol". Pinned as an assertion in
+`s5_responds_to_is_universal_across_value_kinds` so the boundary is visible rather than
+assumed, alongside the now-true `respondsTo:` answers for the migrated protocol.
+
+This is what Q14 is closed on: `respondsTo:` is accurate for **public protocol** on
+every scalar family, by construction, with no builtin-selector registry. It remains
+inaccurate for the seven routing-bound arms (OQ-6), which is recorded rather than fixed.
 
 ### OQ-3 — `=` / `~=` and identity — DECIDED (2026-08-02)
 

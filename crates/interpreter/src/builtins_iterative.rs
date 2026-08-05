@@ -588,16 +588,6 @@ pub(crate) fn cons_to_vec(ev: &Evaluator, list: Value) -> Result<Vec<Value>, Eva
     }
 }
 
-fn bigint_from_value(ev: &Evaluator, v: Value, sel: &Arc<str>) -> Result<BigInt, EvalError> {
-    match force_value(ev, v)? {
-        Value::Int(n) => Ok(BigInt::from(n)),
-        Value::LargeInt(b) => Ok((*b).clone()),
-        _ => Err(EvalError::TypeError(format!(
-            "{sel}: argument must be Int or LargeInt"
-        ))),
-    }
-}
-
 fn normalize_bigint(b: BigInt) -> Value {
     use num_traits::ToPrimitive;
     if let Some(n) = b.to_i64() {
@@ -1197,16 +1187,18 @@ fn dispatch_primitive_fallback(
             expect_arity(sel, 0, args.len())?;
             match self_val {
                 Value::Int(n) => Ok(Value::Float(n as f64)),
-                // Behaviour preserved verbatim from the arm this replaces: a
-                // BigInt too large for f64 saturates rather than erroring. Note
-                // the fallback is sign-BLIND (a huge negative would answer +inf),
-                // which is latent either way — `to_f64` answers `Some(±inf)` for
-                // out-of-range values, so the `unwrap_or` is defensive only.
-                // Flagged for S6 rather than changed here; a migration step should
-                // not quietly alter behaviour.
+                // A BigInt too large for f64 saturates rather than erroring.
+                // `to_f64` already answers `Some(±inf)` out of range (verified), so
+                // the fallback is defensive only — but S6 made it sign-correct
+                // rather than leaving a latent wrong answer: the arm this replaced
+                // answered `+inf` for a huge NEGATIVE value.
                 Value::LargeInt(n) => {
-                    use num_traits::ToPrimitive;
-                    Ok(Value::Float(n.to_f64().unwrap_or(f64::INFINITY)))
+                    use num_traits::{Signed, ToPrimitive};
+                    Ok(Value::Float(n.to_f64().unwrap_or(if n.is_negative() {
+                        f64::NEG_INFINITY
+                    } else {
+                        f64::INFINITY
+                    })))
                 }
                 other => Err(EvalError::TypeError(format!(
                     "{sel}: no float encoding for {}",
@@ -1234,14 +1226,6 @@ fn dispatch_primitive_fallback(
                     other.kind()
                 ))),
             }
-        }
-        "error:" => {
-            expect_arity(sel, 1, args.len())?;
-            let msg = match args.remove(0) {
-                Value::Str(s) => s,
-                other => Arc::from(format!("{other}").as_str()),
-            };
-            Err(EvalError::Signal(make_error_value(&ev.registry, &msg)))
         }
         _ => Err(mnu(kind, sel)),
     }
@@ -1297,17 +1281,6 @@ fn dispatch_largeint(
     _env: &mut Env,
 ) -> Result<Value, EvalError> {
     match sel.as_ref() {
-        "+" | "-" | "*" => {
-            expect_arity(sel, 1, args.len())?;
-            let rhs = bigint_from_value(ev, args.remove(0), sel)?;
-            let result = match sel.as_ref() {
-                "+" => (*n).clone() + rhs,
-                "-" => (*n).clone() - rhs,
-                "*" => (*n).clone() * rhs,
-                _ => unreachable!(),
-            };
-            Ok(normalize_bigint(result))
-        }
         "_primLt:" => {
             expect_arity(sel, 1, args.len())?;
             Ok(Value::Bool(numeric_lt(
@@ -2042,14 +2015,6 @@ fn obj_prim_conditions(
 ) -> Result<Option<Value>, EvalError> {
     let ev = cx.ev;
     Ok(Some(match sel.as_ref() {
-        "error:" => {
-            expect_arity(sel, 1, args.len())?;
-            let msg = match force_value(ev, args.remove(0))? {
-                Value::Str(s) => s,
-                other => Arc::from(format!("error: argument was {}", other.kind()).as_str()),
-            };
-            signal_condition(ev, make_error_value(&ev.registry, &msg), env)?
-        }
         "_primSignalCondition:" => {
             expect_arity(sel, 1, args.len())?;
             let condition = force_value(ev, args.remove(0))?;

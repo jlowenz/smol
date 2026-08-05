@@ -893,3 +893,62 @@ fn class_rendering_is_synchronous_not_a_future() {
         Value::Str(Arc::from("the Array"))
     );
 }
+
+// ── C34 S6: prune + audit ────────────────────────────────────────────────────
+
+#[test]
+fn error_is_catchable_on_every_receiver_kind() {
+    // Before S6 `error:` had THREE Rust implementations and the primitive-receiver
+    // one returned a bare EvalError::Signal that bypassed the handler chain, so
+    // `[3 error: 'x'] on: Error do: [...]` did not catch. One Smol method replaces
+    // all three.
+    for recv in [
+        "3",
+        "2.5",
+        "'s'",
+        "#s",
+        "nil",
+        "true",
+        "Object new",
+        "(100 factorial)",
+    ] {
+        assert_eq!(
+            eval(&format!(
+                "[{recv} error: 'boom'] on: Error do: [:e | e messageText]"
+            )),
+            Value::Str(Arc::from("boom")),
+            "error: on {recv} must be catchable"
+        );
+    }
+}
+
+#[test]
+fn kernel_domain_errors_are_catchable() {
+    // The concrete casualty of the old asymmetry: factorial's domain error was
+    // raised on an encoded leaf, so it could not be caught.
+    assert_eq!(
+        eval("[-1 factorial] on: Error do: [:e | e messageText]"),
+        Value::Str(Arc::from("factorial of a negative integer"))
+    );
+    assert_eq!(
+        eval("[1 to: 5 by: 0 do: [:i | i]] on: Error do: [:e | e messageText]"),
+        Value::Str(Arc::from("to:by:do: step must be non-zero"))
+    );
+}
+
+#[test]
+fn large_integer_as_float_saturates_with_the_right_sign() {
+    assert_eq!(
+        eval("(1000 factorial) asFloat"),
+        Value::Float(f64::INFINITY)
+    );
+    assert_eq!(
+        eval("(1000 factorial) negated asFloat"),
+        Value::Float(f64::NEG_INFINITY)
+    );
+    assert_eq!(eval("(100 factorial) asFloat > 0.0"), Value::Bool(true));
+    assert_eq!(
+        eval("(100 factorial) negated asFloat < 0.0"),
+        Value::Bool(true)
+    );
+}

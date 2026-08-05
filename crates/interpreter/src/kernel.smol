@@ -405,6 +405,18 @@ answer `self`, so printing chains."
 Object >> asString      [ ^self _primAsString ]
 Object >> asDebugString [ ^self asString ]
 
+"`error:` is ordinary Smol (C34 S6). It had THREE Rust implementations — one in
+`dispatch_primitive_fallback`, one in `obj_prim_conditions`, and an evaluator
+special-case at step (1d) — and the first was BROKEN: it returned a bare
+`EvalError::Signal` that bypassed the handler chain, so `[3 error: 'x'] on: Error
+do: [...]` did not catch while `[Error signal: 'x'] on: Error do: [...]` did. That
+asymmetry silently made `Integer >> factorial`'s domain error uncatchable, and it
+is why S1b's `to:by:do:` had to signal the condition directly instead.
+
+One Smol method replaces all three, and routes every receiver through the same
+condition machinery."
+Object >> error: aMessage [ ^Error signal: aMessage ]
+
 Object >> print   [ self asString print.   ^self ]
 Object >> printNl [ self asString printNl. ^self ]
 
@@ -1682,16 +1694,11 @@ Number >> to: stop do: aBlock [
     ^(self + 1) to: stop do: aBlock
 ]
 
-"`Error signal:` rather than `self error:` deliberately. `error:` sent to a PRIMITIVE
-receiver is uncatchable: dispatch step (1d) gates flattened signal dispatch on an
-Instance receiver, so a Number leaf falls through to `dispatch_primitive_fallback`,
-which returns a bare `EvalError::Signal` that bypasses the handler chain — `[3 error:
-'x'] on: Error do: [...]` does not catch, while `[Error signal: 'x'] on: Error do:
-[...]` does. That asymmetry is a pre-existing defect in `error:` (a Rust fallback arm,
-see §3's `fallback` row); until it is resolved, kernel code whose `self` may be an
-encoded leaf must signal the condition directly."
+"S1b wrote this as `Error signal:` because `self error:` was then UNCATCHABLE on an
+encoded leaf. S6 fixed `error:` (it is one Smol method now, routing every receiver
+through the condition machinery), so the idiomatic form works and is used here."
 Number >> to: stop by: step do: aBlock [
-    step isZero ifTrue: [ ^Error signal: 'to:by:do: step must be non-zero' ].
+    step isZero ifTrue: [ ^self error: 'to:by:do: step must be non-zero' ].
     ^step > 0
         ifTrue:  [ self pvtUpTo:   stop by: step do: aBlock ]
         ifFalse: [ self pvtDownTo: stop by: step do: aBlock ]
@@ -1740,7 +1747,7 @@ Number >> until: stop do: aBlock [
 ]
 
 Number >> until: stop by: step do: aBlock [
-    step isZero ifTrue: [ ^Error signal: 'until:by:do: step must be non-zero' ].
+    step isZero ifTrue: [ ^self error: 'until:by:do: step must be non-zero' ].
     ^step > 0
         ifTrue:  [ self pvtUpUntil:   stop by: step do: aBlock ]
         ifFalse: [ self pvtDownUntil: stop by: step do: aBlock ]
