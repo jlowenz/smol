@@ -37,7 +37,7 @@ fn float_unary() {
 
 #[test]
 fn float_print_string() {
-    assert_eq!(eval_diff("3.14 printString"), Value::Str(Arc::from("3.14")));
+    assert_eq!(eval_diff("3.14 asString"), Value::Str(Arc::from("3.14")));
 }
 
 // ── LargeInt ─────────────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ fn largeint_unary() {
         Value::LargeInt(_)
     ));
     assert!(matches!(
-        eval_diff(&format!("{big} printString")),
+        eval_diff(&format!("{big} asString")),
         Value::Str(_)
     ));
     assert!(matches!(
@@ -268,11 +268,8 @@ fn bool_eq() {
 
 #[test]
 fn bool_print_string() {
-    assert_eq!(eval_diff("true printString"), Value::Str(Arc::from("true")));
-    assert_eq!(
-        eval_diff("false printString"),
-        Value::Str(Arc::from("false"))
-    );
+    assert_eq!(eval_diff("true asString"), Value::Str(Arc::from("true")));
+    assert_eq!(eval_diff("false asString"), Value::Str(Arc::from("false")));
 }
 
 #[test]
@@ -319,7 +316,7 @@ fn nil_eq() {
 
 #[test]
 fn nil_print_string() {
-    assert_eq!(eval_diff("nil printString"), Value::Str(Arc::from("nil")));
+    assert_eq!(eval_diff("nil asString"), Value::Str(Arc::from("nil")));
 }
 
 // ── String ───────────────────────────────────────────────────────────────
@@ -390,9 +387,11 @@ fn string_eq() {
 }
 
 #[test]
-fn string_print_string() {
+fn string_rendering_bare_vs_debug() {
+    // C34 S5: asString is the BARE text, asDebugString the disambiguating one.
+    assert_eq!(eval_diff("'abc' asString"), Value::Str(Arc::from("abc")));
     assert_eq!(
-        eval_diff("'abc' printString"),
+        eval_diff("'abc' asDebugString"),
         Value::Str(Arc::from("'abc'"))
     );
 }
@@ -498,9 +497,10 @@ fn symbol_eq() {
 }
 
 #[test]
-fn symbol_print_string() {
+fn symbol_rendering_bare_vs_debug() {
+    assert_eq!(eval_diff("#hello asString"), Value::Str(Arc::from("hello")));
     assert_eq!(
-        eval_diff("#hello printString"),
+        eval_diff("#hello asDebugString"),
         Value::Str(Arc::from("#hello"))
     );
 }
@@ -744,7 +744,7 @@ fn namespace_name_message() {
 #[test]
 fn namespace_print_string_message() {
     assert_eq!(
-        eval_diff("Kernel printString"),
+        eval_diff("Kernel asString"),
         Value::Str(Arc::from("Namespace(Kernel)"))
     );
 }
@@ -760,7 +760,7 @@ Foo name
     assert_eq!(eval_diff(src), Value::Str(Arc::from("Foo")));
     let src2 = r#"
 Object subclass: #Bar instanceVariableNames: ''.
-Bar printString
+Bar asString
 "#;
     assert_eq!(eval_diff(src2), Value::Str(Arc::from("Bar")));
 }
@@ -1027,17 +1027,16 @@ a _primAt: 0 put: 'bad'
 }
 
 #[test]
-fn prim_as_string_on_non_byte_storage_errors() {
+fn prim_as_string_on_non_byte_storage_falls_back_to_the_generic_rendering() {
+    // As above: float64 storage is not byte storage, so the ByteArray decode
+    // declines and the generic rendering answers.
     let src = r#"
 Value subclass: #FA instanceVariableNames: '' classVariableNames: '' indexedSlots: #float64.
 | a |
 a := FA new: 2.
 a _primAsString
 "#;
-    assert!(matches!(
-        eval_err_diff(src),
-        crate::eval::EvalError::TypeError(_)
-    ));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("a FA")));
 }
 
 // ── Int op LargeInt promotion ─────────────────────────────────────────────
@@ -1434,15 +1433,16 @@ a _primSize
 }
 
 #[test]
-fn prim_as_string_no_indexed_storage_errors() {
+fn prim_as_string_without_byte_storage_falls_back_to_the_generic_rendering() {
+    // C34 S5: `_primAsString` is one operation ("render me as a String") and is
+    // TOTAL — every object renders somehow. The ByteArray chunk decodes only when
+    // there IS byte storage and otherwise declines, so a plain object reaches the
+    // generic `a ClassName` default instead of erroring as it used to.
     let src = r#"
 Value subclass: #Plain instanceVariableNames: ''.
 Plain new _primAsString
 "#;
-    assert!(matches!(
-        eval_err_diff(src),
-        crate::eval::EvalError::TypeError(_)
-    ));
+    assert_eq!(eval_diff(src), Value::Str(Arc::from("a Plain")));
 }
 
 // ── handle_subclass error paths ───────────────────────────────────────────
@@ -2064,7 +2064,7 @@ fn hash_negative_largeint_returns_int() {
 fn subclass_unknown_keyword_silently_ignored() {
     // Unknown keyword pair in subclass: declaration is ignored; class is still defined.
     assert_eq!(
-        eval_diff("Object subclass: #FooUnknown unknownKeyword: 42. FooUnknown printString"),
+        eval_diff("Object subclass: #FooUnknown unknownKeyword: 42. FooUnknown asString"),
         Value::Str(Arc::from("FooUnknown"))
     );
 }

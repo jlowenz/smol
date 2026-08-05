@@ -44,14 +44,14 @@ arithmetic over `_primAdd:` and friends, and S7 then deleted 39 superseded arms.
 
 | Family | Arms | Selectors |
 |---|---|---|
-| String | 10 → **1** | `printString` (~~`= ~=`~~ → `Object >> =`, S2; ~~`, at: copyFrom:to: includesSubString: reversed size asSymbol`~~ → Smol, S4) |
-| Float | 6 → **1** | `printString` (~~`asInt ceiling floor rounded truncated`~~ → Smol, S3) |
-| Int | 5 → **1** | `printString` (~~`to:do: to:by:do:`~~ S1/S1b; ~~`asFloat asString`~~ → Smol, S3) |
-| LargeInt | 3 → **1** | `printString` (~~`asFloat asString`~~ → Smol, S3) |
-| Symbol | 5 → **1** | `printString` (~~`= ~=`~~ → `Object >> =`; ~~`asString asSymbol`~~ → Smol, S2) |
-| Nil | 3 → **1** | `printString` (~~`= ~=`~~ → `Object >> =`, S2) |
-| Namespace | 3 | `do: name printString` |
-| Class | 4 | `= ~= name printString` |
+| String | 10 → **0** | all migrated (S2 `= ~=`; S4 the protocol; S5 rendering) |
+| Float | 6 → **0** | all migrated (S3 conversions; S5 rendering) |
+| Int | 5 → **0** | all migrated (S1/S1b loops; S3 conversions; S5 rendering) |
+| LargeInt | 3 → **0** | all migrated (S3 conversions; S5 rendering) |
+| Symbol | 5 → **0** | all migrated — **`dispatch_symbol` deleted entirely** |
+| Nil | 3 → **0** | all migrated — **`dispatch_nil` deleted entirely** |
+| Namespace | 3 | `do: name asString` — routing-bound, §6 OQ-6 |
+| Class | 4 | `= ~= name asString` — routing-bound, §6 OQ-6 |
 | fallback | 1 | `error:` (+ `_primIdentical:`/`_primAsString` grounding added in S2) |
 
 Also removed in S2 but not in the table above (it counts only scalar/namespace/class
@@ -128,8 +128,9 @@ Each phase is independently committable and leaves the suite green.
 - **S4 — String** (10 arms). Also folds in and retires `string_representation_plan.md`
   entirely, per OQ-5. `copyFrom:to:`'s convention is already settled by S3a, so its
   migration is now mechanical. **DONE 2026-08-02** — see §5h.
-- **S5 — `printString` / `asString`** across all families, pending the naming decision
-  (OQ-4) — deliberately last, because it may rename the selector.
+- **S5 — rendering + console output** across all families. **DONE 2026-08-04** — see
+  §5i. OQ-4 resolved: `printString` is gone, replaced by `asString`/`asDebugString`,
+  and console output moved to `print`/`printNl` over a new write primitive.
 - **S6 — Prune + audit**, mirroring tower S7: delete superseded arms, verify irreducibility
   of what remains, update `docs/primitives.md`.
 
@@ -561,6 +562,66 @@ lands. Open-ended accumulation — building in a loop, or conditionally — stil
 mutable `StringBuilder`/`WriteStream` (§5, open). Factories cover fixed-shape
 construction; they do not replace the builder.
 
+## 5i. S5 — rendering and console output (DONE 2026-08-04)
+
+**OQ-4 resolved, and against its own premise.** That entry recorded `printString` as
+misnamed because it *returns* rather than prints, and wondered whether renaming was
+worth it. The evidence said the name was a symptom and the `println!` buried inside it
+was the disease:
+
+- The side effect was **already inconsistent** — 4 of 9 Rust arms had it (Int, String,
+  instances, classes); Float, LargeInt, Symbol, Nil and Namespace did not; and the 9
+  `printString` methods already written in `kernel.smol` *could not*, there being no
+  primitive for it.
+- It **leaked compositionally**. `Duration >> printString` is `^ms printString , 'ms'`,
+  so rendering a Duration emitted a stray line for its milliseconds; an Association
+  emitted two. Every composite rendering — which is how all the Smol ones are written —
+  corrupted the console it was supposedly serving.
+
+So rendering and printing are now separate, and both are ordinary Smol.
+
+**Two renderings, because one is not enough.**
+
+| | `asString` (bare) | `asDebugString` (disambiguating) |
+|---|---|---|
+| `'hi'` | `hi` | `'hi'` |
+| `#hi` | `hi` | `#hi` |
+| `3`, `2.5`, `nil`, `true` | `3` … | *(same — inherited from `Object`)* |
+
+They differ only where a bare rendering would be ambiguous, so everything else inherits
+`asDebugString` from `Object` and answers identically. Collections render their
+**elements** with `asDebugString` for exactly that reason:
+`#('hi' #hi 3) asString` → `('hi' #hi 3 )`.
+
+**`print`/`printNl` emit the bare form**, and `Nl` is the newline rather than a different
+rendering. Bare is the only **non-circular** choice: if printing decorated were the
+default there would be no way to print a plain string, since converting first and then
+printing would decorate the result again. Decorated output is therefore
+conversion-first, which composes — `x asDebugString printNl`. Both answer `self`, so
+printing chains.
+
+The write primitives live on `String` rather than `Object` because a `_prim` may only be
+sent to `self`; `Object >> print` converts and delegates to `String >> print`. This is
+the **only** channel by which Smol writes to the console — there was none before other
+than the side effect being removed here.
+
+**Two dispatchers disappeared.** `dispatch_nil` and `dispatch_symbol` were left holding
+nothing but the shared fallback, so both functions are deleted and the top-level match
+routes straight to `dispatch_primitive_fallback`. Every scalar family is now at **zero**
+public arms (§3).
+
+**Three things this shook out, each a real defect:**
+1. `ByteArray` genuinely has *both* renderings — `asString` decodes the bytes as UTF-8
+   (a conversion, like `asSymbol`), `asDebugString` lists them. A blind
+   `printString`→`asString` rename briefly collapsed the two.
+2. `_primAsString` is now **one operation, total over all receivers**, so the
+   byte-decoding chunk had to *decline* rather than error when there is no byte storage,
+   letting the generic `a ClassName` default answer. Two tests asserted the old erroring
+   behaviour.
+3. `asString`/`name` on a **class** had to join `dispatch_class`'s synchronous selector
+   list — the same trap S2 hit with `==`. Without it `'x: ' , Array asString` would
+   concatenate a **Future**.
+
 ## 6. Open questions
 
 All settled as of 2026-08-02 except **OQ-2** (minor, statable during implementation) and
@@ -737,7 +798,7 @@ shareable Value *has* no identity separate from its content, so asking whether t
 artifact of everything being a heap object. Decide explicitly rather than inheriting it
 from `PartialEq` by accident.
 
-### OQ-4 — `printString` is misnamed *(deferred, but scheduled)*
+### OQ-4 — `printString` is misnamed — RESOLVED (S5, 2026-08-04)
 
 Recorded 2026-08-02: `printString` is `toString`-shaped — it *returns* a string rather than
 printing — and its Rust arm contains a `println!` that is currently the only debugging

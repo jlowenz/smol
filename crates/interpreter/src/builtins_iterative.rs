@@ -165,9 +165,11 @@ pub fn dispatch(
         Value::Int(n) => dispatch_int(ev, n, &selector, args, env),
         Value::Float(f) => dispatch_float(ev, f, &selector, args, env),
         Value::Bool(b) => dispatch_primitive_fallback(ev, Value::Bool(b), "Bool", &selector, args),
-        Value::Nil => dispatch_nil(ev, &selector, args, env),
+        Value::Nil => dispatch_primitive_fallback(ev, Value::Nil, "Nil", &selector, args),
         Value::Str(s) => dispatch_str(ev, s, &selector, args, env),
-        Value::Symbol(s) => dispatch_symbol(ev, s, &selector, args, env),
+        Value::Symbol(s) => {
+            dispatch_primitive_fallback(ev, Value::Symbol(s), "Symbol", &selector, args)
+        }
         Value::Block(blk) => dispatch_block(ev, blk, &selector, args, env),
         Value::LargeInt(n) => dispatch_largeint(ev, n, &selector, args, env),
         Value::Instance(handle) => match &handle.0.kind {
@@ -1184,6 +1186,7 @@ fn dispatch_primitive_fallback(
                 Value::Symbol(s) => Ok(Value::Str(s)),
                 Value::Int(n) => Ok(Value::Str(Arc::from(n.to_string().as_str()))),
                 Value::LargeInt(n) => Ok(Value::Str(Arc::from(n.to_string().as_str()))),
+                Value::Float(f) => Ok(Value::Str(Arc::from(format!("{f:?}").as_str()))),
                 other => Err(EvalError::TypeError(format!(
                     "{sel}: no string encoding for {}",
                     other.kind()
@@ -1280,12 +1283,6 @@ fn dispatch_int(
             let op = arith_prim_op(sel).expect("guarded by the match arm");
             numeric_binop(ev, op, Value::Int(n), args.remove(0), sel)
         }
-        "printString" => {
-            expect_arity(sel, 0, args.len())?;
-            let s = n.to_string();
-            println!("{:?}", s);
-            Ok(Value::Str(Arc::from(s)))
-        }
         _ => dispatch_primitive_fallback(ev, Value::Int(n), "MachineInteger", sel, args),
     }
 }
@@ -1334,10 +1331,6 @@ fn dispatch_largeint(
             let op = arith_prim_op(sel).expect("guarded by the match arm");
             numeric_binop(ev, op, Value::LargeInt(n), args.remove(0), sel)
         }
-        "printString" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(Arc::from(n.to_string().as_str())))
-        }
         _ => dispatch_primitive_fallback(ev, Value::LargeInt(n), "ArbitraryInteger", sel, args),
     }
 }
@@ -1375,32 +1368,11 @@ fn dispatch_float(
             let op = arith_prim_op(sel).expect("guarded by the match arm");
             numeric_binop(ev, op, Value::Float(f), args.remove(0), sel)
         }
-        "printString" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(Arc::from(format!("{f:?}").as_str())))
-        }
         _ => dispatch_primitive_fallback(ev, Value::Float(f), "Float", sel, args),
     }
 }
 
 // ── Nil ───────────────────────────────────────────────────────────────────────
-
-fn dispatch_nil(
-    ev: &Evaluator,
-    sel: &Arc<str>,
-    args: Vec<Value>,
-    _env: &mut Env,
-) -> Result<Value, EvalError> {
-    // User-defined Nil methods (e.g. isEmpty, inject:into:) are intercepted by
-    // lookup_user_method in dispatch_to_stack before dispatch() is called.
-    match sel.as_ref() {
-        "printString" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(Arc::from("nil")))
-        }
-        _ => dispatch_primitive_fallback(ev, Value::Nil, "Nil", sel, args),
-    }
-}
 
 // ── String ────────────────────────────────────────────────────────────────────
 
@@ -1488,6 +1460,22 @@ fn dispatch_str(
             })?;
             Ok(Value::Str(Arc::from(s.repeat(count).as_str())))
         }
+        // Console output (C34 S5). The ONLY channel by which Smol writes to the
+        // console; rendering selectors (`asString`/`asDebugString`) are pure.
+        // Instance-side on String for the self-only rule: `Object >> print`
+        // converts and delegates to `String >> print`.
+        "_primWrite" => {
+            expect_arity(sel, 0, args.len())?;
+            print!("{s}");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            Ok(Value::Str(s))
+        }
+        "_primWriteLine" => {
+            expect_arity(sel, 0, args.len())?;
+            println!("{s}");
+            Ok(Value::Str(s))
+        }
         "_primIncludesSubString:" => {
             expect_arity(sel, 1, args.len())?;
             match force_value(ev, args.remove(0))? {
@@ -1497,33 +1485,11 @@ fn dispatch_str(
                 ))),
             }
         }
-        "printString" => {
-            expect_arity(sel, 0, args.len())?;
-            let s: Arc<str> = Arc::from(format!("'{s}'").as_str());
-            println!("{:?}", s);
-            Ok(Value::Str(s))
-        }
         _ => dispatch_primitive_fallback(ev, Value::Str(s), "String", sel, args),
     }
 }
 
 // ── Symbol ────────────────────────────────────────────────────────────────────
-
-fn dispatch_symbol(
-    ev: &Evaluator,
-    s: Arc<str>,
-    sel: &Arc<str>,
-    args: Vec<Value>,
-    _env: &mut Env,
-) -> Result<Value, EvalError> {
-    match sel.as_ref() {
-        "printString" => {
-            expect_arity(sel, 0, args.len())?;
-            Ok(Value::Str(Arc::from(format!("#{s}").as_str())))
-        }
-        _ => dispatch_primitive_fallback(ev, Value::Symbol(s), "Symbol", sel, args),
-    }
-}
 
 // ── Block ─────────────────────────────────────────────────────────────────────
 
@@ -1731,6 +1697,18 @@ pub(crate) fn dispatch_object_primitive(
     if let Some(v) = obj_prim_futures(&cx, sel, &mut args)? {
         return Ok(v);
     }
+    // Generic instance rendering, grounding `Object >> asString` (C34 S5). LAST
+    // on purpose: `_primAsString` is one operation ("render me as a String") whose
+    // answer depends on the receiver, and a more specific chunk must get first
+    // refusal — `ByteArray` decodes its bytes as UTF-8 rather than answering
+    // "a ByteArray". The class name is host data, so this stays a primitive; a
+    // user class overrides `asString` in Smol.
+    if sel.as_ref() == "_primAsString" {
+        expect_arity(sel, 0, args.len())?;
+        return Ok(Value::Str(Arc::from(
+            format!("a {}", cx.obj.class.name).as_str(),
+        )));
+    }
     Err(EvalError::MessageNotUnderstood {
         receiver_kind: "Object",
         selector: sel.clone(),
@@ -1751,12 +1729,6 @@ fn obj_prim_core(
         "_primIdentical:" => {
             expect_arity(sel, 1, args.len())?;
             Value::Bool(*cx.self_val == force_value(ev, args.remove(0))?)
-        }
-        "printString" => {
-            expect_arity(sel, 0, args.len())?;
-            let s: Arc<str> = Arc::from(format!("a {}", cx.obj.class.name).as_str());
-            println!("{:?}", s);
-            Value::Str(s)
         }
         "respondsTo:" => {
             expect_arity(sel, 1, args.len())?;
@@ -2041,22 +2013,19 @@ fn obj_prim_indexed(
             };
             Value::Int(len as i64)
         }
-        "_primAsString" => {
-            expect_arity(sel, 0, args.len())?;
-            match obj.indexed.as_ref().ok_or_else(|| {
-                EvalError::TypeError(format!("{sel}: receiver has no indexed storage"))
-            })? {
-                IndexedStorage::Byte(bytes) => {
-                    let s = String::from_utf8_lossy(&bytes.lock()).into_owned();
-                    Value::Str(Arc::from(s.as_str()))
-                }
-                _ => {
-                    return Err(EvalError::TypeError(format!(
-                        "{sel}: requires Byte indexed storage"
-                    )));
-                }
+        // `ByteArray >> asString` decodes the bytes as UTF-8. DECLINES (rather
+        // than erroring) for any receiver without byte storage, so the generic
+        // `a ClassName` rendering at the end of `dispatch_object_primitive` gets
+        // it instead — `_primAsString` is one operation whose answer depends on
+        // the receiver, and this chunk only owns the byte-storage case.
+        "_primAsString" => match obj.indexed.as_ref() {
+            Some(IndexedStorage::Byte(bytes)) => {
+                expect_arity(sel, 0, args.len())?;
+                let s = String::from_utf8_lossy(&bytes.lock()).into_owned();
+                Value::Str(Arc::from(s.as_str()))
             }
-        }
+            _ => return Ok(None),
+        },
         _ => return Ok(None),
     }))
 }
@@ -3010,7 +2979,9 @@ fn dispatch_namespace(
             expect_arity(&selector, 0, args.len())?;
             Ok(Value::Symbol(ns.name.clone()))
         }
-        "printString" => {
+        // Still Rust: Namespace is routing-bound (§6 OQ-6). Renamed with the rest
+        // of the family in S5 so the language has ONE rendering selector.
+        "asString" => {
             expect_arity(&selector, 0, args.len())?;
             Ok(Value::Str(Arc::from(
                 format!("Namespace({})", ns.name).as_str(),
@@ -3053,7 +3024,10 @@ fn dispatch_class(
         || selector.starts_with("subclass:")
         || selector.starts_with("vmSubclass:")
         || handle.0.class.inherits_is_value()
-        || matches!(selector.as_ref(), "=" | "~=" | "==" | "~~")
+        || matches!(
+            selector.as_ref(),
+            "=" | "~=" | "==" | "~~" | "asString" | "name"
+        )
     {
         let class = handle.0.class.clone();
         if let Some((method, def_class)) = class.lookup_class_method(&selector) {
@@ -3325,11 +3299,12 @@ pub(crate) fn dispatch_class_builtin(
             expect_arity(&selector, 0, args.len())?;
             Ok(Value::Str(class.name.clone()))
         }
-        "printString" => {
+        // Still Rust: class-side dispatch is routing-bound (§6 OQ-6). Renamed with
+        // the rest of the family in S5, and the `println!` dropped — rendering
+        // never writes to the console now; `print`/`printNl` do that.
+        "asString" => {
             expect_arity(&selector, 0, args.len())?;
-            let s: Arc<str> = class.name.clone();
-            println!("{:?}", s);
-            Ok(Value::Str(s))
+            Ok(Value::Str(class.name.clone()))
         }
         sel if sel.contains("subclass:") || sel.starts_with("vmSubclass:") => {
             // Extract the handle back from self_val to pass the Arc<Class> as superclass.

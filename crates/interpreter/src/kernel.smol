@@ -110,11 +110,11 @@ Array >> = other [
 
 Array >> ~= other [ ^(self = other) not ]
 
-Array >> printString [
+Array >> asString [
     | holder |
     holder := ValueHolder initialValue: '('.
     ^[self do: [:each |
-        holder update: [:s | s , each printString , ' ']
+        holder update: [:s | s , each asDebugString , ' ']
     ]] then: [:done | holder get , ')'] orElse: #reject
 ]
 
@@ -149,11 +149,11 @@ ByteArray >> copyFrom: start to: stop [ ^self copyFrom: start until: stop + 1 ]
 
 ByteArray >> asString [ ^self _primAsString ]
 
-ByteArray >> printString [
+ByteArray >> asDebugString [
     | holder |
     holder := ValueHolder initialValue: '('.
     ^[self do: [:each |
-        holder update: [:s | s , each printString , ' ']
+        holder update: [:s | s , each asDebugString , ' ']
     ]] then: [:done | holder get , ')'] orElse: #reject
 ]
 
@@ -314,11 +314,11 @@ OrderedCollection >> = other [
 
 OrderedCollection >> ~= other [ ^(self = other) not ]
 
-OrderedCollection >> printString [
+OrderedCollection >> asString [
     | holder |
     holder := ValueHolder initialValue: 'OrderedCollection ('.
     ^[self do: [:each |
-        holder update: [:s | s , each printString , ' ']
+        holder update: [:s | s , each asDebugString , ' ']
     ]] then: [:done | holder get , ')'] orElse: #reject
 ]
 
@@ -371,6 +371,42 @@ Object >> == other [ ^self _primIdentical: other ]
 Object >> ~~ other [ ^(self == other) not ]
 Object >> =  other [ ^self == other ]
 Object >> ~= other [ ^(self = other) not ]
+
+"── Rendering and console output (plan chunk_34 §6 OQ-4, S5) ─────────────────
+
+`printString` is GONE. It was misnamed — it rendered rather than printed — and its
+Rust arms carried a `println!` that was the language's only output channel, which
+made every rendering send write to the console as a side effect. That side effect
+was not even consistent (4 of 9 arms had it, and the 9 Smol-defined ones could not),
+and worse, it LEAKED COMPOSITIONALLY: `Duration >> printString` is
+`^ms printString , 'ms'`, so rendering a Duration emitted a stray line for its
+milliseconds, and rendering an Association emitted two.
+
+Rendering and printing are now separate, and both are ordinary Smol.
+
+TWO RENDERINGS, because one is not enough. `asString` answers the BARE text — what
+the receiver looks like as a string, suitable for building a message or writing to a
+socket. `asDebugString` answers the DISAMBIGUATING text, which is what you want when
+a human is reading it and needs to tell `3` from `'3'`, or `#hi` from `'hi'`. They
+differ only where a bare rendering would be ambiguous — String and Symbol — so
+everything else inherits `asDebugString` from `Object` and answers the same for both.
+Collections render their ELEMENTS with `asDebugString` for exactly this reason.
+
+`print` / `printNl` write `asString` — the bare form — and `Nl` is the newline, not a
+different rendering. Bare is the only non-circular choice: if printing decorated were
+the default there would be no way to print a plain string, since converting first and
+then printing would decorate the result again. Decorated output is therefore
+conversion-first, which composes: `x asDebugString printNl`.
+
+The write primitives live on String rather than Object because a `_prim` may only be
+sent to `self`; `Object >> print` converts and delegates to `String >> print`. Both
+answer `self`, so printing chains."
+
+Object >> asString      [ ^self _primAsString ]
+Object >> asDebugString [ ^self asString ]
+
+Object >> print   [ self asString print.   ^self ]
+Object >> printNl [ self asString printNl. ^self ]
 
 "Default hash delegates to _primHash (identity-based pointer hash).
  Subclasses that override = for value equality must also override hash
@@ -436,8 +472,8 @@ Association >> = other [
     self class = other class ifFalse: [^false].
     ^key = other key
 ]
-Association >> printString [
-    ^key printString , ' -> ' , value printString
+Association >> asString [
+    ^key asDebugString , ' -> ' , value asDebugString
 ]
 
 "Shorthand for building Associations via binary message -> ."
@@ -473,7 +509,7 @@ Trait >> @ aliases [ ^self _primTraitAlias: aliases ]
 Trait >> name          [ ^self _primTraitName ]
 Trait >> requirements  [ ^self _primTraitRequirements ]
 Trait >> conflicts     [ ^self _primTraitConflicts ]
-Trait >> printString   [ ^'Trait(' , self _primTraitName printString , ')' ]
+Trait >> asString      [ ^'Trait(' , self _primTraitName asDebugString , ')' ]
 
 "Cons — immutable singly-linked list node.
  nil is the empty list; isNil / isEmpty are the emptiness checks."
@@ -509,6 +545,10 @@ Cons >> do: aBlock [
 Cons >> size [
     ^1 + (tail isNil ifTrue: [0] ifFalse: [tail size])
 ]
+
+"nil renders as itself; the Rust arm that used to do this went with the rest of
+the printString family in S5."
+Nil >> asString [ ^'nil' ]
 
 Nil >> isEmpty [ ^true ]
 Nil >> do: aBlock [ ^nil ]
@@ -663,11 +703,11 @@ Dictionary >> = other [
     ^true
 ]
 
-Dictionary >> printString [
+Dictionary >> asString [
     | holder |
     holder := ValueHolder initialValue: 'Dictionary ('.
     ^[self associationsDo: [:assoc |
-        holder update: [:s | s , assoc printString , ' ']
+        holder update: [:s | s , assoc asDebugString , ' ']
     ]] then: [:done | holder get , ')'] orElse: #reject
 ]
 
@@ -852,7 +892,7 @@ NoCoercion >> pvtSetReceiver: r argument: a selector: sel [
     receiver := r.
     argument := a.
     selector := sel.
-    self pvtSetMessage: 'cannot coerce ', a printString, ' to a number for ', sel asString
+    self pvtSetMessage: 'cannot coerce ', a asDebugString, ' to a number for ', sel asString
 ]
 
 NoCoercion >> receiver [ ^receiver ]
@@ -1345,6 +1385,17 @@ wants a mutable `StringBuilder`/`WriteStream` (§5, still open). Factories cover
 fixed-shape construction; they do not replace the builder."
 String >> repeated: n [ ^self _primRepeated: n ]
 
+"A String's bare rendering is itself — no primitive needed. The debug rendering
+quotes it, which is what lets a collection show that an element IS a string.
+A quote is doubled to escape it (per the lexer), so the four-quote literal below
+is a String containing exactly one quote character."
+String >> asString      [ ^self ]
+String >> asDebugString [ ^'''' , self , '''' ]
+
+"Grounds the console channel; `Object >> print` converts and delegates here."
+String >> print   [ self _primWrite.     ^self ]
+String >> printNl [ self _primWriteLine. ^self ]
+
 String class >> new: n withAll: aChar [ ^aChar repeated: n ]
 
 Value vmSubclass: #Symbol
@@ -1362,8 +1413,9 @@ numeric leaves rather than adding a selector per family.
 `=`, `~=`, `==` and `~~` are NOT defined here: Symbol inherits them from Object
 (§6 OQ-3), where `==` is structural for an encoded scalar — two occurrences of
 `#foo` are the same value, not two allocations."
-Symbol >> asString [ ^self _primAsString ]
-Symbol >> asSymbol [ ^self ]
+Symbol >> asString      [ ^self _primAsString ]
+Symbol >> asSymbol      [ ^self ]
+Symbol >> asDebugString [ ^'#' , self asString ]
 
 "Boolean hierarchy — True and False are singleton-style classes.
 Value::Bool(b) is the runtime representation; Bool is routed through
@@ -1392,7 +1444,7 @@ True  >> and: aBlock                [ ^aBlock value ]
 True  >> or: aBlock                 [ ^true ]
 True  >> not                        [ ^false ]
 True  >> xor: aBool                 [ ^aBool not ]
-True  >> printString                [ ^'true' ]
+True  >> asString                   [ ^'true' ]
 True  >> = other                    [ ^other isKindOf: True ]
 True  >> & other                    [ ^other ]
 True  >> | other                    [ ^true ]
@@ -1405,7 +1457,7 @@ False >> and: aBlock                [ ^false ]
 False >> or: aBlock                 [ ^aBlock value ]
 False >> not                        [ ^true ]
 False >> xor: aBool                 [ ^aBool not ]
-False >> printString                [ ^'false' ]
+False >> asString                   [ ^'false' ]
 False >> = other                    [ ^other isKindOf: False ]
 False >> & other                    [ ^false ]
 False >> | other                    [ ^other ]
@@ -1729,7 +1781,7 @@ Duration class >> s: n       [ ^self _primNewValue: [:d | d pvtMs: n * 1000] ]
 Duration class >> minutes: n [ ^self _primNewValue: [:d | d pvtMs: n * 60000] ]
 Duration >> pvtMs: n         [ ms := n ]
 Duration >> asMilliseconds   [ ^ms ]
-Duration >> printString      [ ^ms printString, 'ms' ]
+Duration >> asString         [ ^ms asString, 'ms' ]
 
 "── Timer ────────────────────────────────────────────────────────────────────"
 "Cancellable one-shot timer.  Value object; immutable after construction."

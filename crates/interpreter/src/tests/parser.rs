@@ -488,7 +488,7 @@ fn cascade_keyword_message() {
 #[test]
 fn cascade_invalid_message_after_semi_errors() {
     // `123` after `;` is not a valid cascade message.
-    let err = Parser::parse("3 printString; 123").unwrap_err();
+    let err = Parser::parse("3 asString; 123").unwrap_err();
     assert!(matches!(
         err,
         ParseError::UnexpectedToken(_, "cascade message")

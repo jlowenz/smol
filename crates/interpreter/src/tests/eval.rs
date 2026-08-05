@@ -82,12 +82,12 @@ fn cascade() {
 
 #[test]
 fn print_string_int() {
-    assert_eq!(eval_diff("42 printString"), Value::Str(Arc::from("42")));
+    assert_eq!(eval_diff("42 asString"), Value::Str(Arc::from("42")));
 }
 
 #[test]
 fn print_string_float() {
-    assert_eq!(eval_diff("1.5 printString"), Value::Str(Arc::from("1.5")));
+    assert_eq!(eval_diff("1.5 asString"), Value::Str(Arc::from("1.5")));
 }
 
 #[test]
@@ -195,7 +195,7 @@ fn largeint_literal() {
 fn object_print_string() {
     let src = r#"
 Object subclass: #Foo instanceVariableNames: ''.
-Foo new printString
+Foo new asString
 "#;
     assert_eq!(eval_diff(src), Value::Str(Arc::from("a Foo")));
 }
@@ -240,7 +240,7 @@ c count
 #[test]
 fn namespace_ref() {
     let src = r#"
-Kernel::Object new printString
+Kernel::Object new asString
 "#;
     assert_eq!(eval_diff(src), Value::Str(Arc::from("a Object")));
 }
@@ -299,7 +299,7 @@ MyLib do: [
     // Widget remains accessible via the namespace ref.
     let via_ns = ev
         .eval_program(
-            &Parser::parse("MyLib::Widget new printString")
+            &Parser::parse("MyLib::Widget new asString")
                 .expect("parse")
                 .stmts,
             &mut env,
@@ -546,7 +546,7 @@ fn array_detect_no_match_signals() {
 fn array_print_string() {
     let src = "| a |
     a := Array new: 2. a at: 0 put: 1. a at: 1 put: 2.
-    a printString";
+    a asString";
     assert_eq!(eval_diff(src), Value::Str(Arc::from("(1 2 )")));
 }
 
@@ -566,9 +566,15 @@ fn bytearray_is_empty() {
 }
 
 #[test]
-fn bytearray_print_string() {
-    let src = "| b | b := ByteArray new: 2. b at: 0 put: 65. b at: 1 put: 66. b printString";
+fn bytearray_debug_string_lists_the_bytes() {
+    // C34 S5: ByteArray genuinely has both renderings. `asString` DECODES the
+    // bytes as UTF-8 (a conversion, like asSymbol/asFloat); `asDebugString` shows
+    // what the bytes are. The blind printString -> asString rename briefly
+    // collapsed the two, which is what caught this.
+    let src = "| b | b := ByteArray new: 2. b at: 0 put: 65. b at: 1 put: 66. b asDebugString";
     assert_eq!(eval_diff(src), Value::Str(Arc::from("(65 66 )")));
+    let decoded = "| b | b := ByteArray new: 2. b at: 0 put: 65. b at: 1 put: 66. b asString";
+    assert_eq!(eval_diff(decoded), Value::Str(Arc::from("AB")));
 }
 
 #[test]
@@ -776,7 +782,7 @@ fn oc_not_equal() {
 
 #[test]
 fn oc_print_string() {
-    let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc printString";
+    let src = "| oc | oc := OrderedCollection new. oc add: 1. oc add: 2. oc asString";
     assert_eq!(
         eval_diff(src),
         Value::Str(Arc::from("OrderedCollection (1 2 )"))
@@ -924,7 +930,7 @@ oc inject: 0 into: [:acc :e | acc + e]
 
 #[test]
 fn block_with_locals() {
-    let prog = "b := [:i | | a | a := 42. a := a + i. a]. (b value: 42) printString.";
+    let prog = "b := [:i | | a | a := 42. a := a + i. a]. (b value: 42) asString.";
     assert_eq!(eval_diff(prog), Value::Str(Arc::from("84")));
 }
 
@@ -1151,7 +1157,7 @@ fn association_eq_class_mismatch() {
 
 #[test]
 fn association_print_string() {
-    let src = "('x' -> 42) printString";
+    let src = "('x' -> 42) asString";
     assert_eq!(eval_diff(src), Value::Str(Arc::from("'x' -> 42")));
 }
 
@@ -1361,7 +1367,7 @@ d removeKey: 'b' ifAbsent: [0].
 
 #[test]
 fn dict_print_string() {
-    let src = "| d | d := Dictionary new. d at: 'k' put: 1. d printString";
+    let src = "| d | d := Dictionary new. d at: 'k' put: 1. d asString";
     // Exact order may vary, but should contain the association
     let v = eval_diff(src);
     if let Value::Str(s) = v {
@@ -2853,7 +2859,7 @@ fn trait_reflection_name_and_print() {
     assert_eq!(eval(src), Value::Symbol("Greeter".into()));
     let src2 = r#"
         Trait named: #Greeter.
-        Greeter printString
+        Greeter asString
     "#;
     assert_eq!(eval(src2), Value::Str("Trait(#Greeter)".into()));
 }
@@ -3190,17 +3196,17 @@ fn s3_overflow_promotes_and_result_demotes() {
     // Representation follows magnitude, not operand history: overflow promotes to
     // ArbitraryInteger, and a result that fits a machine word demotes back.
     assert_eq!(
-        eval("(4611686018427387904 * 4) class printString"),
+        eval("(4611686018427387904 * 4) class asString"),
         Value::Str("ArbitraryInteger".into())
     );
     assert_eq!(
-        eval("(99999999999999999999 - 99999999999999999998) class printString"),
+        eval("(99999999999999999999 - 99999999999999999998) class asString"),
         Value::Str("MachineInteger".into())
     );
     // i64::MIN edge cases that overflow the machine fast path.
     assert_eq!(eval("(-9223372036854775807 - 1) \\\\ -1"), Value::Int(0));
     assert_eq!(
-        eval("((-9223372036854775807 - 1) / -1) class printString"),
+        eval("((-9223372036854775807 - 1) / -1) class asString"),
         Value::Str("ArbitraryInteger".into())
     );
 }
@@ -3285,7 +3291,7 @@ fn s3_wrapper_reconstructs_via_the_value_seam() {
         Value::Int(8)
     );
     assert_eq!(
-        eval(&format!("{src} ((Boxed of: 5) + 3) class printString")),
+        eval(&format!("{src} ((Boxed of: 5) + 3) class asString")),
         Value::Str("Boxed".into())
     );
     // Cross-type through the seam: the projected leaf promotes, then reconstructs.
@@ -3395,7 +3401,7 @@ fn s4_number_squared_reciprocal_is_zero() {
 fn s4_negated_promotes_at_the_machine_word_boundary() {
     // i64::MIN has no positive machine-word counterpart, so `negated` must promote.
     assert_eq!(
-        eval("(-9223372036854775807 - 1) negated class printString"),
+        eval("(-9223372036854775807 - 1) negated class asString"),
         Value::Str("ArbitraryInteger".into())
     );
     assert_eq!(
@@ -3441,11 +3447,11 @@ fn s4_integer_factorial_promotes_exactly() {
     assert_eq!(eval("20 factorial"), Value::Int(2432902008176640000));
     // 21! exceeds i64: the leaf primitives promote, so the result stays exact.
     assert_eq!(
-        eval("21 factorial class printString"),
+        eval("21 factorial class asString"),
         Value::Str("ArbitraryInteger".into())
     );
     assert_eq!(
-        eval("21 factorial printString"),
+        eval("21 factorial asString"),
         Value::Str("51090942171709440000".into())
     );
     assert_eq!(eval("30 factorial > (20 factorial)"), Value::Bool(true));
@@ -3493,7 +3499,7 @@ fn s4_protocol_is_encoding_agnostic_for_a_wrapper() {
     );
     // Quantities keep the receiver's kind through reconstruction…
     assert_eq!(
-        eval(&format!("{src} (Boxed of: -7) abs class printString")),
+        eval(&format!("{src} (Boxed of: -7) abs class asString")),
         Value::Str("Boxed".into())
     );
     // …while classifications answer plain values.
@@ -3521,7 +3527,7 @@ fn s5_wrapper_domain_wins_in_either_operand_position() {
     // `boxed * 3` and a wrapper for `3 * boxed`.
     for expr in ["(Boxed of: 3) * 8", "8 * (Boxed of: 3)"] {
         assert_eq!(
-            eval(&format!("{S5_BOXED} ({expr}) class printString")),
+            eval(&format!("{S5_BOXED} ({expr}) class asString")),
             Value::Str("Boxed".into()),
             "{expr} should answer a Boxed"
         );
@@ -3579,7 +3585,7 @@ fn s5_receiver_in_argument_position_is_carried() {
             "{expr}"
         );
         assert_eq!(
-            eval(&format!("{S5_BOXED} ({expr}) class printString")),
+            eval(&format!("{S5_BOXED} ({expr}) class asString")),
             Value::Str("Boxed".into()),
             "{expr} should stay in the wrapper's domain"
         );
@@ -3607,7 +3613,7 @@ fn s5_two_different_wrappers_reach_domain_named_dispatch() {
     // Argument's domain wins, because the argument is what got asked.
     assert_eq!(
         eval(&format!(
-            "{src} ((Boxed of: 5) + (Money of: 3)) class printString"
+            "{src} ((Boxed of: 5) + (Money of: 3)) class asString"
         )),
         Value::Str("Money".into())
     );
@@ -3624,7 +3630,7 @@ fn s5_two_different_wrappers_reach_domain_named_dispatch() {
     // reconstructs once, so Boxed stays Boxed.
     assert_eq!(
         eval(&format!(
-            "{src} ((Boxed of: 5) + (Boxed of: 3)) class printString"
+            "{src} ((Boxed of: 5) + (Boxed of: 3)) class asString"
         )),
         Value::Str("Boxed".into())
     );
@@ -3646,7 +3652,7 @@ fn s5_no_coercion_carries_both_operands_unprojected() {
     assert_eq!(
         eval(&format!(
             "{src} [(Boxed of: 5) + (Money of: 3)] \
-             on: NoCoercion do: [:e | e receiver class printString]"
+             on: NoCoercion do: [:e | e receiver class asString]"
         )),
         Value::Str("Boxed".into()),
         "receiver must arrive un-projected, still a Boxed"
@@ -3654,7 +3660,7 @@ fn s5_no_coercion_carries_both_operands_unprojected() {
     assert_eq!(
         eval(&format!(
             "{src} [(Boxed of: 5) + (Money of: 3)] \
-             on: NoCoercion do: [:e | e argument class printString]"
+             on: NoCoercion do: [:e | e argument class asString]"
         )),
         Value::Str("Money".into())
     );
@@ -3715,15 +3721,21 @@ fn s5_responds_to_is_universal_across_value_kinds() {
     // A non-Symbol argument answers false rather than erroring.
     assert_eq!(eval("3 respondsTo: 'abs'"), Value::Bool(false));
 
-    // Closed by C34 S4 — String's protocol is a method dictionary now.
+    // Closed by C34 S4/S5 — the scalar protocol is a method dictionary now, so
+    // `respondsTo:` is accurate for it by construction. `#size` was false before
+    // S4; the whole rendering family was Rust before S5.
     assert_eq!(eval("'s' respondsTo: #size"), Value::Bool(true));
     assert_eq!(eval("'s' respondsTo: #asSymbol"), Value::Bool(true));
+    assert_eq!(eval("'s' respondsTo: #asString"), Value::Bool(true));
+    assert_eq!(eval("'s' respondsTo: #asDebugString"), Value::Bool(true));
+    assert_eq!(eval("'s' respondsTo: #printNl"), Value::Bool(true));
+    assert_eq!(eval("3 respondsTo: #asString"), Value::Bool(true));
+    assert_eq!(eval("nil respondsTo: #asString"), Value::Bool(true));
 
-    // The remaining blind spot, pinned: `printString` is still a Rust arm on every
-    // family (C34 S5 owns it, gated on the OQ-4 naming decision). When S5 lands,
-    // these flip to true and this pin moves to whatever is still in Rust.
-    assert_eq!(eval("'s' respondsTo: #printString"), Value::Bool(false));
-    assert_eq!(eval("3 respondsTo: #printString"), Value::Bool(false));
+    // What stays invisible is `_prim*` grounding, which is Rust arms by
+    // construction. §6 OQ-2 states this is fine — they are internal grounding,
+    // not protocol — and Q14 is closed on the strength of it.
+    assert_eq!(eval("'s' respondsTo: #_primAsString"), Value::Bool(false));
 }
 
 #[test]
@@ -3871,7 +3883,7 @@ fn s6_unblocks_gcd_and_lcm_on_a_wrapper() {
     // And the wrapper's domain still survives the round trip.
     assert_eq!(
         eval(&format!(
-            "{src} ((Boxed of: 12) gcd: (Boxed of: 18)) class printString"
+            "{src} ((Boxed of: 12) gcd: (Boxed of: 18)) class asString"
         )),
         Value::Str("Boxed".into())
     );

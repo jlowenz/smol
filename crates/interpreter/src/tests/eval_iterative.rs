@@ -183,8 +183,8 @@ fn s2_chained_user_methods() {
 #[test]
 fn s3_cascade() {
     // Cascade sends multiple messages to the same receiver; result is last send.
-    // 'hello' printString returns 'hello'; 'hello' size returns 5.
-    let v = eval("'hello' printString; size");
+    // 'hello' asString returns 'hello'; 'hello' size returns 5.
+    let v = eval("'hello' asString; size");
     assert_eq!(v, Value::Int(5));
 }
 

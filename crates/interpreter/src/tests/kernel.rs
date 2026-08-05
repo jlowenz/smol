@@ -5,19 +5,16 @@ use std::sync::Arc;
 
 #[test]
 fn class_print_string() {
-    // Tests that sending `printString` to a class returns a String matching the class name.
-    // Note: The `println!` in `builtins.rs` for `printString` is intentionally kept
+    // Tests that sending `asString` to a class returns a String matching the class name.
+    // Note: The `println!` in `builtins.rs` for `asString` is intentionally kept
     // for now as per user instruction, even though it's a side-effect.
     assert_eq!(
-        eval_diff("Object printString"),
+        eval_diff("Object asString"),
         Value::Str(Arc::from("Object"))
     );
+    assert_eq!(eval_diff("Array asString"), Value::Str(Arc::from("Array")));
     assert_eq!(
-        eval_diff("Array printString"),
-        Value::Str(Arc::from("Array"))
-    );
-    assert_eq!(
-        eval_diff("ValueHolder printString"),
+        eval_diff("ValueHolder asString"),
         Value::Str(Arc::from("ValueHolder"))
     );
 }
@@ -137,7 +134,7 @@ fn duration_minutes_factory() {
 #[test]
 fn duration_print_string() {
     assert_eq!(
-        eval_diff("(Duration ms: 250) printString"),
+        eval_diff("(Duration ms: 250) asString"),
         Value::Str(Arc::from("250ms"))
     );
 }
@@ -534,7 +531,7 @@ fn integer_conversions_are_smol() {
     // ArbitraryInteger shares the same two methods, grounded on the same prims.
     // 21! is the first factorial past i64, so this is genuinely the LargeInt path.
     assert_eq!(
-        eval("(21 factorial) class printString"),
+        eval("(21 factorial) class asString"),
         Value::Str(Arc::from("ArbitraryInteger"))
     );
     assert_eq!(
@@ -796,4 +793,103 @@ fn string_repeated_rejects_a_negative_count() {
         eval_err("'ab' repeated: -1"),
         EvalError::TypeError(msg) if msg.contains("must not be negative")
     ));
+}
+
+// ── C34 S5: rendering (asString / asDebugString) and console output ──────────
+//
+// `printString` is gone: it was misnamed, and its Rust arms carried a `println!`
+// that made every rendering send write to the console as a side effect.
+
+#[test]
+fn as_string_is_bare_and_as_debug_string_disambiguates() {
+    assert_eq!(eval("'hi' asString"), Value::Str(Arc::from("hi")));
+    assert_eq!(eval("'hi' asDebugString"), Value::Str(Arc::from("'hi'")));
+    assert_eq!(eval("#s asString"), Value::Str(Arc::from("s")));
+    assert_eq!(eval("#s asDebugString"), Value::Str(Arc::from("#s")));
+    // Everything unambiguous renders the same either way, inheriting
+    // asDebugString from Object.
+    for (expr, want) in [("3", "3"), ("2.5", "2.5"), ("nil", "nil"), ("true", "true")] {
+        assert_eq!(
+            eval(&format!("{expr} asString")),
+            Value::Str(Arc::from(want))
+        );
+        assert_eq!(
+            eval(&format!("{expr} asDebugString")),
+            Value::Str(Arc::from(want))
+        );
+    }
+}
+
+#[test]
+fn rendering_no_longer_leaks_output_when_composed() {
+    // The defect that decided OQ-4. `Duration >> asString` is `^ms asString , 'ms'`,
+    // and the nested send used to emit a stray line for the milliseconds; an
+    // Association emitted two. Rendering is pure now, so composing is silent.
+    assert_eq!(
+        eval("(Duration ms: 5) asString"),
+        Value::Str(Arc::from("5ms"))
+    );
+    assert_eq!(
+        eval("(Association key: 1 value: 2) asString"),
+        Value::Str(Arc::from("1 -> 2"))
+    );
+}
+
+#[test]
+fn collections_render_elements_with_as_debug_string() {
+    // Which is the whole reason two renderings exist: inside a collection you
+    // must be able to tell a String from a Symbol from a number.
+    let src = "| a | a := Array new: 3.
+        a at: 0 put: 'hi'. a at: 1 put: #hi. a at: 2 put: 3. a asString";
+    assert_eq!(eval(src), Value::Str(Arc::from("('hi' #hi 3 )")));
+}
+
+#[test]
+fn print_answers_self_so_it_chains() {
+    // printNl returns the receiver, not the rendered string.
+    assert_eq!(eval("(3 printNl) + 1"), Value::Int(4));
+    assert_eq!(eval("'hi' printNl"), Value::Str(Arc::from("hi")));
+}
+
+#[test]
+fn decorated_output_is_conversion_first() {
+    // print emits the BARE form, which is the only non-circular choice: if it
+    // decorated by default there would be no way to print a plain string, since
+    // converting first and printing would decorate the result again. So
+    // `x asDebugString printNl` is how you get decorated output, and it composes.
+    assert_eq!(
+        eval("'hi' asDebugString"),
+        Value::Str(Arc::from("'hi'")),
+        "the debug text is itself an ordinary String, printed bare"
+    );
+    assert_eq!(
+        eval("'hi' asDebugString printNl"),
+        Value::Str(Arc::from("'hi'"))
+    );
+}
+
+#[test]
+fn rendering_is_visible_to_reflection() {
+    for sel in ["#asString", "#asDebugString", "#print", "#printNl"] {
+        assert_eq!(
+            eval(&format!("3 respondsTo: {sel}")),
+            Value::Bool(true),
+            "should respondTo: {sel}"
+        );
+    }
+    // printString is gone from the language entirely.
+    assert_eq!(eval("3 respondsTo: #printString"), Value::Bool(false));
+}
+
+#[test]
+fn class_rendering_is_synchronous_not_a_future() {
+    // Same trap S2 hit with `==`: a class is an entity, so a behavioural send
+    // answers a Future. asString and name are pure functions of the class, so
+    // they joined dispatch_class's synchronous list.
+    assert_eq!(eval("Array asString"), Value::Str(Arc::from("Array")));
+    assert_eq!(eval("Array name"), Value::Str(Arc::from("Array")));
+    assert_eq!(
+        eval("'the ' , Array asString"),
+        Value::Str(Arc::from("the Array"))
+    );
 }
