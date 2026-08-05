@@ -136,20 +136,34 @@ Each phase is independently committable and leaves the suite green.
 
 ## 5a. Measurements (release, this machine)
 
-`before` = `7a2702c` + S1; `after` = + S1a. The `to:do:` family is untouched by S1a
-(it is the `Cont::ToDoStep` special-case, not a method) and is the S1b before-number.
+`start` = `7a2702c` + S1. `+S1a` = the lexical-scope fix. `end` = chunk complete (S6).
+The `to:do:` family is untouched by S1a (it was the `Cont::ToDoStep` special-case, not a
+method), which is why it is flat there and moves only at S1b.
 
-| bench | before | after | |
-|---|---|---|---|
-| `timesRepeat 1000` | 189.7 ms | 16.87 ms | **11.2×** |
-| `valueholder accumulate 1000` | 189.7 ms | 17.37 ms | **10.9×** |
-| `object new 1000` | 187.5 ms | 16.95 ms | **11.1×** |
-| `method send increment 1000` | 187.5 ms | 16.94 ms | **11.1×** |
-| `fibonacci 20 iterative` | 480 µs | 361 µs | 1.33× |
-| `to:do: 100000` | 50.7 ms | 51.2 ms | unchanged |
-| `to:by:do: 100000` | 50.7 ms | 51.0 ms | unchanged |
-| `nested to:do: 300x300` | 47.4 ms | 47.4 ms | unchanged |
-| `array do: 10000` | 12.5 ms | 12.3 ms | unchanged |
+| bench | start | +S1a | end | net |
+|---|---|---|---|---|
+| `timesRepeat 1000` | 189.7 ms | 16.87 ms | 16.71 ms | **11.4× faster** |
+| `valueholder accumulate 1000` | 189.7 ms | 17.37 ms | 17.36 ms | **10.9× faster** |
+| `object new 1000` | 187.5 ms | 16.95 ms | 14.61 ms | **12.8× faster** |
+| `method send increment 1000` | 187.5 ms | 16.94 ms | 14.97 ms | **12.5× faster** |
+| `fibonacci 20 iterative` | 480 µs | 361 µs | 357 µs | 1.34× faster |
+| `to:do: 100000` | 50.7 ms | 51.2 ms | 1.59 s | **31× slower** |
+| `to:by:do: 100000` | 50.7 ms | 51.0 ms | 1.43 s | **28× slower** |
+| `nested to:do: 300x300` | 47.4 ms | 47.4 ms | 1.25 s | **26× slower** |
+| `array do: 10000` | 12.5 ms | 12.3 ms | 105 ms | **8× slower** |
+
+Two opposite movements, both expected and both recorded rather than acted on (§1):
+
+- **Everything dispatch-bound got an order of magnitude faster**, from S1a alone — that
+  was a defect fix, not a tradeoff, and S2–S6 held the gain (entity benches drifted a
+  further ~13% faster as arms and their side effects came out).
+- **The loop family got ~30× slower**, entirely at S1b, when `to:do:` stopped being an
+  evaluator special-case. §5d decomposes it: one iteration is 13 sends, of which
+  `to:do:` is 1 and nine are the numeric tower's `<=`/`+`. The lever is per-send cost
+  (~1.2 µs), not this construct.
+
+Whole test suite: 14.9 s → 28 s, of which ~10 s is the two ≥100k acceptance tests S1b
+added. Net of those it is roughly flat, because S1a paid for S1b.
 
 The four ~188 ms entries were not measuring their nominal subjects at all — each was
 dominated by the `1000 timesRepeat:` driving it. Test-suite side effects: whole suite
