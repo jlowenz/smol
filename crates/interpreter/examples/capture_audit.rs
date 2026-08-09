@@ -172,6 +172,19 @@ fn analyze(
         }
     }
 
+    // Straight-line reassignment: a local assigned more than once. (Method temps
+    // can only be assigned in straight-line code — never in a block/branch/loop —
+    // so >1 assignment is a genuine mutable-local reassignment, the thing a
+    // `let`-only language would forbid and `let mut` would require.)
+    for (name, assigns) in &assign_idx {
+        if assigns.len() > 1 {
+            stats.reassigned.push(format!(
+                "{label}: `{name}` assigned {}× @{assigns:?}",
+                assigns.len()
+            ));
+        }
+    }
+
     for (name, caps) in &capture_idx {
         stats.captured_pairs += 1;
         let Some(assigns) = assign_idx.get(name) else {
@@ -215,6 +228,7 @@ struct Stats {
     scopes: usize,
     captured_pairs: usize,
     captured_and_assigned: usize,
+    reassigned: Vec<String>,
     safe: Vec<String>,
 }
 
@@ -263,5 +277,17 @@ fn main() {
     println!("\n=== SAFE captured-and-assigned cases (assigned strictly before capture) ===");
     for s in &stats.safe {
         println!("  {s}");
+    }
+
+    println!(
+        "\n=== STRAIGHT-LINE REASSIGNMENTS (locals assigned >1×) — the `let mut` demand ===\n\
+         count: {}   (0 ⇒ let-only is viable; >0 ⇒ these need `let mut` or shadowing)",
+        stats.reassigned.len()
+    );
+    for s in &stats.reassigned {
+        println!("  {s}");
+    }
+    if stats.reassigned.is_empty() {
+        println!("  (none)");
     }
 }

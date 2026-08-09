@@ -1,15 +1,15 @@
 # Env-frame redesign — slot resolution + snapshot capture
 
 **Status:** design, written 2026-08-08. Opened from `next_steps_after_c34.md` §4.
-The verify step is complete (§1); the semantic decision (snapshot capture via a
-freeze-on-capture rule) is taken (§2), grounded in the audit (§2.3). **Not yet
+The verify step is complete (§1); the semantic decision (**single-assignment
+locals** + snapshot capture) is taken (§2), grounded in the audit (§2.3). **Not yet
 implemented.** This doc specifies the target design, the interaction points that
 must be preserved, and a phased plan where each phase is independently landable
 and re-profiled.
 
 Reproducible evidence lives in two committed examples:
 `crates/interpreter/examples/alloc_probe.rs` (per-send timing + samply soak) and
-`crates/interpreter/examples/capture_audit.rs` (freeze-on-capture audit).
+`crates/interpreter/examples/capture_audit.rs` (single-assignment + capture audit).
 
 ---
 
@@ -41,54 +41,73 @@ gave ~12× on dispatch-bound benchmarks.
 
 ## 2. The two semantic commitments (foundation)
 
-The performance design rests on two language-level commitments. They are stated
-first because everything downstream depends on them.
+The performance design rests on one language-level commitment. It is stated first
+because everything downstream depends on it.
 
-### 2.1 Freeze-on-capture (new parse rule)
+### 2.1 Single-assignment locals (SSA)
 
-> A local variable may not be assigned after a block has captured it.
+> A local is bound once and never reassigned. `:=` to an already-bound local is a
+> compile error, as is `:=` to an undeclared name (no implicit locals).
 
-This *extends* the strict block-assignment rule (chunk 26), which already forbids
-a block from assigning any name outside its own params/locals. Freeze-on-capture
-adds the one remaining case: the *home* scope reassigning, in its own
-straight-line code, a variable that a nested block has already closed over
-(`| x b | x := 1. b := [x]. x := 2` — the reassignment becomes a parse error).
+This is the decision, taken 2026-08-09, and it **subsumes** two earlier framings:
 
-Together the two rules express **one principle**: *a block mutates nothing
-outside itself, and nothing outside mutates what a block has closed over.* Blocks
-become genuinely value-like closures.
+- It *includes* the chunk-26 strict block-assignment rule (a block can't assign a
+  home temp) as a special case — a block can't reassign *anything* it didn't bind.
+- It makes the once-considered **freeze-on-capture** rule **vacuous**: "may not
+  reassign a local after a block captures it" is trivially satisfied when a local
+  is never reassigned at all. There is no separate capture rule to state, teach,
+  or test.
+
+**No expressiveness is lost.** Smol already confines reassignment to straight-line
+method code (the strict rule bars it in every block/branch/loop). Any straight-line
+`x := e` is expressible as a shadowing `let`-style rebinding `x := e` whose RHS
+still sees the prior binding — and Smol locals have **no observable identity** (you
+cannot alias a local, take its address, or compare slots), so "reuse the slot" vs
+"new slot" is unobservable. A mutable local would therefore be pure sugar for
+slot-reuse, never a capability. `let mut`/`var` is deliberately **not** provided.
+
+The principle, stated once: *a local names a value, not a cell.* This is the
+Value-immutability philosophy pushed down to locals, and it hands the future VM an
+SSA IR for free.
 
 ### 2.2 Snapshot capture
 
 > A block captures the *values* of the lexical variables it reads, copied at
 > block-creation time — not a live reference to the defining environment.
 
-Under freeze-on-capture, snapshot and the current live-capture are
-**observationally identical**: no legal program can distinguish them, because the
-only program that could (reassign-after-capture) is now rejected. So this is a
-representation change with **no behavioral change** on valid code. Its payoff:
-a captured block becomes **self-contained and `Send` by construction**, which is
-what lets frames become thread-local flat slot arrays with no lock and no
-refcounting.
+Because locals are immutable (§2.1), snapshot and a live reference are
+**observationally identical** — a captured value can never change, so there is no
+program that can tell a copy from a shared cell. Snapshot is therefore purely a
+**lifetime** decision, not a semantic one: the home frame is a LIFO stack frame
+freed when its activation returns, while a block can outlive it (returned, stored,
+sent cross-entity). Copying the read-set makes the block **self-contained and
+`Send` by construction**, which is what lets frames become thread-local flat slot
+arrays with no lock and no refcounting.
 
-This mirrors Rust's own `move` closures for crossing thread boundaries; Smol
-blocks cross entity/`may`-coroutine (real OS-thread) boundaries, and `ValueHolder`
-remains the sanctioned mechanism for genuinely shared mutable state.
+This mirrors Rust's `move` closures for crossing thread boundaries; Smol blocks
+cross entity/`may`-coroutine (real OS-thread) boundaries, and `ValueHolder` remains
+the sanctioned mechanism for genuinely shared mutable state.
 
-### 2.3 Cost of the rule (audited)
+### 2.3 Evidence (audited)
 
 `capture_audit.rs` parsed all of `kernel.smol` with the real parser:
 
-- 391 methods, 711 scopes, 161 (name, scope) capture pairs.
-- **0 freeze-on-capture violations.**
-- 29 captured-and-also-assigned locals — every one assigned *once, before*
-  capture (the accumulator idiom: `result := …` then `self do: [:e | result add: …]`).
+- 391 methods, 711 scopes.
+- **0 straight-line reassignments** — every local in the entire kernel is already
+  written exactly once. The stdlib already lives in the SSA world §2.1 mandates.
+- **0 capture-after-reassignment cases** (the freeze rule would have had nothing to
+  do anyway). The 29 captured-and-assigned locals are all the accumulator idiom —
+  `result := …` bound once, then `self do: [:e | result add: …]`.
 
-Every classic Smalltalk pattern that mutates a captured temp (accumulator, flag,
-counter, running max) is *already* illegal under the chunk-26 strict rule and
-already routes through `ValueHolder`. Freeze-on-capture forbids nothing beyond
-that except the reassign-in-straight-line case, which occurs 0 times and is a
-smell.
+Caveat: this is the kernel's style, not proof SSA is painless for *all* future
+code (one test snippet reassigns a block-local). But since shadowing covers every
+legal reassignment position losslessly (above), the constraint is ergonomic, not
+expressive.
+
+**Syntax is unchanged for now:** `| … |` continues to declare locals, now with
+single-assignment semantics. Replacing `| … |` with an inline `let` binding form
+is a separate, deferred ergonomic improvement (§9) and is not required by this
+redesign.
 
 ---
 
@@ -168,12 +187,15 @@ capture plan (an ordered list of sources, each either "current frame slot j" or
     `Dynamic` / `SelfRef`, shadowing-aware (innermost declaration wins).
   - Every block's capture plan lists exactly the enclosing lexical variables its
     body reads, in a fixed order matching its snapshot layout.
-  - **Freeze-on-capture is enforced:** an assignment to a local at a program point
-    at or after that local's first capture is rejected with a new parse/resolve
-    error (mirror of `NonLocalBlockAssignment`).
+  - **Single-assignment is enforced (§2.1):** a `:=` whose target is an
+    already-bound local, or a name that resolves to neither a local, ivar,
+    classvar, nor global, is rejected with a new resolve error (mirror of
+    `NonLocalBlockAssignment`). Distinguishing "undeclared" from "ivar/classvar/
+    global" requires class/namespace context, so this check needs the registry,
+    not the AST alone (see §9).
 
-The audit tool (`capture_audit.rs`) already implements the capture/ordering
-analysis and can seed the enforcement check and its tests.
+The audit tool (`capture_audit.rs`) already implements the reassignment and
+capture analysis and can seed the enforcement check and its tests.
 
 ---
 
@@ -232,9 +254,11 @@ Each of these is load-bearing today; the redesign must keep them correct.
   (`rustc-hash`/`ahash`). ~10% for a one-line change, no semantics. Skippable —
   the slot work removes hashing entirely — but useful as an early validated win.
 - **P1 — rule + analysis, no representation change.** Add the resolve pass and the
-  freeze-on-capture parse error; assert the classification against today's runtime
-  behavior. Full suite stays green (audit says 0 kernel violations). Ships the
-  language rule with targeted tests before any risky rewrite.
+  single-assignment enforcement (§2.1): `:=` to an already-bound local, or to a
+  name that is neither local/ivar/classvar/global, is a resolve error. Full suite
+  stays green (audit says 0 kernel reassignments; verify the kernel also has no
+  implicit-local assignments). Ships the language rule with targeted tests before
+  any risky rewrite.
 - **P2 — flat frames for the common case.** Introduce the evaluator frame stack +
   `LocalSlot`/`Dynamic` resolution for method frames; keep blocks on the old path.
   Re-profile: expect the alloc/hash/mutex share to drop for method-heavy soaks.
@@ -261,6 +285,11 @@ Re-run `alloc_probe` + the `cargo bench` loop/object benches after each phase.
   block-home). Needs a careful pass over all `Cont` variants.
 - **Frame pooling.** Whether to pool freed frames by slot-count to eliminate the
   residual per-activation `Vec` allocation, or rely on TCO reuse + allocator.
+- **Inline `let` binding syntax (deferred, §2.3).** Replace top-of-scope `| … |`
+  with an inline `let name := expr` binding. Pure ergonomics — SSA semantics are
+  already the decision; this is a later low-stakes syntax change with a kernel
+  rewrite, not part of this redesign. Whether shadowing-only reads clearly enough
+  is the open sub-question.
 - **Debugger/inspector contract.** How much of the `slot → name` table and live
   frame contents must be exposed, given the observability goal.
 - **Relationship to the future custom VM.** This resolved form is a stepping stone
@@ -270,11 +299,12 @@ Re-run `alloc_probe` + the `cargo bench` loop/object benches after each phase.
 
 ## 10. Acceptance criteria
 
-- Full test suite green; freeze-on-capture rule added with targeted pass/fail
-  tests (including the `x:=1. b:=[x]. x:=2` rejection and the
-  assign-before-capture acceptance).
+- Full test suite green; single-assignment rule (§2.1) added with targeted
+  pass/fail tests (the `x := 1. … x := 2` reassignment rejection, the undeclared-
+  assignment rejection, and shadowing acceptance where applicable).
 - Cross-entity capture semantics unchanged (existing tests pass unmodified).
 - Re-profile via `alloc_probe soak`: alloc + hashing + mutex self-time shares drop
   substantially toward the predicted floor; state a concrete ns/send target when
   P2 lands (candidate: < 500 ns, i.e. > 2× overall).
-- `capture_audit` remains at 0 violations (now enforced, not just observed).
+- `capture_audit` remains at 0 reassignments / 0 capture violations (now enforced,
+  not just observed).
