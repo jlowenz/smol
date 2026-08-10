@@ -1,5 +1,7 @@
 use super::*;
-use crate::test_helpers::{assert_signal_contains, eval, eval_diff, eval_err, eval_err_diff};
+use crate::test_helpers::{
+    assert_signal_contains, eval, eval_diff, eval_err, eval_err_diff, signal_message,
+};
 
 #[test]
 fn integer_arithmetic() {
@@ -4099,5 +4101,86 @@ fn deep_times_repeat_is_not_quadratic() {
     assert_eq!(
         eval("| n | n := 10000. n timesRepeat: [ 1 + 1 ]. n"),
         Value::Int(10000)
+    );
+}
+
+// ── Single-assignment (SSA) locals (perf_env_frame_redesign §2.1) ────────────
+// Locals bind once; a second `:=` to a scope-local is rejected at method install.
+
+fn ssa_type_error(src: &str) {
+    match eval_err(src) {
+        EvalError::TypeError(msg) => assert!(
+            msg.contains("single-assignment"),
+            "expected single-assignment TypeError, got {msg:?}"
+        ),
+        e => panic!("expected TypeError, got {e:?}"),
+    }
+}
+
+#[test]
+fn ssa_reassigning_method_temp_is_rejected() {
+    ssa_type_error(
+        "Object subclass: #SsaReassign instanceVariableNames: ''.
+         SsaReassign >> bad [ | x | x := 1. x := 2 ]",
+    );
+}
+
+#[test]
+fn ssa_reassigning_param_is_rejected() {
+    ssa_type_error(
+        "Object subclass: #SsaParam instanceVariableNames: ''.
+         SsaParam >> foo: x [ x := 5. ^x ]",
+    );
+}
+
+#[test]
+fn ssa_reassigning_block_local_is_rejected() {
+    ssa_type_error(
+        "Object subclass: #SsaBlk instanceVariableNames: ''.
+         SsaBlk >> bad [ ^[:i | | a | a := 42. a := a + i. a] ]",
+    );
+}
+
+#[test]
+fn ssa_single_assignment_method_is_accepted() {
+    // One binding per local — the ordinary case; must still work.
+    assert_eq!(
+        eval_diff(
+            "Object subclass: #SsaOk instanceVariableNames: ''.
+             SsaOk >> good [ | x | x := 1. ^x + 1 ]
+             SsaOk new good"
+        ),
+        Value::Int(2)
+    );
+}
+
+#[test]
+fn ssa_assigning_undeclared_name_in_method_is_rejected() {
+    // P1b: previously created an implicit local silently (the dynamic-scope
+    // probe's P2 finding). Fires when the method runs, so the error may arrive
+    // as a Signal (condition) rather than a raw TypeError — accept either.
+    let err = eval_err(
+        "Object subclass: #SsaUndecl instanceVariableNames: ''.
+         SsaUndecl >> bad [ secret := 99 ]
+         SsaUndecl new bad",
+    );
+    let msg = match &err {
+        EvalError::TypeError(m) => m.clone(),
+        EvalError::Signal(_) => signal_message(&err).unwrap_or_default(),
+        e => panic!("expected TypeError or Signal, got {e:?}"),
+    };
+    assert!(msg.contains("undeclared"), "got {msg:?}");
+}
+
+#[test]
+fn ssa_ivar_may_be_assigned_repeatedly() {
+    // Single-assignment governs LOCALS only; ivars are mutable object state.
+    assert_eq!(
+        eval_diff(
+            "Object subclass: #SsaIvar instanceVariableNames: 'v'.
+             SsaIvar >> bump [ v := 1. v := 2. ^v ]
+             SsaIvar new bump"
+        ),
+        Value::Int(2)
     );
 }

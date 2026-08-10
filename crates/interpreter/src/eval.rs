@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use crate::entity::{EntityId, InstanceHandle, InstanceKind, InstanceState};
@@ -517,8 +517,20 @@ impl Evaluator {
                 }
                 None => {}
             }
+            // Method/block scope: the target must already exist — a declared local
+            // (defined `Nil` by `push_*_frame`) or an existing outer binding.
+            // ivars and classvars were handled by the match arms above. Never
+            // silently create a new local: that swallowed typos (the implicit-
+            // declaration wart; `perf_env_frame_redesign.md` §2.1 / P1b).
+            let ret = value.clone();
+            if env.set(name.as_ref(), value) {
+                return Ok(ret);
+            }
+            return Err(EvalError::TypeError(format!(
+                "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
+            )));
         }
-        // Default: update existing binding or create new local.
+        // Top-level (REPL/script) scope: create-or-update a binding.
         env.update_or_define(name.clone(), value.clone());
         Ok(value)
     }
@@ -925,6 +937,114 @@ pub(crate) fn check_prim_sends_in_body(stmts: &[Stmt]) -> Result<(), EvalError> 
         }
     }
     Ok(())
+}
+
+/// Enforce single-assignment (SSA) locals — `docs/perf_env_frame_redesign.md` §2.1.
+///
+/// Requires: `params`/`locals` are a method's parameters and top-level temporaries;
+///   `body` is its statement list.
+/// Ensures: returns `Err(EvalError::TypeError)` if any local — of the method scope
+///   or of any nested block scope — is assigned more than once. Assignments to
+///   names not declared in their scope (ivars/classvars/globals) are not this
+///   check's concern (undeclared-assignment enforcement is separate). Otherwise
+///   `Ok(())`.
+pub(crate) fn check_single_assignment_in_method(
+    params: &[Arc<str>],
+    locals: &[Arc<str>],
+    body: &[Stmt],
+) -> Result<(), EvalError> {
+    let mut declared: HashSet<Arc<str>> = params.iter().cloned().collect();
+    declared.extend(locals.iter().cloned());
+    // Parameters are *bound on entry* to their argument, so any `:=` to a param is
+    // already a second binding — seed `assigned` with them.
+    let assigned: HashSet<Arc<str>> = params.iter().cloned().collect();
+    check_single_assignment_scope(declared, assigned, body)
+}
+
+/// Check one scope (method or block body) for a second assignment to any of its
+/// own declared locals, then recurse into nested block scopes. `declared` is this
+/// scope's binding names; `assigned` is pre-seeded with names already bound on
+/// entry (params); mid-body `LocalDecl`s are folded into `declared`.
+fn check_single_assignment_scope(
+    mut declared: HashSet<Arc<str>>,
+    mut assigned: HashSet<Arc<str>>,
+    body: &[Stmt],
+) -> Result<(), EvalError> {
+    for s in body {
+        if let Stmt::LocalDecl(names) = s {
+            declared.extend(names.iter().cloned());
+        }
+    }
+    for s in body {
+        match s {
+            Stmt::Assign { name, value } => {
+                if declared.contains(name) && !assigned.insert(name.clone()) {
+                    return Err(EvalError::TypeError(format!(
+                        "cannot reassign local `{name}`: locals are single-assignment \
+                         (bind once); introduce a new binding instead"
+                    )));
+                }
+                check_single_assignment_expr(value)?;
+            }
+            Stmt::Expr(e) | Stmt::Return(e) => check_single_assignment_expr(e)?,
+            Stmt::LocalDecl(_) => {}
+            // Nested method defs are checked when they are installed.
+            Stmt::MethodDef(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Recurse into an expression, treating each block literal as its own scope.
+fn check_single_assignment_expr(e: &Expr) -> Result<(), EvalError> {
+    match e {
+        Expr::Block {
+            params,
+            locals,
+            body,
+        } => {
+            let mut declared: HashSet<Arc<str>> = params.iter().cloned().collect();
+            declared.extend(locals.iter().cloned());
+            // Block params are bound when the block is invoked — pre-seed them.
+            let assigned: HashSet<Arc<str>> = params.iter().cloned().collect();
+            check_single_assignment_scope(declared, assigned, body)
+        }
+        Expr::Send { receiver, message } => {
+            check_single_assignment_expr(receiver)?;
+            check_single_assignment_message(message)
+        }
+        Expr::Cascade { receiver, messages } => {
+            check_single_assignment_expr(receiver)?;
+            for m in messages {
+                check_single_assignment_message(m)?;
+            }
+            Ok(())
+        }
+        Expr::DynamicArray(es) => {
+            for x in es {
+                check_single_assignment_expr(x)?;
+            }
+            Ok(())
+        }
+        Expr::Lit(_)
+        | Expr::Var(_)
+        | Expr::Super
+        | Expr::NamespaceRef { .. }
+        | Expr::ArrayLiteral(_) => Ok(()),
+    }
+}
+
+fn check_single_assignment_message(msg: &Message) -> Result<(), EvalError> {
+    match msg {
+        Message::Unary(_) => Ok(()),
+        Message::Binary { arg, .. } => check_single_assignment_expr(arg),
+        Message::Keyword { parts } => {
+            for (_, e) in parts {
+                check_single_assignment_expr(e)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

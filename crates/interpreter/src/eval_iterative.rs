@@ -2276,6 +2276,11 @@ fn install_method_def(ev: &Evaluator, def: MethodDef, env: &Env) -> Result<(), E
             ));
         }
         check_prim_sends_in_body(&def.body)?;
+        crate::eval::check_single_assignment_in_method(
+            &def.pattern.params(),
+            &def.locals,
+            &def.body,
+        )?;
         let method = Arc::new(Method {
             pattern: def.pattern.clone(),
             locals: def.locals.clone(),
@@ -2297,6 +2302,7 @@ fn install_method_def(ev: &Evaluator, def: MethodDef, env: &Env) -> Result<(), E
         None => return Err(EvalError::UndefinedVariable(def.class_name.clone())),
     };
     check_prim_sends_in_body(&def.body)?;
+    crate::eval::check_single_assignment_in_method(&def.pattern.params(), &def.locals, &def.body)?;
     let method = Arc::new(Method {
         pattern: def.pattern.clone(),
         locals: def.locals.clone(),
