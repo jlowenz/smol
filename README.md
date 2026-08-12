@@ -79,4 +79,6 @@ to the memory subsystem with an explicit containment argument.
 
 ## A note on the name
 
-This project is the `smol` language. It is unrelated to the `smol` async-runtime crate ecosystem — when searching, qualify that as "smol-rs". Smol depends on `async-channel` (which originates there) but is not coupled to that runtime.
+This project is the `smol` language. I thought it would be a fun play on the "_Small_ talk" name.  
+
+It is unrelated to the `smol` async-runtime crate ecosystem — when searching, qualify that as "smol-rs". Smol depends on `async-channel` (which originates there) but is not coupled to that runtime.
