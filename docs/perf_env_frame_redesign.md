@@ -308,3 +308,125 @@ Re-run `alloc_probe` + the `cargo bench` loop/object benches after each phase.
   P2 lands (candidate: < 500 ns, i.e. > 2× overall).
 - `capture_audit` remains at 0 reassignments / 0 capture violations (now enforced,
   not just observed).
+
+---
+
+## 11. P2.1 detailed design — flat frames + snapshot capture (CONFIRMED 2026-08-11)
+
+Written after P1 (`fa89efa`) and P2.0 (`5182706`) landed; the four decisions below
+(§11.1 phasing, §11.2 representation, §11.3 `self`, §11.6 top-level) were reviewed
+and confirmed 2026-08-11. This is the invasive step.
+
+### 11.1 Phasing revision: P2.1 subsumes the old P3
+
+The doc's original split — P2 = flat method frames with *blocks on the old path*,
+P3 = snapshot capture — **is not separable**, and P2.1 should land flat frames and
+snapshot capture together. Reason: control-flow blocks (`ifTrue:`/`ifFalse:` arms)
+capture method locals (`self`, params) and sit squarely on the hot path. A flat
+method frame only helps if the blocks inside the method read from it — and, since a
+block can outlive its frame, "read from it" means **snapshot** (§2.2). There is no
+useful intermediate in which methods are flat but their blocks are not.
+
+### 11.2 Resolved AST (the representation — resolved-AST direction, confirmed)
+
+P2.0's resolver emits a classification *list* (`refs`); execution needs the
+resolution *attached to each variable node*. **Recommendation:** change
+`Expr::Var(Arc<str>)` to `Expr::Var { name: Arc<str>, res: VarRef }`, add
+`VarRef::Unresolved` as the parser's output, and have the resolve pass functionally
+rewrite each method/block body into a resolved copy (once, at install — not hot).
+
+- One AST — no parallel `RExpr` duplication; the only surface change is `Var`'s
+  shape (no four new `Expr` variants and no `unreachable!` arms in the install-time
+  checks, which run before resolution and would otherwise have to match them).
+- The evaluator reads `res` directly: no runtime hashing, no name walk for
+  locals/upvalues.
+- Churn: ~6 `Expr::Var(name)` match sites become `Var { name, .. }` (parser,
+  evaluator, the two install-time checks, `resolve.rs`, the `capture_audit`
+  example). Mechanical. P2.0's `refs`-list output and its tests get reworked into
+  the tree rewrite (the *logic* is unchanged and stays covered).
+- Rejected alternatives: (a) new resolved `Expr` variants — more variants + dead
+  arms in checks; (b) a separate resolved AST type — clean but duplicates the whole
+  enum for a bootstrap.
+
+### 11.3 Frame stack
+
+- `Frame = Vec<Value>` (candidate `SmallVec<[Value; N]>` to skip the heap for small
+  frames — measure before committing).
+- The evaluator gains `frames: Vec<Frame>`, a LIFO stack: push on activation
+  (method/block), pop on teardown. Because blocks snapshot, **no frame outlives its
+  activation** → pure LIFO, nothing refcounted, no `Arc`/`Mutex`/`HashMap`.
+- `self` is **not** a slot. `SelfRef` reconstructs the receiver from the current
+  `SelfBinding` on `method_stack` (`Instance`/`ClassSide` handle, or `Primitive`
+  self-value) exactly as that data exists today. Frame slots hold params + locals.
+
+### 11.4 Block value + snapshot
+
+- Drop `Block.env: Env`; add `snapshot: Arc<[Value]>` and the block's slot count.
+  `Upvalue(i)` reads `snapshot[i]`.
+- At block creation, fill the snapshot from the creating scope's frame slots /
+  its own snapshot, following each capture's `CaptureSource` (`ParentLocal` /
+  `ParentUpvalue`).
+- A running block's activation carries its snapshot handle so `Upvalue(i)` resolves.
+  `home_depth` / `home_self` / `home_entity` are unchanged.
+
+### 11.5 Cont stack
+
+- Replace `env: Env` in every `Cont` variant with a frame index into `ev.frames`
+  (stable for the activation's lifetime — LIFO guarantees the referenced frame is
+  not popped while its Conts are live). Block-frame Conts also carry the snapshot.
+- Var evaluation: `Local(i)` → `ev.frames[frame][i]`; `Upvalue(i)` → `snapshot[i]`;
+  `SelfRef` → `method_stack`; `Dynamic(name)` → the existing ivar/classvar/global
+  resolution.
+
+### 11.6 Interaction points (delta from §6)
+
+- **ivar / classvar / global** — unchanged resolution, now triggered by
+  `VarRef::Dynamic` rather than a failed local lookup. `assign_var`'s ivar/classvar
+  arms stay; a declared-local assignment becomes a slot write; the P1b
+  undeclared-assignment error can become static once resolution has the registry
+  (or stays the runtime check).
+- **TCO** — a tail self-send reuses the top frame (clear/resize) instead of
+  pop-then-push.
+- **async `then:` continuations** — snapshot makes the block self-contained, so the
+  continuation carries its snapshot; no frame-stack transfer. Verify against
+  `value_object_update_captures_outer_var` and the `then:`/`await` tests.
+- **top-level / REPL scope (RESOLVED 2026-08-11 — top-level temps are globals).**
+  Top-level `| x |` already defines `x` in the *root* frame — the same name-keyed
+  `Env` frame that holds classes and namespaces — and a method's `global_scope()`
+  shares that frame, so top-level temps have always been globals. So there is **not**
+  a second local-variable system: there are **slots** for closed local scopes
+  (methods, blocks) and **one irreducible global namespace** (the root `Env` frame,
+  needed for classes regardless), with `VarRef::Dynamic` the single bridge between
+  them. What P2.1 removes is the *per-activation* frame; the *global* root frame
+  stays because globals are name-addressed by nature.
+  - **Resolution rule:** resolve top-level code with an empty local scope → every
+    `Var` there is `Dynamic` (→ root env), `self` → `SelfRef` (no anchor → nil/error,
+    as today), `| x |` defines a global. Equivalently, leave top-level `Var`s
+    `Unresolved` and let the evaluator's `Unresolved` arm *be* the root-env lookup —
+    same operation.
+  - This also dissolves the block-capture wrinkle: a top-level block `[x]` does not
+    *capture* `x` (it is `Dynamic`), it reads it live from the root env — nothing to
+    snapshot. Consistent with P1, which already exempts top-level from
+    single-assignment and no-implicit-locals (both scoped to `method_depth > 0`).
+  - **Revisit when namespaces are fleshed out** — a richer namespace model may change
+    how the global/top-level scope is structured; this resolution holds until then.
+
+### 11.7 Implementation sub-sequence
+
+- **P2.1a** — resolved AST: change `Var`, add `Unresolved`, make `resolve` rewrite
+  bodies, store the resolved body on `Method`/`Block`; update match sites and P2.0
+  tests. Evaluator still runs via name lookup (honoring `res` where present) so the
+  suite stays green.
+- **P2.1b** — evaluator frame stack; method-local `Local`/`SelfRef`/`Dynamic` reads
+  and writes go through slots.
+- **P2.1c** — snapshot capture on block creation; `Upvalue` reads.
+- **P2.1d** — de-`Env` the `Cont` variants (carry the frame index).
+- **P2.1e** — re-profile (`alloc_probe soak`); TCO frame reuse; `SmallVec` decision.
+
+### 11.8 Risks
+
+- The `Cont`-carries-frame-index change touches every `Cont` variant and all their
+  construction/read sites — the single largest edit; frame-index lifetime across
+  nested activations is the main correctness risk.
+- Async continuation frame handling — must be re-verified against existing tests.
+- `Frame` allocation behavior (`Vec` vs `SmallVec`) — measure, don't assume.
