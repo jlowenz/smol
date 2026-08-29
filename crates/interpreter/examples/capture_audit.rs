@@ -26,7 +26,7 @@ type Names = HashSet<Arc<str>>;
 /// crossed a block boundary relative to the scope being analyzed.
 fn caps_expr(declared: &Names, e: &Expr, in_block: bool, shadow: &Names, out: &mut Names) {
     match e {
-        Expr::Var(v) => {
+        Expr::Var { name: v, .. } => {
             if in_block && declared.contains(v) && !shadow.contains(v) {
                 out.insert(v.clone());
             }

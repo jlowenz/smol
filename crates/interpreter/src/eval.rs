@@ -863,7 +863,7 @@ fn selector_starts_with_prim(msg: &Message) -> bool {
 }
 
 fn is_self_or_super(expr: &Expr) -> bool {
-    matches!(expr, Expr::Super) || matches!(expr, Expr::Var(name) if name.as_ref() == "self")
+    matches!(expr, Expr::Super) || matches!(expr, Expr::Var { name, .. } if name.as_ref() == "self")
 }
 
 /// Walk `expr` and return an error if any `_prim*` message is sent to a
@@ -901,7 +901,7 @@ fn check_prim_sends_in_expr(expr: &Expr) -> Result<(), EvalError> {
             Ok(())
         }
         Expr::Lit(_)
-        | Expr::Var(_)
+        | Expr::Var { .. }
         | Expr::Super
         | Expr::ArrayLiteral(_)
         | Expr::NamespaceRef { .. } => Ok(()),
@@ -1027,7 +1027,7 @@ fn check_single_assignment_expr(e: &Expr) -> Result<(), EvalError> {
             Ok(())
         }
         Expr::Lit(_)
-        | Expr::Var(_)
+        | Expr::Var { .. }
         | Expr::Super
         | Expr::NamespaceRef { .. }
         | Expr::ArrayLiteral(_) => Ok(()),

@@ -23,7 +23,13 @@ fn string_literal() {
 
 #[test]
 fn variable() {
-    assert_eq!(expr("x"), Expr::Var(Arc::from("x")));
+    assert_eq!(
+        expr("x"),
+        Expr::Var {
+            name: Arc::from("x"),
+            res: VarRef::Unresolved,
+        }
+    );
 }
 
 #[test]

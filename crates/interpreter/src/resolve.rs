@@ -1,38 +1,27 @@
 //! Variable resolution — env-frame redesign (`docs/perf_env_frame_redesign.md`
-//! §5, phase P2.0).
+//! §5, §11).
 //!
 //! Classifies every variable reference in a method and its nested blocks into a
 //! [`VarRef`], assigns each lexical scope a flat set of frame slots, and computes
 //! each block's capture plan (with proper upvalue chaining — a name a nested block
 //! reads is captured by every scope between it and the binder). This is the
-//! analysis P2.1 will use to give method activations flat `Vec<Value>` frames and
+//! analysis P2.1 uses to give method activations flat `Vec<Value>` frames and
 //! blocks value snapshots.
 //!
-//! P2.0 scope: this module is pure analysis. It does **not** change the AST or the
-//! evaluator; nothing calls it in the execution path yet. It exists to be built
-//! and validated in isolation before the representation change lands.
+//! Status (P2.1a): [`resolve_and_rewrite`] fills `Expr::Var.res` for reads and is
+//! wired into method installation, but the evaluator still resolves by name and
+//! ignores `res` — so it is behavior-preserving. [`resolve_method`] is the
+//! `ResolvedScope` analysis view (validation/tooling), which P2.1c will fold into
+//! the AST once capture plans and slot writes land.
 
-// Exercised only by unit tests until P2.1 wires resolution into the evaluator.
+// `resolve_and_rewrite` is wired into method installation (P2.1a). The
+// `ResolvedScope` analysis view (`resolve_method` + its walk) stays test/tooling-only
+// until P2.1c folds capture plans onto the AST; allow its as-yet-unused items.
 #![allow(dead_code)]
 
 use std::sync::Arc;
 
-use crate::ast::{Expr, Message, Stmt};
-
-/// How a variable reference resolves.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum VarRef {
-    /// Slot `i` in the current scope's frame (a parameter or local).
-    Local(u16),
-    /// Index `i` into the current block's capture snapshot (a binding from an
-    /// enclosing scope). Only appears inside block bodies.
-    Upvalue(u16),
-    /// The receiver, `self`.
-    SelfRef,
-    /// Not a lexical variable: an instance variable, class variable, or global.
-    /// Resolved at runtime exactly as today.
-    Dynamic(Arc<str>),
-}
+use crate::ast::{Expr, Message, Stmt, VarRef};
 
 /// Where a block capture slot is filled from at block-creation time.
 #[derive(Debug, Clone, PartialEq)]
@@ -79,6 +68,106 @@ pub(crate) fn resolve_method(
     let slots = scope_slots(params, locals, body);
     let mut stack: Vec<ScopeCtx> = Vec::new();
     resolve_scope(&mut stack, slots, body)
+}
+
+/// Rewrite a method body into a copy with every `Expr::Var.res` filled
+/// (`Local` / `Upvalue` / `SelfRef` / `Dynamic`), reusing the same classification
+/// as [`resolve_method`].
+///
+/// P2.1a scope: variable **reads** only. `Stmt::Assign`'s target keeps its bare
+/// name — write-target resolution lands with slot writes in P2.1b. Because the
+/// evaluator still resolves by name and ignores `res`, storing a rewritten body is
+/// behavior-preserving.
+///
+/// Ensures: the returned statements are structurally identical to `body` except
+///   that each `Expr::Var` carries its resolved `VarRef`.
+pub(crate) fn resolve_and_rewrite(
+    params: &[Arc<str>],
+    locals: &[Arc<str>],
+    body: &[Stmt],
+) -> Vec<Stmt> {
+    let slots = scope_slots(params, locals, body);
+    let mut stack: Vec<ScopeCtx> = Vec::new();
+    rewrite_scope(&mut stack, slots, body)
+}
+
+fn rewrite_scope(stack: &mut Vec<ScopeCtx>, slots: Vec<Arc<str>>, body: &[Stmt]) -> Vec<Stmt> {
+    stack.push(ScopeCtx {
+        slots,
+        captures: Vec::new(),
+        sources: Vec::new(),
+    });
+    let out = body.iter().map(|s| rewrite_stmt(stack, s)).collect();
+    stack.pop();
+    out
+}
+
+fn rewrite_stmt(stack: &mut Vec<ScopeCtx>, s: &Stmt) -> Stmt {
+    match s {
+        Stmt::Expr(e) => Stmt::Expr(rewrite_expr(stack, e)),
+        Stmt::Return(e) => Stmt::Return(rewrite_expr(stack, e)),
+        Stmt::Assign { name, value } => Stmt::Assign {
+            name: name.clone(),
+            value: rewrite_expr(stack, value),
+        },
+        Stmt::LocalDecl(n) => Stmt::LocalDecl(n.clone()),
+        // A nested method def is resolved when it is itself installed.
+        Stmt::MethodDef(d) => Stmt::MethodDef(d.clone()),
+    }
+}
+
+fn rewrite_expr(stack: &mut Vec<ScopeCtx>, e: &Expr) -> Expr {
+    match e {
+        Expr::Var { name, .. } => {
+            let depth = stack.len() - 1;
+            let res = resolve_name(stack, depth, name);
+            Expr::Var {
+                name: name.clone(),
+                res,
+            }
+        }
+        Expr::Block {
+            params,
+            locals,
+            body,
+        } => {
+            let slots = scope_slots(params, locals, body);
+            let new_body = rewrite_scope(stack, slots, body);
+            Expr::Block {
+                params: params.clone(),
+                locals: locals.clone(),
+                body: new_body,
+            }
+        }
+        Expr::Send { receiver, message } => Expr::Send {
+            receiver: Box::new(rewrite_expr(stack, receiver)),
+            message: rewrite_message(stack, message),
+        },
+        Expr::Cascade { receiver, messages } => Expr::Cascade {
+            receiver: Box::new(rewrite_expr(stack, receiver)),
+            messages: messages.iter().map(|m| rewrite_message(stack, m)).collect(),
+        },
+        Expr::DynamicArray(es) => {
+            Expr::DynamicArray(es.iter().map(|x| rewrite_expr(stack, x)).collect())
+        }
+        Expr::Lit(_) | Expr::Super | Expr::NamespaceRef { .. } | Expr::ArrayLiteral(_) => e.clone(),
+    }
+}
+
+fn rewrite_message(stack: &mut Vec<ScopeCtx>, msg: &Message) -> Message {
+    match msg {
+        Message::Unary(s) => Message::Unary(s.clone()),
+        Message::Binary { op, arg } => Message::Binary {
+            op: op.clone(),
+            arg: Box::new(rewrite_expr(stack, arg)),
+        },
+        Message::Keyword { parts } => Message::Keyword {
+            parts: parts
+                .iter()
+                .map(|(k, e)| (k.clone(), rewrite_expr(stack, e)))
+                .collect(),
+        },
+    }
 }
 
 /// A scope's mutable resolution state while its subtree is being walked.
@@ -151,7 +240,7 @@ fn walk_expr(
     children: &mut Vec<ResolvedScope>,
 ) {
     match e {
-        Expr::Var(name) => {
+        Expr::Var { name, .. } => {
             let depth = stack.len() - 1;
             let r = resolve_name(stack, depth, name);
             refs.push(r);
@@ -228,6 +317,8 @@ fn resolve_name(stack: &mut [ScopeCtx], depth: usize, name: &Arc<str>) -> VarRef
         VarRef::SelfRef => VarRef::SelfRef,
         // Not lexically bound anywhere → dynamic at every level.
         VarRef::Dynamic(n) => VarRef::Dynamic(n),
+        // `resolve_name` only ever yields the four classifications above.
+        VarRef::Unresolved => unreachable!("resolve_name never yields Unresolved"),
     }
 }
 

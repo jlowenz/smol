@@ -48,10 +48,29 @@ impl Message {
     }
 }
 
+/// How a variable reference resolves. Filled by the resolve pass
+/// (`docs/perf_env_frame_redesign.md` §5); the parser emits `Unresolved`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VarRef {
+    /// Not yet resolved — the parser's output, before the resolve pass runs.
+    Unresolved,
+    /// Slot `i` in the current scope's frame (a parameter or local).
+    Local(u16),
+    /// Index `i` into the current block's capture snapshot (an enclosing binding).
+    Upvalue(u16),
+    /// The receiver, `self`.
+    SelfRef,
+    /// An instance variable, class variable, or global — resolved at runtime.
+    Dynamic(Arc<str>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Lit(Literal),
-    Var(Arc<str>),
+    Var {
+        name: Arc<str>,
+        res: VarRef,
+    },
     /// A single message send.
     Send {
         receiver: Box<Expr>,

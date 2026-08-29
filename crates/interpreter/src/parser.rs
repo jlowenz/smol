@@ -522,7 +522,10 @@ impl Parser {
                         name,
                     });
                 }
-                Ok(Expr::Var(name))
+                Ok(Expr::Var {
+                    name,
+                    res: VarRef::Unresolved,
+                })
             }
             Token::LParen => {
                 self.advance();

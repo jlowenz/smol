@@ -179,7 +179,7 @@ impl TraitData {
 
 /// Is `expr` the pseudo-variable `self`?
 fn is_self(expr: &Expr) -> bool {
-    matches!(expr, Expr::Var(name) if name.as_ref() == "self")
+    matches!(expr, Expr::Var { name, .. } if name.as_ref() == "self")
 }
 
 fn collect_self_sends_stmt(stmt: &Stmt, out: &mut HashSet<Arc<str>>) {
@@ -221,7 +221,7 @@ fn collect_self_sends_expr(expr: &Expr, out: &mut HashSet<Arc<str>>) {
             }
         }
         Expr::Lit(_)
-        | Expr::Var(_)
+        | Expr::Var { .. }
         | Expr::Super
         | Expr::NamespaceRef { .. }
         | Expr::ArrayLiteral(_) => {}

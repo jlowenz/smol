@@ -620,7 +620,7 @@ fn handle_eval_expr(
         Expr::Lit(lit) => {
             *acc = eval_literal(&lit);
         }
-        Expr::Var(name) => {
+        Expr::Var { name, .. } => {
             *acc = ev
                 .lookup_var(&name, &env)
                 .ok_or_else(|| EvalError::UndefinedVariable(name.clone()))?;
@@ -2284,7 +2284,11 @@ fn install_method_def(ev: &Evaluator, def: MethodDef, env: &Env) -> Result<(), E
         let method = Arc::new(Method {
             pattern: def.pattern.clone(),
             locals: def.locals.clone(),
-            body: def.body.clone(),
+            body: crate::resolve::resolve_and_rewrite(
+                &def.pattern.params(),
+                &def.locals,
+                &def.body,
+            ),
         });
         data.insert_own_method(def.pattern.selector(), method);
         return Ok(());
@@ -2306,7 +2310,7 @@ fn install_method_def(ev: &Evaluator, def: MethodDef, env: &Env) -> Result<(), E
     let method = Arc::new(Method {
         pattern: def.pattern.clone(),
         locals: def.locals.clone(),
-        body: def.body.clone(),
+        body: crate::resolve::resolve_and_rewrite(&def.pattern.params(), &def.locals, &def.body),
     });
     let selector = def.pattern.selector();
     if def.is_class_side {
