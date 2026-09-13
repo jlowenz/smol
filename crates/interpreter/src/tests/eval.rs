@@ -4184,3 +4184,174 @@ fn ssa_ivar_may_be_assigned_repeatedly() {
         Value::Int(2)
     );
 }
+
+// ── env-frame redesign P2.1b: slot reads/writes ─────────────────────────────
+// These pin the `VarRef::Local` slot path directly. A wrong slot index or a
+// broken dual-write would surface here even though the broader suite is green.
+
+#[test]
+fn p21b_keyword_params_resolve_to_correct_slots() {
+    // Three params in one keyword method: the returned expression uses each in a
+    // distinct position, so an off-by-one in slot indexing gives a wrong number.
+    // `a*100 + b*10 + c` = 123 iff a=1 (slot 0), b=2 (slot 1), c=3 (slot 2).
+    assert_eq!(
+        eval(
+            "Object subclass: #SlotKw instanceVariableNames: ''.
+             SlotKw >> a: a b: b c: c [ ^(a * 100) + (b * 10) + c ]
+             SlotKw new a: 1 b: 2 c: 3"
+        ),
+        Value::Int(123)
+    );
+}
+
+#[test]
+fn p21b_params_and_locals_share_one_slot_frame() {
+    // Params (slots 0..1) then a declared local (slot 2), all read positionally.
+    assert_eq!(
+        eval(
+            "Object subclass: #SlotMix instanceVariableNames: ''.
+             SlotMix >> a: a b: b [ | s | s := a + b. ^(s * 10) + a ]
+             SlotMix new a: 3 b: 4"
+        ),
+        // s = 7 -> 70 + a(3) = 73
+        Value::Int(73)
+    );
+}
+
+#[test]
+fn p21b_local_write_then_read_round_trips_through_slot() {
+    // Read side is a slot read; write side writes the slot. If the write did not
+    // land in the slot, `^x` would read the pre-write value (nil) and fail.
+    assert_eq!(
+        eval(
+            "Object subclass: #SlotRW instanceVariableNames: ''.
+             SlotRW >> doubled: n [ | x | x := n * 2. ^x ]
+             SlotRW new doubled: 21"
+        ),
+        Value::Int(42)
+    );
+}
+
+#[test]
+fn p21b_block_captures_outer_local_via_dual_write() {
+    // `x` is a method Local (slot + env dual-write); the block reads it as an
+    // Upvalue, which in P2.1b still resolves by name through the env. This fails
+    // if the Local write updated only the slot and not the env map.
+    assert_eq!(
+        eval(
+            "Object subclass: #SlotCap instanceVariableNames: ''.
+             SlotCap >> compute [ | x | x := 5. ^[ x + 1 ] value ]
+             SlotCap new compute"
+        ),
+        Value::Int(6)
+    );
+}
+
+#[test]
+fn p21b_block_own_param_is_a_slot_while_capturing_outer() {
+    // Inside the block, `b` is a Local (block frame slot 0) and `a` is an Upvalue
+    // (outer method param). Both must resolve correctly at once.
+    assert_eq!(
+        eval(
+            "Object subclass: #SlotBlk instanceVariableNames: ''.
+             SlotBlk >> with: a [ ^[ :b | a + b ] value: 10 ]
+             SlotBlk new with: 32"
+        ),
+        Value::Int(42)
+    );
+}
+
+#[test]
+fn p21c_block_snapshot_indexes_multiple_upvalues() {
+    // Two captured outer locals read in source order x-then-y → Upvalue(0)=x,
+    // Upvalue(1)=y. `(x*10)+y` = 53 iff the snapshot is indexed correctly; a
+    // swapped index would give 35.
+    assert_eq!(
+        eval(
+            "Object subclass: #SnapIdx instanceVariableNames: ''.
+             SnapIdx >> go [ | x y | x := 5. y := 3. ^[ (x * 10) + y ] value ]
+             SnapIdx new go"
+        ),
+        Value::Int(53)
+    );
+}
+
+#[test]
+fn p21c_capture_before_assignment_is_rejected() {
+    // A block that captures a method local whose single assignment comes *later*
+    // could only ever snapshot the nil placeholder — under single-assignment this
+    // is always a bug, and (unlike Smalltalk's cell capture) silent. We reject it
+    // at install time. See docs/perf_env_frame_redesign.md §2.2 / open_questions.
+    let err = eval_err(
+        "Object subclass: #CapBefore instanceVariableNames: ''.
+         CapBefore >> probe [ | x b | b := [ x ]. x := 5. ^b value ]
+         CapBefore new probe",
+    );
+    let msg = match &err {
+        EvalError::TypeError(m) => m.clone(),
+        EvalError::Signal(_) => signal_message(&err).unwrap_or_default(),
+        e => panic!("expected TypeError or Signal, got {e:?}"),
+    };
+    assert!(msg.contains("before it is assigned"), "got {msg:?}");
+}
+
+#[test]
+fn p21c_capture_after_assignment_is_accepted() {
+    // The normal order — assign, then capture — is fine and returns the value
+    // (matching Smalltalk); only capture-*before*-assign is rejected.
+    assert_eq!(
+        eval(
+            "Object subclass: #CapAfter instanceVariableNames: ''.
+             CapAfter >> probe [ | x b | x := 5. b := [ x ]. ^b value ]
+             CapAfter new probe"
+        ),
+        Value::Int(5)
+    );
+}
+
+#[test]
+fn p21c_capture_before_assignment_rejected_in_nested_block() {
+    // The rule applies at every scope depth: an inner block capturing an outer
+    // *block* local before that local is assigned is likewise rejected.
+    let err = eval_err(
+        "Object subclass: #CapNest instanceVariableNames: ''.
+         CapNest >> probe [ ^[ | y inner | inner := [ y ]. y := 3. inner value ] value ]
+         CapNest new probe",
+    );
+    let msg = match &err {
+        EvalError::TypeError(m) => m.clone(),
+        EvalError::Signal(_) => signal_message(&err).unwrap_or_default(),
+        e => panic!("expected TypeError or Signal, got {e:?}"),
+    };
+    assert!(msg.contains("before it is assigned"), "got {msg:?}");
+}
+
+#[test]
+fn p21c_block_outlives_its_creating_frame() {
+    // The whole point of snapshot capture: the returned block is invoked *after*
+    // its creating method frame has been torn down, so `n` must live in the
+    // block's snapshot, not a freed frame slot.
+    assert_eq!(
+        eval(
+            "Object subclass: #SnapEsc instanceVariableNames: ''.
+             SnapEsc >> makeAdder: n [ ^[ :x | x + n ] ]
+             (SnapEsc new makeAdder: 100) value: 23"
+        ),
+        Value::Int(123)
+    );
+}
+
+#[test]
+fn p21b_nested_blocks_chain_upvalues_to_method_local() {
+    // Two nested blocks: the innermost reads a method local through a two-hop
+    // upvalue chain while carrying its own Local param. Exercises slot frames at
+    // three depths simultaneously.
+    assert_eq!(
+        eval(
+            "Object subclass: #SlotNest instanceVariableNames: ''.
+             SlotNest >> go [ | base | base := 100. ^[ :i | [ :j | base + i + j ] value: 20 ] value: 3 ]
+             SlotNest new go"
+        ),
+        Value::Int(123)
+    );
+}

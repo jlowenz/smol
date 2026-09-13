@@ -357,6 +357,7 @@ fn nlr_with_failing_commit_faults_entity() {
         params: vec![],
         locals: vec![],
         body: vec![Stmt::Return(Expr::Lit(Literal::Int(77)))],
+        snapshot: Arc::from(Vec::new()),
         env: Env::new(),
         home_depth: 2,
         home_entity: None,

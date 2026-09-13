@@ -202,7 +202,11 @@ impl Parser {
                 self.skip_comments();
                 self.advance(); // consume `:=`
                 let value = self.parse_expr()?;
-                return Ok(Stmt::Assign { name, value });
+                return Ok(Stmt::Assign {
+                    name,
+                    res: VarRef::Unresolved,
+                    value,
+                });
             }
         }
         Ok(Stmt::Expr(self.parse_expr()?))
@@ -662,6 +666,9 @@ impl Parser {
             params,
             locals,
             body,
+            // Filled by the resolve pass; a block that is never resolved
+            // (top-level) captures nothing.
+            captures: Vec::new(),
         })
     }
 }

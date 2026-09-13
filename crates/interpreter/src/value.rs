@@ -47,8 +47,15 @@ pub struct Block {
     pub params: Vec<Arc<str>>,
     pub locals: Vec<Arc<str>>,
     pub body: Vec<Stmt>,
-    /// Captured lexical environment. Because `Env` frames are
-    /// `Arc<Mutex<Frame>>`, this is a live shared reference, not a snapshot.
+    /// Captured upvalue values, snapshotted at block-creation time in
+    /// `Upvalue(i)` order (env-frame redesign P2.1c). Because locals are
+    /// single-assignment, this value-copy is observationally identical to a live
+    /// reference, and being `Arc<[Value]>` it is `Send` — the block can outlive its
+    /// creating frame and cross entity boundaries self-contained.
+    pub snapshot: Arc<[Value]>,
+    /// Captured lexical environment. Retained alongside `snapshot` (dual storage)
+    /// so `Dynamic` (ivar/classvar/global) name lookups still resolve until P2.1d
+    /// removes it; `Upvalue` reads use `snapshot`, not this.
     pub env: Env,
     /// Method-stack depth of the frame a `^`-return inside this block should
     /// target. Equal to the method depth at the block's creation site, so that

@@ -88,6 +88,22 @@ This mirrors Rust's `move` closures for crossing thread boundaries; Smol blocks
 cross entity/`may`-coroutine (real OS-thread) boundaries, and `ValueHolder` remains
 the sanctioned mechanism for genuinely shared mutable state.
 
+**One hole in "observationally identical," and its resolution (P2.1c, decided
+2026-09-13).** The equivalence argument assumes the capture happens *after* the
+local's single assignment. Capturing *before* it — `| x b | b := [x]. x := 5. b
+value` in a method — is the one case a value-snapshot and a Smalltalk cell diverge:
+Smalltalk's cell yields `5`, a snapshot yields the nil placeholder captured at
+creation. Under single-assignment this capture can *only ever* snapshot the
+placeholder (the sole assignment is still in the future), so it is never useful —
+always a latent bug, and silent. Rather than accept the silent nil, the evaluator
+**rejects capture-before-assignment at install time** (`check_capture_before_assignment`,
+run on the resolved body): a block whose `ParentLocal` capture names an enclosing
+declared local not yet assigned at the block's textual position is a compile error.
+This keeps "a local names a value" honest — you cannot observe a local before it has
+one — and closes the divergence without special runtime handling. (Top-level/REPL
+code stays exempt, as it is from §2.1: it is the mutable global scope, resolved with
+an empty local scope, so its blocks read live via the root env.)
+
 ### 2.3 Evidence (audited)
 
 `capture_audit.rs` parsed all of `kernel.smol` with the real parser:
@@ -417,9 +433,55 @@ rewrite each method/block body into a resolved copy (once, at install — not ho
   bodies, store the resolved body on `Method`/`Block`; update match sites and P2.0
   tests. Evaluator still runs via name lookup (honoring `res` where present) so the
   suite stays green.
-- **P2.1b** — evaluator frame stack; method-local `Local`/`SelfRef`/`Dynamic` reads
-  and writes go through slots.
-- **P2.1c** — snapshot capture on block creation; `Upvalue` reads.
+- **P2.1b** — evaluator frame stack; method-local `Local` reads and writes go
+  through slots. **DONE** (this commit). Details:
+  - **P2.1b-0 (prerequisite refactor):** consolidated the duplicated frame
+    setup/teardown into single choke points — `release_frame` (one teardown,
+    replacing four hand-copied sequences) and `push_method_frame` (one method-frame
+    setup for all four entry points); `eval_block` now delegates to
+    `push_block_frame`. Behavior-preserving; surfaced the class-side `super`
+    base-env inconsistency (open_questions Q16).
+  - `Stmt::Assign` gained `res: VarRef` (parser emits `Unresolved`; resolver fills
+    it) — write-target resolution, deferred from P2.1a.
+  - `Evaluator::frames: RefCell<Vec<Vec<Value>>>` — a strictly-LIFO slot stack
+    pushed per method/block activation (params, then locals, then body temps, in
+    resolver order; `self` is not a slot) in `push_method_frame`/`push_block_frame`,
+    popped in `release_frame`. Balanced on the same paths that keep `method_stack`
+    balanced (continuable `Signal` errors drain via `teardown_frame`; raw `?` errors
+    fault-and-terminate the entity). No `current_frame` cell: `frames.last()` is
+    always the current scope (Conts fire LIFO; async continuations run on a fresh
+    evaluator with a fresh stack).
+  - `Local(i)` reads (`handle_eval_expr`) index `frames.last()[i]`; writes
+    (`assign_var`) write the slot and mirror into the env (dual write — two clones)
+    so nested-block `Upvalue`-by-name reads stay correct until P2.1c.
+  - **Deliberately deferred:** `SelfRef` / `Dynamic` still route through
+    `lookup_var` by name (behavior-identical; routing them by `res` is a marginal,
+    optional follow-on — only `Local` avoids a hash). The name-keyed `Env` and its
+    `HashMap` remain (dual storage); P2.1c/d collapse them.
+- **P2.1c** — snapshot capture on block creation; `Upvalue` reads. **DONE** (this commit). Details:
+  - `CaptureSource` moved to ast.rs; `Expr::Block` gained `captures: Vec<CaptureSource>`
+    (parser emits empty, resolver's `rewrite_scope` now returns the scope's capture
+    plan and attaches it to the block node — methods assert an empty plan).
+  - `Block` gained `snapshot: Arc<[Value]>`; the evaluator's frame element became
+    `Frame { slots, snapshot }`. At block creation `build_capture_snapshot` fills the
+    snapshot from the creating (top) frame — `ParentLocal`→its slots, `ParentUpvalue`
+    →its snapshot; capture-free scopes share a cached `empty_snapshot()`.
+  - A running block's frame carries `block.snapshot`; `Upvalue(i)` reads
+    `frames.last().snapshot[i]`. A method frame's snapshot is empty.
+  - The P2.1b `Local`-write **env mirror is removed** — with `Upvalue` on snapshots,
+    no reader consults env-local entries, so `Local` writes are back to a single
+    clone. Verified: full suite green after removal; poison-test confirmed `Upvalue`
+    reads are live and index-sensitive.
+  - **Capture-before-assignment is now a compile error** (§2.2, decided 2026-09-13):
+    `check_capture_before_assignment` runs on the resolved body at install and
+    rejects a block whose `ParentLocal` capture names an enclosing declared local
+    not yet assigned at the block's position. Closes the one snapshot-vs-Smalltalk
+    divergence; the kernel and full suite pass unchanged (nothing captures before
+    assigning).
+  - **Still deferred to P2.1d:** `Block.env` is retained (dual storage) because
+    `Dynamic` (ivar/classvar/global) and `SelfRef` still resolve by name; the
+    per-block `env.clone()` at creation therefore remains until P2.1d de-`Env`s the
+    `Cont` variants and removes it.
 - **P2.1d** — de-`Env` the `Cont` variants (carry the frame index).
 - **P2.1e** — re-profile (`alloc_probe soak`); TCO frame reuse; `SmallVec` decision.
 

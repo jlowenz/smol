@@ -526,3 +526,46 @@ Note that Option 3 is a substantially larger change than reverting S6: `hash` al
 `Dictionary` key unification, and the `Ordered` contract all follow from the choice.
 
 Related: numeric tower plan §2a (Ordered requires `=`), §4g/S6.
+
+---
+
+## Q16: Class-side `super` uses `env.clone()` as its method base scope, not `global_scope()`
+
+**Status:** Open — surfaced during the env-frame redesign P2.1b-0 setup/teardown
+consolidation; behavior preserved, deferred for a dedicated look.
+
+**What:** Every method activation is rooted at a *base env* before its frame is
+pushed. Three of the four method-frame entry points root at `env.global_scope()`
+— the documented method-scope base: the receiver's own args/temps + storage +
+globals, explicitly *not* the caller's frames (`env.rs` `global_scope` contract).
+The fourth, `push_class_method_frame` (the class-side **`super`** send path in
+`eval_iterative.rs`), roots at `env.clone()` instead, which keeps the *caller's*
+frames live as outer scope.
+
+| entry point | base env |
+|---|---|
+| `push_method_call_frame` (instance / primitive self-send) | `global_scope()` |
+| `Evaluator::invoke_class_method` (direct class-side call) | `global_scope()` |
+| `push_class_method_frame` (class-side `super`) | `env.clone()` |
+
+**Why it matters:** with `env.clone()`, a name unresolved in a class-side `super`
+method's own frame/classvars can fall through `lookup_var`'s
+`lookup_outer_frames` step to a *caller's* local — a lexical leak the
+`global_scope()` rooting is specifically designed to prevent. It is likely
+unobserved today (a `super` method body rarely reads a name that shadows a caller
+local), which is why the suite is green either way.
+
+**Tensions / options:**
+1. **Bug — unify on `global_scope()`.** Most likely correct; makes all four method
+   entry points consistent. Needs a test that would actually catch the leak
+   (class-side `super` reading a name that exists as a caller local) to confirm
+   nothing depended on the `clone()` behavior.
+2. **Intentional — document why.** If class-side `super` genuinely needs caller
+   scope visible (none is apparent), record the reason at the call site so it
+   stops reading as an accident.
+
+Post-consolidation the difference is a single visible argument at the four
+`push_method_frame(...)` call sites, so whichever way it resolves is a one-line
+change. Revisit alongside the env-frame redesign (the redesign replaces name-keyed
+outer-frame lookup with slot/snapshot resolution, at which point this leak either
+disappears or must be reproduced deliberately).

@@ -8,11 +8,14 @@
 //! analysis P2.1 uses to give method activations flat `Vec<Value>` frames and
 //! blocks value snapshots.
 //!
-//! Status (P2.1a): [`resolve_and_rewrite`] fills `Expr::Var.res` for reads and is
-//! wired into method installation, but the evaluator still resolves by name and
-//! ignores `res` — so it is behavior-preserving. [`resolve_method`] is the
-//! `ResolvedScope` analysis view (validation/tooling), which P2.1c will fold into
-//! the AST once capture plans and slot writes land.
+//! Status (P2.1c): [`resolve_and_rewrite`] fills `Expr::Var.res` (reads),
+//! `Stmt::Assign.res` (write targets), and each `Expr::Block.captures` (the block's
+//! capture plan), wired into method installation. The evaluator honors `res`:
+//! `Local` reads/writes go through the flat slot frames (`Evaluator::frames`) and
+//! `Upvalue` reads through the block's capture snapshot — both bypass the name hash.
+//! `SelfRef` / `Dynamic` still resolve by name via the env (dual storage) until
+//! P2.1d removes it. [`resolve_method`] remains the `ResolvedScope` analysis view
+//! (validation/tooling); `resolve_and_rewrite` is now the authoritative rewrite.
 
 // `resolve_and_rewrite` is wired into method installation (P2.1a). The
 // `ResolvedScope` analysis view (`resolve_method` + its walk) stays test/tooling-only
@@ -21,16 +24,7 @@
 
 use std::sync::Arc;
 
-use crate::ast::{Expr, Message, Stmt, VarRef};
-
-/// Where a block capture slot is filled from at block-creation time.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum CaptureSource {
-    /// Slot `i` in the immediately-enclosing scope's frame.
-    ParentLocal(u16),
-    /// Index `i` in the immediately-enclosing scope's own capture snapshot.
-    ParentUpvalue(u16),
-}
+use crate::ast::{CaptureSource, Expr, Message, Stmt, VarRef};
 
 /// The resolved plan for one lexical scope: a method body or a block body.
 #[derive(Debug, Clone, PartialEq)]
@@ -88,28 +82,48 @@ pub(crate) fn resolve_and_rewrite(
 ) -> Vec<Stmt> {
     let slots = scope_slots(params, locals, body);
     let mut stack: Vec<ScopeCtx> = Vec::new();
-    rewrite_scope(&mut stack, slots, body)
+    let (out, sources) = rewrite_scope(&mut stack, slots, body);
+    debug_assert!(
+        sources.is_empty(),
+        "a method scope never captures (no enclosing lexical scope)"
+    );
+    out
 }
 
-fn rewrite_scope(stack: &mut Vec<ScopeCtx>, slots: Vec<Arc<str>>, body: &[Stmt]) -> Vec<Stmt> {
+/// Rewrite one scope's body, returning the rewritten statements and the scope's
+/// capture plan (`sources[i]` fills `Upvalue(i)` / snapshot slot `i`). The plan is
+/// empty for a method scope; a block scope attaches it to its `Expr::Block`.
+fn rewrite_scope(
+    stack: &mut Vec<ScopeCtx>,
+    slots: Vec<Arc<str>>,
+    body: &[Stmt],
+) -> (Vec<Stmt>, Vec<CaptureSource>) {
     stack.push(ScopeCtx {
         slots,
         captures: Vec::new(),
         sources: Vec::new(),
     });
     let out = body.iter().map(|s| rewrite_stmt(stack, s)).collect();
-    stack.pop();
-    out
+    let ctx = stack.pop().expect("scope stack underflow");
+    (out, ctx.sources)
 }
 
 fn rewrite_stmt(stack: &mut Vec<ScopeCtx>, s: &Stmt) -> Stmt {
     match s {
         Stmt::Expr(e) => Stmt::Expr(rewrite_expr(stack, e)),
         Stmt::Return(e) => Stmt::Return(rewrite_expr(stack, e)),
-        Stmt::Assign { name, value } => Stmt::Assign {
-            name: name.clone(),
-            value: rewrite_expr(stack, value),
-        },
+        Stmt::Assign { name, value, .. } => {
+            // Resolve the target first (matching the analysis walk order), then
+            // the RHS. The strict block rule keeps the target a `Local` or
+            // `Dynamic`, so this never adds an upvalue.
+            let depth = stack.len() - 1;
+            let res = resolve_name(stack, depth, name);
+            Stmt::Assign {
+                name: name.clone(),
+                res,
+                value: rewrite_expr(stack, value),
+            }
+        }
         Stmt::LocalDecl(n) => Stmt::LocalDecl(n.clone()),
         // A nested method def is resolved when it is itself installed.
         Stmt::MethodDef(d) => Stmt::MethodDef(d.clone()),
@@ -130,13 +144,15 @@ fn rewrite_expr(stack: &mut Vec<ScopeCtx>, e: &Expr) -> Expr {
             params,
             locals,
             body,
+            ..
         } => {
             let slots = scope_slots(params, locals, body);
-            let new_body = rewrite_scope(stack, slots, body);
+            let (new_body, captures) = rewrite_scope(stack, slots, body);
             Expr::Block {
                 params: params.clone(),
                 locals: locals.clone(),
                 body: new_body,
+                captures,
             }
         }
         Expr::Send { receiver, message } => Expr::Send {
@@ -220,7 +236,7 @@ fn walk_stmt(
 ) {
     match s {
         Stmt::Expr(e) | Stmt::Return(e) => walk_expr(stack, e, refs, children),
-        Stmt::Assign { name, value } => {
+        Stmt::Assign { name, value, .. } => {
             // The assignment target is itself a reference (an lvalue). The strict
             // block rule guarantees it is a scope-local or a dynamic name, never a
             // capture, so resolving it never adds an upvalue.
@@ -249,6 +265,7 @@ fn walk_expr(
             params,
             locals,
             body,
+            ..
         } => {
             let slots = scope_slots(params, locals, body);
             let child = resolve_scope(stack, slots, body);

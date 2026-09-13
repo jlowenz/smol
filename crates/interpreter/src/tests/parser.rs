@@ -96,6 +96,7 @@ fn assignment() {
         prog.stmts[0],
         Stmt::Assign {
             name: Arc::from("x"),
+            res: VarRef::Unresolved,
             value: Expr::Lit(Literal::Int(42))
         }
     );

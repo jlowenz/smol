@@ -1,13 +1,13 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::ast::{Expr, Message, MethodDef, Stmt};
+use crate::ast::{CaptureSource, Expr, Message, MethodDef, Stmt, VarRef};
 use crate::builtins::{UserMethodFound, as_block, force_value, lookup_user_method};
 use crate::class::{Class, Method};
 use crate::entity::{InstanceHandle, InstanceKind};
 use crate::env::Env;
 use crate::eval::{
-    EvalError, Evaluator, SelfBinding, check_prim_sends_in_body, eval_literal, self_sym,
+    EvalError, Evaluator, Frame, SelfBinding, check_prim_sends_in_body, eval_literal, self_sym,
 };
 use crate::value::Value;
 
@@ -222,8 +222,12 @@ pub(crate) enum Cont {
         env: Env,
     },
 
-    /// RHS just evaluated (`acc`); assign to `name` in `env`.
-    Assign { name: Arc<str>, env: Env },
+    /// RHS just evaluated (`acc`); assign to `name` (resolved as `res`) in `env`.
+    Assign {
+        name: Arc<str>,
+        res: VarRef,
+        env: Env,
+    },
 
     /// Non-local `^`-return: `acc` is the return value; unwind to the
     /// `CallFrame` whose `depth` matches `block.home_depth`.
@@ -393,6 +397,36 @@ enum UnwindOutcome {
     Exhausted,
 }
 
+/// Release a method or block activation's runtime resources: pop its `self`
+/// binding if it pushed one, restore `current_block_home`, and pop its owned env
+/// frame.
+///
+/// The single source of truth for frame teardown, shared by normal completion
+/// (`handle_method_frame` / `handle_block_frame`) and the unwind / error / TCO
+/// path (`teardown_frame`). Callers layer their own concerns on top (setting
+/// `acc`, returning the `^`-match depth).
+///
+/// `pushed_self` is the one point of variation between the two frame kinds: a
+/// method frame always pushes a `self` binding (`true`); a block frame pushes one
+/// only when it captured a home instance (`block_home_self.is_some()`).
+fn release_frame(
+    ev: &Evaluator,
+    env: &mut Env,
+    saved_block_home: Option<usize>,
+    pushed_self: bool,
+) {
+    if pushed_self {
+        ev.pop_self();
+    }
+    ev.current_block_home.set(saved_block_home);
+    env.pop_frame();
+    // Pop this activation's slot frame (env-frame redesign P2.1b). Every
+    // `push_method_frame` / `push_block_frame` pushes exactly one, and every
+    // method/block teardown routes through here, so the slot stack stays
+    // LIFO-balanced on the same paths that keep `method_stack` balanced.
+    ev.frames.borrow_mut().pop();
+}
+
 /// Run the evaluator-side teardown for a popped frame continuation.
 ///
 /// Requires: `frame` was just popped from the step-loop stack.
@@ -409,9 +443,7 @@ fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
             saved_block_home,
             ..
         } => {
-            ev.pop_self();
-            ev.current_block_home.set(saved_block_home);
-            env.pop_frame();
+            release_frame(ev, &mut env, saved_block_home, true);
             Some(depth)
         }
         Cont::BlockFrame {
@@ -420,11 +452,7 @@ fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
             block_home_self,
             ..
         } => {
-            if block_home_self.is_some() {
-                ev.pop_self();
-            }
-            ev.current_block_home.set(saved_block_home);
-            env.pop_frame();
+            release_frame(ev, &mut env, saved_block_home, block_home_self.is_some());
             Some(0)
         }
         Cont::ProgramFrame {
@@ -620,15 +648,46 @@ fn handle_eval_expr(
         Expr::Lit(lit) => {
             *acc = eval_literal(&lit);
         }
-        Expr::Var { name, .. } => {
-            *acc = ev
-                .lookup_var(&name, &env)
-                .ok_or_else(|| EvalError::UndefinedVariable(name.clone()))?;
+        Expr::Var { name, res } => {
+            *acc = match res {
+                // Scope-local: read the current activation's slot directly, no hash
+                // (env-frame redesign P2.1b). `res == Local` only occurs in a
+                // resolved method/block body, where a frame is always live and the
+                // resolver guarantees `i` is in range.
+                VarRef::Local(i) => ev
+                    .frames
+                    .borrow()
+                    .last()
+                    .expect("Local read with no active frame")
+                    .slots
+                    .get(i as usize)
+                    .expect("Local slot index out of range")
+                    .clone(),
+                // Captured upvalue: read the block's snapshot (values copied at
+                // block-creation time), no name walk (env-frame redesign P2.1c).
+                // Only occurs in a resolved block body, where a frame is live and
+                // the resolver guarantees `i` is in range.
+                VarRef::Upvalue(i) => ev
+                    .frames
+                    .borrow()
+                    .last()
+                    .expect("Upvalue read with no active frame")
+                    .snapshot
+                    .get(i as usize)
+                    .expect("Upvalue index out of range")
+                    .clone(),
+                // `SelfRef` / `Dynamic` / `Unresolved` still resolve by name via the
+                // env + method_stack (name-addressed; folded in P2.1d).
+                _ => ev
+                    .lookup_var(&name, &env)
+                    .ok_or_else(|| EvalError::UndefinedVariable(name.clone()))?,
+            };
         }
         Expr::Block {
             params,
             locals,
             body,
+            captures,
         } => {
             let home_depth = ev
                 .current_block_home
@@ -641,10 +700,15 @@ fn handle_eval_expr(
                     _ => None,
                 })
             };
+            // Snapshot the captured upvalues from the creating (current) frame:
+            // `ParentLocal` from its slots, `ParentUpvalue` from its own snapshot
+            // (env-frame redesign P2.1c). Empty for a block that captures nothing.
+            let snapshot = build_capture_snapshot(ev, &captures);
             *acc = Value::Block(Arc::new(crate::value::Block {
                 params,
                 locals,
                 body,
+                snapshot,
                 env: env.clone(),
                 home_depth,
                 home_entity: ev.current_entity_id.get(),
@@ -774,8 +838,8 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
             Cont::EvalExpr { expr, env } => handle_eval_expr(ev, expr, env, &mut stack, &mut acc)?,
 
             // ── Assignment ───────────────────────────────────────────────
-            Cont::Assign { name, mut env } => {
-                acc = ev.assign_var(&name, acc.clone(), &mut env)?;
+            Cont::Assign { name, res, mut env } => {
+                acc = ev.assign_var(&name, &res, acc.clone(), &mut env)?;
             }
 
             // ── Non-local return ─────────────────────────────────────────
@@ -1044,10 +1108,8 @@ fn handle_method_frame(
     acc: &mut Value,
 ) -> Result<(), EvalError> {
     if pending.is_empty() {
-        // Frame exhausted — pop self binding, restore home, pop env.
-        ev.pop_self();
-        ev.current_block_home.set(saved_block_home);
-        env.pop_frame();
+        // Frame exhausted — release resources (a method frame always pushed self).
+        release_frame(ev, &mut env, saved_block_home, true);
         // Methods answer `self` absent an explicit `^`.
         *acc = implicit_self;
     } else {
@@ -1079,12 +1141,9 @@ fn handle_block_frame(
     acc: &mut Value,
 ) -> Result<(), EvalError> {
     if pending.is_empty() {
-        // Frame exhausted — pop synthetic self (if any), restore home, pop env.
-        if block_home_self.is_some() {
-            ev.pop_self();
-        }
-        ev.current_block_home.set(saved_block_home);
-        env.pop_frame();
+        // Frame exhausted — release resources (self popped only if the block
+        // captured a home instance).
+        release_frame(ev, &mut env, saved_block_home, block_home_self.is_some());
         // acc stays as the last expression result.
     } else {
         let stmt = pending.pop_front().unwrap();
@@ -1331,9 +1390,10 @@ fn dispatch_stmt(
                 env: env.clone(),
             });
         }
-        Stmt::Assign { name, value } => {
+        Stmt::Assign { name, res, value } => {
             stack.push(Cont::Assign {
                 name,
+                res,
                 env: env.clone(),
             });
             stack.push(Cont::EvalExpr {
@@ -1359,6 +1419,38 @@ fn dispatch_stmt(
     Ok(())
 }
 
+/// A shared zero-length snapshot for scopes that capture nothing (every method,
+/// and blocks with no upvalues). Cached so a capture-free activation allocates no
+/// snapshot; cloning it is a refcount bump.
+fn empty_snapshot() -> Arc<[Value]> {
+    static EMPTY: std::sync::OnceLock<Arc<[Value]>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::from(Vec::<Value>::new())).clone()
+}
+
+/// Build a block's capture snapshot from the creating (current top) frame, per the
+/// resolver's capture plan (env-frame redesign P2.1c).
+///
+/// Requires: called while evaluating the block literal, so `frames.last()` is the
+///   enclosing scope. `captures[i]` is the fill source for snapshot slot `i` (=
+///   the block's `Upvalue(i)`).
+/// Ensures: `snapshot[i]` holds a clone of the captured value — `ParentLocal(j)`
+///   from the creating frame's slot `j`, `ParentUpvalue(j)` from its snapshot `j`.
+///   An empty plan yields the shared [`empty_snapshot`] without touching `frames`.
+fn build_capture_snapshot(ev: &Evaluator, captures: &[CaptureSource]) -> Arc<[Value]> {
+    if captures.is_empty() {
+        return empty_snapshot();
+    }
+    let frames = ev.frames.borrow();
+    let cur = frames.last().expect("block creation with no active frame");
+    captures
+        .iter()
+        .map(|src| match src {
+            CaptureSource::ParentLocal(i) => cur.slots[*i as usize].clone(),
+            CaptureSource::ParentUpvalue(i) => cur.snapshot[*i as usize].clone(),
+        })
+        .collect()
+}
+
 /// Push a block evaluation frame onto the iterative stack.
 ///
 /// Requires: `args.len() == block.params.len()`.
@@ -1368,7 +1460,7 @@ fn dispatch_stmt(
 ///   resolved before the next statement runs.
 pub(crate) fn push_block_frame(
     ev: &Evaluator,
-    block: &Arc<crate::value::Block>,
+    block: &crate::value::Block,
     args: Vec<Value>,
     sync: bool,
     stack: &mut Vec<Cont>,
@@ -1382,16 +1474,27 @@ pub(crate) fn push_block_frame(
     }
     let mut block_env = block.env.clone();
     block_env.push_frame();
+    // Map: preserve the existing define order (locals, then params, then body
+    // temporaries) so any same-name shadowing resolves as before.
     for name in &block.locals {
         block_env.define(name.clone(), Value::Nil);
     }
+    // Slot frame in resolver order — params, then locals, then body temporaries
+    // (a block has no `self` slot). Built independently of the map define order
+    // so `Local(i)` indices match the resolver (env-frame redesign P2.1b).
+    let mut slots: Vec<Value> = Vec::with_capacity(block.params.len() + block.locals.len());
     for (name, val) in block.params.iter().zip(args) {
-        block_env.define(name.clone(), val);
+        block_env.define(name.clone(), val.clone());
+        slots.push(val);
+    }
+    for _ in &block.locals {
+        slots.push(Value::Nil);
     }
     for stmt in &block.body {
         if let Stmt::LocalDecl(names) = stmt {
             for name in names {
                 block_env.define(name.clone(), Value::Nil);
+                slots.push(Value::Nil);
             }
         }
     }
@@ -1403,6 +1506,12 @@ pub(crate) fn push_block_frame(
             defining_class: handle.0.class.clone(),
         });
     }
+    // The running block carries the snapshot captured at its creation, so
+    // `Upvalue(i)` reads resolve against `frames.last().snapshot`.
+    ev.frames.borrow_mut().push(Frame {
+        slots,
+        snapshot: block.snapshot.clone(),
+    });
     let saved_home = ev.current_block_home.get();
     ev.current_block_home.set(Some(block.home_depth));
     stack.push(Cont::BlockFrame {
@@ -1493,20 +1602,79 @@ fn drain_tail_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
     }
 }
 
-/// Dispatch a message send to the iterative stack.
+/// Push a method-activation `MethodFrame` onto `stack`. The single source of
+/// truth for method-frame setup, shared by instance, primitive, and class-side
+/// invocations (`push_method_call_frame`, `push_class_method_frame`,
+/// `Evaluator::invoke_class_method`).
 ///
-/// Requires: `args` are fully evaluated in left-to-right order.
-/// Ensures:
-///   (1) User-defined methods for Block/Int/Nil/ValueObject/Entity-self-send found
-///       via `lookup_user_method` → TCO drain + `push_method_call_frame`.
-///   (2) `Block >> value` family → `push_block_frame(sync=false)`.
-///   (3) `Block >> syncValue` → `push_block_frame(sync=true)`.
-///   (4) `Block >> ensure:` → push `EnsureGuard`, then `push_block_frame(sync=true)` for body.
-///   (5) `Block >> on:do:` → register handler pair in `handler_chain`, push
-///       `HCRunGuard { sync: true }`, then `push_block_frame(sync=true)` for body.
-///   (6) `Bool >> ifTrue:` family → `push_block_frame(false)` for selected branch.
-///   (7) Universal nil-guard family (`ifNil:` / `ifNotNil:` / combined) → inline.
-///   (8) All other selectors → `builtins::dispatch`.
+/// Requires: `args.len() == method.pattern.params().len()` (checked; returns
+///   `ArityMismatch` otherwise). `base_env` is the method's already-rooted base
+///   scope — `global_scope()` for a self-rooted call, `clone()` where the caller
+///   intends the enclosing env to remain visible; `binding` is the `SelfBinding`
+///   the receiver installs; `self_value` is that same receiver (answered as the
+///   implicit `^self`).
+/// Ensures: a fresh frame is pushed on `base_env` binding `self` + params +
+///   locals + body temporaries; `binding` is pushed onto `method_stack`;
+///   `current_block_home` is saved into the frame and reset to `None` (method
+///   bodies are not blocks); exactly one `Cont::MethodFrame` is pushed.
+pub(crate) fn push_method_frame(
+    ev: &Evaluator,
+    mut base_env: Env,
+    binding: SelfBinding,
+    self_value: Value,
+    method: &Method,
+    args: Vec<Value>,
+    stack: &mut Vec<Cont>,
+) -> Result<(), EvalError> {
+    let params = method.pattern.params();
+    if args.len() != params.len() {
+        return Err(EvalError::ArityMismatch {
+            expected: params.len(),
+            got: args.len(),
+        });
+    }
+    base_env.push_frame();
+    base_env.define(self_sym(), self_value.clone());
+    // Slot frame in resolver order — params, then locals, then body temporaries
+    // (`self` is not a slot; it resolves via `SelfRef`). Kept in lockstep with the
+    // name-keyed `Env` (dual storage, P2.1b).
+    let mut slots: Vec<Value> = Vec::with_capacity(params.len() + method.locals.len());
+    for (param, val) in params.iter().zip(args) {
+        base_env.define(param.clone(), val.clone());
+        slots.push(val);
+    }
+    for local in &method.locals {
+        base_env.define(local.clone(), Value::Nil);
+        slots.push(Value::Nil);
+    }
+    // Pre-bind LocalDecl names (eval_program pre-binding equivalent).
+    for stmt in &method.body {
+        if let Stmt::LocalDecl(names) = stmt {
+            for name in names {
+                base_env.define(name.clone(), Value::Nil);
+                slots.push(Value::Nil);
+            }
+        }
+    }
+    ev.push_self(binding);
+    // A method never captures — empty snapshot.
+    ev.frames.borrow_mut().push(Frame {
+        slots,
+        snapshot: empty_snapshot(),
+    });
+    let depth = ev.method_depth.get();
+    let saved_block_home = ev.current_block_home.get();
+    ev.current_block_home.set(None);
+    stack.push(Cont::MethodFrame {
+        depth,
+        pending: method.body.iter().cloned().collect(),
+        env: base_env,
+        implicit_self: self_value,
+        saved_block_home,
+    });
+    Ok(())
+}
+
 /// Push a `CallFrame` for a class-side method invocation.
 ///
 /// Requires: `args.len() == method.pattern.params().len()`.
@@ -1520,46 +1688,12 @@ fn push_class_method_frame(
     env: &Env,
     stack: &mut Vec<Cont>,
 ) -> Result<(), EvalError> {
-    let params = method.pattern.params();
-    if args.len() != params.len() {
-        return Err(EvalError::ArityMismatch {
-            expected: params.len(),
-            got: args.len(),
-        });
-    }
     let self_val = Value::Instance(handle.clone());
-    let mut method_env = env.clone();
-    method_env.push_frame();
-    method_env.define(self_sym(), self_val.clone());
-    for (param, val) in params.iter().zip(args.iter()) {
-        method_env.define(param.clone(), val.clone());
-    }
-    for local in &method.locals {
-        method_env.define(local.clone(), Value::Nil);
-    }
-    for stmt in &method.body {
-        if let Stmt::LocalDecl(names) = stmt {
-            for name in names {
-                method_env.define(name.clone(), Value::Nil);
-            }
-        }
-    }
     let binding = SelfBinding::ClassSide {
         handle,
-        defining_class: def_class.clone(),
+        defining_class: def_class,
     };
-    ev.push_self(binding);
-    let depth = ev.method_depth.get();
-    let saved_block_home = ev.current_block_home.get();
-    ev.current_block_home.set(None);
-    stack.push(Cont::MethodFrame {
-        depth,
-        pending: method.body.iter().cloned().collect(),
-        env: method_env,
-        implicit_self: self_val,
-        saved_block_home,
-    });
-    Ok(())
+    push_method_frame(ev, env.clone(), binding, self_val, &method, args, stack)
 }
 
 /// Dispatch a super send iteratively: look up `selector` starting from the
@@ -1705,6 +1839,20 @@ fn dispatch_signal(
     }
 }
 
+/// Dispatch a message send to the iterative stack.
+///
+/// Requires: `args` are fully evaluated in left-to-right order.
+/// Ensures:
+///   (1) User-defined methods for Block/Int/Nil/ValueObject/Entity-self-send found
+///       via `lookup_user_method` → TCO drain + `push_method_call_frame`.
+///   (2) `Block >> value` family → `push_block_frame(sync=false)`.
+///   (3) `Block >> syncValue` → `push_block_frame(sync=true)`.
+///   (4) `Block >> ensure:` → push `EnsureGuard`, then `push_block_frame(sync=true)` for body.
+///   (5) `Block >> on:do:` → register handler pair in `handler_chain`, push
+///       `HCRunGuard { sync: true }`, then `push_block_frame(sync=true)` for body.
+///   (6) `Bool >> ifTrue:` family → `push_block_frame(false)` for selected branch.
+///   (7) Universal nil-guard family (`ifNil:` / `ifNotNil:` / combined) → inline.
+///   (8) All other selectors → `builtins::dispatch`.
 fn dispatch_to_stack(
     ev: &Evaluator,
     receiver: Value,
@@ -2171,90 +2319,39 @@ pub(crate) fn push_method_call_frame(
             method,
             def_class,
         } => {
-            let params = method.pattern.params();
-            if args.len() != params.len() {
-                return Err(EvalError::ArityMismatch {
-                    expected: params.len(),
-                    got: args.len(),
-                });
-            }
             let self_value = Value::Instance(handle.clone());
-            let mut method_env = env.global_scope();
-            method_env.push_frame();
-            method_env.define(self_sym(), self_value.clone());
-            for (param, val) in params.iter().zip(args.iter()) {
-                method_env.define(param.clone(), val.clone());
-            }
-            for local in &method.locals {
-                method_env.define(local.clone(), Value::Nil);
-            }
-            // Pre-bind LocalDecl names (eval_program pre-binding equivalent).
-            for stmt in &method.body {
-                if let Stmt::LocalDecl(names) = stmt {
-                    for name in names {
-                        method_env.define(name.clone(), Value::Nil);
-                    }
-                }
-            }
             let binding = SelfBinding::Instance {
                 handle,
                 defining_class: def_class,
             };
-            ev.push_self(binding);
-            let depth = ev.method_depth.get();
-            let saved_block_home = ev.current_block_home.get();
-            ev.current_block_home.set(None);
-            stack.push(Cont::MethodFrame {
-                depth,
-                pending: method.body.iter().cloned().collect(),
-                env: method_env,
-                implicit_self: self_value,
-                saved_block_home,
-            });
+            push_method_frame(
+                ev,
+                env.global_scope(),
+                binding,
+                self_value,
+                &method,
+                args,
+                stack,
+            )?;
         }
         UserMethodFound::Primitive {
             self_value,
             method,
             def_class,
         } => {
-            let params = method.pattern.params();
-            if args.len() != params.len() {
-                return Err(EvalError::ArityMismatch {
-                    expected: params.len(),
-                    got: args.len(),
-                });
-            }
-            let mut method_env = env.global_scope();
-            method_env.push_frame();
-            method_env.define(self_sym(), self_value.clone());
-            for (param, val) in params.iter().zip(args.iter()) {
-                method_env.define(param.clone(), val.clone());
-            }
-            for local in &method.locals {
-                method_env.define(local.clone(), Value::Nil);
-            }
-            for stmt in &method.body {
-                if let Stmt::LocalDecl(names) = stmt {
-                    for name in names {
-                        method_env.define(name.clone(), Value::Nil);
-                    }
-                }
-            }
             let binding = SelfBinding::Primitive {
                 defining_class: def_class,
                 self_value: self_value.clone(),
             };
-            ev.push_self(binding);
-            let depth = ev.method_depth.get();
-            let saved_block_home = ev.current_block_home.get();
-            ev.current_block_home.set(None);
-            stack.push(Cont::MethodFrame {
-                depth,
-                pending: method.body.iter().cloned().collect(),
-                env: method_env,
-                implicit_self: self_value,
-                saved_block_home,
-            });
+            push_method_frame(
+                ev,
+                env.global_scope(),
+                binding,
+                self_value,
+                &method,
+                args,
+                stack,
+            )?;
         }
     }
     Ok(())
@@ -2281,14 +2378,17 @@ fn install_method_def(ev: &Evaluator, def: MethodDef, env: &Env) -> Result<(), E
             &def.locals,
             &def.body,
         )?;
+        let resolved =
+            crate::resolve::resolve_and_rewrite(&def.pattern.params(), &def.locals, &def.body);
+        crate::eval::check_capture_before_assignment(
+            &def.pattern.params(),
+            &def.locals,
+            &resolved,
+        )?;
         let method = Arc::new(Method {
             pattern: def.pattern.clone(),
             locals: def.locals.clone(),
-            body: crate::resolve::resolve_and_rewrite(
-                &def.pattern.params(),
-                &def.locals,
-                &def.body,
-            ),
+            body: resolved,
         });
         data.insert_own_method(def.pattern.selector(), method);
         return Ok(());
@@ -2307,10 +2407,13 @@ fn install_method_def(ev: &Evaluator, def: MethodDef, env: &Env) -> Result<(), E
     };
     check_prim_sends_in_body(&def.body)?;
     crate::eval::check_single_assignment_in_method(&def.pattern.params(), &def.locals, &def.body)?;
+    let resolved =
+        crate::resolve::resolve_and_rewrite(&def.pattern.params(), &def.locals, &def.body);
+    crate::eval::check_capture_before_assignment(&def.pattern.params(), &def.locals, &resolved)?;
     let method = Arc::new(Method {
         pattern: def.pattern.clone(),
         locals: def.locals.clone(),
-        body: crate::resolve::resolve_and_rewrite(&def.pattern.params(), &def.locals, &def.body),
+        body: resolved,
     });
     let selector = def.pattern.selector();
     if def.is_class_side {

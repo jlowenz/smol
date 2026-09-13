@@ -64,6 +64,17 @@ pub enum VarRef {
     Dynamic(Arc<str>),
 }
 
+/// Where a block capture slot is filled from at block-creation time. Parallel to a
+/// block's `Upvalue` indices: `captures[i]` says where snapshot slot `i` comes from
+/// in the *immediately-enclosing* (creating) scope. Filled by the resolve pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CaptureSource {
+    /// Slot `i` in the enclosing scope's frame (`Frame::slots`).
+    ParentLocal(u16),
+    /// Index `i` in the enclosing scope's own capture snapshot (`Frame::snapshot`).
+    ParentUpvalue(u16),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Lit(Literal),
@@ -81,6 +92,11 @@ pub enum Expr {
         /// Local variable declarations (`| x y |`) inside the block.
         locals: Vec<Arc<str>>,
         body: Vec<Stmt>,
+        /// Capture plan, parallel to the block's `Upvalue(i)` indices: `captures[i]`
+        /// says where snapshot slot `i` is filled from in the enclosing scope at
+        /// block-creation time. Empty from the parser; filled by the resolve pass
+        /// (`Vec::new()` for an unresolved/top-level block, which captures nothing).
+        captures: Vec<CaptureSource>,
     },
     /// Cascade: `receiver msg1; msg2; msg3`.
     /// All messages are sent to the same receiver object; evaluates to the
@@ -108,6 +124,11 @@ pub enum Stmt {
     Expr(Expr),
     Assign {
         name: Arc<str>,
+        /// How the assignment target resolves. Filled by the resolve pass (P2.1b);
+        /// the parser emits `Unresolved`. The strict block rule (P1) guarantees a
+        /// target is a scope-local (`Local`) or a dynamic name (`Dynamic`), never a
+        /// capture — a block may not assign a non-local.
+        res: VarRef,
         value: Expr,
     },
     /// `^expr` — non-local return from the enclosing method frame.

@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use crate::entity::{EntityId, InstanceHandle, InstanceKind, InstanceState};
-use crate::eval_iterative::{Cont, push_method_call_frame, step_loop};
+use crate::eval_iterative::{
+    Cont, push_block_frame, push_method_call_frame, push_method_frame, step_loop,
+};
 use triple_store::store::{OwnedStoreTransaction, Store};
 
 use thiserror::Error;
@@ -111,6 +113,7 @@ impl ContinuationContext {
             method_stack: RefCell::new(Vec::new()),
             method_depth: Cell::new(0),
             current_block_home: Cell::new(None),
+            frames: RefCell::new(Vec::new()),
             current_entity_id: Cell::new(self.current_entity_id),
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
@@ -119,6 +122,21 @@ impl ContinuationContext {
             probe: crate::eval_iterative::probe::ProbeState::default(),
         }
     }
+}
+
+/// One method/block activation's flat local storage (env-frame redesign).
+///
+/// Lives on the evaluator's LIFO [`Evaluator::frames`] stack. Both fields are
+/// resolver-indexed: `slots[i]` is `Local(i)`, `snapshot[i]` is `Upvalue(i)`.
+pub(crate) struct Frame {
+    /// Slot values in resolver order: params, then locals, then body temporaries.
+    /// `self` is *not* a slot (it resolves via `SelfRef`).
+    pub(crate) slots: Vec<Value>,
+    /// The block's captured upvalue snapshot, filled at block-creation time.
+    /// Empty for a method activation (methods never capture). Shared `Arc` so the
+    /// block value and its running frame reference one copy — cheap to clone and
+    /// `Send`, which is what lets a block outlive its creating frame.
+    pub(crate) snapshot: Arc<[Value]>,
 }
 
 pub struct Evaluator {
@@ -157,6 +175,16 @@ pub struct Evaluator {
     /// (i.e., evaluating a method body directly). Saved and restored by each
     /// `eval_block` call so nesting is handled correctly.
     pub(crate) current_block_home: Cell<Option<usize>>,
+    /// Slot frames for closed local scopes (methods, blocks) — the flat frame stack
+    /// of the env-frame redesign. One [`Frame`] is pushed per method/block
+    /// activation and popped on teardown, so the stack is strictly LIFO and the
+    /// currently-executing scope's frame is always the top. `VarRef::Local(i)`
+    /// reads/writes `frames.last().slots[i]`; `VarRef::Upvalue(i)` reads
+    /// `frames.last().snapshot[i]` (P2.1c).
+    ///
+    /// Still kept in lockstep with the name-keyed `Env` (dual storage): `SelfRef`
+    /// and `Dynamic` resolve by name via `Env` until P2.1d collapses it.
+    pub(crate) frames: RefCell<Vec<Frame>>,
     /// The `EntityId` of the entity whose message handler is currently executing
     /// on this evaluator. `None` outside any entity handler. Used for sync
     /// self-send detection. Stored here (not in a thread-local) because may
@@ -215,6 +243,7 @@ impl Evaluator {
             method_depth: Cell::new(0),
             active_namespace: RefCell::new(kernel),
             current_block_home: Cell::new(None),
+            frames: RefCell::new(Vec::new()),
             current_entity_id: Cell::new(None),
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
@@ -421,18 +450,40 @@ impl Evaluator {
         }
     }
 
-    /// Assign `value` to `name`, following the method-context lookup order, and
-    /// return the stored value for use as the statement's result.
+    /// Assign `value` to `name` (resolved as `res`) and return the stored value
+    /// for use as the statement's result.
     ///
-    /// Requires: `value` is the fully-evaluated right-hand side.
-    /// Ensures: exactly one `Value::clone` is performed regardless of path.
+    /// Requires: `value` is the fully-evaluated right-hand side; `res` is `name`'s
+    ///   resolution from the resolve pass.
+    /// Ensures: a `Local` target writes the current activation's slot and the
+    ///   name-keyed env in lockstep (dual storage, P2.1b — two clones until P2.1c/d
+    ///   drop the env); every other target follows the method-context lookup order
+    ///   with a single clone.
     #[inline]
     pub(crate) fn assign_var(
         &self,
         name: &Arc<str>,
+        res: &VarRef,
         value: Value,
         env: &mut Env,
     ) -> Result<Value, EvalError> {
+        // Scope-local: write the slot directly (no ivar/classvar hash walk). Since
+        // P2.1c, no reader consults the env's local entries — `Local` reads come from
+        // slots, `Upvalue` from the block snapshot, and `Dynamic`/`SelfRef` never
+        // name a local — so there is no env mirror to maintain here (one clone).
+        // `Local` shadows any same-named ivar, consistent with `lookup_var`, whose
+        // local frame is checked first.
+        if let VarRef::Local(i) = res {
+            let mut frames = self.frames.borrow_mut();
+            let slot = frames
+                .last_mut()
+                .expect("Local assign with no active frame")
+                .slots
+                .get_mut(*i as usize)
+                .expect("Local slot index out of range");
+            *slot = value;
+            return Ok(slot.clone());
+        }
         if self.method_depth.get() > 0 {
             let top = self.method_stack.borrow().last().cloned();
             match top {
@@ -649,46 +700,12 @@ impl Evaluator {
         args: Vec<Value>,
         _outer_env: &mut Env,
     ) -> Result<Value, EvalError> {
-        if args.len() != block.params.len() {
-            return Err(EvalError::ArityMismatch {
-                expected: block.params.len(),
-                got: args.len(),
-            });
-        }
-        let mut block_env = block.env.clone();
-        block_env.push_frame();
-        for name in &block.locals {
-            block_env.define(name.clone(), Value::Nil);
-        }
-        for (name, val) in block.params.iter().zip(args) {
-            block_env.define(name.clone(), val);
-        }
-        for stmt in &block.body {
-            if let Stmt::LocalDecl(names) = stmt {
-                for name in names {
-                    block_env.define(name.clone(), Value::Nil);
-                }
-            }
-        }
-        // If the block captured a home instance, push its SelfBinding now so
-        // lookup_var finds ivars. The frame cleanup in step_loop pops it.
-        if let Some(ref handle) = block.home_self {
-            self.push_self(SelfBinding::Instance {
-                handle: handle.clone(),
-                defining_class: handle.0.class.clone(),
-            });
-        }
-        let saved_home = self.current_block_home.get();
-        let frame = Cont::BlockFrame {
-            pending: block.body.iter().cloned().collect(),
-            env: block_env,
-            saved_block_home: saved_home,
-            block_home_self: block.home_self.clone(),
-            sync: false,
-        };
-        self.current_block_home.set(Some(block.home_depth));
-        // current_block_home is restored by the CallFrame when it pops.
-        step_loop(self, frame)
+        let mut stack = Vec::new();
+        push_block_frame(self, block, args, false, &mut stack)?;
+        let initial = stack
+            .pop()
+            .expect("push_block_frame must push exactly one frame");
+        step_loop(self, initial)
     }
 
     /// Iterative method invocation: runs via the step-loop evaluator.
@@ -730,46 +747,25 @@ impl Evaluator {
         args: Vec<Value>,
         env: &mut Env,
     ) -> Result<Value, EvalError> {
-        let params = method.pattern.params();
-        if args.len() != params.len() {
-            return Err(EvalError::ArityMismatch {
-                expected: params.len(),
-                got: args.len(),
-            });
-        }
         let self_val = Value::Instance(handle.clone());
-        let mut method_env = env.global_scope();
-        method_env.push_frame();
-        method_env.define(self_sym(), self_val.clone());
-        for (param, val) in params.iter().zip(args.iter()) {
-            method_env.define(param.clone(), val.clone());
-        }
-        for local in &method.locals {
-            method_env.define(local.clone(), Value::Nil);
-        }
-        for stmt in &method.body {
-            if let Stmt::LocalDecl(names) = stmt {
-                for name in names {
-                    method_env.define(name.clone(), Value::Nil);
-                }
-            }
-        }
         let binding = SelfBinding::ClassSide {
             handle,
             defining_class,
         };
-        self.push_self(binding);
-        let depth = self.method_depth.get();
-        let saved_block_home = self.current_block_home.get();
-        self.current_block_home.set(None);
-        let frame = Cont::MethodFrame {
-            depth,
-            pending: method.body.iter().cloned().collect(),
-            env: method_env,
-            implicit_self: self_val,
-            saved_block_home,
-        };
-        step_loop(self, frame)
+        let mut stack = Vec::new();
+        push_method_frame(
+            self,
+            env.global_scope(),
+            binding,
+            self_val,
+            &method,
+            args,
+            &mut stack,
+        )?;
+        let initial = stack
+            .pop()
+            .expect("push_method_frame must push exactly one frame");
+        step_loop(self, initial)
     }
 
     /// Create an evaluator from an existing `ClassRegistry`, loading `kernel.smol`.
@@ -788,6 +784,7 @@ impl Evaluator {
             method_depth: Cell::new(0),
             active_namespace: RefCell::new(kernel),
             current_block_home: Cell::new(None),
+            frames: RefCell::new(Vec::new()),
             current_entity_id: Cell::new(None),
             value_objects: RefCell::new(HashMap::new()),
             current_tx: RefCell::new(None),
@@ -977,7 +974,7 @@ fn check_single_assignment_scope(
     }
     for s in body {
         match s {
-            Stmt::Assign { name, value } => {
+            Stmt::Assign { name, value, .. } => {
                 if declared.contains(name) && !assigned.insert(name.clone()) {
                     return Err(EvalError::TypeError(format!(
                         "cannot reassign local `{name}`: locals are single-assignment \
@@ -1002,6 +999,7 @@ fn check_single_assignment_expr(e: &Expr) -> Result<(), EvalError> {
             params,
             locals,
             body,
+            ..
         } => {
             let mut declared: HashSet<Arc<str>> = params.iter().cloned().collect();
             declared.extend(locals.iter().cloned());
@@ -1041,6 +1039,144 @@ fn check_single_assignment_message(msg: &Message) -> Result<(), EvalError> {
         Message::Keyword { parts } => {
             for (_, e) in parts {
                 check_single_assignment_expr(e)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+// ── Capture-before-assignment check (env-frame redesign P2.1c) ───────────────
+
+/// Reject a block that captures a local before that local's (single) assignment.
+///
+/// Requires: `params`/`locals` are the scope's parameters and declared temporaries;
+///   `body` is the scope's **resolved** statement list (every `Expr::Block` carries
+///   its `captures` plan and every `Stmt::Assign` its `res`). Run at install time,
+///   *after* `resolve_and_rewrite`.
+/// Ensures: returns `Err(EvalError::TypeError)` if any block literal captures an
+///   enclosing declared local (`CaptureSource::ParentLocal`) whose assignment does
+///   not textually precede the block. Under single-assignment (`§2.1`) such a
+///   capture can only ever snapshot the nil placeholder, so it is always a
+///   programming error — and, unlike Smalltalk's cell capture, it is silent
+///   (`docs/perf_env_frame_redesign.md §2.2`, `open_questions.md`). Otherwise `Ok(())`.
+pub(crate) fn check_capture_before_assignment(
+    params: &[Arc<str>],
+    locals: &[Arc<str>],
+    body: &[Stmt],
+) -> Result<(), EvalError> {
+    let slots = scope_slot_names(params, locals, body);
+    check_captures_scope(&slots, params.len(), body)
+}
+
+/// Slot names in resolver order — params, then declared locals, then mid-body
+/// `LocalDecl` names. Mirrors `resolve::scope_slots` so a `ParentLocal(i)` index
+/// names the right local in the error.
+fn scope_slot_names(params: &[Arc<str>], locals: &[Arc<str>], body: &[Stmt]) -> Vec<Arc<str>> {
+    let mut slots: Vec<Arc<str>> = params.to_vec();
+    slots.extend(locals.iter().cloned());
+    for s in body {
+        if let Stmt::LocalDecl(names) = s {
+            slots.extend(names.iter().cloned());
+        }
+    }
+    slots
+}
+
+/// Walk one scope's body in source order, tracking which slots are assigned, and
+/// validate each nested block's `ParentLocal` captures against that set.
+fn check_captures_scope(
+    slots: &[Arc<str>],
+    nparams: usize,
+    body: &[Stmt],
+) -> Result<(), EvalError> {
+    // Params are bound on entry → assigned from the start. Slot indices align with
+    // `slots` (params occupy `0..nparams`).
+    let mut assigned: HashSet<u16> = (0..nparams as u16).collect();
+    for s in body {
+        match s {
+            Stmt::Assign { res, value, .. } => {
+                // The RHS is evaluated *before* the target is bound, so a block in
+                // the RHS captures with the target still unassigned.
+                check_captures_expr(slots, &assigned, value)?;
+                if let VarRef::Local(i) = res {
+                    assigned.insert(*i);
+                }
+            }
+            Stmt::Expr(e) | Stmt::Return(e) => check_captures_expr(slots, &assigned, e)?,
+            Stmt::LocalDecl(_) | Stmt::MethodDef(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_captures_expr(
+    slots: &[Arc<str>],
+    assigned: &HashSet<u16>,
+    e: &Expr,
+) -> Result<(), EvalError> {
+    match e {
+        Expr::Block {
+            params,
+            locals,
+            body,
+            captures,
+        } => {
+            // A `ParentLocal` capture reads this (enclosing) scope's slot directly,
+            // so it must be assigned by now. `ParentUpvalue` captures descend from an
+            // outer `ParentLocal` already validated at its own level, and params are
+            // always in `assigned`, so neither is checked here.
+            for cap in captures {
+                if let CaptureSource::ParentLocal(i) = cap
+                    && !assigned.contains(i)
+                {
+                    let name = slots.get(*i as usize).map(|s| s.as_ref()).unwrap_or("?");
+                    return Err(EvalError::TypeError(format!(
+                        "block captures local `{name}` before it is assigned: locals are \
+                         single-assignment, so this would capture nil — assign `{name}` \
+                         before the block that captures it"
+                    )));
+                }
+            }
+            // Recurse into the block's own scope (fresh `assigned` = its params).
+            let inner = scope_slot_names(params, locals, body);
+            check_captures_scope(&inner, params.len(), body)
+        }
+        Expr::Send { receiver, message } => {
+            check_captures_expr(slots, assigned, receiver)?;
+            check_captures_message(slots, assigned, message)
+        }
+        Expr::Cascade { receiver, messages } => {
+            check_captures_expr(slots, assigned, receiver)?;
+            for m in messages {
+                check_captures_message(slots, assigned, m)?;
+            }
+            Ok(())
+        }
+        Expr::DynamicArray(es) => {
+            for x in es {
+                check_captures_expr(slots, assigned, x)?;
+            }
+            Ok(())
+        }
+        Expr::Lit(_)
+        | Expr::Var { .. }
+        | Expr::Super
+        | Expr::NamespaceRef { .. }
+        | Expr::ArrayLiteral(_) => Ok(()),
+    }
+}
+
+fn check_captures_message(
+    slots: &[Arc<str>],
+    assigned: &HashSet<u16>,
+    msg: &Message,
+) -> Result<(), EvalError> {
+    match msg {
+        Message::Unary(_) => Ok(()),
+        Message::Binary { arg, .. } => check_captures_expr(slots, assigned, arg),
+        Message::Keyword { parts } => {
+            for (_, e) in parts {
+                check_captures_expr(slots, assigned, e)?;
             }
             Ok(())
         }

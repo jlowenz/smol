@@ -47,6 +47,7 @@ fn caps_expr(declared: &Names, e: &Expr, in_block: bool, shadow: &Names, out: &m
             params,
             locals,
             body,
+            ..
         } => {
             let mut sh = shadow.clone();
             sh.extend(params.iter().cloned());
@@ -98,6 +99,7 @@ fn collect_blocks<'a>(s: &'a Stmt, out: &mut Vec<BlockRef<'a>>) {
                 params,
                 locals,
                 body,
+                ..
             } => {
                 out.push((params, locals, body));
                 for st in body {
