@@ -2385,7 +2385,7 @@ BaseCond signal: 'quiet'
 #[test]
 fn ivar_read_in_block_arg_to_bool_method_tail_position() {
     // TCO removes the enclosing P>>= frame before `and:` evaluates its block.
-    // Block must still reach `y` via home_self captured at block creation.
+    // Block must still reach `y` via the block's captured home_binding.
     let src = r#"
         Object subclass: #P instanceVariableNames: 'x y'.
         P class >> x: anX y: aY [ ^self new pvtInit: anX y: aY ]
@@ -2404,7 +2404,7 @@ fn ivar_read_in_block_arg_to_bool_method_tail_position() {
 #[test]
 fn ivar_read_in_nested_block_after_tco() {
     // Nested block: outer block is the and: arg (TCO removes P>>= frame),
-    // inner block is the or: arg. Both must see `y` via home_self.
+    // inner block is the or: arg. Both must see `y` via the captured home_binding.
     let src = r#"
         Object subclass: #P instanceVariableNames: 'x y'.
         P class >> x: anX y: aY [ ^self new pvtInit: anX y: aY ]
@@ -4353,5 +4353,37 @@ fn p21b_nested_blocks_chain_upvalues_to_method_local() {
              SlotNest new go"
         ),
         Value::Int(123)
+    );
+}
+
+#[test]
+fn p21d_classside_block_answers_class_self_after_home_returns() {
+    // A class-side method returns a block closing over `self` (= the class),
+    // invoked at top level where `method_stack` is empty. `self` must come from
+    // the block's captured `home_binding` (any kind), not the call-site stack —
+    // env-frame redesign P2.1d. (Regression guard for the capture gap that
+    // motivated generalizing home_self -> home_binding.)
+    assert_eq!(
+        eval(
+            "Object subclass: #SelfCS instanceVariableNames: ''.
+             SelfCS class >> makeProbe [ ^[ self ] ]
+             (SelfCS makeProbe) value == SelfCS"
+        ),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn p21d_instance_block_answers_instance_self_after_home_returns() {
+    // Instance-home counterpart: a returned block reads `self` (the instance) and
+    // one of its ivars after the creating method has returned.
+    assert_eq!(
+        eval(
+            "Object subclass: #SelfIn instanceVariableNames: 'v'.
+             SelfIn >> init [ v := 42 ]
+             SelfIn >> makeProbe [ ^[ v ] ]
+             | o | o := SelfIn new. o init. (o makeProbe) value"
+        ),
+        Value::Int(42)
     );
 }

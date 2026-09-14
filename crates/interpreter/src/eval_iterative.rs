@@ -254,10 +254,10 @@ pub(crate) enum Cont {
 
     /// An active block invocation (`value`, `ifTrue:` arm, `on:do:` body, …).
     ///
-    /// Pushed by `push_block_frame`. Blocks do not push a self binding *unless*
-    /// they captured a `home_self` (then a synthetic `SelfBinding::Instance` was
-    /// pushed and `block_home_self` records the handle to pop). A block answers
-    /// its last expression's value, so there is no implicit-return override.
+    /// Pushed by `push_block_frame`. A block re-pushes its captured `home_binding`
+    /// (the lexical home's `SelfBinding`, any kind) when it has one; `pushed_self`
+    /// records whether to pop it on teardown. A block answers its last
+    /// expression's value, so there is no implicit-return override.
     BlockFrame {
         /// Remaining statements to run.
         pending: VecDeque<Stmt>,
@@ -265,9 +265,9 @@ pub(crate) enum Cont {
         env: Env,
         /// `current_block_home` before this frame; restored on teardown.
         saved_block_home: Option<usize>,
-        /// `Some(h)` if a synthetic self binding for the captured home instance
-        /// was pushed onto `method_stack` and must be popped on teardown.
-        block_home_self: Option<InstanceHandle>,
+        /// `true` if the block re-pushed its `home_binding` onto `method_stack`
+        /// (i.e. `home_binding.is_some()`) and it must be popped on teardown.
+        pushed_self: bool,
         /// When `true`, a `ForceAcc` is pushed after each statement so that
         /// `Value::Future` results resolve before the next statement runs.
         /// Used by `syncValue`, `on:do:` body, and `ensure:` body.
@@ -408,7 +408,7 @@ enum UnwindOutcome {
 ///
 /// `pushed_self` is the one point of variation between the two frame kinds: a
 /// method frame always pushes a `self` binding (`true`); a block frame pushes one
-/// only when it captured a home instance (`block_home_self.is_some()`).
+/// only when it captured a `home_binding`.
 fn release_frame(
     ev: &Evaluator,
     env: &mut Env,
@@ -449,10 +449,10 @@ fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
         Cont::BlockFrame {
             mut env,
             saved_block_home,
-            block_home_self,
+            pushed_self,
             ..
         } => {
-            release_frame(ev, &mut env, saved_block_home, block_home_self.is_some());
+            release_frame(ev, &mut env, saved_block_home, pushed_self);
             Some(0)
         }
         Cont::ProgramFrame {
@@ -676,8 +676,11 @@ fn handle_eval_expr(
                     .get(i as usize)
                     .expect("Upvalue index out of range")
                     .clone(),
-                // `SelfRef` / `Dynamic` / `Unresolved` still resolve by name via the
-                // env + method_stack (name-addressed; folded in P2.1d).
+                // `self`: reconstruct the receiver from `method_stack` (a block
+                // re-pushes its captured `home_binding`), no env lookup (P2.1d).
+                VarRef::SelfRef => ev.self_value(),
+                // `Dynamic` / `Unresolved` still resolve by name via the env +
+                // method_stack (ivar/classvar/global; folded further in P2.1d).
                 _ => ev
                     .lookup_var(&name, &env)
                     .ok_or_else(|| EvalError::UndefinedVariable(name.clone()))?,
@@ -693,13 +696,10 @@ fn handle_eval_expr(
                 .current_block_home
                 .get()
                 .unwrap_or_else(|| ev.method_depth.get());
-            let home_self = {
-                let ms = ev.method_stack.borrow();
-                ms.iter().rev().find_map(|b| match b {
-                    SelfBinding::Instance { handle, .. } => Some(handle.clone()),
-                    _ => None,
-                })
-            };
+            // Capture the lexical home's `self` binding (any kind), so the block
+            // answers `self` — and accesses ivars/classvars — from `method_stack`
+            // even after its home frame is gone (env-frame redesign P2.1d).
+            let home_binding = ev.method_stack.borrow().last().cloned();
             // Snapshot the captured upvalues from the creating (current) frame:
             // `ParentLocal` from its slots, `ParentUpvalue` from its own snapshot
             // (env-frame redesign P2.1c). Empty for a block that captures nothing.
@@ -712,7 +712,7 @@ fn handle_eval_expr(
                 env: env.clone(),
                 home_depth,
                 home_entity: ev.current_entity_id.get(),
-                home_self,
+                home_binding,
             }));
         }
         Expr::NamespaceRef {
@@ -883,7 +883,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 pending,
                 env,
                 saved_block_home,
-                block_home_self,
+                pushed_self,
                 sync,
             } => {
                 handle_block_frame(
@@ -891,7 +891,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                     pending,
                     env,
                     saved_block_home,
-                    block_home_self,
+                    pushed_self,
                     sync,
                     &mut stack,
                     &mut acc,
@@ -1135,15 +1135,15 @@ fn handle_block_frame(
     mut pending: VecDeque<Stmt>,
     mut env: Env,
     saved_block_home: Option<usize>,
-    block_home_self: Option<InstanceHandle>,
+    pushed_self: bool,
     sync: bool,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
     if pending.is_empty() {
         // Frame exhausted — release resources (self popped only if the block
-        // captured a home instance).
-        release_frame(ev, &mut env, saved_block_home, block_home_self.is_some());
+        // re-pushed its home binding).
+        release_frame(ev, &mut env, saved_block_home, pushed_self);
         // acc stays as the last expression result.
     } else {
         let stmt = pending.pop_front().unwrap();
@@ -1151,7 +1151,7 @@ fn handle_block_frame(
             pending,
             env: env.clone(),
             saved_block_home,
-            block_home_self,
+            pushed_self,
             sync,
         });
         // For sync frames, force the statement result before the frame resumes.
@@ -1498,13 +1498,12 @@ pub(crate) fn push_block_frame(
             }
         }
     }
-    // If the block captured a home instance, push it onto method_stack so
-    // lookup_var finds ivars even after TCO has removed the enclosing method frame.
-    if let Some(ref handle) = block.home_self {
-        ev.push_self(SelfBinding::Instance {
-            handle: handle.clone(),
-            defining_class: handle.0.class.clone(),
-        });
+    // Re-push the block's captured home `self` binding (any kind) so `self`,
+    // ivars, and classvars resolve from method_stack even after the home frame
+    // is gone (env-frame redesign P2.1d).
+    let pushed_self = block.home_binding.is_some();
+    if let Some(binding) = &block.home_binding {
+        ev.push_self(binding.clone());
     }
     // The running block carries the snapshot captured at its creation, so
     // `Upvalue(i)` reads resolve against `frames.last().snapshot`.
@@ -1518,7 +1517,7 @@ pub(crate) fn push_block_frame(
         pending: block.body.iter().cloned().collect(),
         env: block_env,
         saved_block_home: saved_home,
-        block_home_self: block.home_self.clone(),
+        pushed_self,
         sync,
     });
     Ok(())

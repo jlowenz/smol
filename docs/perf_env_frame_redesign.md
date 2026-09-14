@@ -482,7 +482,23 @@ rewrite each method/block body into a resolved copy (once, at install — not ho
     `Dynamic` (ivar/classvar/global) and `SelfRef` still resolve by name; the
     per-block `env.clone()` at creation therefore remains until P2.1d de-`Env`s the
     `Cont` variants and removes it.
-- **P2.1d** — de-`Env` the `Cont` variants (carry the frame index).
+- **P2.1d** — remove the per-activation `env`. Reshaped by the `frames.last()`
+  insight: the Conts don't need a frame index (§11.5's original plan), they can drop
+  `env` entirely, once its three remaining uses are rehomed. Landing in sub-steps:
+  - **d1 (DONE)** — `SelfRef` resolves via `method_stack`, not env: new
+    `Evaluator::self_value()` reconstructs the receiver from `method_stack.last()`.
+    A block's captured self is generalized from Instance-only
+    `home_self: Option<InstanceHandle>` to `home_binding: Option<SelfBinding>` (any
+    kind), re-pushed by `push_block_frame`; `Cont::BlockFrame`'s `block_home_self`
+    becomes a `pushed_self: bool`. Fixes a latent divergence — a class-side/primitive
+    block that outlives its home now answers `self` from `method_stack` rather than
+    the captured env's `"self"`. (`SelfBinding` gains a manual `Debug`.)
+  - **d2** — hoist the shared global-root `Env` onto the `Evaluator`; route `Dynamic`
+    globals + top-level through it (namespaces unchanged). All entities already share
+    one root frame (`Arc`-cloned), so this is a rehoming, not a new store.
+  - **d3** — stop building the per-activation env map (setup no longer defines
+    self/params/locals); drop `Block.env`.
+  - **d4** — drop `env: Env` from the ~20 Cont variants + the handler params.
 - **P2.1e** — re-profile (`alloc_probe soak`); TCO frame reuse; `SmallVec` decision.
 
 ### 11.8 Risks

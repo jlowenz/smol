@@ -361,7 +361,7 @@ fn nlr_with_failing_commit_faults_entity() {
         env: Env::new(),
         home_depth: 2,
         home_entity: None,
-        home_self: None,
+        home_binding: None,
     });
 
     // Push the envelope directly onto the entity's mailbox.

@@ -6,6 +6,7 @@ use num_bigint::BigInt;
 use crate::ast::Stmt;
 use crate::entity::{EntityId, FutureHandle, InstanceHandle};
 use crate::env::Env;
+use crate::eval::SelfBinding;
 use crate::namespace::Namespace;
 
 /// Runtime representation of every object in the language.
@@ -66,13 +67,16 @@ pub struct Block {
     /// created outside any entity context. Used to detect cross-entity block
     /// invocations for write-guard enforcement.
     pub home_entity: Option<EntityId>,
-    /// The instance `self` at the point the block was captured, if any.
+    /// The home scope's `self` binding at the point the block was captured, if
+    /// any (`None` only outside any method — e.g. a top-level block).
     ///
-    /// Ensures ivar/classvar access in blocks is correct even after TCO removes
-    /// the enclosing method frame from the `method_stack`. `push_block_frame`
-    /// pushes a `SelfBinding::Instance` for this handle so `lookup_var` finds
-    /// ivars without walking the stack.
-    pub home_self: Option<InstanceHandle>,
+    /// Captured as `method_stack.last()` — the lexical home's binding, of *any*
+    /// kind (`Instance`/`ClassSide`/`Primitive`) — so the block answers `self`
+    /// correctly for all receivers, not just instances. `push_block_frame`
+    /// re-pushes it for the block's duration, which makes `SelfRef` resolve from
+    /// `method_stack` and keeps ivar/classvar access correct even after TCO has
+    /// removed the enclosing method frame.
+    pub home_binding: Option<SelfBinding>,
 }
 
 impl PartialEq for Value {

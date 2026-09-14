@@ -75,6 +75,19 @@ pub enum SelfBinding {
     },
 }
 
+// Manual `Debug` (the variant name only): `Class` is not `Debug`, and `Block`
+// now carries an `Option<SelfBinding>` (`home_binding`) yet derives `Debug`.
+impl std::fmt::Debug for SelfBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            SelfBinding::Instance { .. } => "Instance",
+            SelfBinding::ClassSide { .. } => "ClassSide",
+            SelfBinding::Primitive { .. } => "Primitive",
+        };
+        write!(f, "SelfBinding::{kind}")
+    }
+}
+
 /// Snapshot of an evaluator's inherited dynamic context for async continuations.
 ///
 /// All fields are `Send + 'static` so this can be moved into `may::go!` closures.
@@ -342,6 +355,25 @@ impl Evaluator {
         }
     }
 
+    /// Reconstruct the receiver (`self`) from the top of `method_stack` — the
+    /// resolution for `VarRef::SelfRef` (env-frame redesign P2.1d).
+    ///
+    /// Requires: called from resolved method/block code, where a `SelfBinding` is
+    ///   active — a block re-pushes its captured `home_binding`, so this holds even
+    ///   after the block outlives its home frame.
+    /// Ensures: `Instance`/`ClassSide` → `Value::Instance(handle)`; `Primitive` →
+    ///   its `self_value`; no active binding (only reachable outside any method,
+    ///   where `self` is not a `SelfRef`) → `Value::Nil`.
+    pub(crate) fn self_value(&self) -> Value {
+        match self.method_stack.borrow().last() {
+            Some(SelfBinding::Instance { handle, .. } | SelfBinding::ClassSide { handle, .. }) => {
+                Value::Instance(handle.clone())
+            }
+            Some(SelfBinding::Primitive { self_value, .. }) => self_value.clone(),
+            None => Value::Nil,
+        }
+    }
+
     // ── Namespace helpers ─────────────────────────────────────────────────────
 
     pub fn active_namespace(&self) -> Arc<Namespace> {
@@ -441,9 +473,9 @@ impl Evaluator {
                     return Some(v);
                 }
                 // 3. outer env (globals)
-                // Ivar access for blocks with a home instance is handled by
-                // push_block_frame which pushes SelfBinding::Instance{home_self}
-                // before the block frame, so lookup_var sees Instance at top, not Primitive.
+                // Ivar access for blocks with an instance home is handled by
+                // push_block_frame re-pushing the block's `home_binding` before the
+                // block frame, so lookup_var sees Instance at top, not Primitive.
                 env.lookup_outer_frames(name)
             }
             None => env.get(name),
@@ -557,9 +589,9 @@ impl Evaluator {
                 }
                 Some(SelfBinding::Primitive { defining_class, .. }) => {
                     // Primitive receivers have no ivars. Ivar writes from blocks
-                    // with a home instance are handled by push_block_frame pushing
-                    // SelfBinding::Instance{home_self}, so assign_var sees Instance
-                    // at top, not Primitive.
+                    // with an instance home are handled by push_block_frame
+                    // re-pushing the block's `home_binding`, so assign_var sees
+                    // Instance at top, not Primitive.
                     if let Some(owner) = defining_class.lookup_class_var_owner(name.as_ref()) {
                         let ret = value.clone();
                         owner.class_var_storage.write().insert(name.clone(), value);

@@ -786,7 +786,7 @@ fn cleanup_frames_empty_stack() {
 
 #[test]
 fn cleanup_frames_plain_block_frame_no_pop_self() {
-    // BlockFrame with block_home_self=None → pop_self must NOT be called;
+    // BlockFrame with pushed_self=false → pop_self must NOT be called;
     // saved_block_home is restored. (Block frames always own an env frame.)
     let ev = crate::eval::Evaluator::new_without_kernel();
     ev.current_block_home.set(Some(99));
@@ -796,7 +796,7 @@ fn cleanup_frames_plain_block_frame_no_pop_self() {
         pending: std::collections::VecDeque::new(),
         env,
         saved_block_home: Some(3),
-        block_home_self: None,
+        pushed_self: false,
         sync: false,
     }];
     super::cleanup_frames(&ev, &mut stack);
@@ -854,10 +854,9 @@ fn cleanup_frames_method_frame_pops_self() {
 }
 
 #[test]
-fn cleanup_frames_block_with_home_self_pops_self() {
-    // is_method=false, block_home_self=Some → pop_self called; saved_block_home restored.
-    use crate::entity::{InstanceHandle, InstanceKind, InstanceState};
-    use crate::object::Object;
+fn cleanup_frames_block_with_pushed_self_pops_self() {
+    // A block that re-pushed its home binding (pushed_self=true) → pop_self is
+    // called on teardown; saved_block_home restored.
     let ev = crate::eval::Evaluator::new_without_kernel();
     let nil_class = ev
         .registry
@@ -868,13 +867,9 @@ fn cleanup_frames_block_with_home_self_pops_self() {
         .class
         .clone();
     ev.push_self(crate::eval::SelfBinding::Primitive {
-        defining_class: nil_class.clone(),
+        defining_class: nil_class,
         self_value: Value::Nil,
     });
-    let home_handle = InstanceHandle(std::sync::Arc::new(InstanceState {
-        class: nil_class.clone(),
-        kind: InstanceKind::ValueObject(std::sync::Arc::new(Object::new(nil_class))),
-    }));
     ev.current_block_home.set(Some(5));
     let mut env = crate::env::Env::new();
     env.push_frame();
@@ -882,7 +877,7 @@ fn cleanup_frames_block_with_home_self_pops_self() {
         pending: std::collections::VecDeque::new(),
         env,
         saved_block_home: Some(2),
-        block_home_self: Some(home_handle),
+        pushed_self: true,
         sync: false,
     }];
     super::cleanup_frames(&ev, &mut stack);
@@ -890,7 +885,7 @@ fn cleanup_frames_block_with_home_self_pops_self() {
     assert_eq!(
         ev.method_stack.borrow().len(),
         0,
-        "pop_self must have been called for block_home_self"
+        "pop_self must have been called for the re-pushed home binding"
     );
     assert_eq!(ev.current_block_home.get(), Some(2));
 }
@@ -906,7 +901,7 @@ fn cleanup_frames_pops_env_frame_when_flagged() {
         pending: std::collections::VecDeque::new(),
         env,
         saved_block_home: None,
-        block_home_self: None,
+        pushed_self: false,
         sync: false,
     }];
     super::cleanup_frames(&ev, &mut stack);
