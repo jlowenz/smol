@@ -76,6 +76,13 @@ cov-lcov:
 
 # Statement-level execution-coverage report for kernel.smol itself (Smol-level,
 # via the interpreter's own CoverageCollector — distinct from the llvm-cov
-# targets above, which measure Rust coverage).
+# targets above, which measure Rust coverage). Runs one exercise battery.
 cov-smol:
     cargo run --release --example kernel_coverage -p interpreter
+
+# Whole-test-suite kernel.smol coverage: runs the lib test suite with the global
+# coverage sink on, then prints the accumulated report. This is the automated
+# replacement for the manual "every kernel method body is exercised" audit.
+cov-suite:
+    SMOL_COVERAGE=1 SMOL_COVERAGE_OUT="{{justfile_directory()}}/target/smol-coverage.txt" cargo test -p interpreter --lib
+    @cat "{{justfile_directory()}}/target/smol-coverage.txt"

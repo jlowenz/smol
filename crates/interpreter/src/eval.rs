@@ -638,6 +638,9 @@ impl Evaluator {
         if let Some(cov) = self.registry.coverage.get() {
             cov.lock().record(span);
         }
+        if let Some(g) = crate::coverage::global_sink() {
+            g.lock().record(span);
+        }
     }
 
     pub fn eval_program(&self, stmts: &[TaggedStmt], env: &mut Env) -> Result<Value, EvalError> {

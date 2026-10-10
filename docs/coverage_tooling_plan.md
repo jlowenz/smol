@@ -1,6 +1,9 @@
 # Coverage Tooling Plan — Smol source coverage via AST source-tagging
 
-Status: **in progress** (2026-10-10). S1 underway.
+Status: **COMPLETE — S1–S7** (2026-10-10). Whole-suite result: **1217/1263 kernel.smol
+statements (96.4%)**; 43 uncovered lines remain to investigate (dead code / unreached error
+paths / untested features). `just cov-smol` = one exercise battery; `just cov-suite` = whole test
+suite.
 This is CLAUDE.md "Planned tooling" **item 1** (AST span tracking + `CoverageCollector`);
 it unblocks **item 2** (SUnit-style Smol testing framework).
 
@@ -96,7 +99,16 @@ plus a coverage %. MVP target: `kernel.smol`. Introduces the source registry (`S
 
 ### S6 — Tests + wiring
 Run the kernel (or a fixture) with the collector on; assert known-covered and known-uncovered
-regions. Expose via a `just cov-smol` target or an example binary.
+regions. Expose via a `just cov-smol` target or an example binary. **Done:** `examples/kernel_coverage.rs`
++ `branch_coverage_tracks_untaken_arm` (both arms of `ifTrue:ifFalse:`).
+
+### S7 — Whole-suite coverage (the real deliverable)
+`$SMOL_COVERAGE`-gated **process-global** collector that `record_coverage` also feeds, so every
+evaluator across every test records into it. Flushed to `$SMOL_COVERAGE_OUT` from
+`ClassRegistry::drop` — the harness has no "after all tests" hook, and `atexit` needs the `unsafe`
+the workspace forbids, so the last registry to drop writes the complete report. `just cov-suite`
+runs `cargo test --lib` with the sink on and prints it. **Result: 1217/1263 (96.4%), 43 uncovered
+lines.**
 
 ## 5. Decisions (resolved)
 

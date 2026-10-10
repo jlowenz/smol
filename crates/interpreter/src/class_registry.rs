@@ -466,6 +466,14 @@ impl ClassRegistry {
     }
 }
 
+impl Drop for ClassRegistry {
+    /// When whole-suite coverage is enabled (`$SMOL_COVERAGE`), flush the global
+    /// kernel coverage report as registries are torn down. A no-op otherwise.
+    fn drop(&mut self) {
+        crate::coverage::flush_global_report();
+    }
+}
+
 impl Default for ClassRegistry {
     fn default() -> Self {
         Self::new()

@@ -9,7 +9,10 @@
 //! point. See `docs/coverage_tooling_plan.md` for the alternatives considered.
 
 use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
 
 use crate::ast::{Expr, Message, Program, Stmt, TaggedStmt};
 use crate::span::Span;
@@ -190,6 +193,62 @@ fn line_starts(text: &str) -> Vec<u32> {
 /// 1-based line number containing byte `offset`.
 fn line_of(starts: &[u32], offset: u32) -> u32 {
     starts.partition_point(|&s| s <= offset) as u32
+}
+
+// ── Whole-suite sink: a process-global collector gated by $SMOL_COVERAGE ──────
+//
+// When `SMOL_COVERAGE` is set, every evaluator — across every test — also
+// records into one global collector, so a whole `cargo test` run yields
+// kernel.smol coverage for the entire suite. The report is flushed to
+// `$SMOL_COVERAGE_OUT` (default `smol-coverage.txt`) from `ClassRegistry::drop`,
+// because the test harness offers no "after all tests" hook and the workspace
+// forbids the `unsafe` an `atexit` dump would need. The last registry to drop
+// writes the complete report.
+
+const KERNEL_SRC: &str = include_str!("kernel.smol");
+
+/// The process-global collector, or `None` when `$SMOL_COVERAGE` is unset
+/// (decided once, on first use).
+pub(crate) fn global_sink() -> Option<&'static Mutex<CoverageCollector>> {
+    static GLOBAL: OnceLock<Option<Mutex<CoverageCollector>>> = OnceLock::new();
+    GLOBAL
+        .get_or_init(|| {
+            std::env::var_os("SMOL_COVERAGE").map(|_| Mutex::new(CoverageCollector::new()))
+        })
+        .as_ref()
+}
+
+/// All kernel statement spans — the coverage denominator — parsed once.
+fn kernel_all_spans() -> &'static [Span] {
+    static CACHE: OnceLock<Vec<Span>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let prog = crate::parser::Parser::parse_source(crate::span::SourceId::KERNEL, KERNEL_SRC)
+            .expect("kernel.smol parse (coverage denominator)");
+        collect_stmt_spans(&prog)
+    })
+}
+
+/// Write the whole-suite kernel coverage report to `$SMOL_COVERAGE_OUT`, but only
+/// when the global collector has grown since the last flush (so a `cargo test`
+/// run writes a handful of times, ending with the complete report). A no-op when
+/// `$SMOL_COVERAGE` is unset. Called from `ClassRegistry::drop`.
+pub(crate) fn flush_global_report() {
+    let Some(g) = global_sink() else { return };
+    let len = g.lock().len();
+    static LAST: AtomicUsize = AtomicUsize::new(0);
+    if len <= LAST.load(Ordering::Relaxed) {
+        return;
+    }
+    LAST.store(len, Ordering::Relaxed);
+    let touched = g.lock().touched().clone();
+    let report = report_source("kernel.smol", KERNEL_SRC, kernel_all_spans(), &touched);
+    let path = std::env::var("SMOL_COVERAGE_OUT").unwrap_or_else(|_| "smol-coverage.txt".into());
+    let body = format!(
+        "{report}\nuncovered lines ({}): {:?}\n",
+        report.uncovered_lines.len(),
+        report.uncovered_lines
+    );
+    let _ = std::fs::write(path, body);
 }
 
 #[cfg(test)]
