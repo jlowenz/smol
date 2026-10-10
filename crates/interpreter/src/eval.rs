@@ -236,7 +236,8 @@ impl Evaluator {
         let mut bootstrap_env = Env::new();
         ev.registry.populate_env(&mut bootstrap_env);
         let src = include_str!("kernel.smol");
-        let prog = Parser::parse(src).expect("kernel.smol: parse error");
+        let prog = Parser::parse_source(crate::span::SourceId::KERNEL, src)
+            .expect("kernel.smol: parse error");
         ev.eval_program(&prog.stmts, &mut bootstrap_env)
             .expect("kernel.smol: eval error");
         ev

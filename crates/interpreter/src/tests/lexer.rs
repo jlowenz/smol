@@ -1,7 +1,7 @@
 use super::*;
 
 fn tok(src: &str) -> Vec<Token> {
-    Lexer::tokenize(src)
+    Lexer::tokenize(crate::span::SourceId::ANON, src)
         .expect("lex error")
         .into_iter()
         .map(|t| t.node)
@@ -49,7 +49,7 @@ fn float_with_signed_exponent() {
 #[test]
 fn float_exponent_missing_digits_errors() {
     // `1.5e` followed by a non-digit — LexError::InvalidNumber.
-    let err = Lexer::tokenize("1.5e!").unwrap_err();
+    let err = Lexer::tokenize(crate::span::SourceId::ANON, "1.5e!").unwrap_err();
     assert!(matches!(err, LexError::InvalidNumber(_)));
 }
 

@@ -12,10 +12,14 @@
 pub struct SourceId(pub u32);
 
 impl SourceId {
-    /// Placeholder id used while parsing, before the source registry (coverage
-    /// report, S5) assigns a distinct id per source. Ordinary `parse`/`tokenize`
-    /// stamp spans with this.
+    /// Placeholder id for parses that are not attributed to a named source —
+    /// the default for `Parser::parse` (tests, REPL-style one-offs, ad-hoc
+    /// reparsing). Coverage reporting ignores spans from this source.
     pub const ANON: SourceId = SourceId(0);
+
+    /// The embedded `kernel.smol`. Kernel loading parses with this id so its
+    /// statement spans are distinct from user/test spans in coverage reports.
+    pub const KERNEL: SourceId = SourceId(1);
 }
 
 /// A half-open byte range `[start, end)` within the text of `source`.

@@ -85,9 +85,8 @@ impl<'src> Lexer<'src> {
     /// Tokenize the entire source into a `Vec<SpannedToken>`, each token paired
     /// with its byte range.
     ///
-    /// Ensures: the last token is always `Token::Eof`; spans carry
-    /// [`SourceId::ANON`] until the source registry assigns real ids.
-    pub fn tokenize(src: &'src str) -> Result<Vec<SpannedToken>, LexError> {
+    /// Ensures: the last token is always `Token::Eof`; each token's span carries `source`.
+    pub fn tokenize(source: SourceId, src: &'src str) -> Result<Vec<SpannedToken>, LexError> {
         let mut lexer = Self::new(src);
         let mut tokens = Vec::new();
         loop {
@@ -98,10 +97,7 @@ impl<'src> Lexer<'src> {
             let tok = lexer.next_token()?;
             let end = lexer.pos as u32;
             let done = tok == Token::Eof;
-            tokens.push(SourceTagged::new(
-                Span::new(SourceId::ANON, start, end),
-                tok,
-            ));
+            tokens.push(SourceTagged::new(Span::new(source, start, end), tok));
             if done {
                 break;
             }

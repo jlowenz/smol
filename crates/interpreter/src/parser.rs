@@ -46,7 +46,14 @@ pub struct Parser {
 
 impl Parser {
     pub fn parse(src: &str) -> Result<Program, ParseError> {
-        let tokens = Lexer::tokenize(src)?;
+        Self::parse_source(crate::span::SourceId::ANON, src)
+    }
+
+    /// Parse `src`, attributing every span to `source` (so coverage and
+    /// diagnostics can map back to the right `.smol` file). [`Parser::parse`]
+    /// delegates here with [`crate::span::SourceId::ANON`].
+    pub fn parse_source(source: crate::span::SourceId, src: &str) -> Result<Program, ParseError> {
+        let tokens = Lexer::tokenize(source, src)?;
         let mut p = Parser {
             tokens,
             pos: 0,
