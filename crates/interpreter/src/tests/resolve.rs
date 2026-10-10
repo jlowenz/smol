@@ -1,15 +1,15 @@
 use super::*;
-use crate::ast::{Expr, Message, Stmt, VarRef};
+use crate::ast::{Expr, Message, Stmt, TaggedStmt, VarRef};
 use crate::parser::Parser;
 use std::sync::Arc;
 
 /// Parse `X >> sel [...]` and rewrite its (first) method with `res` filled.
-fn rewrite_src(src: &str) -> Vec<Stmt> {
+fn rewrite_src(src: &str) -> Vec<TaggedStmt> {
     let prog = Parser::parse(src).expect("parse");
     let def = prog
         .stmts
         .iter()
-        .find_map(|s| match s {
+        .find_map(|s| match &s.node {
             Stmt::MethodDef(d) => Some(d),
             _ => None,
         })
@@ -31,7 +31,7 @@ fn resolve_src(src: &str) -> ResolvedScope {
     let def = prog
         .stmts
         .iter()
-        .find_map(|s| match s {
+        .find_map(|s| match &s.node {
             Stmt::MethodDef(d) => Some(d),
             _ => None,
         })
@@ -137,12 +137,12 @@ fn rewrite_fills_local_param_and_dynamic() {
     let body = rewrite_src("X >> foo: p [ | m | m := p. ^m + ivar ]");
     // stmt 0: `m := p` — the VALUE `p` resolves to Local(0). (Target stays a bare
     // name in P2.1a.)
-    let Stmt::Assign { value, .. } = &body[0] else {
+    let Stmt::Assign { value, .. } = &body[0].node else {
         panic!("expected assign, got {:?}", body[0]);
     };
     assert_eq!(as_var(value), &VarRef::Local(0));
     // stmt 1: `^m + ivar` — m → Local(1), ivar → Dynamic.
-    let Stmt::Return(Expr::Send { receiver, message }) = &body[1] else {
+    let Stmt::Return(Expr::Send { receiver, message }) = &body[1].node else {
         panic!("expected return-send, got {:?}", body[1]);
     };
     assert_eq!(as_var(receiver), &VarRef::Local(1));
@@ -155,7 +155,7 @@ fn rewrite_fills_local_param_and_dynamic() {
 #[test]
 fn rewrite_fills_selfref() {
     let body = rewrite_src("X >> foo [ ^self ]");
-    let Stmt::Return(e) = &body[0] else { panic!() };
+    let Stmt::Return(e) = &body[0].node else { panic!() };
     assert_eq!(as_var(e), &VarRef::SelfRef);
 }
 
@@ -163,10 +163,12 @@ fn rewrite_fills_selfref() {
 fn rewrite_fills_upvalue_in_block() {
     // The block reads the method local `m` → Upvalue(0).
     let body = rewrite_src("X >> foo [ | m | m := 1. ^[ m ] ]");
-    let Stmt::Return(Expr::Block { body: blk, .. }) = &body[1] else {
+    let Stmt::Return(Expr::Block { body: blk, .. }) = &body[1].node else {
         panic!("expected return-block, got {:?}", body[1]);
     };
-    let Stmt::Expr(e) = &blk[0] else { panic!() };
+    let Stmt::Expr(e) = &blk[0].node else {
+        panic!()
+    };
     assert_eq!(as_var(e), &VarRef::Upvalue(0));
 }
 
@@ -178,7 +180,7 @@ fn resolves_the_entire_kernel_without_panic() {
     let prog = Parser::parse(src).expect("kernel parse");
     let mut methods = 0usize;
     for s in &prog.stmts {
-        if let Stmt::MethodDef(d) = s {
+        if let Stmt::MethodDef(d) = &s.node {
             let r = resolve_method(&d.pattern.params(), &d.locals, &d.body);
             assert!(r.slots.len() <= u16::MAX as usize);
             methods += 1;

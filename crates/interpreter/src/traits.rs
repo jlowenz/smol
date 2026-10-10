@@ -169,7 +169,7 @@ impl TraitData {
         let mut reqs: HashSet<Arc<str>> = HashSet::new();
         for entry in methods.values() {
             for stmt in &entry.method.body {
-                collect_self_sends_stmt(stmt, &mut reqs);
+                collect_self_sends_stmt(&stmt.node, &mut reqs);
             }
         }
         reqs.retain(|s| !provided.contains(s));
@@ -212,7 +212,7 @@ fn collect_self_sends_expr(expr: &Expr, out: &mut HashSet<Arc<str>>) {
         }
         Expr::Block { body, .. } => {
             for s in body {
-                collect_self_sends_stmt(s, out);
+                collect_self_sends_stmt(&s.node, out);
             }
         }
         Expr::DynamicArray(elems) => {

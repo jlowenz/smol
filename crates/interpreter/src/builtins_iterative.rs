@@ -2671,7 +2671,7 @@ pub(crate) fn class_is_resumable(ev: &Evaluator, handler_class: &Arc<Class>) -> 
     if let Some((method, _)) = handler_class.lookup_class_method("isResumable")
         && method.body.len() == 1
         && let crate::ast::Stmt::Return(crate::ast::Expr::Lit(crate::ast::Literal::Bool(b))) =
-            &method.body[0]
+            &method.body[0].node
     {
         return *b;
     }

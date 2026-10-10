@@ -109,18 +109,28 @@ impl Parser {
         }
     }
 
+    /// Wrap `node` with the source span covering tokens `start..=self.pos - 1`
+    /// (the statement's first token through its last consumed token).
+    ///
+    /// Requires: `start < self.pos` (at least one token was consumed for `node`).
+    fn tag_from(&self, start: usize, node: Stmt) -> TaggedStmt {
+        let span = self.tokens[start].span.to(self.tokens[self.pos - 1].span);
+        TaggedStmt::new(span, node)
+    }
+
     // ── Grammar ───────────────────────────────────────────────────────────────
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut stmts = Vec::new();
         while self.peek() != &Token::Eof {
+            let start = self.pos;
             // Allow local declarations (`| x y |`) anywhere at the statement level.
-            if self.peek() == &Token::Pipe {
-                stmts.push(self.parse_local_decl()?);
-                self.eat(&Token::Dot);
-                continue;
-            }
-            stmts.push(self.parse_stmt()?);
+            let node = if self.peek() == &Token::Pipe {
+                self.parse_local_decl()?
+            } else {
+                self.parse_stmt()?
+            };
+            stmts.push(self.tag_from(start, node));
             self.eat(&Token::Dot);
         }
         Ok(Program {
@@ -295,7 +305,9 @@ impl Parser {
         self.in_block = false;
         let mut body = Vec::new();
         while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
-            body.push(self.parse_stmt()?);
+            let start = self.pos;
+            let node = self.parse_stmt()?;
+            body.push(self.tag_from(start, node));
             self.eat(&Token::Dot);
         }
         self.in_method = prev_in_method;
@@ -656,7 +668,9 @@ impl Parser {
         self.block_scope_stack.push(scope);
         let mut body = Vec::new();
         while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
-            body.push(self.parse_stmt()?);
+            let start = self.pos;
+            let node = self.parse_stmt()?;
+            body.push(self.tag_from(start, node));
             self.eat(&Token::Dot);
         }
         self.block_scope_stack.pop();

@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use interpreter::ast::{Expr, Message, Stmt};
+use interpreter::ast::{Expr, Message, Stmt, TaggedStmt};
 use interpreter::parser::Parser;
 
 type Names = HashSet<Arc<str>>;
@@ -53,7 +53,7 @@ fn caps_expr(declared: &Names, e: &Expr, in_block: bool, shadow: &Names, out: &m
             sh.extend(params.iter().cloned());
             sh.extend(locals.iter().cloned());
             for st in body {
-                caps_stmt(declared, st, true, &sh, out);
+                caps_stmt(declared, &st.node, true, &sh, out);
             }
         }
         Expr::Cascade { receiver, messages } => {
@@ -88,7 +88,7 @@ fn caps_stmt(declared: &Names, s: &Stmt, in_block: bool, shadow: &Names, out: &m
 }
 
 /// A nested block, as (params, locals, body) borrowed from the AST.
-type BlockRef<'a> = (&'a [Arc<str>], &'a [Arc<str>], &'a [Stmt]);
+type BlockRef<'a> = (&'a [Arc<str>], &'a [Arc<str>], &'a [TaggedStmt]);
 
 /// Every `Block` literal appearing anywhere in a statement (for recursing into
 /// nested scopes), returned as (params∪locals, body).
@@ -103,7 +103,7 @@ fn collect_blocks<'a>(s: &'a Stmt, out: &mut Vec<BlockRef<'a>>) {
             } => {
                 out.push((params, locals, body));
                 for st in body {
-                    collect_blocks(st, out);
+                    collect_blocks(&st.node, out);
                 }
             }
             Expr::Send { receiver, message } => {
@@ -147,13 +147,13 @@ struct Finding {
 /// into every nested block as its own scope.
 fn analyze(
     mut declared: Names,
-    body: &[Stmt],
+    body: &[TaggedStmt],
     label: &str,
     findings: &mut Vec<Finding>,
     stats: &mut Stats,
 ) {
     for s in body {
-        if let Stmt::LocalDecl(ns) = s {
+        if let Stmt::LocalDecl(ns) = &s.node {
             declared.extend(ns.iter().cloned());
         }
     }
@@ -163,11 +163,11 @@ fn analyze(
     let mut capture_idx: HashMap<Arc<str>, Vec<usize>> = HashMap::new();
     for (i, s) in body.iter().enumerate() {
         let mut caps = Names::new();
-        caps_stmt(&declared, s, false, &Names::new(), &mut caps);
+        caps_stmt(&declared, &s.node, false, &Names::new(), &mut caps);
         for c in caps {
             capture_idx.entry(c).or_default().push(i);
         }
-        if let Stmt::Assign { name, .. } = s
+        if let Stmt::Assign { name, .. } = &s.node
             && declared.contains(name)
         {
             assign_idx.entry(name.clone()).or_default().push(i);
@@ -214,7 +214,7 @@ fn analyze(
     // Recurse into nested blocks as their own scopes.
     let mut blocks = Vec::new();
     for s in body {
-        collect_blocks(s, &mut blocks);
+        collect_blocks(&s.node, &mut blocks);
     }
     for (params, locals, b) in blocks {
         let mut d = Names::new();
@@ -241,7 +241,7 @@ fn main() {
     let mut stats = Stats::default();
 
     for s in &prog.stmts {
-        if let Stmt::MethodDef(m) = s {
+        if let Stmt::MethodDef(m) = &s.node {
             stats.methods += 1;
             let mut declared: Names = m.pattern.params().into_iter().collect();
             declared.extend(m.locals.iter().cloned());

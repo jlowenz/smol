@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::ast::{CaptureSource, Expr, Message, MethodDef, Stmt, VarRef};
+use crate::ast::{CaptureSource, Expr, Message, MethodDef, Stmt, TaggedStmt, VarRef};
 use crate::builtins::{UserMethodFound, as_block, force_value, lookup_user_method};
 use crate::class::{Class, Method};
 use crate::entity::{InstanceHandle, InstanceKind};
@@ -243,7 +243,7 @@ pub(crate) enum Cont {
         /// Method-stack depth of this frame (matches `EvalError::Return`).
         depth: usize,
         /// Remaining statements to run.
-        pending: VecDeque<Stmt>,
+        pending: VecDeque<TaggedStmt>,
         /// Method environment (always `push_frame`d on setup; popped on teardown).
         env: Env,
         /// The receiver, returned when the body ends without an explicit `^`.
@@ -260,7 +260,7 @@ pub(crate) enum Cont {
     /// expression's value, so there is no implicit-return override.
     BlockFrame {
         /// Remaining statements to run.
-        pending: VecDeque<Stmt>,
+        pending: VecDeque<TaggedStmt>,
         /// Block environment (always `push_frame`d on setup; popped on teardown).
         env: Env,
         /// `current_block_home` before this frame; restored on teardown.
@@ -281,7 +281,7 @@ pub(crate) enum Cont {
     /// only restores `current_block_home`. Answers its last expression's value.
     ProgramFrame {
         /// Remaining statements to run.
-        pending: VecDeque<Stmt>,
+        pending: VecDeque<TaggedStmt>,
         /// Program environment (not `push_frame`d; not popped on teardown).
         env: Env,
         /// `current_block_home` before this frame; restored on teardown.
@@ -1100,7 +1100,7 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
 fn handle_method_frame(
     ev: &Evaluator,
     depth: usize,
-    mut pending: VecDeque<Stmt>,
+    mut pending: VecDeque<TaggedStmt>,
     mut env: Env,
     implicit_self: Value,
     saved_block_home: Option<usize>,
@@ -1122,7 +1122,7 @@ fn handle_method_frame(
             implicit_self,
             saved_block_home,
         });
-        dispatch_stmt(ev, stmt, &env, depth, stack, acc)?;
+        dispatch_stmt(ev, stmt.node, &env, depth, stack, acc)?;
     }
     Ok(())
 }
@@ -1132,7 +1132,7 @@ fn handle_method_frame(
 #[allow(clippy::too_many_arguments)]
 fn handle_block_frame(
     ev: &Evaluator,
-    mut pending: VecDeque<Stmt>,
+    mut pending: VecDeque<TaggedStmt>,
     mut env: Env,
     saved_block_home: Option<usize>,
     pushed_self: bool,
@@ -1160,7 +1160,7 @@ fn handle_block_frame(
         }
         // Blocks match `^`-returns against `current_block_home` (always set during a
         // block), so the frame depth here is irrelevant.
-        dispatch_stmt(ev, stmt, &env, 0, stack, acc)?;
+        dispatch_stmt(ev, stmt.node, &env, 0, stack, acc)?;
     }
     Ok(())
 }
@@ -1169,7 +1169,7 @@ fn handle_block_frame(
 #[inline(never)]
 fn handle_program_frame(
     ev: &Evaluator,
-    mut pending: VecDeque<Stmt>,
+    mut pending: VecDeque<TaggedStmt>,
     env: Env,
     saved_block_home: Option<usize>,
     stack: &mut Vec<Cont>,
@@ -1186,7 +1186,7 @@ fn handle_program_frame(
             env: env.clone(),
             saved_block_home,
         });
-        dispatch_stmt(ev, stmt, &env, 0, stack, acc)?;
+        dispatch_stmt(ev, stmt.node, &env, 0, stack, acc)?;
     }
     Ok(())
 }
@@ -1491,7 +1491,7 @@ pub(crate) fn push_block_frame(
         slots.push(Value::Nil);
     }
     for stmt in &block.body {
-        if let Stmt::LocalDecl(names) = stmt {
+        if let Stmt::LocalDecl(names) = &stmt.node {
             for name in names {
                 block_env.define(name.clone(), Value::Nil);
                 slots.push(Value::Nil);
@@ -1648,7 +1648,7 @@ pub(crate) fn push_method_frame(
     }
     // Pre-bind LocalDecl names (eval_program pre-binding equivalent).
     for stmt in &method.body {
-        if let Stmt::LocalDecl(names) = stmt {
+        if let Stmt::LocalDecl(names) = &stmt.node {
             for name in names {
                 base_env.define(name.clone(), Value::Nil);
                 slots.push(Value::Nil);

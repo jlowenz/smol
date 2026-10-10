@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use num_bigint::BigInt;
 
-use crate::ast::Stmt;
+use crate::ast::TaggedStmt;
 use crate::entity::{EntityId, FutureHandle, InstanceHandle};
 use crate::env::Env;
 use crate::eval::SelfBinding;
@@ -47,7 +47,7 @@ pub enum Value {
 pub struct Block {
     pub params: Vec<Arc<str>>,
     pub locals: Vec<Arc<str>>,
-    pub body: Vec<Stmt>,
+    pub body: Vec<TaggedStmt>,
     /// Captured upvalue values, snapshotted at block-creation time in
     /// `Upvalue(i)` order (env-frame redesign P2.1c). Because locals are
     /// single-assignment, this value-copy is observationally identical to a live

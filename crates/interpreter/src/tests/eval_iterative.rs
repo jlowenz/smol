@@ -997,6 +997,11 @@ fn make_class_handle(class: std::sync::Arc<crate::class::Class>) -> crate::entit
     }))
 }
 
+/// Tag a statement with a placeholder span, for hand-built test bodies.
+fn ts(s: crate::ast::Stmt) -> crate::ast::TaggedStmt {
+    crate::ast::TaggedStmt::new(crate::span::Span::new(crate::span::SourceId::ANON, 0, 0), s)
+}
+
 /// Builds a unary `Method` with the given body stmts and locals.
 fn make_method(
     selector: &str,
@@ -1007,7 +1012,7 @@ fn make_method(
     std::sync::Arc::new(crate::class::Method {
         pattern: crate::class::MethodPattern::Unary(Arc::from(selector)),
         locals: locals.into_iter().map(Arc::from).collect(),
-        body,
+        body: body.into_iter().map(ts).collect(),
     })
 }
 
@@ -1171,7 +1176,7 @@ fn push_class_method_frame_locals_initialized_nil() {
     let method = Arc::new(crate::class::Method {
         pattern: crate::class::MethodPattern::Unary(Arc::from("foo")),
         locals: vec![Arc::from("a")],
-        body: vec![Stmt::LocalDecl(vec![Arc::from("b")])],
+        body: vec![ts(Stmt::LocalDecl(vec![Arc::from("b")]))],
     });
     let env = crate::env::Env::new();
     let mut stack = vec![];

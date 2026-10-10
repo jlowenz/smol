@@ -356,7 +356,10 @@ fn nlr_with_failing_commit_faults_entity() {
     let nlr_block = Arc::new(Block {
         params: vec![],
         locals: vec![],
-        body: vec![Stmt::Return(Expr::Lit(Literal::Int(77)))],
+        body: vec![crate::ast::TaggedStmt::new(
+            crate::span::Span::new(crate::span::SourceId::ANON, 0, 0),
+            Stmt::Return(Expr::Lit(Literal::Int(77))),
+        )],
         snapshot: Arc::from(Vec::new()),
         env: Env::new(),
         home_depth: 2,

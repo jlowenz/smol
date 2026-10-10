@@ -631,9 +631,9 @@ impl Evaluator {
     /// Requires: `env` has at least one live frame.
     /// Ensures: semantically identical to `eval_program_recursive`; Smol method calls
     ///   use heap-allocated `CallFrame`s rather than Rust stack frames.
-    pub fn eval_program(&self, stmts: &[Stmt], env: &mut Env) -> Result<Value, EvalError> {
+    pub fn eval_program(&self, stmts: &[TaggedStmt], env: &mut Env) -> Result<Value, EvalError> {
         for stmt in stmts {
-            if let Stmt::LocalDecl(names) = stmt {
+            if let Stmt::LocalDecl(names) = &stmt.node {
                 for name in names {
                     env.define(name.clone(), Value::Nil);
                 }
@@ -955,9 +955,9 @@ fn check_prim_sends_in_message(msg: &Message) -> Result<(), EvalError> {
 /// Requires: `stmts` is the body of a method being installed.
 /// Ensures: returns `Err(EvalError::TypeError)` if any such send is found;
 ///   otherwise `Ok(())`.
-pub(crate) fn check_prim_sends_in_body(stmts: &[Stmt]) -> Result<(), EvalError> {
+pub(crate) fn check_prim_sends_in_body(stmts: &[TaggedStmt]) -> Result<(), EvalError> {
     for stmt in stmts {
-        match stmt {
+        match &stmt.node {
             Stmt::Expr(e) | Stmt::Return(e) => check_prim_sends_in_expr(e)?,
             Stmt::Assign { value, .. } => check_prim_sends_in_expr(value)?,
             Stmt::LocalDecl(_) => {}
@@ -980,7 +980,7 @@ pub(crate) fn check_prim_sends_in_body(stmts: &[Stmt]) -> Result<(), EvalError> 
 pub(crate) fn check_single_assignment_in_method(
     params: &[Arc<str>],
     locals: &[Arc<str>],
-    body: &[Stmt],
+    body: &[TaggedStmt],
 ) -> Result<(), EvalError> {
     let mut declared: HashSet<Arc<str>> = params.iter().cloned().collect();
     declared.extend(locals.iter().cloned());
@@ -997,15 +997,15 @@ pub(crate) fn check_single_assignment_in_method(
 fn check_single_assignment_scope(
     mut declared: HashSet<Arc<str>>,
     mut assigned: HashSet<Arc<str>>,
-    body: &[Stmt],
+    body: &[TaggedStmt],
 ) -> Result<(), EvalError> {
     for s in body {
-        if let Stmt::LocalDecl(names) = s {
+        if let Stmt::LocalDecl(names) = &s.node {
             declared.extend(names.iter().cloned());
         }
     }
     for s in body {
-        match s {
+        match &s.node {
             Stmt::Assign { name, value, .. } => {
                 if declared.contains(name) && !assigned.insert(name.clone()) {
                     return Err(EvalError::TypeError(format!(
@@ -1094,7 +1094,7 @@ fn check_single_assignment_message(msg: &Message) -> Result<(), EvalError> {
 pub(crate) fn check_capture_before_assignment(
     params: &[Arc<str>],
     locals: &[Arc<str>],
-    body: &[Stmt],
+    body: &[TaggedStmt],
 ) -> Result<(), EvalError> {
     let slots = scope_slot_names(params, locals, body);
     check_captures_scope(&slots, params.len(), body)
@@ -1103,11 +1103,15 @@ pub(crate) fn check_capture_before_assignment(
 /// Slot names in resolver order — params, then declared locals, then mid-body
 /// `LocalDecl` names. Mirrors `resolve::scope_slots` so a `ParentLocal(i)` index
 /// names the right local in the error.
-fn scope_slot_names(params: &[Arc<str>], locals: &[Arc<str>], body: &[Stmt]) -> Vec<Arc<str>> {
+fn scope_slot_names(
+    params: &[Arc<str>],
+    locals: &[Arc<str>],
+    body: &[TaggedStmt],
+) -> Vec<Arc<str>> {
     let mut slots: Vec<Arc<str>> = params.to_vec();
     slots.extend(locals.iter().cloned());
     for s in body {
-        if let Stmt::LocalDecl(names) = s {
+        if let Stmt::LocalDecl(names) = &s.node {
             slots.extend(names.iter().cloned());
         }
     }
@@ -1119,13 +1123,13 @@ fn scope_slot_names(params: &[Arc<str>], locals: &[Arc<str>], body: &[Stmt]) -> 
 fn check_captures_scope(
     slots: &[Arc<str>],
     nparams: usize,
-    body: &[Stmt],
+    body: &[TaggedStmt],
 ) -> Result<(), EvalError> {
     // Params are bound on entry → assigned from the start. Slot indices align with
     // `slots` (params occupy `0..nparams`).
     let mut assigned: HashSet<u16> = (0..nparams as u16).collect();
     for s in body {
-        match s {
+        match &s.node {
             Stmt::Assign { res, value, .. } => {
                 // The RHS is evaluated *before* the target is bound, so a block in
                 // the RHS captures with the target still unassigned.

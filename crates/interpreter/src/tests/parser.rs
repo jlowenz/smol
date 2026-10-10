@@ -5,7 +5,7 @@ fn parse(src: &str) -> Program {
 }
 
 fn expr(src: &str) -> Expr {
-    match parse(src).stmts.into_iter().next().unwrap() {
+    match parse(src).stmts.into_iter().next().unwrap().node {
         Stmt::Expr(e) => e,
         other => panic!("expected Expr stmt, got {other:?}"),
     }
@@ -93,7 +93,7 @@ fn keyword_send_two_part() {
 fn assignment() {
     let prog = parse("x := 42");
     assert_eq!(
-        prog.stmts[0],
+        prog.stmts[0].node,
         Stmt::Assign {
             name: Arc::from("x"),
             res: VarRef::Unresolved,
@@ -106,7 +106,7 @@ fn assignment() {
 fn local_decl() {
     let prog = parse("| x y |");
     assert_eq!(
-        prog.stmts[0],
+        prog.stmts[0].node,
         Stmt::LocalDecl(vec![Arc::from("x"), Arc::from("y")])
     );
 }
@@ -114,7 +114,7 @@ fn local_decl() {
 #[test]
 fn caret_return() {
     let prog = parse("^ 1");
-    assert_eq!(prog.stmts[0], Stmt::Return(Expr::Lit(Literal::Int(1))));
+    assert_eq!(prog.stmts[0].node, Stmt::Return(Expr::Lit(Literal::Int(1))));
 }
 
 #[test]
@@ -210,7 +210,7 @@ fn precedence_unary_over_binary() {
 #[test]
 fn method_def_unary() {
     let prog = parse("Counter >> increment [ count := count + 1 ]");
-    match &prog.stmts[0] {
+    match &prog.stmts[0].node {
         Stmt::MethodDef(def) => {
             assert_eq!(def.class_name.as_ref(), "Counter");
             assert_eq!(def.pattern, MethodPattern::Unary(Arc::from("increment")));
@@ -223,7 +223,7 @@ fn method_def_unary() {
 #[test]
 fn method_def_binary() {
     let prog = parse("Vec >> + other [ ^self ]");
-    match &prog.stmts[0] {
+    match &prog.stmts[0].node {
         Stmt::MethodDef(def) => {
             assert_eq!(def.class_name.as_ref(), "Vec");
             assert_eq!(
@@ -243,7 +243,7 @@ fn method_def_binary() {
 #[test]
 fn method_def_keyword_single() {
     let prog = parse("Counter >> incrementBy: n [ count := count + n ]");
-    match &prog.stmts[0] {
+    match &prog.stmts[0].node {
         Stmt::MethodDef(def) => {
             assert_eq!(def.class_name.as_ref(), "Counter");
             assert_eq!(def.pattern.selector().as_ref(), "incrementBy:");
@@ -256,7 +256,7 @@ fn method_def_keyword_single() {
 #[test]
 fn method_def_keyword_multi() {
     let prog = parse("Coll >> at: i put: v [ ]");
-    match &prog.stmts[0] {
+    match &prog.stmts[0].node {
         Stmt::MethodDef(def) => {
             assert_eq!(def.pattern.selector().as_ref(), "at:put:");
             assert_eq!(def.pattern.params(), vec![Arc::from("i"), Arc::from("v")]);
@@ -268,7 +268,7 @@ fn method_def_keyword_multi() {
 #[test]
 fn method_def_with_locals() {
     let prog = parse("Foo >> bar [ | tmp | tmp := 1. ^tmp ]");
-    match &prog.stmts[0] {
+    match &prog.stmts[0].node {
         Stmt::MethodDef(def) => {
             assert_eq!(def.locals, vec![Arc::from("tmp")]);
             assert_eq!(def.body.len(), 2); // Assign + Return
@@ -280,11 +280,11 @@ fn method_def_with_locals() {
 #[test]
 fn method_def_with_return() {
     let prog = parse("Counter >> count [ ^count ]");
-    match &prog.stmts[0] {
+    match &prog.stmts[0].node {
         Stmt::MethodDef(def) => {
             assert_eq!(def.class_name.as_ref(), "Counter");
             assert_eq!(def.body.len(), 1);
-            assert!(matches!(def.body[0], Stmt::Return(_)));
+            assert!(matches!(def.body[0].node, Stmt::Return(_)));
         }
         _ => panic!("expected MethodDef"),
     }
@@ -309,13 +309,13 @@ fn caret_inside_method_block_is_valid() {
     // `^` inside a block that's inside a method body is a legitimate
     // non-local return targeting the method frame.
     let prog = parse("Foo >> run [ [^42] value ]");
-    assert!(matches!(prog.stmts[0], Stmt::MethodDef(_)));
+    assert!(matches!(prog.stmts[0].node, Stmt::MethodDef(_)));
 }
 
 #[test]
 fn caret_directly_in_method_body_is_valid() {
     let prog = parse("Foo >> count [ ^count ]");
-    assert!(matches!(prog.stmts[0], Stmt::MethodDef(_)));
+    assert!(matches!(prog.stmts[0].node, Stmt::MethodDef(_)));
 }
 
 // ── Primary literal variants ──────────────────────────────────────────────
@@ -439,7 +439,7 @@ fn unexpected_token_as_primary_is_error() {
 #[test]
 fn method_def_with_comment_between_class_and_arrow() {
     let prog = parse("Counter \"note\" >> inc [ ]");
-    assert!(matches!(prog.stmts[0], Stmt::MethodDef(_)));
+    assert!(matches!(prog.stmts[0].node, Stmt::MethodDef(_)));
 }
 
 // ── expect() EOF and UnexpectedToken paths ────────────────────────────────
@@ -464,7 +464,7 @@ fn unclosed_paren_with_extra_token_gives_unexpected_token() {
 fn assignment_with_comment_between_ident_and_assign() {
     // Comment token between variable and `:=` is skipped during lookahead.
     let prog = parse("x \"a note\" := 5");
-    assert!(matches!(prog.stmts[0], Stmt::Assign { .. }));
+    assert!(matches!(prog.stmts[0].node, Stmt::Assign { .. }));
 }
 
 // ── Method def invalid pattern (lines 206-207) ────────────────────────────
@@ -518,8 +518,8 @@ fn unary_level_skips_comment_in_assign_lookahead() {
     // comment-skip loop inside the assign-lookahead check (lines 339-340, 344).
     let prog = parse("3 factorial x \"a note\" := 5");
     assert_eq!(prog.stmts.len(), 2);
-    assert!(matches!(prog.stmts[0], Stmt::Expr(_)));
-    assert!(matches!(prog.stmts[1], Stmt::Assign { .. }));
+    assert!(matches!(prog.stmts[0].node, Stmt::Expr(_)));
+    assert!(matches!(prog.stmts[1].node, Stmt::Assign { .. }));
 }
 
 // ── Array literal: Float and LargeInt elements (lines 423, 429) ───────────

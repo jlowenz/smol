@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use crate::ast::{CaptureSource, Expr, Message, Stmt, VarRef};
+use crate::ast::{CaptureSource, Expr, Message, Stmt, TaggedStmt, VarRef};
 
 /// The resolved plan for one lexical scope: a method body or a block body.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,7 +57,7 @@ pub(crate) struct ResolvedScope {
 pub(crate) fn resolve_method(
     params: &[Arc<str>],
     locals: &[Arc<str>],
-    body: &[Stmt],
+    body: &[TaggedStmt],
 ) -> ResolvedScope {
     let slots = scope_slots(params, locals, body);
     let mut stack: Vec<ScopeCtx> = Vec::new();
@@ -78,8 +78,8 @@ pub(crate) fn resolve_method(
 pub(crate) fn resolve_and_rewrite(
     params: &[Arc<str>],
     locals: &[Arc<str>],
-    body: &[Stmt],
-) -> Vec<Stmt> {
+    body: &[TaggedStmt],
+) -> Vec<TaggedStmt> {
     let slots = scope_slots(params, locals, body);
     let mut stack: Vec<ScopeCtx> = Vec::new();
     let (out, sources) = rewrite_scope(&mut stack, slots, body);
@@ -96,14 +96,17 @@ pub(crate) fn resolve_and_rewrite(
 fn rewrite_scope(
     stack: &mut Vec<ScopeCtx>,
     slots: Vec<Arc<str>>,
-    body: &[Stmt],
-) -> (Vec<Stmt>, Vec<CaptureSource>) {
+    body: &[TaggedStmt],
+) -> (Vec<TaggedStmt>, Vec<CaptureSource>) {
     stack.push(ScopeCtx {
         slots,
         captures: Vec::new(),
         sources: Vec::new(),
     });
-    let out = body.iter().map(|s| rewrite_stmt(stack, s)).collect();
+    let out = body
+        .iter()
+        .map(|s| TaggedStmt::new(s.span, rewrite_stmt(stack, &s.node)))
+        .collect();
     let ctx = stack.pop().expect("scope stack underflow");
     (out, ctx.sources)
 }
@@ -196,18 +199,22 @@ struct ScopeCtx {
 /// Slots of a scope: params, then declared locals, then mid-body `| … |` locals,
 /// in that order. All are live for the whole scope (`push_*_frame` pre-binds them
 /// to `Nil`), so ordering only fixes slot indices.
-fn scope_slots(params: &[Arc<str>], locals: &[Arc<str>], body: &[Stmt]) -> Vec<Arc<str>> {
+fn scope_slots(params: &[Arc<str>], locals: &[Arc<str>], body: &[TaggedStmt]) -> Vec<Arc<str>> {
     let mut slots: Vec<Arc<str>> = params.to_vec();
     slots.extend(locals.iter().cloned());
     for s in body {
-        if let Stmt::LocalDecl(names) = s {
+        if let Stmt::LocalDecl(names) = &s.node {
             slots.extend(names.iter().cloned());
         }
     }
     slots
 }
 
-fn resolve_scope(stack: &mut Vec<ScopeCtx>, slots: Vec<Arc<str>>, body: &[Stmt]) -> ResolvedScope {
+fn resolve_scope(
+    stack: &mut Vec<ScopeCtx>,
+    slots: Vec<Arc<str>>,
+    body: &[TaggedStmt],
+) -> ResolvedScope {
     stack.push(ScopeCtx {
         slots,
         captures: Vec::new(),
@@ -216,7 +223,7 @@ fn resolve_scope(stack: &mut Vec<ScopeCtx>, slots: Vec<Arc<str>>, body: &[Stmt])
     let mut refs = Vec::new();
     let mut children = Vec::new();
     for s in body {
-        walk_stmt(stack, s, &mut refs, &mut children);
+        walk_stmt(stack, &s.node, &mut refs, &mut children);
     }
     let ctx = stack.pop().expect("scope stack underflow");
     ResolvedScope {

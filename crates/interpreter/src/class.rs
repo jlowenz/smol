@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::RwLock;
 
-use crate::ast::Stmt;
+use crate::ast::TaggedStmt;
 use crate::value::Value;
 
 /// Indexed storage kind declared at class definition time.
@@ -62,7 +62,7 @@ pub struct Method {
     pub pattern: MethodPattern,
     /// Local variable names declared with `| x y |` in the method body.
     pub locals: Vec<Arc<str>>,
-    pub body: Vec<Stmt>,
+    pub body: Vec<TaggedStmt>,
 }
 
 /// A user-defined class.

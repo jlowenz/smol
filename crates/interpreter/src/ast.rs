@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::span::SourceTagged;
+
 pub use crate::class::{IndexedSlotKind, MethodPattern};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,7 +93,7 @@ pub enum Expr {
         params: Vec<Arc<str>>,
         /// Local variable declarations (`| x y |`) inside the block.
         locals: Vec<Arc<str>>,
-        body: Vec<Stmt>,
+        body: Vec<TaggedStmt>,
         /// Capture plan, parallel to the block's `Upvalue(i)` indices: `captures[i]`
         /// says where snapshot slot `i` is filled from in the enclosing scope at
         /// block-creation time. Empty from the parser; filled by the resolve pass
@@ -139,19 +141,24 @@ pub enum Stmt {
     MethodDef(MethodDef),
 }
 
+/// A [`Stmt`] paired with its source span. Statement containers (`Program.stmts`,
+/// block and method bodies) hold these so the coverage collector can record
+/// which statements executed; equality ignores the span (see [`SourceTagged`]).
+pub type TaggedStmt = SourceTagged<Stmt>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MethodDef {
     pub class_name: Arc<str>,
     pub pattern: MethodPattern,
     pub locals: Vec<Arc<str>>,
-    pub body: Vec<Stmt>,
+    pub body: Vec<TaggedStmt>,
     /// True for `Foo class >> selector` definitions.
     pub is_class_side: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
-    pub stmts: Vec<Stmt>,
+    pub stmts: Vec<TaggedStmt>,
     /// Comments collected during parsing, in source order.
     /// Full trivia attachment to individual nodes is deferred.
     pub comments: Vec<Arc<str>>,
