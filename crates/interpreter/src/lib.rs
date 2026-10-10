@@ -10,6 +10,7 @@ pub mod builtins;
 pub(crate) mod builtins_iterative;
 pub mod class;
 pub mod class_registry;
+pub mod coverage;
 pub mod entity;
 pub mod env;
 pub mod eval;

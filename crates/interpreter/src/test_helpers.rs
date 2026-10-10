@@ -63,6 +63,30 @@ pub(crate) fn eval(src: &str) -> Value {
     rx.recv().expect("eval coroutine panicked")
 }
 
+/// Evaluate `src` with coverage enabled on the evaluator's registry; return the
+/// set of statement spans recorded as executed by the user program (coverage is
+/// enabled *after* `Evaluator::new()`, so kernel-load execution is excluded).
+///
+/// Requires: `src` is valid Smol; program must not error.
+pub(crate) fn eval_coverage(src: &str) -> std::collections::HashSet<crate::span::Span> {
+    let src = src.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::entity::init_coroutine_stack();
+    let _ = may::go_with!(TEST_COROUTINE_STACK, move || {
+        let prog = Parser::parse(&src).expect("parse");
+        let ev = Evaluator::new();
+        let cov = ev.registry.enable_coverage();
+        let mut env = Env::new();
+        ev.registry.populate_env(&mut env);
+        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        let _ = resolve(v).expect("eval future resolution");
+        let touched = cov.lock().touched().clone();
+        ev.shutdown();
+        tx.send(touched).unwrap();
+    });
+    rx.recv().expect("eval_coverage coroutine panicked")
+}
+
 /// Evaluate Smol source on an oversized coroutine stack and report the maximum
 /// `step_loop` recursion depth reached plus `size_of::<Cont>()`.
 ///

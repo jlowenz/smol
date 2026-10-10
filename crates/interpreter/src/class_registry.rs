@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::class::Class;
+use crate::coverage::CoverageCollector;
 use crate::entity::{
     EntityId, InstanceHandle, InstanceKind, InstanceState, new_entity_data, spawn_class_entity,
 };
@@ -40,6 +41,11 @@ pub struct ClassRegistry {
     /// `(entity, __instance_of__, class_entity)` — `Visibility::Shared` so any
     /// entity may read; `Cardinality::Single` (one class per entity).
     pub(crate) instance_of_pred: Predicate,
+    /// Shared, opt-in execution-coverage sink. `None` until `enable_coverage` is
+    /// called; then every evaluator sharing this registry — main thread and
+    /// entity coroutines — records executed statement spans into it. See
+    /// [`crate::coverage`].
+    pub(crate) coverage: OnceLock<Arc<Mutex<CoverageCollector>>>,
 }
 
 impl ClassRegistry {
@@ -183,6 +189,7 @@ impl ClassRegistry {
             store,
             indexed_slots_pred,
             instance_of_pred,
+            coverage: OnceLock::new(),
         }
     }
 
@@ -197,6 +204,16 @@ impl ClassRegistry {
     ///
     /// The class actors start with an empty env; `dispatch_class_envelope` refreshes
     /// the env on every dispatch, so all classes are always in scope.
+    /// Enable execution-coverage collection on this registry (idempotent).
+    /// Every evaluator sharing this registry — main thread and entity coroutines
+    /// — records executed statement spans into the returned collector. Read it at
+    /// a quiescent point to build the coverage report.
+    pub fn enable_coverage(&self) -> Arc<Mutex<CoverageCollector>> {
+        self.coverage
+            .get_or_init(|| Arc::new(Mutex::new(CoverageCollector::new())))
+            .clone()
+    }
+
     pub fn new_arc() -> Arc<Self> {
         let store = Store::in_memory();
         let indexed_slots_pred = store
@@ -277,6 +294,7 @@ impl ClassRegistry {
             store: store.clone_handle(),
             indexed_slots_pred,
             instance_of_pred,
+            coverage: OnceLock::new(),
         });
 
         // Phase 2: spawn actors with an empty initial env.

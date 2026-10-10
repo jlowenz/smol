@@ -1122,7 +1122,7 @@ fn handle_method_frame(
             implicit_self,
             saved_block_home,
         });
-        dispatch_stmt(ev, stmt.node, &env, depth, stack, acc)?;
+        dispatch_stmt(ev, stmt, &env, depth, stack, acc)?;
     }
     Ok(())
 }
@@ -1160,7 +1160,7 @@ fn handle_block_frame(
         }
         // Blocks match `^`-returns against `current_block_home` (always set during a
         // block), so the frame depth here is irrelevant.
-        dispatch_stmt(ev, stmt.node, &env, 0, stack, acc)?;
+        dispatch_stmt(ev, stmt, &env, 0, stack, acc)?;
     }
     Ok(())
 }
@@ -1186,7 +1186,7 @@ fn handle_program_frame(
             env: env.clone(),
             saved_block_home,
         });
-        dispatch_stmt(ev, stmt.node, &env, 0, stack, acc)?;
+        dispatch_stmt(ev, stmt, &env, 0, stack, acc)?;
     }
     Ok(())
 }
@@ -1374,13 +1374,14 @@ fn bump_reductions(reductions: &mut u32) {
 /// Requires: `stack` already contains the enclosing `CallFrame` at the top.
 fn dispatch_stmt(
     ev: &Evaluator,
-    stmt: Stmt,
+    stmt: TaggedStmt,
     env: &Env,
     frame_depth: usize,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
-    match stmt {
+    ev.record_coverage(stmt.span);
+    match stmt.node {
         Stmt::LocalDecl(_) => {
             // Pre-bound during frame setup; nothing to do at runtime.
         }

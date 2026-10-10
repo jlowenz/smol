@@ -155,7 +155,9 @@ fn rewrite_fills_local_param_and_dynamic() {
 #[test]
 fn rewrite_fills_selfref() {
     let body = rewrite_src("X >> foo [ ^self ]");
-    let Stmt::Return(e) = &body[0].node else { panic!() };
+    let Stmt::Return(e) = &body[0].node else {
+        panic!()
+    };
     assert_eq!(as_var(e), &VarRef::SelfRef);
 }
 

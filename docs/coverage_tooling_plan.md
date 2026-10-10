@@ -109,6 +109,14 @@ regions. Expose via a `just cov-smol` target or an example binary.
 4. **Report = kernel-only text MVP** (coverage % + uncovered `file:line`); richer views later.
 5. **Sequencing:** coverage now, then resume env-frame d2–e. S1 shares statement-handling code in
    `eval_iterative.rs` with d4 — ordering overlap, not a semantic conflict.
+6. **Collector sharing (S4):** one `Arc<Mutex<CoverageCollector>>` anchored on the shared
+   `ClassRegistry`, so every evaluator — main thread and entity coroutines — records into it.
+   *Alternative considered:* per-evaluator local collectors with a reduce/union step (lock-free hot
+   path). *Rejected for now* because coverage is opt-in, so the per-statement lock is irrelevant off
+   the production path, and a single live collector can be read at any quiescent point, whereas
+   per-fiber accumulators must all flush (drop/merge) first. The `record(span)` interface is identical
+   either way, so the per-fiber + reduce variant is a drop-in optimization if coverage-run speed ever
+   matters.
 
 ## 6. Out of scope (future)
 

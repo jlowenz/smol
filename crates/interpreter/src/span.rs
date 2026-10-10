@@ -22,7 +22,7 @@ impl SourceId {
 ///
 /// Offsets are **bytes**, not char indices, so they index directly into the source
 /// `&str`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub source: SourceId,
     pub start: u32,

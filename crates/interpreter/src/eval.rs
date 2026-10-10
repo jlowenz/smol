@@ -631,6 +631,14 @@ impl Evaluator {
     /// Requires: `env` has at least one live frame.
     /// Ensures: semantically identical to `eval_program_recursive`; Smol method calls
     ///   use heap-allocated `CallFrame`s rather than Rust stack frames.
+    /// Record that a statement at `span` executed, when coverage is enabled on
+    /// the shared registry. A no-op — one atomic load — otherwise.
+    pub(crate) fn record_coverage(&self, span: crate::span::Span) {
+        if let Some(cov) = self.registry.coverage.get() {
+            cov.lock().record(span);
+        }
+    }
+
     pub fn eval_program(&self, stmts: &[TaggedStmt], env: &mut Env) -> Result<Value, EvalError> {
         for stmt in stmts {
             if let Stmt::LocalDecl(names) = &stmt.node {
