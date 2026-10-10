@@ -41,7 +41,7 @@ pub(crate) const COROUTINE_STACK_SIZE: usize = 0x2000; // 64 KB (release; 32 KB 
 
 /// Set the global `may` stack size exactly once. Idempotent — safe to call from
 /// any spawn site; subsequent calls are a no-op.
-pub(crate) fn init_coroutine_stack() {
+pub fn init_coroutine_stack() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
         may::config().set_stack_size(COROUTINE_STACK_SIZE);

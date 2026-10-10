@@ -248,4 +248,26 @@ mod tests {
             "a tiny program should not cover the whole kernel"
         );
     }
+
+    #[test]
+    fn branch_coverage_tracks_untaken_arm() {
+        // Only the `ifTrue:` arm runs; the `ifFalse:` arm's statement must stay
+        // uncovered — the original manual-audit requirement, now automatic.
+        let src = "true\n  ifTrue: [ 100 ]\n  ifFalse: [ 200 ]";
+        let touched = eval_coverage(src);
+        let prog = crate::parser::Parser::parse(src).expect("parse");
+        let all = collect_stmt_spans(&prog);
+        let report = report_source("branch", src, &all, &touched);
+        // Line 2 = taken arm `[ 100 ]`; line 3 = untaken arm `[ 200 ]`.
+        assert!(
+            !report.uncovered_lines.contains(&2),
+            "taken arm (line 2) should be covered, uncovered={:?}",
+            report.uncovered_lines
+        );
+        assert!(
+            report.uncovered_lines.contains(&3),
+            "untaken arm (line 3) should be uncovered, uncovered={:?}",
+            report.uncovered_lines
+        );
+    }
 }

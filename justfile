@@ -73,3 +73,9 @@ cov-html:
 cov-lcov:
     LLVM_COV={{_llvm}}/llvm-cov LLVM_PROFDATA={{_llvm}}/llvm-profdata \
         cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+# Statement-level execution-coverage report for kernel.smol itself (Smol-level,
+# via the interpreter's own CoverageCollector — distinct from the llvm-cov
+# targets above, which measure Rust coverage).
+cov-smol:
+    cargo run --release --example kernel_coverage -p interpreter
