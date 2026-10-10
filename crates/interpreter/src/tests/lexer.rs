@@ -1,7 +1,11 @@
 use super::*;
 
 fn tok(src: &str) -> Vec<Token> {
-    Lexer::tokenize(src).expect("lex error")
+    Lexer::tokenize(src)
+        .expect("lex error")
+        .into_iter()
+        .map(|t| t.node)
+        .collect()
 }
 
 fn ident(s: &str) -> Token {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::ast::*;
-use crate::lexer::{LexError, Lexer, Token};
+use crate::lexer::{LexError, Lexer, SpannedToken, Token};
 
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum ParseError {
@@ -30,7 +30,7 @@ pub enum ParseError {
 }
 
 pub struct Parser {
-    tokens: Vec<Token>,
+    tokens: Vec<SpannedToken>,
     pos: usize,
     comments: Vec<Arc<str>>,
     /// True while parsing a method body. Lets `^` inside nested blocks pass.
@@ -62,12 +62,12 @@ impl Parser {
 
     fn peek(&mut self) -> &Token {
         self.skip_comments();
-        &self.tokens[self.pos]
+        &self.tokens[self.pos].node
     }
 
     fn skip_comments(&mut self) {
         while self.pos < self.tokens.len() {
-            if let Token::Comment(c) = &self.tokens[self.pos] {
+            if let Token::Comment(c) = &self.tokens[self.pos].node {
                 self.comments.push(c.clone());
                 self.pos += 1;
             } else {
@@ -78,7 +78,7 @@ impl Parser {
 
     fn advance(&mut self) -> Token {
         self.skip_comments();
-        let tok = self.tokens[self.pos].clone();
+        let tok = self.tokens[self.pos].node.clone();
         if tok != Token::Eof {
             self.pos += 1;
         }
@@ -153,18 +153,18 @@ impl Parser {
 
         // Method def lookahead: IDENT '>>' (instance-side) or IDENT Ident("class") '>>' (class-side)
         {
-            let is_method_def = matches!(self.tokens[self.pos], Token::Ident(_))
+            let is_method_def = matches!(self.tokens[self.pos].node, Token::Ident(_))
                 && {
                     let mut i = self.pos + 1;
-                    while i < self.tokens.len() && matches!(self.tokens[i], Token::Comment(_)) {
+                    while i < self.tokens.len() && matches!(self.tokens[i].node, Token::Comment(_))
+                    {
                         i += 1;
                     }
                     // instance-side: IDENT >>
-                    let direct_arrow =
-                        matches!(self.tokens.get(i), Some(Token::BinOp(op)) if op.as_ref() == ">>");
+                    let direct_arrow = matches!(self.tokens.get(i).map(|t| &t.node), Some(Token::BinOp(op)) if op.as_ref() == ">>");
                     // class-side: IDENT Ident("class") >>
-                    let class_side_arrow = matches!(self.tokens.get(i), Some(Token::Ident(s)) if s.as_ref() == "class")
-                        && matches!(self.tokens.get(i + 1), Some(Token::BinOp(op)) if op.as_ref() == ">>");
+                    let class_side_arrow = matches!(self.tokens.get(i).map(|t| &t.node), Some(Token::Ident(s)) if s.as_ref() == "class")
+                        && matches!(self.tokens.get(i + 1).map(|t| &t.node), Some(Token::BinOp(op)) if op.as_ref() == ">>");
                     direct_arrow || class_side_arrow
                 };
             if is_method_def {
@@ -175,17 +175,17 @@ impl Parser {
         // Assignment: lookahead — Ident followed immediately by Assign.
         // We must look at raw tokens (pre-comment-skip) so we don't over-consume.
         {
-            let is_assign = matches!(self.tokens[self.pos], Token::Ident(_)) && {
+            let is_assign = matches!(self.tokens[self.pos].node, Token::Ident(_)) && {
                 // Skip any comments between ident and next real token.
                 let mut i = self.pos + 1;
                 while i < self.tokens.len() {
-                    if matches!(self.tokens[i], Token::Comment(_)) {
+                    if matches!(self.tokens[i].node, Token::Comment(_)) {
                         i += 1;
                     } else {
                         break;
                     }
                 }
-                matches!(self.tokens.get(i), Some(Token::Assign))
+                matches!(self.tokens.get(i).map(|t| &t.node), Some(Token::Assign))
             };
             if is_assign {
                 let name = match self.advance() {
@@ -220,7 +220,7 @@ impl Parser {
         };
         // Detect class-side: `IDENT "class" >>`
         let is_class_side = matches!(self.peek(), Token::Ident(s) if s.as_ref() == "class")
-            && matches!(self.tokens.get(self.pos + 1), Some(Token::BinOp(op)) if op.as_ref() == ">>");
+            && matches!(self.tokens.get(self.pos + 1).map(|t| &t.node), Some(Token::BinOp(op)) if op.as_ref() == ">>");
         if is_class_side {
             self.advance(); // consume "class"
         }
@@ -441,10 +441,10 @@ impl Parser {
             // `x := ...` as a unary send when we're at the ident position.
             let is_assign_lookahead = {
                 let mut i = self.pos + 1;
-                while i < self.tokens.len() && matches!(self.tokens[i], Token::Comment(_)) {
+                while i < self.tokens.len() && matches!(self.tokens[i].node, Token::Comment(_)) {
                     i += 1;
                 }
-                matches!(self.tokens.get(i), Some(Token::Assign))
+                matches!(self.tokens.get(i).map(|t| &t.node), Some(Token::Assign))
             };
             if is_assign_lookahead {
                 break;

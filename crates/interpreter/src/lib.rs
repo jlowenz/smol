@@ -21,6 +21,7 @@ pub mod os_interface;
 pub mod parser;
 pub(crate) mod resolve;
 pub mod shared_tx;
+pub mod span;
 pub mod store_bridge;
 pub mod traits;
 pub mod value;

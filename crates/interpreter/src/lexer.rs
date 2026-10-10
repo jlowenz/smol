@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::span::{SourceId, SourceTagged, Span};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Literals
@@ -49,6 +51,10 @@ pub enum Token {
     Eof,
 }
 
+/// A [`Token`] paired with its source [`Span`]. The parser holds a
+/// `Vec<SpannedToken>`; equality ignores the span (see [`SourceTagged`]).
+pub type SpannedToken = SourceTagged<Token>;
+
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum LexError {
     #[error("unexpected character {0:?} at position {1}")]
@@ -76,16 +82,26 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    /// Tokenize the entire source into a `Vec<Token>`.
+    /// Tokenize the entire source into a `Vec<SpannedToken>`, each token paired
+    /// with its byte range.
     ///
-    /// Ensures: the last token is always `Token::Eof`.
-    pub fn tokenize(src: &'src str) -> Result<Vec<Token>, LexError> {
+    /// Ensures: the last token is always `Token::Eof`; spans carry
+    /// [`SourceId::ANON`] until the source registry assigns real ids.
+    pub fn tokenize(src: &'src str) -> Result<Vec<SpannedToken>, LexError> {
         let mut lexer = Self::new(src);
         let mut tokens = Vec::new();
         loop {
+            // `next_token` skips leading whitespace before recording its own
+            // start; pre-skipping here makes `start` match that position.
+            lexer.skip_whitespace();
+            let start = lexer.pos as u32;
             let tok = lexer.next_token()?;
+            let end = lexer.pos as u32;
             let done = tok == Token::Eof;
-            tokens.push(tok);
+            tokens.push(SourceTagged::new(
+                Span::new(SourceId::ANON, start, end),
+                tok,
+            ));
             if done {
                 break;
             }
