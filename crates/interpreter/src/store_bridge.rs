@@ -618,6 +618,7 @@ mod tests {
             class_methods: RwLock::new(HashMap::new()),
             is_value: true,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
         let obj = Arc::new(crate::object::Object::new(cls.clone()));
         for (name, val) in ivars {
@@ -708,6 +709,7 @@ mod tests {
                 class_methods: RwLock::new(Default::default()),
                 is_value: true,
                 class_object: std::sync::OnceLock::new(),
+                namespace: std::sync::OnceLock::new(),
             })
         };
         let outer_obj = Arc::new(crate::object::Object::new(outer_cls.clone()));
@@ -758,6 +760,7 @@ mod tests {
             class_methods: RwLock::new(Default::default()),
             is_value: true,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
         let obj = Arc::new(crate::object::Object::new(cls.clone()));
         obj.set_slot(Arc::from("a"), point_val.clone());
@@ -794,6 +797,7 @@ mod tests {
             class_methods: RwLock::new(Default::default()),
             is_value: true,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
         let obj = Arc::new(crate::object::Object::new_with_indexed(cls.clone(), 2));
         if let Some(crate::object::IndexedStorage::Pointer(slots)) = &obj.indexed {

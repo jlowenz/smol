@@ -78,6 +78,7 @@ impl ClassRegistry {
             class_methods: RwLock::new(HashMap::new()),
             is_value: false,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
         let object_state = Arc::new(InstanceState {
             class: object_class.clone(),
@@ -104,6 +105,7 @@ impl ClassRegistry {
             class_methods: RwLock::new(HashMap::new()),
             is_value: true,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
         let value_state = Arc::new(InstanceState {
             class: value_class.clone(),
@@ -132,6 +134,7 @@ impl ClassRegistry {
             class_methods: RwLock::new(HashMap::new()),
             is_value: false,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
         let nil_state = Arc::new(InstanceState {
             class: nil_class.clone(),
@@ -156,6 +159,7 @@ impl ClassRegistry {
             class_methods: RwLock::new(HashMap::new()),
             is_value: false,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
         let block_state = Arc::new(InstanceState {
             class: block_class.clone(),
@@ -202,8 +206,9 @@ impl ClassRegistry {
     ///   2. Spawn a `ClassEntity` actor for each bootstrap class, then register it
     ///      in the kernel namespace and set `class_object`.
     ///
-    /// The class actors start with an empty env; `dispatch_class_envelope` refreshes
-    /// the env on every dispatch, so all classes are always in scope.
+    /// The class actors start with an empty env: methods resolve free names through
+    /// their defining class's namespace, read live, so no env snapshot of the
+    /// registry is needed.
     /// Enable execution-coverage collection on this registry (idempotent).
     /// Every evaluator sharing this registry — main thread and entity coroutines
     /// — records executed statement spans into the returned collector. Read it at
@@ -239,6 +244,7 @@ impl ClassRegistry {
             class_methods: RwLock::new(HashMap::new()),
             is_value: false,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
 
         let value_class = Arc::new(Class {
@@ -252,6 +258,7 @@ impl ClassRegistry {
             class_methods: RwLock::new(HashMap::new()),
             is_value: true,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
 
         let nil_class = Arc::new(Class {
@@ -265,6 +272,7 @@ impl ClassRegistry {
             class_methods: RwLock::new(HashMap::new()),
             is_value: false,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
 
         let block_class = Arc::new(Class {
@@ -278,6 +286,7 @@ impl ClassRegistry {
             class_methods: RwLock::new(HashMap::new()),
             is_value: false,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
 
         // Numeric tower + String/Symbol live in kernel.smol (see new()).
@@ -297,9 +306,8 @@ impl ClassRegistry {
             coverage: OnceLock::new(),
         });
 
-        // Phase 2: spawn actors with an empty initial env.
-        // dispatch_class_envelope refreshes the env on each dispatch, so the empty
-        // start is safe even for class-side methods that reference other classes.
+        // Phase 2: spawn actors with an empty initial env. Class-side methods resolve
+        // other classes through their defining namespace, not the env.
         let bootstrap_env = Env::new();
 
         let object_handle = spawn_class_entity(
@@ -454,11 +462,12 @@ impl ClassRegistry {
         }
     }
 
-    /// Seed `env` with Kernel's classes and every root namespace name.
-    /// Sub-namespaces are intentionally excluded — they are reached via `::` only.
+    /// Seed `env` with Kernel's definitions (classes and traits) and every root
+    /// namespace name. Sub-namespaces are intentionally excluded — they are reached
+    /// via `::` only.
     pub fn populate_env(&self, env: &mut crate::env::Env) {
-        for (name, handle) in self.kernel.classes.read().iter() {
-            env.define(name.clone(), Value::Instance(handle.clone()));
+        for (name, value) in self.kernel.own_entries() {
+            env.define(name, value);
         }
         for (name, ns) in self.roots.read().iter() {
             env.define(name.clone(), Value::Namespace(ns.clone()));

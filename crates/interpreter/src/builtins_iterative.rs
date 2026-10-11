@@ -1032,11 +1032,14 @@ pub(crate) fn make_trait_value(
     Ok(Value::Instance(inst))
 }
 
-/// Bind a trait's name in the current scope, mirroring class-name binding in
-/// [`handle_subclass`]: kernel-scope traits get a global binding; others are
-/// scoped to the current frame.
+/// Bind a trait's name, mirroring class-name binding in [`handle_subclass`]: the
+/// trait becomes a definition of the active namespace (so methods resolve it), and
+/// top-level code sees it through the env — a global binding for Kernel traits,
+/// the current frame otherwise.
 fn bind_trait_name(ev: &Evaluator, name: Arc<str>, trait_val: Value, env: &mut Env) {
-    if Arc::ptr_eq(&ev.active_namespace(), &ev.registry.kernel()) {
+    let active_ns = ev.active_namespace();
+    active_ns.bind(name.clone(), trait_val.clone());
+    if Arc::ptr_eq(&active_ns, &ev.registry.kernel()) {
         env.define_global(name, trait_val);
     } else {
         env.define(name, trait_val);
@@ -2833,12 +2836,10 @@ fn build_array(ev: &Evaluator, values: Vec<Value>) -> Result<Value, EvalError> {
         .ok_or_else(|| EvalError::TypeError("Array not in kernel".into()))?;
     let array_class = array_class_handle.0.class.clone();
 
-    let mut global_env = crate::env::Env::new();
-    ev.registry.populate_env(&mut global_env);
     let arr = spawn_entity_bare(
         array_class,
         ev.registry.clone(),
-        global_env,
+        crate::env::Env::new(),
         Some(values.len()),
         ev.store.clone_handle(),
     );
@@ -3071,12 +3072,10 @@ pub(crate) fn dispatch_class_builtin(
                 }))));
             }
             {
-                let mut global_env = Env::new();
-                ev.registry.populate_env(&mut global_env);
                 let inst = spawn_entity_bare(
                     class.clone(),
                     ev.registry.clone(),
-                    global_env,
+                    crate::env::Env::new(),
                     indexed_size,
                     ev.store.clone_handle(),
                 );
@@ -3224,12 +3223,10 @@ pub(crate) fn dispatch_class_builtin(
                 }))));
             }
             {
-                let mut global_env = Env::new();
-                ev.registry.populate_env(&mut global_env);
                 let inst = spawn_entity_bare(
                     class.clone(),
                     ev.registry.clone(),
-                    global_env,
+                    crate::env::Env::new(),
                     Some(n.max(0) as usize),
                     ev.store.clone_handle(),
                 );
@@ -3424,6 +3421,7 @@ fn handle_subclass(
         class_methods: RwLock::new(HashMap::new()),
         is_value: declared_is_value,
         class_object: std::sync::OnceLock::new(),
+        namespace: std::sync::OnceLock::new(),
     });
     // Flatten a composed trait's provided methods into the new class's method dict
     // (docs/traits_plan.md §1). Class-defined methods arrive on later statements and

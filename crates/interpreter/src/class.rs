@@ -97,9 +97,21 @@ pub struct Class {
     /// `handle_subclass`; always populated before any message dispatch can reach this class.
     /// `Weak` avoids a reference cycle between `InstanceState → Class → InstanceState`.
     pub class_object: OnceLock<Weak<crate::entity::InstanceState>>,
+    /// The namespace this class is defined in — the scope a method's free names
+    /// resolve through. Set once by `Namespace::register` (first registration wins:
+    /// a class belongs to exactly one namespace). `Weak` avoids the cycle
+    /// `Namespace → InstanceHandle → Class → Namespace`; the namespace is owned by
+    /// the registry (root namespaces) or its parent (sub-namespaces).
+    pub namespace: OnceLock<Weak<crate::namespace::Namespace>>,
 }
 
 impl Class {
+    /// The namespace this class is defined in, if it was registered in one that is
+    /// still live.
+    pub fn namespace(&self) -> Option<Arc<crate::namespace::Namespace>> {
+        self.namespace.get()?.upgrade()
+    }
+
     /// All instance variable names in definition order: superclass vars first, then own.
     pub fn all_instance_vars(&self) -> Vec<Arc<str>> {
         let mut vars = match &self.superclass {

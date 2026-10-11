@@ -20,6 +20,7 @@ fn make_class(name: &str) -> Arc<Class> {
         class_methods: RwLock::new(HashMap::new()),
         is_value: false,
         class_object: std::sync::OnceLock::new(),
+        namespace: std::sync::OnceLock::new(),
     })
 }
 

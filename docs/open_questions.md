@@ -569,3 +569,81 @@ Post-consolidation the difference is a single visible argument at the four
 change. Revisit alongside the env-frame redesign (the redesign replaces name-keyed
 outer-frame lookup with slot/snapshot resolution, at which point this leak either
 disappears or must be reproduced deliberately).
+
+---
+
+## Q17: How does a workspace import a non-Kernel namespace?
+
+**Status**: Open
+**Raised**: 2026-10-10, env-frame redesign §11.7b
+
+A workspace has an anonymous namespace that imports Kernel by default. Any other
+namespace must be imported explicitly, as in any other context. There is no surface
+form for this yet. `Namespace named:imports:` covers *named* namespaces only. Options
+include a message to the workspace (e.g. `Workspace import: mylib`) or a
+top-of-program import declaration. The answer depends on what a Workspace object is
+(REPL session, notebook — see Q8) and is not needed for d2: until then, non-Kernel
+names are reachable only by `Ns::Name` or inside `Namespace do: [...]`.
+
+---
+
+## Q18: Which namespace do trait-provided methods resolve names in?
+
+**Status**: Open
+**Raised**: 2026-10-11, env-frame redesign d2a (§11.7b)
+
+Since d2a, a method's free names resolve through its *defining class's* namespace.
+Trait methods are flattened into the using class's method dictionary (`uses:`), so a
+trait method resolves names in the **using class's** namespace, not the namespace the
+trait was written in. If trait `T` in namespace `A` references a name only `A` can
+see, and class `C` in namespace `B` uses `T`, then `T`'s methods break inside `C`.
+That would be surprising: the trait author tested `T` against `A`'s scope.
+
+Direction (user, 2026-10-11): traits probably need their own mechanism. At least in
+trait methods, the trait's namespace and the using class's namespace should be
+merged, so a trait's implementation cannot break just because it is used elsewhere.
+
+Sub-questions:
+- **Where the scope lives.** A flattened method probably needs to carry the namespace
+  it was *written* in (`Method` gains a defining-namespace link) rather than relying
+  on `defining_class`.
+- **Merge order and conflicts.** If both namespaces define a name, the trait's own
+  namespace probably wins inside trait methods, so the implementation sees what its
+  author saw. The alternative is the using class's namespace winning, or a conflict
+  error, consistent with the trait-conflict sentinels (Q12).
+- **Requirements.** A trait's required selectors are sends, not names, so they are
+  unaffected. Only free *names* (classes, traits) are at issue.
+
+Not urgent: every trait is in Kernel today.
+
+---
+
+## Q19: What owns workspaces (and their anonymous namespaces)?
+
+**Status**: Open
+**Raised**: 2026-10-11, env-frame redesign d2a/d2c (§11.7b)
+
+A workspace has an anonymous namespace holding the classes and traits defined there.
+`Class → Namespace` is a `Weak` link (avoiding the `Namespace → class handle → Class
+→ Namespace` cycle), so something must keep a workspace's namespace alive while
+anything defined in it is still in use: live instances of its classes, classes
+referenced elsewhere, blocks.
+
+Observations:
+- Something must create workspaces: a REPL session, a notebook, a test harness. That
+  implies a **root object or environment** above them. Today the de facto root is
+  `ClassRegistry`. It owns Kernel, the root namespaces, and every class and instance
+  entity, and it serves as the system's image. `World` (C27) is a store-query gateway,
+  not this root.
+- "Alive while still in use" is reachability, which makes this a **GC** question.
+  Today in-memory objects are reclaimed only by `Arc` refcount, and durable facts are
+  never reclaimed (Q11).
+
+Interim proposal (for d2c): the root (`ClassRegistry`, or a successor root object)
+holds every workspace namespace **strongly** until the root drops. Nothing is freed
+early, so there are no dangling links, consistent with the "glacier, not GC" stance
+taken for values. Reclaiming a workspace namespace once it is unreachable is deferred
+to the GC design.
+
+Open: whether the root deserves a first-class Smol identity (a `System`/`Image`
+object that creates workspaces), and how workspaces relate to notebooks (Q8).

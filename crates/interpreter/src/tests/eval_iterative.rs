@@ -983,6 +983,7 @@ fn make_class(name: &str) -> std::sync::Arc<crate::class::Class> {
         class_methods: RwLock::new(HashMap::new()),
         is_value: true,
         class_object: OnceLock::new(),
+        namespace: OnceLock::new(),
     })
 }
 

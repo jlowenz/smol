@@ -75,6 +75,17 @@ pub enum SelfBinding {
     },
 }
 
+impl SelfBinding {
+    /// The class whose method this binding's activation is running.
+    pub(crate) fn defining_class(&self) -> &Arc<Class> {
+        match self {
+            SelfBinding::Instance { defining_class, .. }
+            | SelfBinding::ClassSide { defining_class, .. }
+            | SelfBinding::Primitive { defining_class, .. } => defining_class,
+        }
+    }
+}
+
 // Manual `Debug` (the variant name only): `Class` is not `Debug`, and `Block`
 // now carries an `Option<SelfBinding>` (`home_binding`) yet derives `Debug`.
 impl std::fmt::Debug for SelfBinding {
@@ -396,6 +407,14 @@ impl Evaluator {
 
     // ── Variable lookup & assignment ──────────────────────────────────────────
 
+    /// Resolve an `Unresolved` name (top-level code, and blocks created at top
+    /// level) by name: the activation's own env frame, then the receiver-scoped
+    /// variables of the current `method_stack` binding, then the outer env frames.
+    ///
+    /// Note: a top-level block invoked from inside a method runs with the *calling*
+    /// method's binding on top of `method_stack` (it has no `home_binding`), so this
+    /// path can see that receiver's ivars — a latent dynamic-scoping leak that goes
+    /// away when top-level code is resolved (env-frame redesign §11.7b, d2c).
     #[inline]
     pub fn lookup_var(&self, name: &str, env: &Env) -> Option<Value> {
         // Fast path: no active method context — skip the RefCell borrow entirely.
@@ -405,12 +424,55 @@ impl Evaluator {
         // Clone the top binding to avoid holding the RefCell borrow across further ops.
         let top = self.method_stack.borrow().last().cloned();
         match top {
-            Some(SelfBinding::Instance { handle, .. }) => {
-                // 1. local frame (params, method locals, self)
+            Some(binding) => {
                 if let Some(v) = env.lookup_top_frame(name) {
                     return Some(v);
                 }
-                // 2. instance variables — ctx-aware read-your-writes (C32). Only the
+                if let Some(v) = self.lookup_receiver_scoped(&binding, name) {
+                    return Some(v);
+                }
+                env.lookup_outer_frames(name)
+            }
+            None => env.get(name),
+        }
+    }
+
+    /// Resolve a `Dynamic` name — a free name in a resolved method or method-block
+    /// body: the receiver's ivars and classvars, then the defining class's
+    /// namespace (own entries, then imports), then the root namespace names.
+    ///
+    /// Requires: called while executing a resolved method body or one of its
+    ///   blocks, so `method_stack`'s top is that code's home binding (a block
+    ///   re-pushes its `home_binding`).
+    /// Ensures: reads are live — a class defined after this activation's entity
+    ///   was spawned is visible; no per-entity snapshot of globals is consulted.
+    pub(crate) fn lookup_dynamic(&self, name: &str) -> Option<Value> {
+        let top = self.method_stack.borrow().last().cloned();
+        let binding = top?;
+        if let Some(v) = self.lookup_receiver_scoped(&binding, name) {
+            return Some(v);
+        }
+        self.resolve_global(binding.defining_class(), name)
+    }
+
+    /// Resolve `name` in `class`'s defining namespace (own entries, then imports),
+    /// then among the root namespace names.
+    ///
+    /// Ensures: a class with no live namespace link resolves root namespace names
+    ///   only.
+    pub(crate) fn resolve_global(&self, class: &Class, name: &str) -> Option<Value> {
+        if let Some(v) = class.namespace().and_then(|ns| ns.resolve(name)) {
+            return Some(v);
+        }
+        self.registry.get_namespace(name).map(Value::Namespace)
+    }
+
+    /// Instance variables (transaction-aware) and class variables visible to the
+    /// receiver bound by `binding`. Locals and globals are not this method's concern.
+    fn lookup_receiver_scoped(&self, binding: &SelfBinding, name: &str) -> Option<Value> {
+        match binding {
+            SelfBinding::Instance { handle, .. } => {
+                // Instance variables — ctx-aware read-your-writes (C32). Only the
                 //    shadow frames belonging to the CURRENT transaction's ancestry
                 //    mask the live slot; unrelated interleaved frames (other txns,
                 //    possible because `#stm` frames don't lock) are never consulted.
@@ -425,7 +487,7 @@ impl Evaluator {
                     if let Some(ctx) = cur_ctx.as_ref()
                         && handle.ivar_storage().has_slot(name)
                     {
-                        self.ensure_tx_enrolled(&handle, ctx);
+                        self.ensure_tx_enrolled(handle, ctx);
                     }
                     let mut cur = cur_ctx;
                     while let Some(c) = cur {
@@ -438,48 +500,22 @@ impl Evaluator {
                 if let Some(v) = handle.ivar_storage().get_slot(name) {
                     return Some(v);
                 }
-                // 3. class variables
                 if let Some(owner) = handle.0.class.lookup_class_var_owner(name)
                     && let Some(v) = owner.class_var_storage.read().get(name).cloned()
                 {
                     return Some(v);
                 }
-                // 4. outer env (globals)
-                env.lookup_outer_frames(name)
+                None
             }
-            Some(SelfBinding::ClassSide { handle, .. }) => {
-                let class = &handle.0.class;
-                // 1. local frame
-                if let Some(v) = env.lookup_top_frame(name) {
-                    return Some(v);
-                }
-                // 2. class variables (no instance variables — class-side has none)
-                if let Some(owner) = class.lookup_class_var_owner(name)
-                    && let Some(v) = owner.class_var_storage.read().get(name).cloned()
-                {
-                    return Some(v);
-                }
-                // 3. outer env (globals)
-                env.lookup_outer_frames(name)
+            // Class side and primitive receivers have no instance variables.
+            SelfBinding::ClassSide { handle, .. } => {
+                let owner = handle.0.class.lookup_class_var_owner(name)?;
+                owner.class_var_storage.read().get(name).cloned()
             }
-            Some(SelfBinding::Primitive { defining_class, .. }) => {
-                // 1. local frame (params, method locals, self)
-                if let Some(v) = env.lookup_top_frame(name) {
-                    return Some(v);
-                }
-                // 2. class variables of the primitive's class (no instance variables)
-                if let Some(owner) = defining_class.lookup_class_var_owner(name)
-                    && let Some(v) = owner.class_var_storage.read().get(name).cloned()
-                {
-                    return Some(v);
-                }
-                // 3. outer env (globals)
-                // Ivar access for blocks with an instance home is handled by
-                // push_block_frame re-pushing the block's `home_binding` before the
-                // block frame, so lookup_var sees Instance at top, not Primitive.
-                env.lookup_outer_frames(name)
+            SelfBinding::Primitive { defining_class, .. } => {
+                let owner = defining_class.lookup_class_var_owner(name)?;
+                owner.class_var_storage.read().get(name).cloned()
             }
-            None => env.get(name),
         }
     }
 
@@ -488,10 +524,11 @@ impl Evaluator {
     ///
     /// Requires: `value` is the fully-evaluated right-hand side; `res` is `name`'s
     ///   resolution from the resolve pass.
-    /// Ensures: a `Local` target writes the current activation's slot and the
-    ///   name-keyed env in lockstep (dual storage, P2.1b — two clones until P2.1c/d
-    ///   drop the env); every other target follows the method-context lookup order
-    ///   with a single clone.
+    /// Ensures: a `Local` target writes the current activation's slot; a `Dynamic`
+    ///   target writes an ivar or classvar of the current binding, or is an error
+    ///   (a namespace definition is never assignable); an `Unresolved` (top-level)
+    ///   target writes an ivar/classvar of the current binding or an existing env
+    ///   binding, and at top level outside any method creates-or-updates the binding.
     #[inline]
     pub(crate) fn assign_var(
         &self,
@@ -601,10 +638,17 @@ impl Evaluator {
                 }
                 None => {}
             }
-            // Method/block scope: the target must already exist — a declared local
-            // (defined `Nil` by `push_*_frame`) or an existing outer binding.
-            // ivars and classvars were handled by the match arms above. Never
-            // silently create a new local: that swallowed typos (the implicit-
+            // A resolved free name that is neither an ivar nor a classvar names a
+            // namespace definition (or nothing): never assignable, and never routed
+            // to an env binding (env-frame redesign d2a).
+            if matches!(res, VarRef::Dynamic(_)) {
+                return Err(EvalError::TypeError(format!(
+                    "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
+                )));
+            }
+            // Unresolved (top-level) code: the target must already exist — a declared
+            // local (defined `Nil` by `push_*_frame`) or an existing outer binding.
+            // Never silently create a new local: that swallowed typos (the implicit-
             // declaration wart; `perf_env_frame_redesign.md` §2.1 / P1b).
             let ret = value.clone();
             if env.set(name.as_ref(), value) {
@@ -707,7 +751,13 @@ impl Evaluator {
         let first = namespace_path
             .first()
             .ok_or_else(|| EvalError::TypeError("empty namespace path".into()))?;
-        let mut ns = match self.lookup_var(first.as_ref(), env) {
+        // By name first (top-level env); inside a method, fall back to the defining
+        // class's namespace and the root namespace names (env-frame redesign d2a).
+        let found = self.lookup_var(first.as_ref(), env).or_else(|| {
+            let class = self.method_stack.borrow().last()?.defining_class().clone();
+            self.resolve_global(&class, first.as_ref())
+        });
+        let mut ns = match found {
             Some(Value::Namespace(ns)) => ns,
             Some(other) => {
                 return Err(EvalError::TypeError(format!(

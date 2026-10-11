@@ -18,6 +18,7 @@ fn make_class(name: &str, ivars: Vec<&str>, indexed: Option<IndexedSlotKind>) ->
         class_methods: RwLock::new(HashMap::new()),
         is_value: false,
         class_object: std::sync::OnceLock::new(),
+        namespace: std::sync::OnceLock::new(),
     })
 }
 

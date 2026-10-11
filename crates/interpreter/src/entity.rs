@@ -681,11 +681,9 @@ pub(crate) fn new_entity_data(class: &Arc<Class>, store: Store) -> EntityData {
 
 /// Spawn a class-side singleton actor for `class`.
 ///
-/// Requires: `global_env` is built from a fully-populated registry before this
-///   call — the caller must call `registry.populate_env` after all classes are
-///   registered and then pass the result here. This matches `spawn_entity_bare`
-///   and avoids a work-stealing race where the coroutine could call `populate_env`
-///   on a still-incomplete registry.
+/// `global_env` is the actor's base env. It holds no globals: methods resolve free
+/// names through their defining class's namespace (env-frame redesign d2a), so
+/// callers pass an empty `Env` (the parameter goes away with the env in d3/d4).
 /// Requires: `store` is a handle to the shared store for this session.
 /// Ensures: the returned handle has `InstanceKind::ClassEntity`; `class.class_object`
 ///   is NOT set here — the caller must set it after this call returns.
@@ -1350,10 +1348,6 @@ fn dispatch_class_envelope(
     args: Vec<Value>,
     env: &mut Env,
 ) -> Result<Value, crate::eval::EvalError> {
-    // Refresh env from the registry before each dispatch so class-side methods can
-    // reference classes defined after this actor was spawned (e.g. `ValueHolder new`
-    // inside `ValueHolder class >> initialValue:`).
-    ev.registry.populate_env(env);
     if let Some((method, def_class)) = handle.0.class.lookup_class_method(selector) {
         return ev.invoke_class_method(handle.clone(), def_class, method, args, env);
     }

@@ -59,6 +59,7 @@ fn instance_handle_entity_debug() {
         class_methods: RwLock::new(HashMap::new()),
         is_value: false,
         class_object: std::sync::OnceLock::new(),
+        namespace: std::sync::OnceLock::new(),
     });
     let obj = Arc::new(crate::object::Object::new(cls.clone()));
     let handle = InstanceHandle(Arc::new(InstanceState {
@@ -125,6 +126,7 @@ fn instance_kind_value_object_debug() {
         class_methods: RwLock::new(HashMap::new()),
         is_value: true,
         class_object: std::sync::OnceLock::new(),
+        namespace: std::sync::OnceLock::new(),
     });
     let obj = Arc::new(crate::object::Object::new(cls.clone()));
     let kind = InstanceKind::ValueObject(obj);
@@ -147,6 +149,7 @@ fn instance_kind_class_entity_debug() {
         class_methods: RwLock::new(HashMap::new()),
         is_value: false,
         class_object: std::sync::OnceLock::new(),
+        namespace: std::sync::OnceLock::new(),
     });
     let kind = InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(
         &cls,
@@ -172,6 +175,7 @@ fn instance_handle_value_object_debug() {
         class_methods: RwLock::new(HashMap::new()),
         is_value: true,
         class_object: std::sync::OnceLock::new(),
+        namespace: std::sync::OnceLock::new(),
     });
     let obj = Arc::new(crate::object::Object::new(cls.clone()));
     let handle = InstanceHandle(Arc::new(InstanceState {
@@ -199,6 +203,7 @@ fn instance_handle_class_entity_debug() {
         class_methods: RwLock::new(HashMap::new()),
         is_value: false,
         class_object: std::sync::OnceLock::new(),
+        namespace: std::sync::OnceLock::new(),
     });
     let handle = InstanceHandle(Arc::new(InstanceState {
         class: cls.clone(),
@@ -236,6 +241,7 @@ fn handle_commit_error_faults_entity_drains_mailbox() {
         class_methods: RwLock::new(HashMap::new()),
         is_value: false,
         class_object: std::sync::OnceLock::new(),
+        namespace: std::sync::OnceLock::new(),
     });
 
     let data = EntityData {
@@ -1544,6 +1550,7 @@ mod tx_frames {
             class_methods: RwLock::new(HashMap::new()),
             is_value: false,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
         let obj = Arc::new(crate::object::Object::new(cls.clone()));
         obj.set_slot(Arc::from("slot"), Value::Int(seed));
@@ -1849,6 +1856,7 @@ mod tx_primitives {
             class_methods: RwLock::new(HashMap::new()),
             is_value: false,
             class_object: std::sync::OnceLock::new(),
+            namespace: std::sync::OnceLock::new(),
         });
         let data = crate::entity::new_entity_data(&cls, ev.store.clone_handle());
         data.data.set_slot(Arc::from("slot"), Value::Int(seed));

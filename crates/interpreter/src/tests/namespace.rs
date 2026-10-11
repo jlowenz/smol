@@ -18,6 +18,7 @@ fn bare_handle(name: &str) -> InstanceHandle {
         class_methods: RwLock::new(HashMap::new()),
         is_value: false,
         class_object: std::sync::OnceLock::new(),
+        namespace: std::sync::OnceLock::new(),
     });
     let data = new_entity_data(&cls, triple_store::store::Store::in_memory());
     InstanceHandle(Arc::new(InstanceState {

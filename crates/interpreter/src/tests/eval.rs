@@ -2422,12 +2422,38 @@ fn ivar_read_in_nested_block_after_tco() {
 
 // ── SelfBinding::Primitive coverage ──────────────────────────────────────────
 
+// Methods never see workspace (top-level) temps, whatever the receiver kind
+// (env-frame redesign §11.7b). One test per `SelfBinding` kind: an encoded
+// receiver (`nil`), a value object, and an entity.
+
 #[test]
-fn primitive_method_reads_outer_env_var() {
-    // lookup_var Primitive arm: outer-frame path (eval.rs line 276).
-    // A user-defined method on Nil accesses a variable from the call-site env.
+fn method_cannot_see_workspace_temp() {
     let src = "| x | x := 99. Nil >> readX [ ^ x ]. nil readX";
-    assert_eq!(eval_diff(src), Value::Int(99));
+    assert!(matches!(eval_err(src), EvalError::UndefinedVariable(n) if &*n == "x"));
+}
+
+#[test]
+fn value_object_method_cannot_see_workspace_temp() {
+    let src = "
+Value subclass: #ReadsX instanceVariableNames: ''.
+ReadsX >> readX [ ^ x ]
+| x |
+x := 99.
+ReadsX new readX
+";
+    assert!(matches!(eval_err(src), EvalError::UndefinedVariable(n) if &*n == "x"));
+}
+
+#[test]
+fn entity_method_cannot_see_workspace_temp() {
+    let src = "
+Object subclass: #ReadsXActor instanceVariableNames: '' classVariableNames: '' indexedSlots: #none.
+ReadsXActor >> readX [ ^ x ]
+| x |
+x := 99.
+(ReadsXActor new readX) await
+";
+    assert!(matches!(eval_err(src), EvalError::UndefinedVariable(n) if &*n == "x"));
 }
 
 #[test]
@@ -4385,5 +4411,50 @@ fn p21d_instance_block_answers_instance_self_after_home_returns() {
              | o | o := SelfIn new. o init. (o makeProbe) value"
         ),
         Value::Int(42)
+    );
+}
+
+// ── Namespace-relative free-name resolution (env-frame redesign d2a) ────────
+
+#[test]
+fn entity_method_sees_class_defined_after_spawn() {
+    // A method's free names resolve live through its defining class's namespace,
+    // not a snapshot taken when the entity was spawned.
+    let src = "
+Object subclass: #Early instanceVariableNames: '' classVariableNames: '' indexedSlots: #none.
+Early >> make [ ^Late new ]
+| e |
+e := Early new await.
+e yourself await.
+Value subclass: #Late instanceVariableNames: ''.
+(e make) await class name
+";
+    assert_eq!(eval(src), Value::Str(Arc::from("Late")));
+}
+
+#[test]
+fn entity_method_resolves_kernel_trait_by_name() {
+    // Traits are namespace definitions, so a method can name a Kernel trait.
+    let src = "
+Object subclass: #TraitPeek instanceVariableNames: '' classVariableNames: '' indexedSlots: #none.
+TraitPeek >> ordered [ ^Ordered ]
+((TraitPeek new) ordered) await == ((TraitPeek new) ordered) await
+";
+    assert_eq!(eval(src), Value::Bool(true));
+}
+
+#[test]
+fn method_assignment_to_namespace_definition_is_error() {
+    // A free name that is not an ivar/classvar names a namespace definition (or
+    // nothing) and is never assignable from a method.
+    let src = "
+Value subclass: #Clobber instanceVariableNames: ''.
+Clobber >> clobber [ Object := 3 ]
+Clobber new clobber
+";
+    let err = eval_err(src);
+    assert!(
+        matches!(&err, EvalError::TypeError(m) if m.contains("undeclared variable `Object`")),
+        "got {err:?}"
     );
 }

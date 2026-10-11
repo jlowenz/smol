@@ -407,6 +407,9 @@ rewrite each method/block body into a resolved copy (once, at install — not ho
   continuation carries its snapshot; no frame-stack transfer. Verify against
   `value_object_update_captures_outer_var` and the `then:`/`await` tests.
 - **top-level / REPL scope (RESOLVED 2026-08-11 — top-level temps are globals).**
+  *SUPERSEDED 2026-10-10 by §11.7a* — the premise that every activation shares one
+  root frame is false; top-level temps are **Workspace** bindings, not globals. Text
+  below kept for the record.
   Top-level `| x |` already defines `x` in the *root* frame — the same name-keyed
   `Env` frame that holds classes and namespaces — and a method's `global_scope()`
   shares that frame, so top-level temps have always been globals. So there is **not**
@@ -493,13 +496,179 @@ rewrite each method/block body into a resolved copy (once, at install — not ho
     becomes a `pushed_self: bool`. Fixes a latent divergence — a class-side/primitive
     block that outlives its home now answers `self` from `method_stack` rather than
     the captured env's `"self"`. (`SelfBinding` gains a manual `Debug`.)
-  - **d2** — hoist the shared global-root `Env` onto the `Evaluator`; route `Dynamic`
+  - **d2** — *SUPERSEDED 2026-10-10 by §11.7a (premise false).* Hoist the shared
+    global-root `Env` onto the `Evaluator`; route `Dynamic`
     globals + top-level through it (namespaces unchanged). All entities already share
     one root frame (`Arc`-cloned), so this is a rehoming, not a new store.
   - **d3** — stop building the per-activation env map (setup no longer defines
     self/params/locals); drop `Block.env`.
   - **d4** — drop `env: Env` from the ~20 Cont variants + the handler params.
 - **P2.1e** — re-profile (`alloc_probe soak`); TCO frame reuse; `SmallVec` decision.
+
+### 11.7a P2.1d-d2 revised — Globals vs Workspace (DECIDED 2026-10-10)
+
+*Partly SUPERSEDED 2026-10-10 by §11.7b:* "Globals = Kernel", the trait-only
+registration, the REPL-rebinding paragraph and the d2a–d2c sub-steps are replaced
+there. The diagnosis, the probe evidence, the Workspace scope rules (single-assignment,
+declared, snapshot capture) and the measured corpus impact still stand.
+
+**Why d2 changed.** The original d2 assumed that "all entities already share one root
+frame (`Arc`-cloned)". **They do not.** Each spawned entity is given a *fresh*
+`Env::new()` filled by `registry.populate_env` (`builtins_iterative.rs`
+`spawn_entity_bare` call sites). Class entities re-run `populate_env` on every dispatch
+(`entity.rs` `dispatch_class_envelope`); instance entities never do. Probes (throwaway
+tests, spawn ordering forced with `await`) showed:
+
+| Probe | Result |
+|---|---|
+| top-level temp `GG := 7`, read from an **entity** method | `UndefinedVariable("GG")` |
+| same, read from a **value-object** method (runs inline on the caller) | `7` |
+| Kernel class defined *after* an instance entity spawned, used in its method | `UndefinedVariable("PB")` |
+
+So a variable's visibility depended on whether the receiver was a Value or an Object,
+which contradicts the Value/Object split. Instance entities also saw a stale class set.
+Kernel **traits** are bound only in the bootstrap `Env` (`bind_trait_name`) and are
+registered in no namespace.
+
+**Decision: two bounded notions replace "the root `Env`".**
+
+- **Globals** — the registry, read *live*: Kernel-namespace classes, Kernel traits,
+  root namespaces. These are the only true globals. Every activation on every
+  evaluator sees the same set, with no per-entity snapshots and no per-dispatch
+  `populate_env`.
+- **Workspace** — the top-level (script/REPL) scope's bindings. It is visible to
+  top-level code and to blocks created at top level, and **never to methods**. (The
+  value-object probe above becomes `UndefinedVariable`, which is the consistent
+  result.) The Workspace obeys the same rules as every other scope:
+  - **single-assignment** — a workspace temp is bound once;
+  - **declared** — no implicit creation by assignment (top level loses its P1
+    exemption);
+  - **blocks capture it by snapshot** — the strict block-assignment rule
+    (`parser.rs`, `NonLocalBlockAssignment`) already forbids a block from assigning
+    any name outside its own scope, top level included. With single assignment and
+    the capture-before-assignment check, a snapshot cannot be distinguished from a
+    live read, so top-level blocks need no `Env` handle. That is what lets d3 drop
+    `Block.env` uniformly.
+- Rejected: a shared mutable globals table on the registry (top-level temps as true
+  globals). It is mutable state shared across actors, against the entity isolation
+  model.
+
+**Measured impact on the existing corpus** (probes, 907 lib tests + `kernel.smol`):
+
+- top-level workspace-temp reassignment: **0** occurrences;
+- reassignment of a block-local inside a *top-level block*: **5** tests
+  (`block_with_locals`, four `invoke_restart_*`). This is a **pre-existing hole**: the
+  SSA check runs only at method install, so blocks at top level were never checked;
+- undeclared top-level assignment: **2** programs;
+- `kernel.smol`: no violations.
+
+**Name resolution after d2.**
+
+- In a method or method-block: `Local` / `Upvalue` / `SelfRef` as now; `Dynamic` →
+  ivar → classvar → **Globals**.
+- At top level or in a top-level block: workspace temp → slot or snapshot capture
+  (resolved like any scope); other names → **active namespace** (with imports) →
+  **Globals**. The active-namespace step replaces the frame-scoped `env.define` that
+  `handle_subclass` / `bind_trait_name` use today for non-Kernel classes inside
+  `Namespace do: [...]`. Visibility is unchanged: a non-Kernel class is reachable by
+  simple name only while its namespace is active, and otherwise only as `Ns::Name`.
+- Open, carried forward: whether a method of a non-Kernel class should resolve
+  sibling classes through its *defining* namespace. Today it cannot, because a method
+  roots at the Kernel-only global frame. d2 keeps that behavior and records the
+  question in `open_questions.md` rather than changing it.
+
+**REPL across programs.** Each `eval_program` call is checked statically (SSA,
+declared, capture-before-assignment). Across calls the Workspace persists. A new
+`| x |` declaration in a later program introduces a **fresh** binding that shadows
+the earlier one (the REPL rebinding idiom). A bare `x := ...` against an
+already-bound workspace temp is a second assignment, so it is an error.
+
+**Sub-steps (each landable, suite green):**
+
+- **d2a — Globals on the registry.** Register Kernel traits in the Kernel namespace.
+  Method `Dynamic` falls through to a live registry lookup. Delete the per-entity
+  `populate_env` snapshots (spawn sites + `dispatch_class_envelope`). Fixes the stale
+  class probe.
+- **d2b — Workspace semantics.** Top-level SSA + declaration + capture checks (static
+  per program, runtime across REPL programs), SSA check extended to top-level blocks.
+  Fix the 7 violating tests: rewrite them as new bindings, or keep the 2 undeclared
+  ones as declaration-required error tests.
+- **d2c — Workspace representation.** The top-level scope is resolved like any scope.
+  Top-level blocks snapshot workspace temps. Other top-level names go through active
+  namespace → Globals. `Namespace do:` bindings move to the active-namespace lookup.
+  Methods no longer see workspace temps (the value-object probe flips; add it as a
+  regression test, along with the entity and late-class probes).
+
+d3 (drop the per-activation env map and `Block.env`) and d4 (drop `env` from `Cont`)
+follow as before. After d2c, nothing reads `Env` except what they remove.
+
+### 11.7b d2 namespace-relative revision (DECIDED 2026-10-10)
+
+§11.7a treated Kernel as *the* global scope. That would hard-code an assumption the
+planned namespace design rejects (`chunk_17_plan.md`: "a class belongs to exactly
+one namespace; namespaces can import other namespaces"; `chunk_18_plan.md`: a simple
+name is searched among the namespace's own entries, then its imports). Decisions:
+
+1. **All free-name resolution is namespace-relative.** `ns.resolve(name)` checks the
+   namespace's own entries, then its imports in order. A namespace does **not
+   implicitly** inherit or look up its parent's names; a parent is visible only if
+   it is explicitly imported, like any other namespace. Kernel is not special
+   either; it is simply what namespaces import.
+   - **In a method** (and its blocks): `Dynamic` → ivar → classvar → the **defining
+     class's namespace**. This needs a `Class → Namespace` back-link (none exists
+     today).
+   - **At top level:** workspace temps (scope bindings) → the **workspace's
+     namespace**. `Namespace do:` switches which namespace that is, as today.
+   - **Qualified `Ns::Name`** resolves from the registry's root-namespace table,
+     unchanged.
+2. **A namespace maps names to any named definition** (class, trait,
+   sub-namespace), not one table per kind. Traits stop being `Env`-only bindings.
+3. **Names stay name-keyed until use.** `VarRef::Dynamic` carries the name, and no
+   class handle is cached into the AST at install, so redefinition, live imports and
+   future store-backed namespaces (`open_questions.md` Q8) keep working. Inline
+   caching is a VM concern.
+4. **A workspace *has* an anonymous namespace.**
+   - Definitions made in the workspace (classes, traits) go into that anonymous
+     namespace, **not Kernel**.
+   - It imports Kernel by default. Any other namespace must be imported, as in any
+     other context (import form: `open_questions.md` Q17).
+   - No other namespace can reach it: it has no name, so it cannot be imported or
+     `::`-qualified.
+   - Workspace **temps are scope bindings, not namespace entries**. Methods (even
+     methods of classes defined in that workspace) never see them.
+   - `kernel.smol` is not loaded as a workspace. Its loader evaluates with Kernel as
+     the namespace, so kernel definitions land in Kernel.
+5. **Each REPL program is a nested scope** inside the workspace, the way a block
+   nests in a method. §2.1 applies in full within a program. A later program may
+   redeclare `| x |`, which shadows the earlier binding exactly as a block-local
+   shadows an outer one. A bare `x := …` naming an already-bound temp is still a
+   second assignment, so it is an error.
+
+**Sub-steps (replace §11.7a's d2a–d2c; each landable, suite green):**
+
+- **d2a — namespace-relative resolution for methods.** Add the `Class → Namespace`
+  link, set at class creation from the active namespace. Generalize namespace entries
+  so traits register too. Method `Dynamic` resolves through the defining namespace,
+  live. Delete the per-entity `populate_env` snapshots. Every class is still in Kernel
+  at this point, so the only behavior change is the stale-class fix (late-class probe
+  → regression test).
+  **Landed (2026-10-11).** One deviation from the plan above: methods stopped seeing
+  workspace temps here, not in d2c, because a method's free names are all `Dynamic`
+  and `Dynamic` no longer reads the env. `primitive_method_reads_outer_env_var` was
+  inverted to `method_cannot_see_workspace_temp`, with value-object and entity
+  variants. Follow-ons recorded: trait-method name resolution (`open_questions.md`
+  Q18) and ownership of workspace namespaces (Q19).
+- **d2b — Workspace scope rules.** Per-program SSA + declaration +
+  capture-before-assignment, including top-level blocks. Nested-scope redeclaration
+  across programs. Fix the 7 violating tests (§11.7a).
+- **d2c — Workspace representation.** Workspace = anonymous namespace (imports
+  Kernel) + nested program scopes. Top-level definitions go to the anonymous
+  namespace. Top-level blocks snapshot workspace temps. The frame-scoped
+  `env.define` for `Namespace do:` definitions is replaced by namespace registration.
+  The kernel loader uses Kernel directly. Methods no longer see workspace temps (the
+  value-object probe flips → regression test).
+  Risk: Rust tests that look up user-defined classes via `registry.kernel()` will
+  need the workspace namespace instead; measure before landing.
 
 ### 11.8 Risks
 

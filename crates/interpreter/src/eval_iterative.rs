@@ -679,9 +679,13 @@ fn handle_eval_expr(
                 // `self`: reconstruct the receiver from `method_stack` (a block
                 // re-pushes its captured `home_binding`), no env lookup (P2.1d).
                 VarRef::SelfRef => ev.self_value(),
-                // `Dynamic` / `Unresolved` still resolve by name via the env +
-                // method_stack (ivar/classvar/global; folded further in P2.1d).
-                _ => ev
+                // Free name in a resolved method/method-block body: ivar → classvar
+                // → defining class's namespace, read live (env-frame redesign d2a).
+                VarRef::Dynamic(_) => ev
+                    .lookup_dynamic(&name)
+                    .ok_or_else(|| EvalError::UndefinedVariable(name.clone()))?,
+                // Top-level code (not yet resolved): by name via the env.
+                VarRef::Unresolved => ev
                     .lookup_var(&name, &env)
                     .ok_or_else(|| EvalError::UndefinedVariable(name.clone()))?,
             };
