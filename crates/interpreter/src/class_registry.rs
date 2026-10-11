@@ -5,9 +5,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::class::Class;
 use crate::coverage::CoverageCollector;
-use crate::entity::{
-    EntityId, InstanceHandle, InstanceKind, InstanceState, new_entity_data, spawn_class_entity,
-};
+use crate::entity::{EntityId, InstanceHandle, InstanceKind, InstanceState, spawn_class_entity};
 use crate::env::Env;
 use crate::namespace::Namespace;
 use crate::value::Value;
@@ -49,166 +47,6 @@ pub struct ClassRegistry {
 }
 
 impl ClassRegistry {
-    /// Creates a new registry with `Kernel` namespace pre-populated with `Object` and `Value`.
-    ///
-    /// Class-entity actors are NOT spawned (no coroutines). Use `new_arc` for a
-    /// fully-live registry that dispatches messages.
-    pub fn new() -> Self {
-        let store = Store::in_memory();
-        let indexed_slots_pred = store
-            .declare(
-                "__indexed_slots__",
-                Visibility::Private,
-                Cardinality::Indexed,
-            )
-            .expect("failed to register __indexed_slots__ predicate");
-        let instance_of_pred = store
-            .declare("__instance_of__", Visibility::Shared, Cardinality::Single)
-            .expect("failed to register __instance_of__ predicate");
-        let kernel = Arc::new(Namespace::new(Arc::from("Kernel"), None));
-
-        let object_class = Arc::new(Class {
-            name: Arc::from("Object"),
-            superclass: None,
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-            class_object: std::sync::OnceLock::new(),
-            namespace: std::sync::OnceLock::new(),
-        });
-        let object_state = Arc::new(InstanceState {
-            class: object_class.clone(),
-            kind: InstanceKind::ClassEntity(Box::new(new_entity_data(
-                &object_class,
-                store.clone_handle(),
-            ))),
-        });
-        object_class
-            .class_object
-            .set(Arc::downgrade(&object_state))
-            .ok();
-        kernel.register(InstanceHandle(object_state));
-
-        // `Value` is the built-in passive base class (is_value: true), a subclass of Object.
-        let value_class = Arc::new(Class {
-            name: Arc::from("Value"),
-            superclass: Some(object_class.clone()),
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: true,
-            class_object: std::sync::OnceLock::new(),
-            namespace: std::sync::OnceLock::new(),
-        });
-        let value_state = Arc::new(InstanceState {
-            class: value_class.clone(),
-            kind: InstanceKind::ClassEntity(Box::new(new_entity_data(
-                &value_class,
-                store.clone_handle(),
-            ))),
-        });
-        value_class
-            .class_object
-            .set(Arc::downgrade(&value_state))
-            .ok();
-        kernel.register(InstanceHandle(value_state));
-
-        // `Nil` is the class of `nil` (analogous to Smalltalk's `UndefinedObject`).
-        // Subclass of Object; user-defined methods on `Nil` are dispatched for `Value::Nil`
-        // receivers via `push_method_call_frame(UserMethodFound::Primitive)`.
-        let nil_class = Arc::new(Class {
-            name: Arc::from("Nil"),
-            superclass: Some(object_class.clone()),
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-            class_object: std::sync::OnceLock::new(),
-            namespace: std::sync::OnceLock::new(),
-        });
-        let nil_state = Arc::new(InstanceState {
-            class: nil_class.clone(),
-            kind: InstanceKind::ClassEntity(Box::new(new_entity_data(
-                &nil_class,
-                store.clone_handle(),
-            ))),
-        });
-        nil_class.class_object.set(Arc::downgrade(&nil_state)).ok();
-        kernel.register(InstanceHandle(nil_state));
-
-        // `Block` is the class of block closures. Subclass of Object; user-defined
-        // methods dispatch for `Value::Block` receivers via `push_method_call_frame(UserMethodFound::Primitive)`.
-        let block_class = Arc::new(Class {
-            name: Arc::from("Block"),
-            superclass: Some(object_class.clone()),
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-            class_object: std::sync::OnceLock::new(),
-            namespace: std::sync::OnceLock::new(),
-        });
-        let block_state = Arc::new(InstanceState {
-            class: block_class.clone(),
-            kind: InstanceKind::ClassEntity(Box::new(new_entity_data(
-                &block_class,
-                store.clone_handle(),
-            ))),
-        });
-        block_class
-            .class_object
-            .set(Arc::downgrade(&block_state))
-            .ok();
-        kernel.register(InstanceHandle(block_state));
-
-        // The numeric tower (Number/Integer/MachineInteger/ArbitraryInteger/Float) and
-        // String/Symbol are defined in `kernel.smol` under `Value`, like the Boolean
-        // hierarchy — not bootstrapped here. Comparability is the `Ordered` trait, not a
-        // class (docs/numeric_tower_plan.md §2a).
-
-        let mut roots = HashMap::new();
-        roots.insert(Arc::from("Kernel"), kernel.clone());
-
-        // Primitive classes have no own_instance_vars; register_class_predicates is a
-        // no-op for them. No call needed here — user-defined subclasses register via
-        // handle_subclass.
-        Self {
-            kernel,
-            roots: RwLock::new(roots),
-            class_entities: RwLock::new(HashMap::new()),
-            instance_entities: RwLock::new(HashMap::new()),
-            store,
-            indexed_slots_pred,
-            instance_of_pred,
-            coverage: OnceLock::new(),
-        }
-    }
-
-    /// Creates a fully-live registry: `Object` and `Value` have running class-actor
-    /// coroutines.  Use this in any context that will dispatch class-side messages.
-    ///
-    /// Two-phase init:
-    ///   1. Build `Arc<ClassRegistry>` with an empty kernel so the Arc is available
-    ///      for passing to `spawn_class_entity`.
-    ///   2. Spawn a `ClassEntity` actor for each bootstrap class, then register it
-    ///      in the kernel namespace and set `class_object`.
-    ///
-    /// The class actors start with an empty env: methods resolve free names through
-    /// their defining class's namespace, read live, so no env snapshot of the
-    /// registry is needed.
     /// Enable execution-coverage collection on this registry (idempotent).
     /// Every evaluator sharing this registry — main thread and entity coroutines
     /// — records executed statement spans into the returned collector. Read it at
@@ -219,6 +57,19 @@ impl ClassRegistry {
             .clone()
     }
 
+    /// Creates the registry — the single bootstrap path. The bootstrap classes
+    /// (`Object`, `Value`, `Nil`, `Block`) are registered in `Kernel` with running
+    /// class-actor coroutines; stop them with `shutdown_class_entities`.
+    ///
+    /// Two-phase init:
+    ///   1. Build `Arc<ClassRegistry>` with an empty kernel so the Arc is available
+    ///      for passing to `spawn_class_entity`.
+    ///   2. Spawn a `ClassEntity` actor for each bootstrap class, then register it
+    ///      in the kernel namespace and set `class_object`.
+    ///
+    /// The class actors start with an empty env: methods resolve free names through
+    /// their defining class's namespace, read live, so no env snapshot of the
+    /// registry is needed.
     pub fn new_arc() -> Arc<Self> {
         let store = Store::in_memory();
         let indexed_slots_pred = store
@@ -233,61 +84,41 @@ impl ClassRegistry {
             .expect("failed to register __instance_of__ predicate");
         let kernel = Arc::new(Namespace::new(Arc::from("Kernel"), None));
 
-        let object_class = Arc::new(Class {
-            name: Arc::from("Object"),
-            superclass: None,
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-            class_object: std::sync::OnceLock::new(),
-            namespace: std::sync::OnceLock::new(),
-        });
+        let object_class = Arc::new(Class::new(
+            Arc::from("Object"),
+            None,
+            vec![],
+            vec![],
+            None,
+            false,
+        ));
 
-        let value_class = Arc::new(Class {
-            name: Arc::from("Value"),
-            superclass: Some(object_class.clone()),
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: true,
-            class_object: std::sync::OnceLock::new(),
-            namespace: std::sync::OnceLock::new(),
-        });
+        let value_class = Arc::new(Class::new(
+            Arc::from("Value"),
+            Some(object_class.clone()),
+            vec![],
+            vec![],
+            None,
+            true,
+        ));
 
-        let nil_class = Arc::new(Class {
-            name: Arc::from("Nil"),
-            superclass: Some(object_class.clone()),
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-            class_object: std::sync::OnceLock::new(),
-            namespace: std::sync::OnceLock::new(),
-        });
+        let nil_class = Arc::new(Class::new(
+            Arc::from("Nil"),
+            Some(object_class.clone()),
+            vec![],
+            vec![],
+            None,
+            false,
+        ));
 
-        let block_class = Arc::new(Class {
-            name: Arc::from("Block"),
-            superclass: Some(object_class.clone()),
-            own_instance_vars: vec![],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-            class_object: std::sync::OnceLock::new(),
-            namespace: std::sync::OnceLock::new(),
-        });
+        let block_class = Arc::new(Class::new(
+            Arc::from("Block"),
+            Some(object_class.clone()),
+            vec![],
+            vec![],
+            None,
+            false,
+        ));
 
         // Numeric tower + String/Symbol live in kernel.smol (see new()).
 
@@ -480,12 +311,6 @@ impl Drop for ClassRegistry {
     /// kernel coverage report as registries are torn down. A no-op otherwise.
     fn drop(&mut self) {
         crate::coverage::flush_global_report();
-    }
-}
-
-impl Default for ClassRegistry {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

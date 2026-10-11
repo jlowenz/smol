@@ -93,7 +93,7 @@ pub struct Class {
     pub is_value: bool,
     /// Back-reference to the canonical `InstanceState` (ClassObject kind) for this class.
     ///
-    /// Set once after the `InstanceState` is allocated by `ClassRegistry::new()` or
+    /// Set once after the `InstanceState` is allocated by `ClassRegistry::new_arc()` or
     /// `handle_subclass`; always populated before any message dispatch can reach this class.
     /// `Weak` avoids a reference cycle between `InstanceState → Class → InstanceState`.
     pub class_object: OnceLock<Weak<crate::entity::InstanceState>>,
@@ -106,6 +106,41 @@ pub struct Class {
 }
 
 impl Class {
+    /// Construct a class descriptor with no methods, not yet registered.
+    ///
+    /// Requires: `own_instance_vars` is disjoint from every superclass's instance
+    ///   variable names (checked by the caller, e.g. `handle_subclass`).
+    /// Ensures: empty instance- and class-side method dictionaries; every name in
+    ///   `own_class_vars` is bound to `nil` in `class_var_storage`; `class_object`
+    ///   and `namespace` are unset (set later by the caller and by
+    ///   `Namespace::register`, respectively).
+    pub fn new(
+        name: Arc<str>,
+        superclass: Option<Arc<Class>>,
+        own_instance_vars: Vec<Arc<str>>,
+        own_class_vars: Vec<Arc<str>>,
+        indexed_slot_kind: Option<IndexedSlotKind>,
+        is_value: bool,
+    ) -> Self {
+        let class_var_storage = own_class_vars
+            .iter()
+            .map(|n| (n.clone(), Value::Nil))
+            .collect();
+        Self {
+            name,
+            superclass,
+            own_instance_vars,
+            own_class_vars,
+            class_var_storage: RwLock::new(class_var_storage),
+            indexed_slot_kind,
+            methods: RwLock::new(HashMap::new()),
+            class_methods: RwLock::new(HashMap::new()),
+            is_value,
+            class_object: OnceLock::new(),
+            namespace: OnceLock::new(),
+        }
+    }
+
     /// The namespace this class is defined in, if it was registered in one that is
     /// still live.
     pub fn namespace(&self) -> Option<Arc<crate::namespace::Namespace>> {

@@ -6,22 +6,16 @@ use crate::class::Class;
 use crate::entity::{InstanceHandle, InstanceKind, InstanceState, new_entity_data};
 use crate::env::Env;
 use crate::object::Object;
-use parking_lot::RwLock;
 
 fn make_class(name: &str) -> Arc<Class> {
-    Arc::new(Class {
-        name: Arc::from(name),
-        superclass: None,
-        own_instance_vars: vec![],
-        own_class_vars: vec![],
-        class_var_storage: RwLock::new(HashMap::new()),
-        indexed_slot_kind: None,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: false,
-        class_object: std::sync::OnceLock::new(),
-        namespace: std::sync::OnceLock::new(),
-    })
+    Arc::new(Class::new(
+        Arc::from(name),
+        None,
+        vec![],
+        vec![],
+        None,
+        false,
+    ))
 }
 
 fn class_handle(name: &str) -> InstanceHandle {

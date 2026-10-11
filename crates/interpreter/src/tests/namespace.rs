@@ -1,25 +1,18 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::*;
 use crate::class::Class;
 use crate::entity::{InstanceHandle, InstanceKind, InstanceState, new_entity_data};
-use parking_lot::RwLock;
 
 fn bare_handle(name: &str) -> InstanceHandle {
-    let cls = Arc::new(Class {
-        name: Arc::from(name),
-        superclass: None,
-        own_instance_vars: vec![],
-        own_class_vars: vec![],
-        class_var_storage: RwLock::new(HashMap::new()),
-        indexed_slot_kind: None,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: false,
-        class_object: std::sync::OnceLock::new(),
-        namespace: std::sync::OnceLock::new(),
-    });
+    let cls = Arc::new(Class::new(
+        Arc::from(name),
+        None,
+        vec![],
+        vec![],
+        None,
+        false,
+    ));
     let data = new_entity_data(&cls, triple_store::store::Store::in_memory());
     InstanceHandle(Arc::new(InstanceState {
         class: cls,
@@ -39,7 +32,8 @@ fn lookup_sub_found_and_missing() {
 #[test]
 fn qualified_name_with_parent_chain() {
     let root = Arc::new(Namespace::new(Arc::from("Kernel"), None));
-    let child = Arc::new(Namespace::new(Arc::from("Collections"), Some(root)));
+    let child = Arc::new(Namespace::new(Arc::from("Collections"), Some(root.clone())));
+    root.register_sub(child.clone());
     assert_eq!(child.qualified_name(), "Kernel::Collections");
 }
 

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use parking_lot::RwLock;
 
@@ -13,8 +13,10 @@ use crate::value::Value;
 /// namespace. `parent` exists solely for qualified-name construction.
 pub struct Namespace {
     pub name: Arc<str>,
-    /// For qualified-name construction only. NOT an implicit search scope.
-    pub parent: Option<Arc<Namespace>>,
+    /// For qualified-name construction only. NOT an implicit search scope. `None`
+    /// for a root namespace. `Weak` because the parent owns this namespace through
+    /// its `sub_namespaces` (a strong back-link would be a cycle).
+    pub parent: Option<Weak<Namespace>>,
     sub_namespaces: RwLock<HashMap<Arc<str>, Arc<Namespace>>>,
     /// Every named definition in this namespace — a class (as its canonical
     /// `Value::Instance` handle, so pointer identity is stable across lookups) or a
@@ -28,7 +30,7 @@ impl Namespace {
     pub fn new(name: Arc<str>, parent: Option<Arc<Namespace>>) -> Self {
         Self {
             name,
-            parent,
+            parent: parent.as_ref().map(Arc::downgrade),
             sub_namespaces: RwLock::new(HashMap::new()),
             entries: RwLock::new(HashMap::new()),
             imports: RwLock::new(Vec::new()),
@@ -104,7 +106,7 @@ impl Namespace {
 
     /// Fully-qualified name built from parent chain (e.g. `Kernel::Collections`).
     pub fn qualified_name(&self) -> String {
-        match &self.parent {
+        match self.parent.as_ref().and_then(Weak::upgrade) {
             None => self.name.to_string(),
             Some(p) => format!("{}::{}", p.qualified_name(), self.name),
         }

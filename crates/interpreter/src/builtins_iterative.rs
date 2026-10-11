@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Cooperative yield interval: one yield every N completed message dispatches.
@@ -6,7 +5,6 @@ use std::sync::Arc;
 /// iterative evaluator yield at the same granularity.
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Zero};
-use parking_lot::RwLock;
 
 use crate::class::{Class, IndexedSlotKind};
 use crate::entity::FrameCommitOutcome;
@@ -3397,11 +3395,6 @@ fn handle_subclass(
         }
     }
 
-    let class_var_storage: HashMap<Arc<str>, Value> = class_var_names
-        .iter()
-        .map(|n| (n.clone(), Value::Nil))
-        .collect();
-
     // Inherit is_value from the superclass chain. Mixed-hierarchy subclassing
     // (actor subclassing a value class or vice versa) is a compile-time error.
     let super_is_value = superclass.inherits_is_value();
@@ -3410,19 +3403,14 @@ fn handle_subclass(
     // We detect this by checking if the superclass is the built-in Value class.
     let declared_is_value = super_is_value; // inherit by default
 
-    let new_class = Arc::new(Class {
-        name: name.clone(),
-        superclass: Some(superclass),
-        own_instance_vars: ivar_names,
-        own_class_vars: class_var_names,
-        class_var_storage: RwLock::new(class_var_storage),
+    let new_class = Arc::new(Class::new(
+        name.clone(),
+        Some(superclass),
+        ivar_names,
+        class_var_names,
         indexed_slot_kind,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: declared_is_value,
-        class_object: std::sync::OnceLock::new(),
-        namespace: std::sync::OnceLock::new(),
-    });
+        declared_is_value,
+    ));
     // Flatten a composed trait's provided methods into the new class's method dict
     // (docs/traits_plan.md §1). Class-defined methods arrive on later statements and
     // overwrite these entries, giving the required `class > trait > super` precedence.

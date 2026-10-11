@@ -969,22 +969,15 @@ fn cleanup_frames_multiple_mixed_frames() {
 
 /// Builds a minimal `Arc<Class>` with the given name and no superclass.
 fn make_class(name: &str) -> std::sync::Arc<crate::class::Class> {
-    use parking_lot::RwLock;
-    use std::collections::HashMap;
-    use std::sync::{Arc, OnceLock};
-    Arc::new(crate::class::Class {
-        name: Arc::from(name),
-        superclass: None,
-        own_instance_vars: vec![],
-        own_class_vars: vec![],
-        class_var_storage: RwLock::new(HashMap::new()),
-        indexed_slot_kind: None,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: true,
-        class_object: OnceLock::new(),
-        namespace: OnceLock::new(),
-    })
+    use std::sync::Arc;
+    Arc::new(crate::class::Class::new(
+        Arc::from(name),
+        None,
+        vec![],
+        vec![],
+        None,
+        true,
+    ))
 }
 
 /// Builds a `ClassEntity`-kind `InstanceHandle` for the given class.

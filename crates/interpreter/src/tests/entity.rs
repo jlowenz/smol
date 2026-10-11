@@ -46,21 +46,15 @@ f anotherFive anotherFive value.
 #[test]
 fn instance_handle_entity_debug() {
     use crate::class::Class;
-    use parking_lot::RwLock;
-    use std::collections::HashMap;
-    let cls = Arc::new(Class {
-        name: Arc::from("TestClass"),
-        superclass: None,
-        own_instance_vars: vec![],
-        own_class_vars: vec![],
-        class_var_storage: RwLock::new(HashMap::new()),
-        indexed_slot_kind: None,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: false,
-        class_object: std::sync::OnceLock::new(),
-        namespace: std::sync::OnceLock::new(),
-    });
+
+    let cls = Arc::new(Class::new(
+        Arc::from("TestClass"),
+        None,
+        vec![],
+        vec![],
+        None,
+        false,
+    ));
     let obj = Arc::new(crate::object::Object::new(cls.clone()));
     let handle = InstanceHandle(Arc::new(InstanceState {
         class: cls,
@@ -113,21 +107,15 @@ fn future_debug_shows_resolved_state() {
 #[test]
 fn instance_kind_value_object_debug() {
     use crate::class::Class;
-    use parking_lot::RwLock;
-    use std::collections::HashMap;
-    let cls = Arc::new(Class {
-        name: Arc::from("TestClass"),
-        superclass: None,
-        own_instance_vars: vec![],
-        own_class_vars: vec![],
-        class_var_storage: RwLock::new(HashMap::new()),
-        indexed_slot_kind: None,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: true,
-        class_object: std::sync::OnceLock::new(),
-        namespace: std::sync::OnceLock::new(),
-    });
+
+    let cls = Arc::new(Class::new(
+        Arc::from("TestClass"),
+        None,
+        vec![],
+        vec![],
+        None,
+        true,
+    ));
     let obj = Arc::new(crate::object::Object::new(cls.clone()));
     let kind = InstanceKind::ValueObject(obj);
     assert_eq!(format!("{kind:?}"), "ValueObject");
@@ -136,21 +124,15 @@ fn instance_kind_value_object_debug() {
 #[test]
 fn instance_kind_class_entity_debug() {
     use crate::class::Class;
-    use parking_lot::RwLock;
-    use std::collections::HashMap;
-    let cls = Arc::new(Class {
-        name: Arc::from("MyClass"),
-        superclass: None,
-        own_instance_vars: vec![],
-        own_class_vars: vec![],
-        class_var_storage: RwLock::new(HashMap::new()),
-        indexed_slot_kind: None,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: false,
-        class_object: std::sync::OnceLock::new(),
-        namespace: std::sync::OnceLock::new(),
-    });
+
+    let cls = Arc::new(Class::new(
+        Arc::from("MyClass"),
+        None,
+        vec![],
+        vec![],
+        None,
+        false,
+    ));
     let kind = InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(
         &cls,
         triple_store::store::Store::in_memory(),
@@ -162,21 +144,15 @@ fn instance_kind_class_entity_debug() {
 #[test]
 fn instance_handle_value_object_debug() {
     use crate::class::Class;
-    use parking_lot::RwLock;
-    use std::collections::HashMap;
-    let cls = Arc::new(Class {
-        name: Arc::from("MyValue"),
-        superclass: None,
-        own_instance_vars: vec![],
-        own_class_vars: vec![],
-        class_var_storage: RwLock::new(HashMap::new()),
-        indexed_slot_kind: None,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: true,
-        class_object: std::sync::OnceLock::new(),
-        namespace: std::sync::OnceLock::new(),
-    });
+
+    let cls = Arc::new(Class::new(
+        Arc::from("MyValue"),
+        None,
+        vec![],
+        vec![],
+        None,
+        true,
+    ));
     let obj = Arc::new(crate::object::Object::new(cls.clone()));
     let handle = InstanceHandle(Arc::new(InstanceState {
         class: cls,
@@ -190,21 +166,15 @@ fn instance_handle_value_object_debug() {
 #[test]
 fn instance_handle_class_entity_debug() {
     use crate::class::Class;
-    use parking_lot::RwLock;
-    use std::collections::HashMap;
-    let cls = Arc::new(Class {
-        name: Arc::from("MyClass"),
-        superclass: None,
-        own_instance_vars: vec![],
-        own_class_vars: vec![],
-        class_var_storage: RwLock::new(HashMap::new()),
-        indexed_slot_kind: None,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: false,
-        class_object: std::sync::OnceLock::new(),
-        namespace: std::sync::OnceLock::new(),
-    });
+
+    let cls = Arc::new(Class::new(
+        Arc::from("MyClass"),
+        None,
+        vec![],
+        vec![],
+        None,
+        false,
+    ));
     let handle = InstanceHandle(Arc::new(InstanceState {
         class: cls.clone(),
         kind: InstanceKind::ClassEntity(Box::new(crate::entity::new_entity_data(
@@ -226,23 +196,17 @@ fn instance_handle_class_entity_debug() {
 #[test]
 fn handle_commit_error_faults_entity_drains_mailbox() {
     use crate::class::Class;
-    use parking_lot::RwLock;
-    use std::collections::HashMap;
+
     use triple_store::store::StoreError;
 
-    let cls = Arc::new(Class {
-        name: Arc::from("Stub"),
-        superclass: None,
-        own_instance_vars: vec![],
-        own_class_vars: vec![],
-        class_var_storage: RwLock::new(HashMap::new()),
-        indexed_slot_kind: None,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: false,
-        class_object: std::sync::OnceLock::new(),
-        namespace: std::sync::OnceLock::new(),
-    });
+    let cls = Arc::new(Class::new(
+        Arc::from("Stub"),
+        None,
+        vec![],
+        vec![],
+        None,
+        false,
+    ));
 
     let data = EntityData {
         id: EntityId(1),
@@ -1537,21 +1501,15 @@ mod tx_frames {
     /// `Value::Int(seed)` in its live slots.
     fn entity_with_slot(seed: i64) -> EntityData {
         use crate::class::Class;
-        use parking_lot::RwLock;
-        use std::collections::HashMap;
-        let cls = Arc::new(Class {
-            name: Arc::from("Cell"),
-            superclass: None,
-            own_instance_vars: vec![Arc::from("slot")],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-            class_object: std::sync::OnceLock::new(),
-            namespace: std::sync::OnceLock::new(),
-        });
+
+        let cls = Arc::new(Class::new(
+            Arc::from("Cell"),
+            None,
+            vec![Arc::from("slot")],
+            vec![],
+            None,
+            false,
+        ));
         let obj = Arc::new(crate::object::Object::new(cls.clone()));
         obj.set_slot(Arc::from("slot"), Value::Int(seed));
         EntityData {
@@ -1843,21 +1801,15 @@ mod tx_primitives {
     /// sharing `ev`'s store so committed facts are visible through `ev.store`.
     fn cell_entity(ev: &Evaluator, seed: i64) -> InstanceHandle {
         use crate::class::Class;
-        use parking_lot::RwLock;
-        use std::collections::HashMap;
-        let cls = Arc::new(Class {
-            name: Arc::from("Cell"),
-            superclass: None,
-            own_instance_vars: vec![Arc::from("slot")],
-            own_class_vars: vec![],
-            class_var_storage: RwLock::new(HashMap::new()),
-            indexed_slot_kind: None,
-            methods: RwLock::new(HashMap::new()),
-            class_methods: RwLock::new(HashMap::new()),
-            is_value: false,
-            class_object: std::sync::OnceLock::new(),
-            namespace: std::sync::OnceLock::new(),
-        });
+
+        let cls = Arc::new(Class::new(
+            Arc::from("Cell"),
+            None,
+            vec![Arc::from("slot")],
+            vec![],
+            None,
+            false,
+        ));
         let data = crate::entity::new_entity_data(&cls, ev.store.clone_handle());
         data.data.set_slot(Arc::from("slot"), Value::Int(seed));
         InstanceHandle(Arc::new(InstanceState {

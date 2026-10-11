@@ -1,25 +1,18 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::*;
 use crate::class::{Class, IndexedSlotKind};
 use crate::value::Value;
-use parking_lot::RwLock;
 
 fn make_class(name: &str, ivars: Vec<&str>, indexed: Option<IndexedSlotKind>) -> Arc<Class> {
-    Arc::new(Class {
-        name: Arc::from(name),
-        superclass: None,
-        own_instance_vars: ivars.into_iter().map(Arc::from).collect(),
-        own_class_vars: vec![],
-        class_var_storage: RwLock::new(HashMap::new()),
-        indexed_slot_kind: indexed,
-        methods: RwLock::new(HashMap::new()),
-        class_methods: RwLock::new(HashMap::new()),
-        is_value: false,
-        class_object: std::sync::OnceLock::new(),
-        namespace: std::sync::OnceLock::new(),
-    })
+    Arc::new(Class::new(
+        Arc::from(name),
+        None,
+        ivars.into_iter().map(Arc::from).collect(),
+        vec![],
+        indexed,
+        false,
+    ))
 }
 
 #[test]
