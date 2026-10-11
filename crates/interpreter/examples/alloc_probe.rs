@@ -2,9 +2,13 @@
 //! (`docs/next_steps_after_c34.md` §4).
 //!
 //! Two jobs:
-//!   * report a MARGINAL ns/iteration (and ns/user-level-send) for scalar
-//!     workloads via a two-size differential — running at size N and 2N and
-//!     differencing cancels one-time setup and first-send lazy costs; and
+//!   * report a MARGINAL ns/iteration for scalar workloads via a two-size
+//!     differential — running at size N and 2N and differencing cancels
+//!     one-time setup and first-send lazy costs. With the `send_count` feature,
+//!     the same differential over the evaluator's send counter gives the
+//!     MEASURED sends/iteration, hence ns/send. (Per-send figures used to come
+//!     from a hand-estimated divisor, which undercounted the numeric-tower
+//!     fan-out of `=`/`-`/`+` by ~4x; measure, don't estimate.); and
 //!   * serve as a dense hot loop for `samply`, which decomposes that time by
 //!     function (allocation vs hashing vs mutex vs `Vec` clone).
 //!
@@ -19,7 +23,9 @@
 //! notes) and is not part of this file.
 //!
 //! Usage:
-//!   cargo run --release --example alloc_probe -p interpreter          # timing table
+//!   cargo run --release --example alloc_probe -p interpreter          # ns/iteration
+//!   cargo run --release --example alloc_probe -p interpreter --features send_count
+//!                                                                     # + sends/iter, ns/send
 //!   cargo run --release --example alloc_probe -p interpreter -- soak  # long hot loop
 //!   samply record -- target/release/examples/alloc_probe soak         # flamegraph
 
@@ -52,15 +58,20 @@ fn eval_ns(ev: &Evaluator, prog: &Program, reps: u32) -> f64 {
     start.elapsed().as_nanos() as f64 / reps as f64
 }
 
-/// Marginal per-iteration / per-send timing from a two-size differential.
-fn differential(
-    ev: &Evaluator,
-    label: &str,
-    sends_per_iter: f64,
-    n_lo: u64,
-    n_hi: u64,
-    make: impl Fn(u64) -> String,
-) {
+/// Sends dispatched by one `eval_program` run of `prog` (fresh env, as in
+/// `eval_ns`).
+#[cfg(feature = "send_count")]
+fn eval_sends(ev: &Evaluator, prog: &Program) -> u64 {
+    let mut env = Env::new();
+    ev.registry.populate_env(&mut env);
+    let before = ev.sends_dispatched();
+    ev.eval_program(&prog.stmts, &mut env).unwrap();
+    ev.sends_dispatched() - before
+}
+
+/// Marginal per-iteration timing (and, with `send_count`, measured
+/// sends/iteration and ns/send) from a two-size differential.
+fn differential(ev: &Evaluator, label: &str, n_lo: u64, n_hi: u64, make: impl Fn(u64) -> String) {
     let lo = parse(&make(n_lo));
     let hi = parse(&make(n_hi));
     let ns_lo = eval_ns(ev, &lo, 300);
@@ -68,10 +79,17 @@ fn differential(
     let d_iters = (n_hi - n_lo) as f64;
     let ns_per_iter = (ns_hi - ns_lo) / d_iters;
     println!("── {label}");
-    println!(
-        "   ns/iteration: {ns_per_iter:7.1}   ns/send (÷{sends_per_iter}): {:6.1}",
-        ns_per_iter / sends_per_iter
-    );
+    #[cfg(feature = "send_count")]
+    {
+        let sends_per_iter = (eval_sends(ev, &hi) - eval_sends(ev, &lo)) as f64 / d_iters;
+        println!(
+            "   ns/iteration: {ns_per_iter:7.1}   sends/iteration: {sends_per_iter:5.2}   \
+             ns/send: {:6.1}",
+            ns_per_iter / sends_per_iter
+        );
+    }
+    #[cfg(not(feature = "send_count"))]
+    println!("   ns/iteration: {ns_per_iter:7.1}");
 }
 
 /// Install the scalar helper methods used by the workloads.
@@ -104,22 +122,18 @@ fn main() {
     }
 
     println!("\n=== per-send timing probe (scalar, coroutine-free) ===\n");
-    // pvtSpin: `=`, `-`, `pvtSpin` per non-base iteration (ifTrue: arm inlined).
     differential(
         &ev,
         "pvtSpin (bare tail-recursive loop)",
-        3.0,
         2_000,
         4_000,
         |n| format!("{n} pvtSpin"),
     );
-    // timesRepeat: [1+1]: loop `-` + loop `timesRepeat:` send + body `+` ≈ 3.
-    differential(&ev, "timesRepeat: [1 + 1]", 3.0, 2_000, 4_000, |n| {
+    differential(&ev, "timesRepeat: [1 + 1]", 2_000, 4_000, |n| {
         format!("{n} timesRepeat: [1 + 1]")
     });
-    // fib: `=`, `-`, `+`, `pvtFibA:b:` per iteration.
-    differential(&ev, "fib (iterative)", 4.0, 2_000, 4_000, |n| {
-        format!("{n} fib")
-    });
+    differential(&ev, "fib (iterative)", 2_000, 4_000, |n| format!("{n} fib"));
+    #[cfg(not(feature = "send_count"))]
+    println!("\n(ns/send: rerun with `--features send_count` for measured sends/iteration)");
     println!();
 }

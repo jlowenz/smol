@@ -607,6 +607,15 @@ already-bound workspace temp is a second assignment, so it is an error.
   earlier program's block sees the new `x`.
   Perf note for P2.1e: `alloc_probe` measures ≈3.9–5.4 µs/send, the same on the
   pre-d2a commit, so the gap from the August ~1.2 µs/send figure predates d2.
+  *Correction (same day):* that "µs/send" used the probe's hard-coded ÷3 divisor,
+  which was wrong. `alloc_probe` now measures sends/iteration (`--features
+  send_count`): `pvtSpin` 12, `timesRepeat: [1 + 1]` 17, `fib` 17, so the numeric
+  tower fans out more than August's estimate of ~13. Measured: **≈600 ns/send**
+  (7.2 / 10.0 / 10.7 µs/iteration, stable over 3 runs, counter overhead
+  unmeasurable). The same code measured ~60% slower earlier the same day, so
+  **timing varies between sessions: compare only back-to-back A/B runs within one
+  session** (e.g. a `git worktree` baseline), never against figures recorded in
+  another session.
 - **d2c — Workspace representation.** The top-level scope is resolved like any scope.
   Top-level blocks snapshot workspace temps. Other top-level names go through active
   namespace → Globals. `Namespace do:` bindings move to the active-namespace lookup.

@@ -16,6 +16,10 @@ path = "src/main.rs"
 # `size_of::<Cont>()`. Used by C31.5 to measure per-level stack cost before/after
 # the frame-shrinking work. Off by default; never affects release behavior.
 step_probe = []
+# Counts message sends dispatched by each evaluator (`Evaluator::sends_dispatched`),
+# so `examples/alloc_probe.rs` can report measured sends/iteration and ns/send
+# instead of a hand-estimated divisor. Off by default; never affects behavior.
+send_count = []
 
 [dependencies]
 thiserror = { workspace = true }

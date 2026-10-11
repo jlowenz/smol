@@ -1715,6 +1715,8 @@ fn dispatch_super_to_stack(
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
+    #[cfg(feature = "send_count")]
+    ev.sends.set(ev.sends.get() + 1);
     let defining_class = ev
         .current_defining_class()
         .ok_or_else(|| EvalError::TypeError("super used outside method context".into()))?;
@@ -1866,6 +1868,8 @@ fn dispatch_to_stack(
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
+    #[cfg(feature = "send_count")]
+    ev.sends.set(ev.sends.get() + 1);
     // `then:orElse:` must see the raw receiver (including Futures) so that
     // `Future then: [blk] orElse: eb` chains asynchronously without eager resolution.
     //

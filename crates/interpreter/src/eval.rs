@@ -144,6 +144,8 @@ impl ContinuationContext {
             current_tx_ctx: RefCell::new(self.current_tx_ctx),
             #[cfg(feature = "step_probe")]
             probe: crate::eval_iterative::probe::ProbeState::default(),
+            #[cfg(feature = "send_count")]
+            sends: Cell::new(0),
         }
     }
 }
@@ -224,6 +226,9 @@ pub struct Evaluator {
     /// per-coroutine) so it is migration-correct under `may` work-stealing.
     #[cfg(feature = "step_probe")]
     pub(crate) probe: crate::eval_iterative::probe::ProbeState,
+    /// Message sends dispatched by this evaluator (see `sends_dispatched`).
+    #[cfg(feature = "send_count")]
+    pub(crate) sends: Cell<u64>,
 }
 
 /// A `HandlerContext` handler registration: `(condition class, handler block)`.
@@ -276,6 +281,8 @@ impl Evaluator {
             handler_chain: RefCell::new(Vec::new()),
             #[cfg(feature = "step_probe")]
             probe: crate::eval_iterative::probe::ProbeState::default(),
+            #[cfg(feature = "send_count")]
+            sends: Cell::new(0),
         }
     }
 
@@ -376,6 +383,15 @@ impl Evaluator {
     /// Ensures: `Instance`/`ClassSide` → `Value::Instance(handle)`; `Primitive` →
     ///   its `self_value`; no active binding (only reachable outside any method,
     ///   where `self` is not a `SelfRef`) → `Value::Nil`.
+    /// Total message sends this evaluator has dispatched: every syntactic send
+    /// (including cascade parts and `super` sends) plus each `perform:` target.
+    /// Sends handled by other evaluators (entity coroutines, async continuations)
+    /// are counted there, not here.
+    #[cfg(feature = "send_count")]
+    pub fn sends_dispatched(&self) -> u64 {
+        self.sends.get()
+    }
+
     pub(crate) fn self_value(&self) -> Value {
         match self.method_stack.borrow().last() {
             Some(SelfBinding::Instance { handle, .. } | SelfBinding::ClassSide { handle, .. }) => {
@@ -898,6 +914,8 @@ impl Evaluator {
             handler_chain: RefCell::new(Vec::new()),
             #[cfg(feature = "step_probe")]
             probe: crate::eval_iterative::probe::ProbeState::default(),
+            #[cfg(feature = "send_count")]
+            sends: Cell::new(0),
         }
     }
 
