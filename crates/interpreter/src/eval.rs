@@ -528,7 +528,8 @@ impl Evaluator {
     ///   target writes an ivar or classvar of the current binding, or is an error
     ///   (a namespace definition is never assignable); an `Unresolved` (top-level)
     ///   target writes an ivar/classvar of the current binding or an existing env
-    ///   binding, and at top level outside any method creates-or-updates the binding.
+    ///   binding; assigning a name with no binding is an error (never an implicit
+    ///   declaration).
     #[inline]
     pub(crate) fn assign_var(
         &self,
@@ -658,24 +659,20 @@ impl Evaluator {
                 "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
             )));
         }
-        // Top-level (REPL/script) scope: create-or-update a binding.
-        env.update_or_define(name.clone(), value.clone());
-        Ok(value)
+        // Top-level (REPL/script) scope: `eval_program` has already rejected any
+        // assignment to a name the program does not declare, and declared temps
+        // are bound (to `Nil`) before the program runs — so the binding exists.
+        let ret = value.clone();
+        if env.set(name.as_ref(), value) {
+            return Ok(ret);
+        }
+        Err(EvalError::TypeError(format!(
+            "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
+        )))
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /// Evaluate a sequence of statements in `env`.
-    ///
-    /// Requires: `env` has at least one live frame.
-    /// Ensures: returns the value of the last statement, or `Value::Nil` if
-    ///   `stmts` is empty. `EvalError::Return` propagates to the caller; a
-    ///   method-frame caller should catch and unwrap it.
-    /// Iterative entry point: runs `stmts` via the step-loop evaluator.
-    ///
-    /// Requires: `env` has at least one live frame.
-    /// Ensures: semantically identical to `eval_program_recursive`; Smol method calls
-    ///   use heap-allocated `CallFrame`s rather than Rust stack frames.
     /// Record that a statement at `span` executed, when coverage is enabled on
     /// the shared registry. A no-op — one atomic load — otherwise.
     pub(crate) fn record_coverage(&self, span: crate::span::Span) {
@@ -687,7 +684,22 @@ impl Evaluator {
         }
     }
 
+    /// Evaluate a top-level program (a script, or one REPL input) in `env`, via
+    /// the step-loop evaluator.
+    ///
+    /// A program is a scope nested in the workspace (env-frame redesign §11.7b):
+    /// its `| ... |` temps are fresh bindings (shadowing any earlier program's
+    /// same-named temps), bound once, and the program may assign only the temps it
+    /// declares itself.
+    ///
+    /// Requires: `env` has at least one live frame.
+    /// Ensures: if any temp — of the program or of a block within it — is assigned
+    ///   more than once, or the program assigns a name it does not declare,
+    ///   returns `Err(EvalError::TypeError)` before executing any statement.
+    ///   Otherwise returns the value of the last statement, or `Value::Nil` if
+    ///   `stmts` is empty. `EvalError::Return` propagates to the caller.
     pub fn eval_program(&self, stmts: &[TaggedStmt], env: &mut Env) -> Result<Value, EvalError> {
+        check_program_assignments(stmts)?;
         for stmt in stmts {
             if let Stmt::LocalDecl(names) = &stmt.node {
                 for name in names {
@@ -1050,6 +1062,32 @@ pub(crate) fn check_single_assignment_in_method(
     // already a second binding — seed `assigned` with them.
     let assigned: HashSet<Arc<str>> = params.iter().cloned().collect();
     check_single_assignment_scope(declared, assigned, body)
+}
+
+/// Enforce the workspace scope rules for one top-level program (env-frame redesign
+/// §11.7b): single-assignment for the program's temps and every nested block's
+/// locals, and no assignment to a name the program does not declare.
+///
+/// Ensures: `Err(EvalError::TypeError)` on the first violation; otherwise `Ok(())`.
+fn check_program_assignments(stmts: &[TaggedStmt]) -> Result<(), EvalError> {
+    let declared: HashSet<Arc<str>> = stmts
+        .iter()
+        .filter_map(|s| match &s.node {
+            Stmt::LocalDecl(names) => Some(names.iter().cloned()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    for s in stmts {
+        if let Stmt::Assign { name, .. } = &s.node
+            && !declared.contains(name)
+        {
+            return Err(EvalError::TypeError(format!(
+                "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
+            )));
+        }
+    }
+    check_single_assignment_scope(declared, HashSet::new(), stmts)
 }
 
 /// Check one scope (method or block body) for a second assignment to any of its

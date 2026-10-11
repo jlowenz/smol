@@ -85,26 +85,6 @@ fn set_top_frame_updates_top_binding() {
 }
 
 #[test]
-fn update_or_define_updates_existing() {
-    let mut env = Env::new();
-    env.define(s("x"), int(1));
-    env.push_frame();
-    env.update_or_define(s("x"), int(99));
-    env.pop_frame();
-    assert_eq!(env.get("x"), Some(int(99)));
-}
-
-#[test]
-fn update_or_define_creates_in_top_when_absent() {
-    let mut env = Env::new();
-    env.push_frame();
-    env.update_or_define(s("fresh"), int(7));
-    assert_eq!(env.lookup_top_frame("fresh"), Some(int(7)));
-    env.pop_frame();
-    assert_eq!(env.get("fresh"), None);
-}
-
-#[test]
 fn define_global_visible_after_push() {
     let mut env = Env::new();
     env.push_frame();

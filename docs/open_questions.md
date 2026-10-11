@@ -647,3 +647,53 @@ to the GC design.
 
 Open: whether the root deserves a first-class Smol identity (a `System`/`Image`
 object that creates workspaces), and how workspaces relate to notebooks (Q8).
+
+---
+
+## Q20: Sum types and pattern matching without compromising the core model
+
+**Status**: Open — exploratory
+**Raised**: 2026-10-11 (user), during env-frame redesign d2b
+
+How can Smol gain the benefits of sum types (closed sets of alternatives,
+exhaustiveness) and pattern matching (destructuring, binding), without violating its
+core constructs: uniform message sends (D12, P2, P9), inspectable dispatch (P3), the
+Value/Object split (D3), async-by-default sends with late-resolved futures (D2), and
+live redefinition (P1)?
+
+**What already overlaps:**
+- **Polymorphic dispatch is already a match on the receiver's class.** A visitor or
+  double dispatch covers most uses of a `match` on a closed hierarchy, though only
+  over the receiver.
+- **Value classes are product types**: immutable, frozen at construction, shareable.
+  A `Value subclass:` family behaves like a sum type in everything except closure.
+- **`on:do:` already matches by class**, for conditions.
+
+**Tensions to resolve:**
+- **Closed vs open.** Exhaustiveness requires a *closed* set of alternatives, but
+  classes are open: anyone can subclass, and live redefinition can add a variant at
+  any time. Any "sealed" notion has to say what happens when the live system adds a
+  variant to a sealed family.
+- **Values only?** Destructuring an *entity* would read mutable actor state across a
+  mailbox boundary. Matching probably has to be restricted to Values, or go through
+  messages (which makes it ordinary dispatch).
+- **Futures.** Matching on a future would force it, which conflicts with the
+  late-resolution rule (CLAUDE.md "Futures"). The match itself would have to be
+  deferred, like `then:`.
+- **Syntax vs messages (P9).** A `match` special form would be a non-message
+  construct. A message form (e.g. `x caseOf: {...}`, or blocks with pattern
+  parameters) keeps uniformity but needs a way to express patterns as values.
+- **Good fit with SSA.** Pattern variables are fresh single-assignment bindings, which
+  fits §2.1 of `perf_env_frame_redesign.md` naturally, and the resolver can give them
+  slots like any other local.
+
+**Directions to evaluate (none chosen):**
+1. Library only: visitor or double-dispatch conventions plus a `caseOf:`-style
+   message. No language change.
+2. A "sealed Value family" declaration used only by tooling, so the observable
+   environment checks exhaustiveness, not the evaluator.
+3. Pattern syntax that *desugars to sends*, so dispatch stays inspectable. This
+   needs patterns as first-class values.
+
+Revisit after the compiler/VM front half (resolved AST), since pattern bindings would
+flow through the same resolver.

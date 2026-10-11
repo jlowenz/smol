@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_helpers::{
-    assert_signal_contains, eval, eval_diff, eval_err, eval_err_diff, signal_message,
+    assert_signal_contains, eval, eval_diff, eval_err, eval_err_diff, eval_programs, signal_message,
 };
 
 #[test]
@@ -62,7 +62,7 @@ fn while_true() {
 
 #[test]
 fn assignment_and_variable() {
-    assert_eq!(eval_diff("x := 42. x"), Value::Int(42));
+    assert_eq!(eval_diff("| x | x := 42. x"), Value::Int(42));
 }
 
 #[test]
@@ -932,7 +932,7 @@ oc inject: 0 into: [:acc :e | acc + e]
 
 #[test]
 fn block_with_locals() {
-    let prog = "b := [:i | | a | a := 42. a := a + i. a]. (b value: 42) asString.";
+    let prog = "| b | b := [:i | | a sum | a := 42. sum := a + i. sum]. (b value: 42) asString.";
     assert_eq!(eval_diff(prog), Value::Str(Arc::from("84")));
 }
 
@@ -2181,9 +2181,9 @@ fn invoke_restart_delivers_value_via_resume() {
 | hc |
 hc := HandlerContext new on: Error do: [:e | e invokeRestart: #useDefault].
 hc run: [
-    | e |
-    e := Error new.
-    e := e addRestart: #useDefault block: [:c | 'fallback'].
+    | base e |
+    base := Error new.
+    e := base addRestart: #useDefault block: [:c | 'fallback'].
     e signal
 ]
 "#;
@@ -2197,9 +2197,9 @@ fn invoke_restart_with_passes_arg() {
 | hc |
 hc := HandlerContext new on: Error do: [:e | e invokeRestart: #useValue: with: 99].
 hc run: [
-    | e |
-    e := Error new.
-    e := e addRestart: #useValue: block: [:c :v | v].
+    | base e |
+    base := Error new.
+    e := base addRestart: #useValue: block: [:c :v | v].
     e signal
 ]
 "#;
@@ -2215,9 +2215,9 @@ fn invoke_restart_control_restart_unwinds_via_return() {
 | hc |
 hc := HandlerContext new on: Error do: [:e | e invokeRestart: #abort].
 hc run: [
-    | e |
-    e := Error new.
-    e := e addRestart: #abort block: [:c | c return: 'aborted'].
+    | base e |
+    base := Error new.
+    e := base addRestart: #abort block: [:c | c return: 'aborted'].
     e signal.
     'unreachable'
 ]
@@ -2232,9 +2232,9 @@ fn invoke_restart_block_receives_condition() {
 | hc |
 hc := HandlerContext new on: Error do: [:e | e invokeRestart: #echo].
 hc run: [
-    | e |
-    e := Error withMessage: 'boom'.
-    e := e addRestart: #echo block: [:c | c message].
+    | base e |
+    base := Error withMessage: 'boom'.
+    e := base addRestart: #echo block: [:c | c message].
     e signal
 ]
 "#;
@@ -4457,4 +4457,60 @@ Clobber new clobber
         matches!(&err, EvalError::TypeError(m) if m.contains("undeclared variable `Object`")),
         "got {err:?}"
     );
+}
+
+// ── Workspace scope rules (env-frame redesign d2b, §11.7b) ───────────────────
+
+fn assert_type_error_contains(r: Result<Value, EvalError>, needle: &str) {
+    match r {
+        Err(EvalError::TypeError(m)) => assert!(m.contains(needle), "got {m:?}"),
+        other => panic!("expected TypeError containing {needle:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn toplevel_reassignment_is_rejected() {
+    let r = eval_programs(&["| x | x := 1. x := 2. x"]).remove(0);
+    assert_type_error_contains(r, "cannot reassign local `x`");
+}
+
+#[test]
+fn toplevel_undeclared_assignment_is_rejected() {
+    let r = eval_programs(&["x := 42. x"]).remove(0);
+    assert_type_error_contains(r, "undeclared variable `x`");
+}
+
+#[test]
+fn toplevel_block_local_reassignment_is_rejected() {
+    // Top-level blocks are checked with their program, not only at method install.
+    let r = eval_programs(&["| b | b := [| a | a := 1. a := 2. a]. b value"]).remove(0);
+    assert_type_error_contains(r, "cannot reassign local `a`");
+}
+
+#[test]
+fn program_is_checked_before_any_statement_runs() {
+    // The division would fail at run time; the static violation is reported instead.
+    let r = eval_programs(&["| x | 1 / 0. x := 1. x := 2"]).remove(0);
+    assert_type_error_contains(r, "cannot reassign local `x`");
+}
+
+#[test]
+fn later_program_cannot_assign_earlier_programs_temp() {
+    let mut rs = eval_programs(&["| x | x := 1. x", "x := 2. x"]);
+    assert_eq!(rs.remove(0).unwrap(), Value::Int(1));
+    assert_type_error_contains(rs.remove(0), "undeclared variable `x`");
+}
+
+#[test]
+fn later_program_reads_earlier_programs_temp() {
+    let rs = eval_programs(&["| x | x := 1. x", "x + 1"]);
+    assert_eq!(rs[1].as_ref().unwrap(), &Value::Int(2));
+}
+
+#[test]
+fn later_program_redeclaration_shadows() {
+    // Each program is a nested scope: redeclaring `| x |` is a fresh binding.
+    let rs = eval_programs(&["| x | x := 1. x", "| x | x := 2. x", "x"]);
+    assert_eq!(rs[1].as_ref().unwrap(), &Value::Int(2));
+    assert_eq!(rs[2].as_ref().unwrap(), &Value::Int(2));
 }

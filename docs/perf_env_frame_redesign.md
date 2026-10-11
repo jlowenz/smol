@@ -593,6 +593,20 @@ already-bound workspace temp is a second assignment, so it is an error.
   per program, runtime across REPL programs), SSA check extended to top-level blocks.
   Fix the 7 violating tests: rewrite them as new bindings, or keep the 2 undeclared
   ones as declaration-required error tests.
+  **Landed (2026-10-11).** Rule as implemented: *a program may assign only the
+  temps it declares* (the block rule, applied to programs). `eval_program` checks this,
+  plus single-assignment for the program and every nested block, before running any
+  statement. So "bare `x := …` against an earlier program's temp" is rejected
+  statically, as undeclared in this program, with no runtime tracking needed. The
+  top-level create-on-assign path and `Env::update_or_define` are removed. The 6
+  violating tests were rewritten as new bindings, and 7 rule tests were added
+  (including multi-program REPL cases via `test_helpers::eval_programs`).
+  **Deferred to d2c:** capture-before-assignment at top level (it needs the resolved
+  capture plan), and snapshot semantics for top-level blocks. Until then a top-level
+  block reads workspace temps live, so after a later program redeclares `x`, an
+  earlier program's block sees the new `x`.
+  Perf note for P2.1e: `alloc_probe` measures ≈3.9–5.4 µs/send, the same on the
+  pre-d2a commit, so the gap from the August ~1.2 µs/send figure predates d2.
 - **d2c — Workspace representation.** The top-level scope is resolved like any scope.
   Top-level blocks snapshot workspace temps. Other top-level names go through active
   namespace → Globals. `Namespace do:` bindings move to the active-namespace lookup.

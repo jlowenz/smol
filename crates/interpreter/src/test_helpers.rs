@@ -63,6 +63,32 @@ pub(crate) fn eval(src: &str) -> Value {
     rx.recv().expect("eval coroutine panicked")
 }
 
+/// Evaluate each source in `srcs` as a separate top-level program on one evaluator
+/// and one workspace env — the REPL shape. Each program's outcome is returned in
+/// order (futures resolved); a failing program does not stop later ones.
+///
+/// Requires: every source parses.
+pub(crate) fn eval_programs(srcs: &[&str]) -> Vec<Result<Value, EvalError>> {
+    let srcs: Vec<String> = srcs.iter().map(|s| s.to_string()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::entity::init_coroutine_stack();
+    let _ = may::go_with!(TEST_COROUTINE_STACK, move || {
+        let ev = Evaluator::new();
+        let mut env = Env::new();
+        ev.registry.populate_env(&mut env);
+        let results = srcs
+            .iter()
+            .map(|src| {
+                let prog = Parser::parse(src).expect("parse");
+                ev.eval_program(&prog.stmts, &mut env).and_then(resolve)
+            })
+            .collect();
+        ev.shutdown();
+        tx.send(results).unwrap();
+    });
+    rx.recv().expect("eval_programs coroutine panicked")
+}
+
 /// Evaluate `src` with coverage enabled on the evaluator's registry; return the
 /// set of statement spans recorded as executed by the user program (coverage is
 /// enabled *after* `Evaluator::new()`, so kernel-load execution is excluded).

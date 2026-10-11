@@ -151,28 +151,6 @@ impl Env {
             .unwrap()
             .insert(name, value);
     }
-
-    /// Update the first existing binding found (innermost to outermost), or define
-    /// in the innermost frame if no binding exists. Takes ownership of both
-    /// arguments to avoid extra clones at call sites.
-    ///
-    /// Ensures: `name` is bound to `value` in the shallowest frame where it
-    ///   already existed, or in the innermost frame if it did not exist.
-    pub fn update_or_define(&mut self, name: Arc<str>, value: Value) {
-        for frame in self.frames.iter().rev() {
-            let mut map = frame.lock().unwrap();
-            if map.contains_key(name.as_ref()) {
-                map.insert(name, value);
-                return;
-            }
-        }
-        self.frames
-            .last()
-            .expect("no frames")
-            .lock()
-            .unwrap()
-            .insert(name, value);
-    }
 }
 
 #[cfg(test)]
