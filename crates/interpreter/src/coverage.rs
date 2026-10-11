@@ -14,7 +14,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
-use crate::ast::{Expr, Message, Program, Stmt, TaggedStmt};
+use crate::ast::{Chunk, Expr, Message, Stmt, TaggedStmt};
 use crate::span::Span;
 
 /// Accumulates the spans of statements executed during a run.
@@ -52,7 +52,7 @@ impl CoverageCollector {
 
 /// Every statement span in `prog`, in source order — the denominator for a
 /// coverage report. Recurses into method bodies and nested block bodies.
-pub fn collect_stmt_spans(prog: &Program) -> Vec<Span> {
+pub fn collect_stmt_spans(prog: &Chunk) -> Vec<Span> {
     let mut out = Vec::new();
     collect_stmts(&prog.stmts, &mut out);
     out
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn records_executed_statement_spans() {
-        // With coverage enabled, running a program records the spans of the
+        // With coverage enabled, running a chunk records the spans of the
         // statements it executed — proves the `dispatch_stmt` hook fires.
         let touched = eval_coverage("| x | x := 3. x + 4");
         assert!(
@@ -304,7 +304,7 @@ mod tests {
         );
         assert!(
             report.covered < report.total,
-            "a tiny program should not cover the whole kernel"
+            "a tiny chunk should not cover the whole kernel"
         );
     }
 

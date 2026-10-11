@@ -1,8 +1,8 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use interpreter::env::Env;
 use interpreter::eval::Evaluator;
 use interpreter::parser::Parser;
+use interpreter::workspace::Workspace;
 
 fn bench_parse_and_eval(c: &mut Criterion) {
     let ev = Evaluator::new();
@@ -14,8 +14,8 @@ fn bench_parse_and_eval(c: &mut Criterion) {
         let src = "1000 timesRepeat: [1 + 1]";
         b.iter(|| {
             let prog = Parser::parse(src).unwrap();
-            let mut env = Env::new();
-            ev.eval_program(&prog.stmts, &mut env).unwrap()
+            let mut workspace = Workspace::new(&ev);
+            ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
 
@@ -29,15 +29,14 @@ Integer >> pvtFibA: a b: b [ self = 0 ifTrue: [ ^a ]. ^(self - 1) pvtFibA: b b: 
 Integer >> fib [ ^self pvtFibA: 0 b: 1 ]
 ";
         let setup_prog = Parser::parse(setup_src).unwrap();
-        let mut setup_env = Env::new();
-        ev.registry.populate_env(&mut setup_env);
-        ev.eval_program(&setup_prog.stmts, &mut setup_env).unwrap();
+        let mut setup_workspace = Workspace::new(&ev);
+        ev.eval_chunk(&setup_prog, &mut setup_workspace).unwrap();
 
         let src = "20 fib";
         b.iter(|| {
             let prog = Parser::parse(src).unwrap();
-            let mut env = Env::new();
-            ev.eval_program(&prog.stmts, &mut env).unwrap()
+            let mut workspace = Workspace::new(&ev);
+            ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
 }
@@ -54,16 +53,16 @@ fn bench_loops(c: &mut Criterion) {
     c.bench_function("to:do: 100000", |b| {
         let prog = Parser::parse("0 to: 100000 do: [:i | i]").unwrap();
         b.iter(|| {
-            let mut env = Env::new();
-            ev.eval_program(&prog.stmts, &mut env).unwrap()
+            let mut workspace = Workspace::new(&ev);
+            ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
 
     c.bench_function("to:by:do: 100000", |b| {
         let prog = Parser::parse("0 to: 200000 by: 2 do: [:i | i]").unwrap();
         b.iter(|| {
-            let mut env = Env::new();
-            ev.eval_program(&prog.stmts, &mut env).unwrap()
+            let mut workspace = Workspace::new(&ev);
+            ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
 
@@ -72,17 +71,16 @@ fn bench_loops(c: &mut Criterion) {
     c.bench_function("nested to:do: 300x300", |b| {
         let prog = Parser::parse("0 to: 300 do: [:i | 0 to: 300 do: [:j | j]]").unwrap();
         b.iter(|| {
-            let mut env = Env::new();
-            ev.eval_program(&prog.stmts, &mut env).unwrap()
+            let mut workspace = Workspace::new(&ev);
+            ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
 
     c.bench_function("array do: 10000", |b| {
         let prog = Parser::parse("| a | a := Array new: 10000. a do: [:x | x]").unwrap();
         b.iter(|| {
-            let mut env = Env::new();
-            ev.registry.populate_env(&mut env);
-            ev.eval_program(&prog.stmts, &mut env).unwrap()
+            let mut workspace = Workspace::new(&ev);
+            ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
 
@@ -100,9 +98,8 @@ fn bench_loops(c: &mut Criterion) {
 h get value";
         let prog = Parser::parse(src).unwrap();
         b.iter(|| {
-            let mut env = Env::new();
-            ev.registry.populate_env(&mut env);
-            ev.eval_program(&prog.stmts, &mut env).unwrap()
+            let mut workspace = Workspace::new(&ev);
+            ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
 }
@@ -117,18 +114,16 @@ Counter >> increment [ count := count + 1 ]
 Counter >> count [ ^count ]
 ";
     let setup_prog = Parser::parse(setup_src).unwrap();
-    let mut setup_env = Env::new();
-    ev.registry.populate_env(&mut setup_env);
-    ev.eval_program(&setup_prog.stmts, &mut setup_env).unwrap();
+    let mut setup_workspace = Workspace::new(&ev);
+    ev.eval_chunk(&setup_prog, &mut setup_workspace).unwrap();
 
     // Object creation: 1000 allocations + initialize per iteration.
     c.bench_function("object new 1000", |b| {
         let src = "1000 timesRepeat: [Counter new]";
         let prog = Parser::parse(src).unwrap();
         b.iter(|| {
-            let mut env = Env::new();
-            ev.registry.populate_env(&mut env);
-            ev.eval_program(&prog.stmts, &mut env).unwrap()
+            let mut workspace = Workspace::new(&ev);
+            ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
 
@@ -137,9 +132,8 @@ Counter >> count [ ^count ]
         let src = "| c | c := Counter new. 1000 timesRepeat: [c increment]. c count";
         let prog = Parser::parse(src).unwrap();
         b.iter(|| {
-            let mut env = Env::new();
-            ev.registry.populate_env(&mut env);
-            ev.eval_program(&prog.stmts, &mut env).unwrap()
+            let mut workspace = Workspace::new(&ev);
+            ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
 }

@@ -1,7 +1,7 @@
-use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
 use crate::parser::Parser;
 use crate::value::Value;
+use crate::workspace::Workspace;
 
 /// Stack size for test-helper coroutines in words (× `size_of::<usize>()`).
 ///
@@ -45,7 +45,7 @@ fn resolve(v: Value) -> Result<Value, EvalError> {
 
 /// Evaluate Smol source using the iterative evaluator only.
 ///
-/// Requires: `src` is valid Smol; program must not error.
+/// Requires: `src` is valid Smol; chunk must not error.
 pub(crate) fn eval(src: &str) -> Value {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -53,9 +53,8 @@ pub(crate) fn eval(src: &str) -> Value {
     let _ = may::go_with!(TEST_COROUTINE_STACK, move || {
         let prog = Parser::parse(&src).expect("parse");
         let ev = Evaluator::new();
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
-        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        let mut workspace = Workspace::new(&ev);
+        let v = ev.eval_chunk(&prog, &mut workspace).expect("eval");
         let v = resolve(v).expect("eval future resolution");
         ev.shutdown();
         tx.send(v).unwrap();
@@ -63,37 +62,36 @@ pub(crate) fn eval(src: &str) -> Value {
     rx.recv().expect("eval coroutine panicked")
 }
 
-/// Evaluate each source in `srcs` as a separate top-level program on one evaluator
-/// and one workspace env — the REPL shape. Each program's outcome is returned in
-/// order (futures resolved); a failing program does not stop later ones.
+/// Evaluate each source in `srcs` as a separate top-level chunk on one evaluator
+/// and one workspace env — the REPL shape. Each chunk's outcome is returned in
+/// order (futures resolved); a failing chunk does not stop later ones.
 ///
 /// Requires: every source parses.
-pub(crate) fn eval_programs(srcs: &[&str]) -> Vec<Result<Value, EvalError>> {
+pub(crate) fn eval_chunks(srcs: &[&str]) -> Vec<Result<Value, EvalError>> {
     let srcs: Vec<String> = srcs.iter().map(|s| s.to_string()).collect();
     let (tx, rx) = std::sync::mpsc::channel();
     crate::entity::init_coroutine_stack();
     let _ = may::go_with!(TEST_COROUTINE_STACK, move || {
         let ev = Evaluator::new();
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
+        let mut workspace = Workspace::new(&ev);
         let results = srcs
             .iter()
             .map(|src| {
                 let prog = Parser::parse(src).expect("parse");
-                ev.eval_program(&prog.stmts, &mut env).and_then(resolve)
+                ev.eval_chunk(&prog, &mut workspace).and_then(resolve)
             })
             .collect();
         ev.shutdown();
         tx.send(results).unwrap();
     });
-    rx.recv().expect("eval_programs coroutine panicked")
+    rx.recv().expect("eval_chunks coroutine panicked")
 }
 
 /// Evaluate `src` with coverage enabled on the evaluator's registry; return the
-/// set of statement spans recorded as executed by the user program (coverage is
+/// set of statement spans recorded as executed by the user chunk (coverage is
 /// enabled *after* `Evaluator::new()`, so kernel-load execution is excluded).
 ///
-/// Requires: `src` is valid Smol; program must not error.
+/// Requires: `src` is valid Smol; chunk must not error.
 pub(crate) fn eval_coverage(src: &str) -> std::collections::HashSet<crate::span::Span> {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -102,9 +100,8 @@ pub(crate) fn eval_coverage(src: &str) -> std::collections::HashSet<crate::span:
         let prog = Parser::parse(&src).expect("parse");
         let ev = Evaluator::new();
         let cov = ev.registry.enable_coverage();
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
-        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        let mut workspace = Workspace::new(&ev);
+        let v = ev.eval_chunk(&prog, &mut workspace).expect("eval");
         let _ = resolve(v).expect("eval future resolution");
         let touched = cov.lock().touched().clone();
         ev.shutdown();
@@ -121,7 +118,7 @@ pub(crate) fn eval_coverage(src: &str) -> std::collections::HashSet<crate::span:
 /// `run:`). The generous stack lets the scenario complete so the depth can be
 /// recorded; it says nothing about whether the scenario fits in 256 KB.
 ///
-/// Requires: `src` is valid Smol; program must not error. The `step_probe`
+/// Requires: `src` is valid Smol; chunk must not error. The `step_probe`
 ///   feature must be enabled.
 /// Ensures: returns `ProbeResult` with the result value and the recorded marks.
 #[cfg(feature = "step_probe")]
@@ -146,10 +143,9 @@ pub(crate) fn eval_probe(src: &str) -> ProbeResult {
     let _ = may::go_with!(BIG_STACK, move || {
         let prog = Parser::parse(&src).expect("parse");
         let ev = Evaluator::new();
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
+        let mut workspace = Workspace::new(&ev);
         ev.probe.reset();
-        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        let v = ev.eval_chunk(&prog, &mut workspace).expect("eval");
         let v = resolve(v).expect("eval future resolution");
         // Read the probe marks from this evaluator before shutdown.
         let result = ProbeResult {
@@ -168,7 +164,7 @@ pub(crate) fn eval_probe(src: &str) -> ProbeResult {
 
 /// Evaluate Smol source using the iterative evaluator and return the error.
 ///
-/// Requires: `src` is valid Smol; program must produce an error.
+/// Requires: `src` is valid Smol; chunk must produce an error.
 pub(crate) fn eval_err(src: &str) -> EvalError {
     let src = src.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -176,9 +172,8 @@ pub(crate) fn eval_err(src: &str) -> EvalError {
     let _ = may::go_with!(TEST_COROUTINE_STACK, move || {
         let prog = Parser::parse(&src).expect("parse");
         let ev = Evaluator::new();
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
-        let err = match ev.eval_program(&prog.stmts, &mut env) {
+        let mut workspace = Workspace::new(&ev);
+        let err = match ev.eval_chunk(&prog, &mut workspace) {
             Err(e) => e,
             Ok(v) => match resolve(v) {
                 Err(e) => e,
@@ -198,7 +193,7 @@ pub(crate) fn eval_err(src: &str) -> EvalError {
 /// iterative evaluator anyway, so the cross-check was largely illusory). Retained
 /// as an alias of [`eval`] so existing call sites need not change.
 ///
-/// Requires: `src` is valid Smol; program must not error.
+/// Requires: `src` is valid Smol; chunk must not error.
 pub(crate) fn eval_diff(src: &str) -> Value {
     eval(src)
 }
@@ -208,7 +203,7 @@ pub(crate) fn eval_diff(src: &str) -> Value {
 /// Alias of [`eval_err`] after the recursive evaluator's retirement (see
 /// [`eval_diff`]).
 ///
-/// Requires: `src` is valid Smol; program must produce an error.
+/// Requires: `src` is valid Smol; chunk must produce an error.
 pub(crate) fn eval_err_diff(src: &str) -> EvalError {
     eval_err(src)
 }

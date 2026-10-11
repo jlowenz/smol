@@ -19,6 +19,7 @@ use crate::object::{IndexedStorage, Object};
 use crate::os_interface::{DefaultOsInterface, OsInterface};
 use crate::parser::Parser;
 use crate::value::{Block, Value};
+use crate::workspace::Workspace;
 
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum EvalError {
@@ -244,17 +245,16 @@ impl Evaluator {
     /// Create an evaluator and load `kernel.smol`, defining `Array`, `ByteArray`,
     /// and `OrderedCollection` in the Kernel namespace.
     ///
-    /// Ensures: after construction, `ev.registry.populate_env(&mut env)` exposes
-    ///   all kernel classes in `env`. A broken `kernel.smol` is a programmer error
+    /// Ensures: after construction, a `Workspace::new(&ev)` sees every kernel
+    ///   class. A broken `kernel.smol` is a programmer error
     ///   and panics immediately.
     pub fn new() -> Self {
         let ev = Self::new_without_kernel();
-        let mut bootstrap_env = Env::new();
-        ev.registry.populate_env(&mut bootstrap_env);
+        let mut kernel_workspace = Workspace::new(&ev);
         let src = include_str!("kernel.smol");
-        let prog = Parser::parse_source(crate::span::SourceId::KERNEL, src)
+        let chunk = Parser::parse_source(crate::span::SourceId::KERNEL, src)
             .expect("kernel.smol: parse error");
-        ev.eval_program(&prog.stmts, &mut bootstrap_env)
+        ev.eval_chunk(&chunk, &mut kernel_workspace)
             .expect("kernel.smol: eval error");
         ev
     }
@@ -675,9 +675,9 @@ impl Evaluator {
                 "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
             )));
         }
-        // Top-level (REPL/script) scope: `eval_program` has already rejected any
-        // assignment to a name the program does not declare, and declared temps
-        // are bound (to `Nil`) before the program runs — so the binding exists.
+        // Top-level (REPL/script) scope: `eval_chunk` has already rejected any
+        // assignment to a name the chunk does not declare, and declared temps
+        // are bound (to `Nil`) before the chunk runs — so the binding exists.
         let ret = value.clone();
         if env.set(name.as_ref(), value) {
             return Ok(ret);
@@ -700,22 +700,23 @@ impl Evaluator {
         }
     }
 
-    /// Evaluate a top-level program (a script, or one REPL input) in `env`, via
+    /// Evaluate a top-level chunk (a script, or one REPL input) in `workspace`, via
     /// the step-loop evaluator.
     ///
-    /// A program is a scope nested in the workspace (env-frame redesign §11.7b):
-    /// its `| ... |` temps are fresh bindings (shadowing any earlier program's
-    /// same-named temps), bound once, and the program may assign only the temps it
+    /// A chunk is a scope nested in the workspace (env-frame redesign §11.7b):
+    /// its `| ... |` temps are fresh bindings (shadowing any earlier chunk's
+    /// same-named temps), bound once, and the chunk may assign only the temps it
     /// declares itself.
     ///
-    /// Requires: `env` has at least one live frame.
-    /// Ensures: if any temp — of the program or of a block within it — is assigned
-    ///   more than once, or the program assigns a name it does not declare,
+    /// Ensures: if any temp — of the chunk or of a block within it — is assigned
+    ///   more than once, or the chunk assigns a name it does not declare,
     ///   returns `Err(EvalError::TypeError)` before executing any statement.
     ///   Otherwise returns the value of the last statement, or `Value::Nil` if
     ///   `stmts` is empty. `EvalError::Return` propagates to the caller.
-    pub fn eval_program(&self, stmts: &[TaggedStmt], env: &mut Env) -> Result<Value, EvalError> {
-        check_program_assignments(stmts)?;
+    pub fn eval_chunk(&self, chunk: &Chunk, workspace: &mut Workspace) -> Result<Value, EvalError> {
+        let stmts = &chunk.stmts;
+        let env = workspace.env_mut();
+        check_chunk_assignments(stmts)?;
         for stmt in stmts {
             if let Stmt::LocalDecl(names) = &stmt.node {
                 for name in names {
@@ -723,7 +724,7 @@ impl Evaluator {
                 }
             }
         }
-        let frame = Cont::ProgramFrame {
+        let frame = Cont::ChunkFrame {
             pending: stmts.iter().cloned().collect(),
             env: env.clone(),
             saved_block_home: self.current_block_home.get(),
@@ -1082,12 +1083,12 @@ pub(crate) fn check_single_assignment_in_method(
     check_single_assignment_scope(declared, assigned, body)
 }
 
-/// Enforce the workspace scope rules for one top-level program (env-frame redesign
-/// §11.7b): single-assignment for the program's temps and every nested block's
-/// locals, and no assignment to a name the program does not declare.
+/// Enforce the workspace scope rules for one top-level chunk (env-frame redesign
+/// §11.7b): single-assignment for the chunk's temps and every nested block's
+/// locals, and no assignment to a name the chunk does not declare.
 ///
 /// Ensures: `Err(EvalError::TypeError)` on the first violation; otherwise `Ok(())`.
-fn check_program_assignments(stmts: &[TaggedStmt]) -> Result<(), EvalError> {
+fn check_chunk_assignments(stmts: &[TaggedStmt]) -> Result<(), EvalError> {
     let declared: HashSet<Arc<str>> = stmts
         .iter()
         .filter_map(|s| match &s.node {

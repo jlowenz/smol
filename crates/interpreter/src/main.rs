@@ -1,16 +1,14 @@
 use std::io::{self, BufRead, Write};
 
-use interpreter::env::Env;
 use interpreter::eval::Evaluator;
 use interpreter::parser::{ParseError, Parser};
+use interpreter::workspace::Workspace;
 
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let ev = Evaluator::new();
-    let mut env = Env::new();
-    // Populate class names (Object, etc.) into the global env.
-    ev.registry.populate_env(&mut env);
+    let mut workspace = Workspace::new(&ev);
 
     println!("smol 0.1.0");
     loop {
@@ -29,7 +27,7 @@ fn main() {
         loop {
             match Parser::parse(&src) {
                 Ok(prog) => {
-                    match ev.eval_program(&prog.stmts, &mut env) {
+                    match ev.eval_chunk(&prog, &mut workspace) {
                         Ok(val) => println!("{val}"),
                         Err(interpreter::eval::EvalError::Return(val, _)) => println!("{val}"),
                         Err(e) => println!("error: {e}"),

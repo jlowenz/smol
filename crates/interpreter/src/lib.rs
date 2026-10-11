@@ -26,3 +26,4 @@ pub mod span;
 pub mod store_bridge;
 pub mod traits;
 pub mod value;
+pub mod workspace;

@@ -1,4 +1,5 @@
 use crate::test_helpers::{eval, eval_diff};
+use crate::workspace::Workspace;
 
 use super::*;
 
@@ -287,20 +288,19 @@ fn nlr_with_failing_commit_faults_entity() {
     // via a full kernel evaluator so predicates and class infrastructure
     // are registered in the in-memory store normally.
     let base_ev = crate::eval::Evaluator::new();
-    let mut env = Env::new();
-    base_ev.registry.populate_env(&mut env);
+    let mut workspace = Workspace::new(&base_ev);
     let prog = crate::parser::Parser::parse(
         "Object subclass: #NLRFaultActor instanceVariableNames: 'ran'.",
     )
     .expect("parse");
     base_ev
-        .eval_program(&prog.stmts, &mut env)
+        .eval_chunk(&prog, &mut workspace)
         .expect("eval class");
     let prog2 =
         crate::parser::Parser::parse("NLRFaultActor >> run: aBlock [ ran := true. ^aBlock value ]")
             .expect("parse method");
     base_ev
-        .eval_program(&prog2.stmts, &mut env)
+        .eval_chunk(&prog2, &mut workspace)
         .expect("eval method");
 
     // Look up the class.
@@ -316,7 +316,7 @@ fn nlr_with_failing_commit_faults_entity() {
     let inst = spawn_entity_bare(
         class,
         base_ev.registry.clone(),
-        env.clone(),
+        Env::new(),
         None,
         Store::new(Arc::new(AlwaysFailingStore)),
     );
@@ -413,8 +413,7 @@ fn type_error_crash_drains_queued_mailbox() {
     crate::entity::init_coroutine_stack();
 
     let ev = crate::eval::Evaluator::new();
-    let mut env = Env::new();
-    ev.registry.populate_env(&mut env);
+    let mut workspace = Workspace::new(&ev);
 
     let prog = crate::parser::Parser::parse(
         "Object subclass: #DrainTypeErrorActor instanceVariableNames: ''.
@@ -422,7 +421,7 @@ fn type_error_crash_drains_queued_mailbox() {
          DrainTypeErrorActor >> noop [ ^nil ]",
     )
     .expect("parse");
-    ev.eval_program(&prog.stmts, &mut env).expect("eval");
+    ev.eval_chunk(&prog, &mut workspace).expect("eval");
 
     let class = ev
         .registry
@@ -436,7 +435,7 @@ fn type_error_crash_drains_queued_mailbox() {
     let inst = spawn_entity_bare(
         class,
         ev.registry.clone(),
-        env.clone(),
+        Env::new(),
         None,
         Store::in_memory(),
     );
@@ -527,9 +526,8 @@ fn entity_stack_depth_probe() {
     let (tx, rx) = std::sync::mpsc::channel::<Value>();
     may::go!(move || {
         let ev = crate::eval::Evaluator::with_registry(registry);
-        let mut env = crate::env::Env::new();
-        ev.registry.populate_env(&mut env);
-        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        let mut workspace = Workspace::new(&ev);
+        let v = ev.eval_chunk(&prog, &mut workspace).expect("eval");
         tx.send(v).unwrap();
     });
     assert_eq!(rx.recv().unwrap(), Value::Int(210));
@@ -550,9 +548,8 @@ fn run_in_coroutine(src: &str) -> Value {
     let (tx, rx) = std::sync::mpsc::channel::<Value>();
     may::go!(move || {
         let ev = crate::eval::Evaluator::with_registry(registry);
-        let mut env = crate::env::Env::new();
-        ev.registry.populate_env(&mut env);
-        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        let mut workspace = Workspace::new(&ev);
+        let v = ev.eval_chunk(&prog, &mut workspace).expect("eval");
         tx.send(v).unwrap();
     });
     rx.recv().unwrap()
@@ -587,9 +584,8 @@ fn tcp_server_serves_one_request_roundtrip() {
     let (tx, rx) = std::sync::mpsc::channel::<Value>();
     may::go!(move || {
         let ev = crate::eval::Evaluator::with_registry(registry);
-        let mut env = crate::env::Env::new();
-        ev.registry.populate_env(&mut env);
-        let v = ev.eval_program(&prog.stmts, &mut env).expect("server eval");
+        let mut workspace = Workspace::new(&ev);
+        let v = ev.eval_chunk(&prog, &mut workspace).expect("server eval");
         tx.send(v).unwrap();
     });
 
@@ -1221,9 +1217,8 @@ fn atomic_transfer_commits_both_participants_under_one_tx_id() {
     let (tx, rx) = std::sync::mpsc::channel::<Value>();
     may::go!(move || {
         let ev = crate::eval::Evaluator::with_registry(registry);
-        let mut env = crate::env::Env::new();
-        ev.registry.populate_env(&mut env);
-        let v = ev.eval_program(&prog.stmts, &mut env).expect("eval");
+        let mut workspace = Workspace::new(&ev);
+        let v = ev.eval_chunk(&prog, &mut workspace).expect("eval");
         tx.send(v).unwrap();
     });
     rx.recv().unwrap();

@@ -274,15 +274,15 @@ pub(crate) enum Cont {
         sync: bool,
     },
 
-    /// The top-level program frame pushed by `eval_program`.
+    /// The top-level chunk frame pushed by `eval_chunk`.
     ///
-    /// Unlike method/block frames it does not own an env frame (`eval_program`
+    /// Unlike method/block frames it does not own an env frame (`eval_chunk`
     /// evaluates in the caller's env) and pushes no self binding, so teardown
     /// only restores `current_block_home`. Answers its last expression's value.
-    ProgramFrame {
+    ChunkFrame {
         /// Remaining statements to run.
         pending: VecDeque<TaggedStmt>,
-        /// Program environment (not `push_frame`d; not popped on teardown).
+        /// Chunk environment (not `push_frame`d; not popped on teardown).
         env: Env,
         /// `current_block_home` before this frame; restored on teardown.
         saved_block_home: Option<usize>,
@@ -430,10 +430,10 @@ fn release_frame(
 /// Run the evaluator-side teardown for a popped frame continuation.
 ///
 /// Requires: `frame` was just popped from the step-loop stack.
-/// Ensures: if `frame` is a `MethodFrame` / `BlockFrame` / `ProgramFrame`, its
+/// Ensures: if `frame` is a `MethodFrame` / `BlockFrame` / `ChunkFrame`, its
 ///   self binding (if any) is popped, `current_block_home` is restored, and its
 ///   owned env frame (if any) is popped; returns `Some(depth)` where `depth` is
-///   the frame's `^`-return match depth (`0` for block/program frames). For any
+///   the frame's `^`-return match depth (`0` for block/chunk frames). For any
 ///   other continuation `frame` is dropped and `None` is returned.
 fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
     match frame {
@@ -455,7 +455,7 @@ fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
             release_frame(ev, &mut env, saved_block_home, pushed_self);
             Some(0)
         }
-        Cont::ProgramFrame {
+        Cont::ChunkFrame {
             saved_block_home, ..
         } => {
             ev.current_block_home.set(saved_block_home);
@@ -902,13 +902,13 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
                 )?;
             }
 
-            // ── ProgramFrame dispatch ─────────────────────────────────────
-            Cont::ProgramFrame {
+            // ── ChunkFrame dispatch ─────────────────────────────────────
+            Cont::ChunkFrame {
                 pending,
                 env,
                 saved_block_home,
             } => {
-                handle_program_frame(ev, pending, env, saved_block_home, &mut stack, &mut acc)?;
+                handle_chunk_frame(ev, pending, env, saved_block_home, &mut stack, &mut acc)?;
             }
 
             // ── ForceAcc ──────────────────────────────────────────────────
@@ -1169,9 +1169,9 @@ fn handle_block_frame(
     Ok(())
 }
 
-/// `Cont::ProgramFrame` handler — see the variant docs. Extracted `#[inline(never)]`.
+/// `Cont::ChunkFrame` handler — see the variant docs. Extracted `#[inline(never)]`.
 #[inline(never)]
-fn handle_program_frame(
+fn handle_chunk_frame(
     ev: &Evaluator,
     mut pending: VecDeque<TaggedStmt>,
     env: Env,
@@ -1185,7 +1185,7 @@ fn handle_program_frame(
         // acc stays as the last expression result.
     } else {
         let stmt = pending.pop_front().unwrap();
-        stack.push(Cont::ProgramFrame {
+        stack.push(Cont::ChunkFrame {
             pending,
             env: env.clone(),
             saved_block_home,
@@ -1528,11 +1528,11 @@ pub(crate) fn push_block_frame(
     Ok(())
 }
 
-/// `true` if the top of `stack` is an empty `BlockFrame` or `ProgramFrame`.
+/// `true` if the top of `stack` is an empty `BlockFrame` or `ChunkFrame`.
 fn top_is_empty_nonmethod(stack: &[Cont]) -> bool {
     matches!(
         stack.last(),
-        Some(Cont::BlockFrame { pending, .. } | Cont::ProgramFrame { pending, .. })
+        Some(Cont::BlockFrame { pending, .. } | Cont::ChunkFrame { pending, .. })
             if pending.is_empty()
     )
 }
@@ -1541,37 +1541,37 @@ fn top_is_empty_nonmethod(stack: &[Cont]) -> bool {
 ///
 /// Requires: none (safe to call on any stack state; no-op if no pattern matches).
 /// Ensures:
-///   (1) All empty block/program frames at the top are drained (teardown run).
+///   (1) All empty block/chunk frames at the top are drained (teardown run).
 ///   (2) If the top is then `ReturnUnwind(D)` and, scanning past any further empty
-///       block/program frames, the next is an empty `MethodFrame` at depth D, the
+///       block/chunk frames, the next is an empty `MethodFrame` at depth D, the
 ///       entire sequence (ReturnUnwind + intervening frames + method frame) is drained.
 ///   (3) Steps (1)–(2) repeat until no further pattern applies.
-///   Safe: empty block/program frames return `acc` unchanged; `ReturnUnwind(D)` would
+///   Safe: empty block/chunk frames return `acc` unchanged; `ReturnUnwind(D)` would
 ///   have overridden the method's implicit self-return with the same value the new
 ///   callee will produce.
 fn drain_tail_frames(ev: &Evaluator, stack: &mut Vec<Cont>) {
     loop {
-        // Phase 1: drain leading empty block/program frames.
+        // Phase 1: drain leading empty block/chunk frames.
         while top_is_empty_nonmethod(stack) {
             let frame = stack.pop().unwrap();
             teardown_frame(ev, frame);
         }
 
-        // Phase 2: check for ReturnUnwind(D) followed (past empty block/program
+        // Phase 2: check for ReturnUnwind(D) followed (past empty block/chunk
         // frames) by an empty MethodFrame at depth D.
         let target = match stack.last() {
             Some(Cont::ReturnUnwind { target_depth }) => *target_depth,
             _ => break,
         };
 
-        // Scan downward past empty block/program frames to find the matching method frame.
+        // Scan downward past empty block/chunk frames to find the matching method frame.
         let mut scan_idx = stack.len().checked_sub(2);
         let mut intermediate = 0usize;
         let found_method = loop {
             match scan_idx {
                 None => break false,
                 Some(idx) => match stack.get(idx) {
-                    Some(Cont::BlockFrame { pending, .. } | Cont::ProgramFrame { pending, .. })
+                    Some(Cont::BlockFrame { pending, .. } | Cont::ChunkFrame { pending, .. })
                         if pending.is_empty() =>
                     {
                         intermediate += 1;
@@ -1651,7 +1651,7 @@ pub(crate) fn push_method_frame(
         base_env.define(local.clone(), Value::Nil);
         slots.push(Value::Nil);
     }
-    // Pre-bind LocalDecl names (eval_program pre-binding equivalent).
+    // Pre-bind LocalDecl names (eval_chunk pre-binding equivalent).
     for stmt in &method.body {
         if let Stmt::LocalDecl(names) = &stmt.node {
             for name in names {

@@ -1,6 +1,6 @@
 use super::*;
 
-fn parse(src: &str) -> Program {
+fn parse(src: &str) -> Chunk {
     Parser::parse(src).expect("parse error")
 }
 

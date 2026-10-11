@@ -31,41 +31,38 @@
 
 use std::time::Instant;
 
-use interpreter::ast::Program;
-use interpreter::env::Env;
+use interpreter::ast::Chunk;
 use interpreter::eval::Evaluator;
 use interpreter::parser::Parser;
+use interpreter::workspace::Workspace;
 
-fn parse(src: &str) -> Program {
+fn parse(src: &str) -> Chunk {
     Parser::parse(src).unwrap_or_else(|e| panic!("parse failed for {src:?}: {e:?}"))
 }
 
-/// Averaged wall-clock ns for one `eval_program` run of `prog`, over `reps`.
-/// A fresh env + `populate_env` is included in every run (as in the benches),
+/// Averaged wall-clock ns for one `eval_chunk` run of `prog`, over `reps`.
+/// A fresh `Workspace` is included in every run (as in the benches),
 /// but it is a per-run constant that cancels in the differential.
-fn eval_ns(ev: &Evaluator, prog: &Program, reps: u32) -> f64 {
+fn eval_ns(ev: &Evaluator, prog: &Chunk, reps: u32) -> f64 {
     for _ in 0..3 {
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
-        ev.eval_program(&prog.stmts, &mut env).unwrap();
+        let mut workspace = Workspace::new(ev);
+        ev.eval_chunk(prog, &mut workspace).unwrap();
     }
     let start = Instant::now();
     for _ in 0..reps {
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
-        ev.eval_program(&prog.stmts, &mut env).unwrap();
+        let mut workspace = Workspace::new(ev);
+        ev.eval_chunk(prog, &mut workspace).unwrap();
     }
     start.elapsed().as_nanos() as f64 / reps as f64
 }
 
-/// Sends dispatched by one `eval_program` run of `prog` (fresh env, as in
+/// Sends dispatched by one `eval_chunk` run of `prog` (fresh workspace, as in
 /// `eval_ns`).
 #[cfg(feature = "send_count")]
-fn eval_sends(ev: &Evaluator, prog: &Program) -> u64 {
-    let mut env = Env::new();
-    ev.registry.populate_env(&mut env);
+fn eval_sends(ev: &Evaluator, prog: &Chunk) -> u64 {
+    let mut workspace = Workspace::new(ev);
     let before = ev.sends_dispatched();
-    ev.eval_program(&prog.stmts, &mut env).unwrap();
+    ev.eval_chunk(prog, &mut workspace).unwrap();
     ev.sends_dispatched() - before
 }
 
@@ -99,9 +96,8 @@ Integer >> pvtSpin [ self = 0 ifTrue: [ ^0 ]. ^(self - 1) pvtSpin ]
 Integer >> pvtFibA: a b: b [ self = 0 ifTrue: [ ^a ]. ^(self - 1) pvtFibA: b b: a + b ]
 Integer >> fib [ ^self pvtFibA: 0 b: 1 ]";
     let prog = parse(src);
-    let mut env = Env::new();
-    ev.registry.populate_env(&mut env);
-    ev.eval_program(&prog.stmts, &mut env).unwrap();
+    let mut workspace = Workspace::new(ev);
+    ev.eval_chunk(&prog, &mut workspace).unwrap();
 }
 
 fn main() {
@@ -114,9 +110,8 @@ fn main() {
         // pure method-activation hot path.
         let prog = parse("100000 pvtSpin");
         for _ in 0..8 {
-            let mut env = Env::new();
-            ev.registry.populate_env(&mut env);
-            ev.eval_program(&prog.stmts, &mut env).unwrap();
+            let mut workspace = Workspace::new(&ev);
+            ev.eval_chunk(&prog, &mut workspace).unwrap();
         }
         return;
     }

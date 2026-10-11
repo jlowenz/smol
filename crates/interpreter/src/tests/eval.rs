@@ -1,7 +1,8 @@
 use super::*;
 use crate::test_helpers::{
-    assert_signal_contains, eval, eval_diff, eval_err, eval_err_diff, eval_programs, signal_message,
+    assert_signal_contains, eval, eval_chunks, eval_diff, eval_err, eval_err_diff, signal_message,
 };
+use crate::workspace::Workspace;
 
 #[test]
 fn integer_arithmetic() {
@@ -265,13 +266,12 @@ fn non_kernel_class_scoped_to_namespace() {
     let ev = Evaluator::new();
     let my_lib = Arc::new(Namespace::new(Arc::from("MyLib"), None));
     ev.registry.register_namespace(my_lib);
-    let mut env = Env::new();
-    ev.registry.populate_env(&mut env);
+    let mut workspace = Workspace::new(&ev);
 
     // Inside MyLib do: [...], Widget is accessible by simple name.
     // Uses Value subclass: (frozen after _primNewValue: init block).
     let result = ev
-        .eval_program(
+        .eval_chunk(
             &Parser::parse(
                 r#"
 MyLib do: [
@@ -285,26 +285,23 @@ MyLib do: [
 ]
 "#,
             )
-            .expect("parse")
-            .stmts,
-            &mut env,
+            .expect("parse"),
+            &mut workspace,
         )
         .expect("eval");
     assert_eq!(result, Value::Int(42));
 
     // After the block, bare Widget is not in scope.
     let err = ev
-        .eval_program(&Parser::parse("Widget").expect("parse").stmts, &mut env)
+        .eval_chunk(&Parser::parse("Widget").expect("parse"), &mut workspace)
         .expect_err("Widget should be out of scope after do: block");
     assert!(matches!(err, EvalError::UndefinedVariable(_)));
 
     // Widget remains accessible via the namespace ref.
     let via_ns = ev
-        .eval_program(
-            &Parser::parse("MyLib::Widget new asString")
-                .expect("parse")
-                .stmts,
-            &mut env,
+        .eval_chunk(
+            &Parser::parse("MyLib::Widget new asString").expect("parse"),
+            &mut workspace,
         )
         .expect("namespace ref"); // Widget is Value subclass: — synchronous, no future
     assert_eq!(via_ns, Value::Str(Arc::from("a Widget")));
@@ -318,23 +315,20 @@ fn kernel_load_does_not_panic() {
 }
 
 #[test]
-fn kernel_classes_in_env() {
+fn kernel_classes_visible_in_workspace() {
     let ev = Evaluator::new();
-    let mut env = Env::new();
-    ev.registry.populate_env(&mut env);
+    let mut workspace = Workspace::new(&ev);
     use crate::entity::InstanceKind;
-    assert!(matches!(
-        env.get("Array"),
-        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassEntity(_))
-    ));
-    assert!(matches!(
-        env.get("ByteArray"),
-        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassEntity(_))
-    ));
-    assert!(matches!(
-        env.get("OrderedCollection"),
-        Some(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassEntity(_))
-    ));
+    for name in ["Array", "ByteArray", "OrderedCollection"] {
+        let chunk = Parser::parse(name).expect("parse");
+        assert!(
+            matches!(
+                ev.eval_chunk(&chunk, &mut workspace),
+                Ok(Value::Instance(h)) if matches!(h.0.kind, InstanceKind::ClassEntity(_))
+            ),
+            "{name} should resolve to its class in a fresh workspace"
+        );
+    }
 }
 
 // ── Array protocol ────────────────────────────────────────────────────────
@@ -1472,10 +1466,9 @@ fn evaluator_default() {
     crate::entity::init_coroutine_stack();
     may::go!(move || {
         let ev = Evaluator::default();
-        let mut env = crate::env::Env::new();
-        ev.registry.populate_env(&mut env);
+        let mut workspace = Workspace::new(&ev);
         let prog = crate::parser::Parser::parse("42").unwrap();
-        let v = ev.eval_program(&prog.stmts, &mut env).unwrap();
+        let v = ev.eval_chunk(&prog, &mut workspace).unwrap();
         tx.send(v).unwrap();
     });
     assert_eq!(rx.recv().unwrap(), Value::Int(42));
@@ -4470,47 +4463,47 @@ fn assert_type_error_contains(r: Result<Value, EvalError>, needle: &str) {
 
 #[test]
 fn toplevel_reassignment_is_rejected() {
-    let r = eval_programs(&["| x | x := 1. x := 2. x"]).remove(0);
+    let r = eval_chunks(&["| x | x := 1. x := 2. x"]).remove(0);
     assert_type_error_contains(r, "cannot reassign local `x`");
 }
 
 #[test]
 fn toplevel_undeclared_assignment_is_rejected() {
-    let r = eval_programs(&["x := 42. x"]).remove(0);
+    let r = eval_chunks(&["x := 42. x"]).remove(0);
     assert_type_error_contains(r, "undeclared variable `x`");
 }
 
 #[test]
 fn toplevel_block_local_reassignment_is_rejected() {
-    // Top-level blocks are checked with their program, not only at method install.
-    let r = eval_programs(&["| b | b := [| a | a := 1. a := 2. a]. b value"]).remove(0);
+    // Top-level blocks are checked with their chunk, not only at method install.
+    let r = eval_chunks(&["| b | b := [| a | a := 1. a := 2. a]. b value"]).remove(0);
     assert_type_error_contains(r, "cannot reassign local `a`");
 }
 
 #[test]
-fn program_is_checked_before_any_statement_runs() {
+fn chunk_is_checked_before_any_statement_runs() {
     // The division would fail at run time; the static violation is reported instead.
-    let r = eval_programs(&["| x | 1 / 0. x := 1. x := 2"]).remove(0);
+    let r = eval_chunks(&["| x | 1 / 0. x := 1. x := 2"]).remove(0);
     assert_type_error_contains(r, "cannot reassign local `x`");
 }
 
 #[test]
-fn later_program_cannot_assign_earlier_programs_temp() {
-    let mut rs = eval_programs(&["| x | x := 1. x", "x := 2. x"]);
+fn later_chunk_cannot_assign_earlier_chunks_temp() {
+    let mut rs = eval_chunks(&["| x | x := 1. x", "x := 2. x"]);
     assert_eq!(rs.remove(0).unwrap(), Value::Int(1));
     assert_type_error_contains(rs.remove(0), "undeclared variable `x`");
 }
 
 #[test]
-fn later_program_reads_earlier_programs_temp() {
-    let rs = eval_programs(&["| x | x := 1. x", "x + 1"]);
+fn later_chunk_reads_earlier_chunks_temp() {
+    let rs = eval_chunks(&["| x | x := 1. x", "x + 1"]);
     assert_eq!(rs[1].as_ref().unwrap(), &Value::Int(2));
 }
 
 #[test]
-fn later_program_redeclaration_shadows() {
-    // Each program is a nested scope: redeclaring `| x |` is a fresh binding.
-    let rs = eval_programs(&["| x | x := 1. x", "| x | x := 2. x", "x"]);
+fn later_chunk_redeclaration_shadows() {
+    // Each chunk is a nested scope: redeclaring `| x |` is a fresh binding.
+    let rs = eval_chunks(&["| x | x := 1. x", "| x | x := 2. x", "x"]);
     assert_eq!(rs[1].as_ref().unwrap(), &Value::Int(2));
     assert_eq!(rs[2].as_ref().unwrap(), &Value::Int(2));
 }

@@ -1,6 +1,7 @@
 use crate::eval::EvalError;
 use crate::test_helpers::{assert_signal_contains, eval, eval_diff, eval_err, eval_err_diff};
 use crate::value::Value;
+use crate::workspace::Workspace;
 use std::sync::Arc;
 
 #[test]
@@ -196,12 +197,11 @@ fn timer_fires_in_entity() {
         "#;
         let prog = crate::parser::Parser::parse(setup).unwrap();
         let ev = crate::eval::Evaluator::new();
-        let mut env = crate::env::Env::new();
-        ev.registry.populate_env(&mut env);
+        let mut workspace = Workspace::new(&ev);
         // actor is the TA3 instance
         let actor = crate::builtins_iterative::force_value(
             &ev,
-            ev.eval_program(&prog.stmts, &mut env).unwrap(),
+            ev.eval_chunk(&prog, &mut workspace).unwrap(),
         )
         .unwrap();
         // Poll for the 50 ms timer to fire rather than sleeping a single fixed span:
@@ -221,7 +221,7 @@ fn timer_fires_in_entity() {
                     actor.clone(),
                     Arc::from("getResult"),
                     vec![],
-                    &mut env,
+                    workspace.env_mut(),
                 )
                 .unwrap(),
             )

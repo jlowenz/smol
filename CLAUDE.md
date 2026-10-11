@@ -72,7 +72,7 @@ kernel grows significantly beyond its current size.
 
 The interpreter has one evaluation path: the **iterative** evaluator
 (`eval.rs` + `eval_iterative.rs`, kernel `kernel.smol`, entry
-`Evaluator::eval_program`). Dispatch is `builtins_iterative.rs`
+`Evaluator::eval_chunk`). Dispatch is `builtins_iterative.rs`
 (`dispatch(ev: &Evaluator, ...)`); block-eval ops are handled by
 `dispatch_to_stack` + `push_block_frame`. `builtins.rs` is a re-export shim for
 `builtins_iterative` (backward compat).

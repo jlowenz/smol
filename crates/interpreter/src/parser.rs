@@ -45,14 +45,14 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn parse(src: &str) -> Result<Program, ParseError> {
+    pub fn parse(src: &str) -> Result<Chunk, ParseError> {
         Self::parse_source(crate::span::SourceId::ANON, src)
     }
 
     /// Parse `src`, attributing every span to `source` (so coverage and
     /// diagnostics can map back to the right `.smol` file). [`Parser::parse`]
     /// delegates here with [`crate::span::SourceId::ANON`].
-    pub fn parse_source(source: crate::span::SourceId, src: &str) -> Result<Program, ParseError> {
+    pub fn parse_source(source: crate::span::SourceId, src: &str) -> Result<Chunk, ParseError> {
         let tokens = Lexer::tokenize(source, src)?;
         let mut p = Parser {
             tokens,
@@ -62,7 +62,7 @@ impl Parser {
             in_block: false,
             block_scope_stack: Vec::new(),
         };
-        p.parse_program()
+        p.parse_chunk()
     }
 
     // ── Token stream helpers ──────────────────────────────────────────────────
@@ -127,7 +127,7 @@ impl Parser {
 
     // ── Grammar ───────────────────────────────────────────────────────────────
 
-    fn parse_program(&mut self) -> Result<Program, ParseError> {
+    fn parse_chunk(&mut self) -> Result<Chunk, ParseError> {
         let mut stmts = Vec::new();
         while self.peek() != &Token::Eof {
             let start = self.pos;
@@ -140,7 +140,7 @@ impl Parser {
             stmts.push(self.tag_from(start, node));
             self.eat(&Token::Dot);
         }
-        Ok(Program {
+        Ok(Chunk {
             stmts,
             comments: std::mem::take(&mut self.comments),
         })
@@ -428,7 +428,7 @@ impl Parser {
         loop {
             // `Token::Pipe` is also valid as the binary `|` operator in expression
             // position; the local-decl uses of `|` are consumed before this level
-            // is reached (in `parse_program` and `parse_block`).
+            // is reached (in `parse_chunk` and `parse_block`).
             let op: Arc<str> = match self.peek().clone() {
                 Token::BinOp(op) => {
                     self.advance();

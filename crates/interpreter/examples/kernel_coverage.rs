@@ -16,11 +16,11 @@ use std::sync::mpsc;
 
 use interpreter::coverage::{collect_stmt_spans, report_source};
 use interpreter::entity::init_coroutine_stack;
-use interpreter::env::Env;
 use interpreter::eval::{EvalError, Evaluator};
 use interpreter::parser::Parser;
 use interpreter::span::SourceId;
 use interpreter::value::Value;
+use interpreter::workspace::Workspace;
 
 const KERNEL: &str = include_str!("../src/kernel.smol");
 
@@ -61,16 +61,14 @@ fn main() {
 
         // Load the kernel with coverage already on.
         let kprog = Parser::parse_source(SourceId::KERNEL, KERNEL).expect("kernel parse");
-        let mut env = Env::new();
-        ev.registry.populate_env(&mut env);
-        ev.eval_program(&kprog.stmts, &mut env)
-            .expect("kernel load");
+        let mut workspace = Workspace::new(&ev);
+        ev.eval_chunk(&kprog, &mut workspace).expect("kernel load");
 
         let (mut ok, mut skipped) = (0usize, 0usize);
         for snippet in BATTERY {
             let outcome = Parser::parse(snippet)
                 .map_err(|_| ())
-                .and_then(|p| ev.eval_program(&p.stmts, &mut env).map_err(|_| ()))
+                .and_then(|p| ev.eval_chunk(&p, &mut workspace).map_err(|_| ()))
                 .and_then(|v| resolve(v).map_err(|_| ()));
             if outcome.is_ok() {
                 ok += 1;

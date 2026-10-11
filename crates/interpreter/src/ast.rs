@@ -141,7 +141,7 @@ pub enum Stmt {
     MethodDef(MethodDef),
 }
 
-/// A [`Stmt`] paired with its source span. Statement containers (`Program.stmts`,
+/// A [`Stmt`] paired with its source span. Statement containers (`Chunk.stmts`,
 /// block and method bodies) hold these so the coverage collector can record
 /// which statements executed; equality ignores the span (see [`SourceTagged`]).
 pub type TaggedStmt = SourceTagged<Stmt>;
@@ -156,8 +156,11 @@ pub struct MethodDef {
     pub is_class_side: bool,
 }
 
+/// One unit of source evaluated in a workspace — a REPL input, a script file, or
+/// `kernel.smol` (env-frame redesign §3). Produced by `Parser::parse`; run by
+/// `Evaluator::eval_chunk`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Program {
+pub struct Chunk {
     pub stmts: Vec<TaggedStmt>,
     /// Comments collected during parsing, in source order.
     /// Full trivia attachment to individual nodes is deferred.

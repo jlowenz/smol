@@ -140,6 +140,19 @@ redesign.
 - **Dynamic name** — a `Var` reference that is *not* a lexical variable of any
   enclosing scope: an instance variable, class variable, or global. Resolved at
   runtime through the receiver / class / namespace, exactly as today.
+- **Root** — the owner of Kernel, the root namespaces, and the workspaces. Today
+  this is `ClassRegistry` (`open_questions.md` Q19). Smol is image-based (P1): the
+  root boots once and then evaluates any number of chunks. There is no single
+  "program" in the batch sense.
+- **Workspace** — a long-lived top-level evaluation context: an anonymous namespace
+  (importing Kernel) plus the temp bindings published by its chunks. A REPL session,
+  a notebook, or a script run each has one. Never visible to methods (§11.7b).
+- **Chunk** — one unit of source evaluated in a workspace (a REPL input, a script
+  file, `kernel.smol`), checked, resolved and run as a scope nested in the
+  workspace. Its temps are published to the workspace when it completes. The term
+  is Lua's (reference manual §3.3.2, "Chunks"); Smalltalk's workspace "Do it" is the
+  same idea. AST type `Chunk` (formerly `Program`), evaluated by
+  `Evaluator::eval_chunk` (formerly `eval_program`).
 
 A `Var` reference is classified, once, at analysis time, into exactly one of:
 
@@ -692,6 +705,49 @@ name is searched among the namespace's own entries, then its imports). Decisions
   value-object probe flips → regression test).
   Risk: Rust tests that look up user-defined classes via `registry.kernel()` will
   need the workspace namespace instead; measure before landing.
+
+### 11.7c d2c design (DECIDED 2026-10-11)
+
+Refines §11.7b's d2c. Decisions:
+
+1. **Kernel is implicitly imported by every namespace.** Resolution order: own
+   entries → explicit imports (in order) → **Kernel last**, so any namespace may
+   shadow a Kernel name. This is the same precedent as `java.lang`, Rust's std
+   prelude, Haskell's `Prelude` and Python's builtins. Making every namespace write
+   `imports: { Kernel }` would be ceremony. The price is that Kernel's contents must
+   stay lean and deliberately chosen. A possible future opt-out (like Haskell's
+   `NoImplicitPrelude`) is not needed now. This closes the gap d2a opened, where
+   methods of a class in an import-less namespace could not see Kernel names.
+2. **Chunk, not program** (§3): the unit evaluated in a workspace.
+3. **D1 — a chunk is resolved like a method body with no `self`.** Its `| … |`
+   temps are slots, and its blocks capture them by snapshot, which gives top-level
+   snapshot semantics and the capture-before-assignment check for free. Chunk
+   prologue: earlier chunks' temps the chunk references are copied into extra
+   slots. Chunk epilogue: the chunk's temps are published to the workspace. Workspace
+   bindings are single-assignment, so a copy cannot be distinguished from a live
+   read, and a block from chunk N never sees chunk N+1's redeclared `x`.
+4. **D2 — `Workspace` replaces `Env` as `eval_chunk`'s argument**: an anonymous
+   namespace plus the temp bindings. The kernel loader uses a workspace whose
+   namespace *is* Kernel. The root holds every workspace namespace strongly (Q19
+   interim).
+5. **D3 — other names in top-level code** resolve through the active namespace
+   (the workspace's by default; `Ns do:` switches it), then root namespace names.
+   Top-level definitions register in the active namespace with no env binding, so a
+   class defined at top level lives in the workspace's anonymous namespace.
+6. **D4 — a block created at top level** pushes a "no receiver" binding, so `self`
+   and free names inside it never fall through to a calling method's receiver
+   (fixes the latent leak noted in §11.7b).
+
+**Sub-steps (each committed with the suite green):**
+
+- **c1** — rename `Program` → `Chunk` and `eval_program` → `eval_chunk`;
+  introduce `Workspace` and make it `eval_chunk`'s argument. Behavior-preserving:
+  `Workspace` wraps the `Env` for now.
+- **c2** — namespace resolution for top-level code (D3) + Kernel implicit import
+  (1): top-level definitions go to the active namespace; the workspace gets its
+  anonymous namespace (D2).
+- **c3** — chunks resolved as slot scopes (D1) + the no-receiver marker (D4);
+  top-level capture-before-assignment enforced.
 
 ### 11.8 Risks
 
