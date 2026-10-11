@@ -95,8 +95,8 @@ fn step_probe_nested_then() {
 }
 
 /// C31.5: nested `Namespace do:` must NOT grow the Rust stack — the block runs on
-/// the heap `Cont` stack behind a `NamespaceGuard` (the flattened equivalent of
-/// `with_namespace`), so depth stays ≈ 1 regardless of nesting.
+/// the heap `Cont` stack behind a `NamespaceGuard` (formerly a recursive
+/// `with_namespace` → `eval_block`), so depth stays ≈ 1 regardless of nesting.
 #[cfg(feature = "step_probe")]
 #[test]
 fn step_probe_nested_namespace_do() {

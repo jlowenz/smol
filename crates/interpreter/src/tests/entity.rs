@@ -304,9 +304,8 @@ fn nlr_with_failing_commit_faults_entity() {
         .expect("eval method");
 
     // Look up the class.
-    let class_handle = base_ev
-        .registry
-        .kernel()
+    let class_handle = workspace
+        .namespace()
         .lookup_class("NLRFaultActor")
         .expect("NLRFaultActor must be defined");
     let class = class_handle.0.class.clone();
@@ -335,6 +334,7 @@ fn nlr_with_failing_commit_faults_entity() {
         home_depth: 2,
         home_entity: None,
         home_binding: None,
+        home_namespace: None,
     });
 
     // Push the envelope directly onto the entity's mailbox.
@@ -423,9 +423,8 @@ fn type_error_crash_drains_queued_mailbox() {
     .expect("parse");
     ev.eval_chunk(&prog, &mut workspace).expect("eval");
 
-    let class = ev
-        .registry
-        .kernel()
+    let class = workspace
+        .namespace()
         .lookup_class("DrainTypeErrorActor")
         .expect("class")
         .0

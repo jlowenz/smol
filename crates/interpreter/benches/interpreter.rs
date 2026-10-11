@@ -12,9 +12,9 @@ fn bench_parse_and_eval(c: &mut Criterion) {
     // TCO and the leaf `_primAdd:` grounding.
     c.bench_function("timesRepeat 1000", |b| {
         let src = "1000 timesRepeat: [1 + 1]";
+        let mut workspace = Workspace::new(&ev);
         b.iter(|| {
             let prog = Parser::parse(src).unwrap();
-            let mut workspace = Workspace::new(&ev);
             ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
@@ -33,9 +33,9 @@ Integer >> fib [ ^self pvtFibA: 0 b: 1 ]
         ev.eval_chunk(&setup_prog, &mut setup_workspace).unwrap();
 
         let src = "20 fib";
+        let mut workspace = Workspace::new(&ev);
         b.iter(|| {
             let prog = Parser::parse(src).unwrap();
-            let mut workspace = Workspace::new(&ev);
             ev.eval_chunk(&prog, &mut workspace).unwrap()
         });
     });
@@ -52,36 +52,28 @@ fn bench_loops(c: &mut Criterion) {
 
     c.bench_function("to:do: 100000", |b| {
         let prog = Parser::parse("0 to: 100000 do: [:i | i]").unwrap();
-        b.iter(|| {
-            let mut workspace = Workspace::new(&ev);
-            ev.eval_chunk(&prog, &mut workspace).unwrap()
-        });
+        let mut workspace = Workspace::new(&ev);
+        b.iter(|| ev.eval_chunk(&prog, &mut workspace).unwrap());
     });
 
     c.bench_function("to:by:do: 100000", |b| {
         let prog = Parser::parse("0 to: 200000 by: 2 do: [:i | i]").unwrap();
-        b.iter(|| {
-            let mut workspace = Workspace::new(&ev);
-            ev.eval_chunk(&prog, &mut workspace).unwrap()
-        });
+        let mut workspace = Workspace::new(&ev);
+        b.iter(|| ev.eval_chunk(&prog, &mut workspace).unwrap());
     });
 
     // Nested iteration is the case `Cont::ToDoStep` was built for: the Rust stack
     // must not grow per nesting level.
     c.bench_function("nested to:do: 300x300", |b| {
         let prog = Parser::parse("0 to: 300 do: [:i | 0 to: 300 do: [:j | j]]").unwrap();
-        b.iter(|| {
-            let mut workspace = Workspace::new(&ev);
-            ev.eval_chunk(&prog, &mut workspace).unwrap()
-        });
+        let mut workspace = Workspace::new(&ev);
+        b.iter(|| ev.eval_chunk(&prog, &mut workspace).unwrap());
     });
 
     c.bench_function("array do: 10000", |b| {
         let prog = Parser::parse("| a | a := Array new: 10000. a do: [:x | x]").unwrap();
-        b.iter(|| {
-            let mut workspace = Workspace::new(&ev);
-            ev.eval_chunk(&prog, &mut workspace).unwrap()
-        });
+        let mut workspace = Workspace::new(&ev);
+        b.iter(|| ev.eval_chunk(&prog, &mut workspace).unwrap());
     });
 
     // Pattern 3 (Smol_Patterns): cross-iteration mutation goes through a
@@ -97,10 +89,8 @@ fn bench_loops(c: &mut Criterion) {
 1000 timesRepeat: [h update: [:a | a + 1]].
 h get value";
         let prog = Parser::parse(src).unwrap();
-        b.iter(|| {
-            let mut workspace = Workspace::new(&ev);
-            ev.eval_chunk(&prog, &mut workspace).unwrap()
-        });
+        let mut workspace = Workspace::new(&ev);
+        b.iter(|| ev.eval_chunk(&prog, &mut workspace).unwrap());
     });
 }
 
@@ -114,6 +104,8 @@ Counter >> increment [ count := count + 1 ]
 Counter >> count [ ^count ]
 ";
     let setup_prog = Parser::parse(setup_src).unwrap();
+    // `Counter` is a definition of this workspace's namespace, so the benches
+    // below evaluate in the same workspace (the REPL shape).
     let mut setup_workspace = Workspace::new(&ev);
     ev.eval_chunk(&setup_prog, &mut setup_workspace).unwrap();
 
@@ -121,20 +113,14 @@ Counter >> count [ ^count ]
     c.bench_function("object new 1000", |b| {
         let src = "1000 timesRepeat: [Counter new]";
         let prog = Parser::parse(src).unwrap();
-        b.iter(|| {
-            let mut workspace = Workspace::new(&ev);
-            ev.eval_chunk(&prog, &mut workspace).unwrap()
-        });
+        b.iter(|| ev.eval_chunk(&prog, &mut setup_workspace).unwrap());
     });
 
     // Method send: 1000 unary sends to the same object.
     c.bench_function("method send increment 1000", |b| {
         let src = "| c | c := Counter new. 1000 timesRepeat: [c increment]. c count";
         let prog = Parser::parse(src).unwrap();
-        b.iter(|| {
-            let mut workspace = Workspace::new(&ev);
-            ev.eval_chunk(&prog, &mut workspace).unwrap()
-        });
+        b.iter(|| ev.eval_chunk(&prog, &mut setup_workspace).unwrap());
     });
 }
 

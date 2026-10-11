@@ -61,9 +61,12 @@ fn main() {
 
         // Load the kernel with coverage already on.
         let kprog = Parser::parse_source(SourceId::KERNEL, KERNEL).expect("kernel parse");
-        let mut workspace = Workspace::new(&ev);
-        ev.eval_chunk(&kprog, &mut workspace).expect("kernel load");
+        let mut kernel_workspace = Workspace::kernel(&ev);
+        ev.eval_chunk(&kprog, &mut kernel_workspace)
+            .expect("kernel load");
 
+        // The battery runs as user code, in its own workspace.
+        let mut workspace = Workspace::new(&ev);
         let (mut ok, mut skipped) = (0usize, 0usize);
         for snippet in BATTERY {
             let outcome = Parser::parse(snippet)

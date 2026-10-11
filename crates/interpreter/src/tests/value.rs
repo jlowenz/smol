@@ -72,6 +72,7 @@ fn kind_remaining_variants() {
         home_depth: 0,
         home_entity: None,
         home_binding: None,
+        home_namespace: None,
     }));
     assert_eq!(Value::Float(1.0).kind(), "Float");
     assert_eq!(Value::Bool(true).kind(), "Bool");
@@ -124,6 +125,7 @@ fn display_composite_variants() {
         home_depth: 0,
         home_entity: None,
         home_binding: None,
+        home_namespace: None,
     }));
     assert_eq!(format!("{block}"), "a Block");
 }
@@ -152,6 +154,7 @@ fn eq_block_uses_pointer_identity() {
         home_depth: 0,
         home_entity: None,
         home_binding: None,
+        home_namespace: None,
     });
     assert_eq!(Value::Block(b.clone()), Value::Block(b.clone()));
     let b2 = Arc::new(Block {
@@ -163,6 +166,7 @@ fn eq_block_uses_pointer_identity() {
         home_depth: 0,
         home_entity: None,
         home_binding: None,
+        home_namespace: None,
     });
     assert_ne!(Value::Block(b), Value::Block(b2));
 }
@@ -211,6 +215,7 @@ fn hash_does_not_panic() {
         home_depth: 0,
         home_entity: None,
         home_binding: None,
+        home_namespace: None,
     });
     map.insert(Value::Block(b), 11);
     assert_eq!(map.len(), 11);

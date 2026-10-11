@@ -104,6 +104,7 @@ fn block_maps_to_skip() {
         home_depth: 0,
         home_entity: None,
         home_binding: None,
+        home_namespace: None,
     }));
     assert!(matches!(value_to_bridge(&blk), BridgeResult::Skip));
 }

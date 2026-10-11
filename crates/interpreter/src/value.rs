@@ -77,6 +77,14 @@ pub struct Block {
     /// `method_stack` and keeps ivar/classvar access correct even after TCO has
     /// removed the enclosing method frame.
     pub home_binding: Option<SelfBinding>,
+    /// The namespace a block created at top level (`home_binding` is `None`)
+    /// resolves free names through and defines into: the active namespace at its
+    /// creation — its chunk's workspace namespace, or the one a `Namespace do:`
+    /// made active. `push_block_frame` makes it active while the block runs, so the
+    /// block resolves the same way on any evaluator (e.g. when run by an entity).
+    /// `None` for a block created in a method, which resolves through its home's
+    /// defining class instead.
+    pub home_namespace: Option<Arc<Namespace>>,
 }
 
 impl PartialEq for Value {

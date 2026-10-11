@@ -21,6 +21,11 @@ pub struct ClassRegistry {
     kernel: Arc<Namespace>,
     /// Root namespaces keyed by their simple name. All entries satisfy `parent == None`.
     roots: RwLock<HashMap<Arc<str>, Arc<Namespace>>>,
+    /// The anonymous namespaces of every workspace created on this registry, held
+    /// strongly so classes defined in a workspace (whose `Class → Namespace` link
+    /// is `Weak`) never outlive their namespace. Reclaiming them once unreachable
+    /// is deferred to the GC design (`open_questions.md` Q19).
+    workspace_namespaces: RwLock<Vec<Arc<Namespace>>>,
     /// Class-entity actors spawned by this registry (bootstrap classes and user-defined
     /// subclasses). Keyed by EntityId for lifecycle management and future entity lookups.
     /// Signalled on `shutdown_class_entities`.
@@ -129,6 +134,7 @@ impl ClassRegistry {
         let arc = Arc::new(Self {
             kernel: kernel.clone(),
             roots: RwLock::new(roots),
+            workspace_namespaces: RwLock::new(Vec::new()),
             class_entities: RwLock::new(HashMap::new()),
             instance_entities: RwLock::new(HashMap::new()),
             store: store.clone_handle(),
@@ -226,6 +232,31 @@ impl ClassRegistry {
         self.kernel.clone()
     }
 
+    /// Resolve a free name relative to `ns`: `ns`'s own entries, then its explicit
+    /// imports in order, then Kernel (implicitly imported by every namespace, and
+    /// searched last so any namespace may shadow a Kernel name), then the root
+    /// namespace names. `None` for `ns` starts at Kernel.
+    pub fn resolve_name(&self, ns: Option<&Namespace>, name: &str) -> Option<Value> {
+        if let Some(ns) = ns
+            && let Some(v) = ns.resolve(name)
+        {
+            return Some(v);
+        }
+        if let Some(v) = self.kernel.resolve(name) {
+            return Some(v);
+        }
+        self.get_namespace(name).map(Value::Namespace)
+    }
+
+    /// Create the anonymous namespace for a new workspace. It is reachable only
+    /// through that workspace (not a root, so never importable or `::`-qualified),
+    /// and is held by this registry for the registry's lifetime.
+    pub fn new_workspace_namespace(&self) -> Arc<Namespace> {
+        let ns = Arc::new(Namespace::new(Arc::from("(workspace)"), None));
+        self.workspace_namespaces.write().push(ns.clone());
+        ns
+    }
+
     /// Look up a root namespace by its simple name.
     pub fn get_namespace(&self, name: &str) -> Option<Arc<Namespace>> {
         self.roots.read().get(name).cloned()
@@ -290,18 +321,6 @@ impl ClassRegistry {
             if let InstanceKind::Entity(d) = &state.kind {
                 d.signal_shutdown();
             }
-        }
-    }
-
-    /// Seed `env` with Kernel's definitions (classes and traits) and every root
-    /// namespace name. Sub-namespaces are intentionally excluded — they are reached
-    /// via `::` only.
-    pub fn populate_env(&self, env: &mut crate::env::Env) {
-        for (name, value) in self.kernel.own_entries() {
-            env.define(name, value);
-        }
-        for (name, ns) in self.roots.read().iter() {
-            env.define(name.clone(), Value::Namespace(ns.clone()));
         }
     }
 }

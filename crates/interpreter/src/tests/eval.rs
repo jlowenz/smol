@@ -4507,3 +4507,92 @@ fn later_chunk_redeclaration_shadows() {
     assert_eq!(rs[1].as_ref().unwrap(), &Value::Int(2));
     assert_eq!(rs[2].as_ref().unwrap(), &Value::Int(2));
 }
+
+// ── Workspace namespaces (env-frame redesign d2c/c2, §11.7c) ─────────────────
+
+#[test]
+fn toplevel_class_lives_in_workspace_namespace_not_kernel() {
+    let ev = Evaluator::new();
+    let mut workspace = Workspace::new(&ev);
+    let chunk = Parser::parse("Value subclass: #WsLocal instanceVariableNames: ''.").unwrap();
+    ev.eval_chunk(&chunk, &mut workspace).expect("eval");
+    assert!(workspace.namespace().lookup_class("WsLocal").is_some());
+    assert!(ev.registry.kernel().lookup_class("WsLocal").is_none());
+}
+
+#[test]
+fn workspaces_do_not_see_each_others_definitions() {
+    let ev = Evaluator::new();
+    let mut first = Workspace::new(&ev);
+    let mut second = Workspace::new(&ev);
+    let define = Parser::parse("Value subclass: #OnlyInFirst instanceVariableNames: ''.").unwrap();
+    ev.eval_chunk(&define, &mut first).expect("define");
+    let use_it = Parser::parse("OnlyInFirst").unwrap();
+    assert!(ev.eval_chunk(&use_it, &mut first).is_ok());
+    assert!(matches!(
+        ev.eval_chunk(&use_it, &mut second),
+        Err(EvalError::UndefinedVariable(n)) if &*n == "OnlyInFirst"
+    ));
+}
+
+#[test]
+fn import_less_namespace_methods_see_kernel_implicitly() {
+    use crate::namespace::Namespace;
+    let ev = Evaluator::new();
+    ev.registry
+        .register_namespace(Arc::new(Namespace::new(Arc::from("Bare"), None)));
+    let mut workspace = Workspace::new(&ev);
+    let chunk = Parser::parse(
+        "
+Bare do: [
+    Value subclass: #Maker instanceVariableNames: ''.
+    Maker >> collectionClass [ ^OrderedCollection ]
+].
+Bare::Maker new collectionClass",
+    )
+    .unwrap();
+    let kernel_oc = ev
+        .registry
+        .kernel()
+        .lookup_class("OrderedCollection")
+        .unwrap();
+    assert_eq!(
+        ev.eval_chunk(&chunk, &mut workspace).expect("eval"),
+        Value::Instance(kernel_oc)
+    );
+}
+
+#[test]
+fn workspace_definition_shadows_kernel_name() {
+    // Kernel is searched last, so a workspace definition shadows a Kernel name in
+    // that workspace — while Kernel's own methods keep resolving to Kernel's.
+    let src = "
+Value subclass: #OrderedCollection instanceVariableNames: ''.
+OrderedCollection >> marker [ ^#shadow ]
+OrderedCollection new marker
+";
+    assert_eq!(eval(src), Value::Symbol(Arc::from("shadow")));
+}
+
+#[test]
+fn toplevel_block_run_by_entity_resolves_workspace_class() {
+    // The block resolves through the namespace it was written in, not the
+    // entity evaluator's.
+    let src = "
+Value subclass: #Thing instanceVariableNames: ''.
+Object subclass: #Runner instanceVariableNames: '' classVariableNames: '' indexedSlots: #none.
+Runner >> run: aBlock [ ^aBlock value ]
+(Runner new run: [Thing new]) await class name
+";
+    assert_eq!(eval(src), Value::Str(Arc::from("Thing")));
+}
+
+#[test]
+fn toplevel_trait_lives_in_workspace_namespace_not_kernel() {
+    let ev = Evaluator::new();
+    let mut workspace = Workspace::new(&ev);
+    let chunk = Parser::parse("Trait named: #WsTrait.").unwrap();
+    ev.eval_chunk(&chunk, &mut workspace).expect("eval");
+    assert!(workspace.namespace().resolve("WsTrait").is_some());
+    assert!(ev.registry.kernel().resolve("WsTrait").is_none());
+}

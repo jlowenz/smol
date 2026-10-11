@@ -90,15 +90,6 @@ impl Namespace {
         }
     }
 
-    /// Snapshot of this namespace's own entries (not its imports).
-    pub(crate) fn own_entries(&self) -> Vec<(Arc<str>, Value)> {
-        self.entries
-            .read()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
-
     /// Look up a sub-namespace by name.
     pub fn lookup_sub(&self, name: &str) -> Option<Arc<Namespace>> {
         self.sub_namespaces.read().get(name).cloned()

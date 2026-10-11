@@ -1030,18 +1030,11 @@ pub(crate) fn make_trait_value(
     Ok(Value::Instance(inst))
 }
 
-/// Bind a trait's name, mirroring class-name binding in [`handle_subclass`]: the
-/// trait becomes a definition of the active namespace (so methods resolve it), and
-/// top-level code sees it through the env — a global binding for Kernel traits,
-/// the current frame otherwise.
-fn bind_trait_name(ev: &Evaluator, name: Arc<str>, trait_val: Value, env: &mut Env) {
-    let active_ns = ev.active_namespace();
-    active_ns.bind(name.clone(), trait_val.clone());
-    if Arc::ptr_eq(&active_ns, &ev.registry.kernel()) {
-        env.define_global(name, trait_val);
-    } else {
-        env.define(name, trait_val);
-    }
+/// Bind a trait's name as a definition of the active namespace, as
+/// [`handle_subclass`] does for classes — the chunk's workspace namespace at top
+/// level, or the namespace a `Namespace do:` block made active.
+fn bind_trait_name(ev: &Evaluator, name: Arc<str>, trait_val: Value) {
+    ev.active_namespace().bind(name, trait_val);
 }
 
 /// Build the sentinel method for an unresolved trait conflict on `sel`. Its body
@@ -2937,7 +2930,12 @@ fn dispatch_namespace(
                     )));
                 }
             };
-            ev.with_namespace(ns, |ev| ev.eval_block(&block, vec![], env))
+            // Run the block *in* `ns` (re-homed), as the iterative `do:` path does.
+            let rehomed = crate::value::Block {
+                home_namespace: Some(ns),
+                ..(*block).clone()
+            };
+            ev.eval_block(&rehomed, vec![], env)
         }
         "name" => {
             expect_arity(&selector, 0, args.len())?;
@@ -3146,7 +3144,7 @@ pub(crate) fn dispatch_class_builtin(
                 }
             };
             let tv = make_trait_value(ev, crate::traits::TraitData::new_empty(name.clone()))?;
-            bind_trait_name(ev, name, tv.clone(), env);
+            bind_trait_name(ev, name, tv.clone());
             Ok(tv)
         }
         "_primDefineTrait:from:" => {
@@ -3165,7 +3163,7 @@ pub(crate) fn dispatch_class_builtin(
                 EvalError::TypeError("_primDefineTrait:from: source is not a Trait".into())
             })?;
             *data.name.write() = name.clone();
-            bind_trait_name(ev, name, src.clone(), env);
+            bind_trait_name(ev, name, src.clone());
             Ok(src)
         }
         "_primScheduleTimer:block:" => {
@@ -3269,7 +3267,7 @@ pub(crate) fn dispatch_class_builtin(
         sel if sel.contains("subclass:") || sel.starts_with("vmSubclass:") => {
             // Extract the handle back from self_val to pass the Arc<Class> as superclass.
             // (`vmSubclass:` has a capital S, so `contains("subclass:")` misses it.)
-            handle_subclass(ev, class, selector, args, env)
+            handle_subclass(ev, class, selector, args)
         }
         _ => Err(EvalError::MessageNotUnderstood {
             receiver_kind: "Class",
@@ -3283,7 +3281,6 @@ fn handle_subclass(
     superclass: Arc<Class>,
     selector: Arc<str>,
     args: Vec<Value>,
-    env: &mut Env,
 ) -> Result<Value, EvalError> {
     // `selector` is something like "subclass:instanceVariableNames:classVariableNames:"
     // Split on ':' boundaries to get the individual keyword parts.
@@ -3444,15 +3441,11 @@ fn handle_subclass(
     ev.registry.register_class_predicates(&new_class);
 
     let active_ns = ev.active_namespace();
+    // The class is a definition of the active namespace (the chunk's workspace
+    // namespace, Kernel while loading the kernel, or the namespace a
+    // `Namespace do:` block made active); code resolves it by name through that
+    // namespace, and from elsewhere only as `Ns::ClassName` or via imports.
     active_ns.register(class_handle.clone());
-    // Kernel classes get a global binding so they're always in scope by simple name.
-    // Non-Kernel classes are scoped to the current frame (e.g. inside `Namespace do: [...]`);
-    // outside that scope they are only reachable via `Ns::ClassName`.
-    if Arc::ptr_eq(&active_ns, &ev.registry.kernel()) {
-        env.define_global(name, Value::Instance(class_handle.clone()));
-    } else {
-        env.define(name, Value::Instance(class_handle.clone()));
-    }
     Ok(Value::Instance(class_handle))
 }
 

@@ -749,6 +749,27 @@ Refines §11.7b's d2c. Decisions:
 - **c3** — chunks resolved as slot scopes (D1) + the no-receiver marker (D4);
   top-level capture-before-assignment enforced.
 
+**c2 landed (2026-10-11).** As designed, plus two implementation refinements found
+while building it:
+
+- **Top-level blocks carry their home namespace** (`Block.home_namespace`, set when
+  the block has no `home_binding`). A top-level block can run on another evaluator,
+  e.g. `worker run: [Foo new]`, whose active namespace is Kernel. `push_block_frame`
+  makes the block's home namespace active under a `NamespaceGuard`, and only when it
+  differs from the current one, so a chunk's own evaluator pays nothing. This
+  replaces the old mechanism, where `block.env` shared the chunk's root env, which
+  held the definitions.
+- **`Ns do: aBlock` re-homes the block** to `Ns`, then pushes it normally. Without
+  that, the block's own (workspace) home would override `do:`. Meaning unchanged:
+  run the block *in* `Ns`. `Evaluator::with_namespace` was removed (unused).
+
+Also: `ClassRegistry::resolve_name` implements the chain (own → imports → Kernel →
+roots). `populate_env` and `Namespace::own_entries` are removed: no env is seeded
+with globals any more. `handle_subclass`/`bind_trait_name` register only in the
+active namespace. Benches evaluate each benchmark in one workspace (setup and
+iterations share it) instead of a fresh workspace per iteration. Same-session A/B
+against c1: no measurable difference (±1%).
+
 ### 11.8 Risks
 
 - The `Cont`-carries-frame-index change touches every `Cont` variant and all their

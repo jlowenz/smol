@@ -376,11 +376,12 @@ pub(crate) enum Cont {
     /// (no freeze), matching the recursive builtin.
     NewValueGuard { inst: InstanceHandle },
 
-    /// Sits below a `Namespace do:` block. The active namespace was swapped to the
-    /// receiver for the block's duration; this guard restores `saved_ns` on every
-    /// exit path (success, error, `^`-return) — the flattened equivalent of
-    /// `Evaluator::with_namespace`, so nested `Namespace do:` doesn't grow the
-    /// Rust stack. The block's value passes through as the result.
+    /// Sits below a block frame whose home namespace was made active for the
+    /// block's duration — a `Namespace do:` block, or a top-level block running
+    /// away from its creating chunk (`push_block_frame`). Restores `saved_ns` on
+    /// every exit path (success, error, `^`-return), on the heap `Cont` stack so
+    /// nested `Namespace do:` doesn't grow the Rust stack. The block's value
+    /// passes through as the result.
     NamespaceGuard {
         saved_ns: Arc<crate::namespace::Namespace>,
     },
@@ -704,6 +705,9 @@ fn handle_eval_expr(
             // answers `self` — and accesses ivars/classvars — from `method_stack`
             // even after its home frame is gone (env-frame redesign P2.1d).
             let home_binding = ev.method_stack.borrow().last().cloned();
+            // A block created at top level resolves through the namespace it was
+            // written in, wherever it later runs (§11.7c D3).
+            let home_namespace = home_binding.is_none().then(|| ev.active_namespace());
             // Snapshot the captured upvalues from the creating (current) frame:
             // `ParentLocal` from its slots, `ParentUpvalue` from its own snapshot
             // (env-frame redesign P2.1c). Empty for a block that captures nothing.
@@ -717,6 +721,7 @@ fn handle_eval_expr(
                 home_depth,
                 home_entity: ev.current_entity_id.get(),
                 home_binding,
+                home_namespace,
             }));
         }
         Expr::NamespaceRef {
@@ -1503,6 +1508,16 @@ pub(crate) fn push_block_frame(
             }
         }
     }
+    // A top-level block runs in the namespace it was written in. Swap it in only
+    // when it differs from the active one (never on the creating evaluator's own
+    // chunk, so hot top-level loops pay nothing); `NamespaceGuard`, pushed beneath
+    // the block frame, restores it on every exit path — as for `Namespace do:`.
+    if let Some(home_ns) = &block.home_namespace
+        && !Arc::ptr_eq(home_ns, &ev.active_namespace.borrow())
+    {
+        let saved_ns = std::mem::replace(&mut *ev.active_namespace.borrow_mut(), home_ns.clone());
+        stack.push(Cont::NamespaceGuard { saved_ns });
+    }
     // Re-push the block's captured home `self` binding (any kind) so `self`,
     // ivars, and classvars resolve from method_stack even after the home frame
     // is gone (env-frame redesign P2.1d).
@@ -2104,9 +2119,11 @@ fn dispatch_to_stack(
         }
     }
 
-    // (1g) `Namespace do:` flattened: swap the active namespace and run the block
-    // on the heap `Cont` stack (NamespaceGuard restores it on every exit path)
-    // instead of recursing `step_loop` via `with_namespace` → `eval_block`.
+    // (1g) `Namespace do:` flattened: run the block *in* `ns` — re-homed so its
+    // definitions register in `ns` and its top-level names resolve through it —
+    // on the heap `Cont` stack instead of recursing `step_loop`. `push_block_frame`
+    // makes the home namespace active under a `NamespaceGuard`, which restores
+    // the previous one on every exit path.
     if let Value::Namespace(ref ns) = receiver
         && selector.as_ref() == "do:"
     {
@@ -2117,10 +2134,11 @@ fn dispatch_to_stack(
             });
         }
         let blk = as_block(ev, args.into_iter().next().unwrap(), &selector)?;
-        let saved_ns = ev.active_namespace.borrow().clone();
-        *ev.active_namespace.borrow_mut() = ns.clone();
-        stack.push(Cont::NamespaceGuard { saved_ns });
-        push_block_frame(ev, &blk, vec![], false, stack)?;
+        let rehomed = crate::value::Block {
+            home_namespace: Some(ns.clone()),
+            ..(*blk).clone()
+        };
+        push_block_frame(ev, &rehomed, vec![], false, stack)?;
         return Ok(());
     }
 

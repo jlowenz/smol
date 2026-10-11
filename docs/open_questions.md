@@ -645,6 +645,12 @@ early, so there are no dangling links, consistent with the "glacier, not GC" sta
 taken for values. Reclaiming a workspace namespace once it is unreachable is deferred
 to the GC design.
 
+Observed (d2c/c2): since every `Workspace::new` registers a namespace that the root
+holds for its lifetime, code that creates a workspace per evaluation accumulates
+namespaces. The benches were changed to reuse one workspace per benchmark for this
+reason. Any embedder that evaluates via throwaway workspaces needs reclamation, or
+must reuse workspaces.
+
 Open: whether the root deserves a first-class Smol identity (a `System`/`Image`
 object that creates workspaces), and how workspaces relate to notebooks (Q8).
 

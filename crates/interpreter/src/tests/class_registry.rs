@@ -1,5 +1,4 @@
 use super::*;
-use crate::env::Env;
 
 /// A live registry whose class-actor coroutines are stopped on drop, so each
 /// test (including a panicking one) leaves no running actors behind.
@@ -56,14 +55,35 @@ fn register_nested_namespace_panics() {
 }
 
 #[test]
-fn populate_env_includes_object_and_kernel() {
+fn resolve_name_order_own_then_imports_then_kernel_then_roots() {
     let reg = LiveRegistry::new();
-    let mut env = Env::new();
-    reg.populate_env(&mut env);
+    let object = reg.kernel().lookup_class("Object").unwrap();
+    let ns = Arc::new(Namespace::new(Arc::from("App"), None));
+    let lib = Arc::new(Namespace::new(Arc::from("Lib"), None));
+    ns.add_import(lib.clone());
 
-    assert!(env.get(&Arc::from("Kernel")).is_some());
-    assert!(env.get(&Arc::from("Object")).is_some());
-    assert!(env.get(&Arc::from("Value")).is_some());
+    // Kernel is implicitly visible, and root namespace names come last.
+    assert!(matches!(
+        reg.resolve_name(Some(&ns), "Object"),
+        Some(Value::Instance(_))
+    ));
+    assert!(matches!(
+        reg.resolve_name(Some(&ns), "Kernel"),
+        Some(Value::Namespace(_))
+    ));
+    assert!(reg.resolve_name(Some(&ns), "Nowhere").is_none());
+
+    // An import shadows Kernel; an own entry shadows an import.
+    lib.bind(Arc::from("Object"), Value::Int(1));
+    assert_eq!(reg.resolve_name(Some(&ns), "Object"), Some(Value::Int(1)));
+    ns.bind(Arc::from("Object"), Value::Int(2));
+    assert_eq!(reg.resolve_name(Some(&ns), "Object"), Some(Value::Int(2)));
+
+    // With no namespace, resolution starts at Kernel.
+    assert_eq!(
+        reg.resolve_name(None, "Object"),
+        Some(Value::Instance(object))
+    );
 }
 
 #[test]

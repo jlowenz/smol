@@ -250,7 +250,7 @@ impl Evaluator {
     ///   and panics immediately.
     pub fn new() -> Self {
         let ev = Self::new_without_kernel();
-        let mut kernel_workspace = Workspace::new(&ev);
+        let mut kernel_workspace = Workspace::kernel(&ev);
         let src = include_str!("kernel.smol");
         let chunk = Parser::parse_source(crate::span::SourceId::KERNEL, src)
             .expect("kernel.smol: parse error");
@@ -408,24 +408,13 @@ impl Evaluator {
         self.active_namespace.borrow().clone()
     }
 
-    /// Temporarily sets the active namespace to `ns` for the duration of `f`,
-    /// restoring the previous namespace on return.
-    pub fn with_namespace<F, R>(&self, ns: Arc<Namespace>, f: F) -> R
-    where
-        F: FnOnce(&Evaluator) -> R,
-    {
-        let old = self.active_namespace.borrow().clone();
-        *self.active_namespace.borrow_mut() = ns;
-        let result = f(self);
-        *self.active_namespace.borrow_mut() = old;
-        result
-    }
-
     // ── Variable lookup & assignment ──────────────────────────────────────────
 
     /// Resolve an `Unresolved` name (top-level code, and blocks created at top
     /// level) by name: the activation's own env frame, then the receiver-scoped
-    /// variables of the current `method_stack` binding, then the outer env frames.
+    /// variables of the current `method_stack` binding, then the outer env frames
+    /// (workspace temps), then the active namespace
+    /// (`resolve_in_active_namespace`).
     ///
     /// Note: a top-level block invoked from inside a method runs with the *calling*
     /// method's binding on top of `method_stack` (it has no `home_binding`), so this
@@ -433,24 +422,22 @@ impl Evaluator {
     /// away when top-level code is resolved (env-frame redesign §11.7b, d2c).
     #[inline]
     pub fn lookup_var(&self, name: &str, env: &Env) -> Option<Value> {
-        // Fast path: no active method context — skip the RefCell borrow entirely.
-        if self.method_depth.get() == 0 {
-            return env.get(name);
-        }
-        // Clone the top binding to avoid holding the RefCell borrow across further ops.
-        let top = self.method_stack.borrow().last().cloned();
-        match top {
-            Some(binding) => {
-                if let Some(v) = env.lookup_top_frame(name) {
-                    return Some(v);
-                }
-                if let Some(v) = self.lookup_receiver_scoped(&binding, name) {
-                    return Some(v);
-                }
-                env.lookup_outer_frames(name)
+        let lexical = if self.method_depth.get() == 0 {
+            // Fast path: no active method context — skip the RefCell borrow.
+            env.get(name)
+        } else {
+            // Clone the top binding to avoid holding the RefCell borrow across
+            // further ops.
+            let top = self.method_stack.borrow().last().cloned();
+            match top {
+                Some(binding) => env
+                    .lookup_top_frame(name)
+                    .or_else(|| self.lookup_receiver_scoped(&binding, name))
+                    .or_else(|| env.lookup_outer_frames(name)),
+                None => env.get(name),
             }
-            None => env.get(name),
-        }
+        };
+        lexical.or_else(|| self.resolve_in_active_namespace(name))
     }
 
     /// Resolve a `Dynamic` name — a free name in a resolved method or method-block
@@ -471,16 +458,20 @@ impl Evaluator {
         self.resolve_global(binding.defining_class(), name)
     }
 
-    /// Resolve `name` in `class`'s defining namespace (own entries, then imports),
-    /// then among the root namespace names.
+    /// Resolve `name` relative to `class`'s defining namespace
+    /// (`ClassRegistry::resolve_name`: own entries → imports → Kernel → roots).
     ///
-    /// Ensures: a class with no live namespace link resolves root namespace names
-    ///   only.
+    /// Ensures: a class with no live namespace link resolves from Kernel onward.
     pub(crate) fn resolve_global(&self, class: &Class, name: &str) -> Option<Value> {
-        if let Some(v) = class.namespace().and_then(|ns| ns.resolve(name)) {
-            return Some(v);
-        }
-        self.registry.get_namespace(name).map(Value::Namespace)
+        self.registry
+            .resolve_name(class.namespace().as_deref(), name)
+    }
+
+    /// Resolve `name` relative to the active namespace — top-level code's
+    /// lexical namespace (`ClassRegistry::resolve_name` order).
+    pub(crate) fn resolve_in_active_namespace(&self, name: &str) -> Option<Value> {
+        let ns = self.active_namespace();
+        self.registry.resolve_name(Some(&ns), name)
     }
 
     /// Instance variables (transaction-aware) and class variables visible to the
@@ -715,8 +706,19 @@ impl Evaluator {
     ///   `stmts` is empty. `EvalError::Return` propagates to the caller.
     pub fn eval_chunk(&self, chunk: &Chunk, workspace: &mut Workspace) -> Result<Value, EvalError> {
         let stmts = &chunk.stmts;
-        let env = workspace.env_mut();
         check_chunk_assignments(stmts)?;
+        // The chunk's lexical namespace is its workspace's: definitions register
+        // there and free names resolve through it (§11.7c D3).
+        let saved_ns = std::mem::replace(
+            &mut *self.active_namespace.borrow_mut(),
+            workspace.namespace().clone(),
+        );
+        let result = self.run_chunk(stmts, workspace.env_mut());
+        *self.active_namespace.borrow_mut() = saved_ns;
+        result
+    }
+
+    fn run_chunk(&self, stmts: &[TaggedStmt], env: &mut Env) -> Result<Value, EvalError> {
         for stmt in stmts {
             if let Stmt::LocalDecl(names) = &stmt.node {
                 for name in names {
