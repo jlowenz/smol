@@ -13,8 +13,8 @@
 //! capture plan), wired into method installation. The evaluator honors `res`:
 //! `Local` reads/writes go through the flat slot frames (`Evaluator::frames`) and
 //! `Upvalue` reads through the block's capture snapshot — both bypass the name hash.
-//! `SelfRef` / `Dynamic` still resolve by name via the env (dual storage) until
-//! P2.1d removes it. [`resolve_method`] remains the `ResolvedScope` analysis view
+//! `SelfRef` resolves through the method stack and `Dynamic` through the receiver
+//! and namespaces; no name is looked up in a per-activation map. [`resolve_method`] remains the `ResolvedScope` analysis view
 //! (validation/tooling); `resolve_and_rewrite` is now the authoritative rewrite.
 //! Since d2c-c3 [`resolve_chunk`] resolves top-level chunks the same way (a method
 //! body with no `self`, importing earlier chunks' temps into extra slots).

@@ -13,7 +13,6 @@ use thiserror::Error;
 use crate::ast::*;
 use crate::class::{Class, Method};
 use crate::class_registry::ClassRegistry;
-use crate::env::Env;
 use crate::namespace::Namespace;
 use crate::object::{IndexedStorage, Object};
 use crate::os_interface::{DefaultOsInterface, OsInterface};
@@ -218,9 +217,6 @@ pub struct Evaluator {
     /// currently-executing scope's frame is always the top. `VarRef::Local(i)`
     /// reads/writes `frames.last().slots[i]`; `VarRef::Upvalue(i)` reads
     /// `frames.last().snapshot[i]` (P2.1c).
-    ///
-    /// Still kept in lockstep with the name-keyed `Env` (dual storage): `SelfRef`
-    /// and `Dynamic` resolve by name via `Env` until P2.1d collapses it.
     pub(crate) frames: RefCell<Vec<Frame>>,
     /// The `EntityId` of the entity whose message handler is currently executing
     /// on this evaluator. `None` outside any entity handler. Used for sync
@@ -705,7 +701,6 @@ impl Evaluator {
         });
         let frame = Cont::ChunkFrame {
             pending: body.into_iter().collect(),
-            env: Env::new(),
             saved_block_home: self.current_block_home.get(),
         };
         let result = step_loop(self, frame);
@@ -723,7 +718,7 @@ impl Evaluator {
         result
     }
 
-    fn eval_array_literal(&self, elements: &[Literal], env: &mut Env) -> Result<Value, EvalError> {
+    fn eval_array_literal(&self, elements: &[Literal]) -> Result<Value, EvalError> {
         use crate::entity::{InstanceHandle, InstanceKind, InstanceState};
         let array_handle = self
             .registry
@@ -736,7 +731,7 @@ impl Evaluator {
             elements.len(),
         ));
         for (i, elem) in elements.iter().enumerate() {
-            let v = self.eval_literal_as_value(elem, env)?;
+            let v = self.eval_literal_as_value(elem)?;
             if let Some(IndexedStorage::Pointer(slots)) = obj.indexed.as_ref() {
                 slots.lock()[i] = v;
             }
@@ -750,13 +745,9 @@ impl Evaluator {
     /// Evaluate a `Literal` into a runtime `Value`. For `Literal::Array` this
     /// requires the evaluator and environment to construct the `Array` object;
     /// all other variants are pure data and do not need either.
-    pub(crate) fn eval_literal_as_value(
-        &self,
-        lit: &Literal,
-        env: &mut Env,
-    ) -> Result<Value, EvalError> {
+    pub(crate) fn eval_literal_as_value(&self, lit: &Literal) -> Result<Value, EvalError> {
         match lit {
-            Literal::Array(elems) => self.eval_array_literal(elems, env),
+            Literal::Array(elems) => self.eval_array_literal(elems),
             _ => Ok(eval_literal(lit)),
         }
     }
@@ -806,12 +797,7 @@ impl Evaluator {
     /// Ensures: semantically identical to `eval_block_recursive`; method calls within
     ///   the body use heap-allocated `CallFrame`s rather than Rust stack frames.
     ///   Does NOT catch `EvalError::Return` — it propagates to the matching frame.
-    pub fn eval_block(
-        &self,
-        block: &Block,
-        args: Vec<Value>,
-        _outer_env: &mut Env,
-    ) -> Result<Value, EvalError> {
+    pub fn eval_block(&self, block: &Block, args: Vec<Value>) -> Result<Value, EvalError> {
         let mut stack = Vec::new();
         push_block_frame(self, block, args, false, &mut stack)?;
         let initial = stack

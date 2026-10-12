@@ -5,7 +5,6 @@ use crate::ast::{CaptureSource, Expr, Message, MethodDef, Stmt, TaggedStmt, VarR
 use crate::builtins::{UserMethodFound, as_block, force_value, lookup_user_method};
 use crate::class::{Class, Method};
 use crate::entity::{InstanceHandle, InstanceKind};
-use crate::env::Env;
 use crate::eval::{
     EvalError, Evaluator, Frame, SelfBinding, check_prim_sends_in_body, eval_literal,
 };
@@ -176,10 +175,10 @@ pub mod probe {
 /// result of the previous step) before it can proceed.
 pub(crate) enum Cont {
     /// Evaluate an expression; result becomes `acc`.
-    EvalExpr { expr: Expr, env: Env },
+    EvalExpr { expr: Expr },
 
     /// Receiver just evaluated (`acc`); now dispatch the message.
-    AfterReceiver { message: Message, env: Env },
+    AfterReceiver { message: Message },
 
     /// Accumulate keyword/binary arguments left-to-right, then dispatch.
     ///
@@ -190,7 +189,6 @@ pub(crate) enum Cont {
         selector: Arc<str>,
         done: Vec<Value>,
         pending: VecDeque<Expr>,
-        env: Env,
     },
 
     /// Accumulate arguments for a super send left-to-right, then dispatch to superclass.
@@ -201,7 +199,6 @@ pub(crate) enum Cont {
         selector: Arc<str>,
         done: Vec<Value>,
         pending: VecDeque<Expr>,
-        env: Env,
     },
 
     /// Cascade: all messages sent to the original receiver; step through `pending`.
@@ -211,7 +208,6 @@ pub(crate) enum Cont {
     CascadeStep {
         receiver: Option<Value>,
         pending: VecDeque<Message>,
-        env: Env,
     },
 
     /// Dynamic array: accumulate evaluated elements, then allocate.
@@ -219,7 +215,6 @@ pub(crate) enum Cont {
         array_class: InstanceHandle,
         done: Vec<Value>,
         pending: VecDeque<Expr>,
-        env: Env,
     },
 
     /// RHS just evaluated (`acc`); assign it to `name` (resolved as `res`).
@@ -241,7 +236,6 @@ pub(crate) enum Cont {
         /// Remaining statements to run.
         pending: VecDeque<TaggedStmt>,
         /// Method environment (always `push_frame`d on setup; popped on teardown).
-        env: Env,
         /// The receiver, returned when the body ends without an explicit `^`.
         implicit_self: Value,
         /// `current_block_home` before this frame; restored on teardown.
@@ -258,7 +252,6 @@ pub(crate) enum Cont {
         /// Remaining statements to run.
         pending: VecDeque<TaggedStmt>,
         /// Block environment (always `push_frame`d on setup; popped on teardown).
-        env: Env,
         /// `current_block_home` before this frame; restored on teardown.
         saved_block_home: Option<usize>,
         /// When `true`, a `ForceAcc` is pushed after each statement so that
@@ -271,13 +264,11 @@ pub(crate) enum Cont {
     ///
     /// Unlike method/block frames it pushes no self binding and does not own its
     /// slot frame (`run_chunk` pushes and pops that, and publishes the chunk's
-    /// temps from it), so teardown only restores `current_block_home`. Answers its last expression's value.
+    /// temps from it), so teardown only restores `current_block_home`. Answers its
+    /// last expression's value.
     ChunkFrame {
         /// Remaining statements to run.
         pending: VecDeque<TaggedStmt>,
-        /// An empty `Env`, kept only for the continuations' env plumbing until
-        /// P2.1d-d4 removes it.
-        env: Env,
         /// `current_block_home` before this frame; restored on teardown.
         saved_block_home: Option<usize>,
     },
@@ -313,7 +304,6 @@ pub(crate) enum Cont {
     ThenCheckOrElse {
         cont_blk: Arc<crate::value::Block>,
         else_val: Value,
-        env: Env,
     },
 
     /// Resume a `^`-return unwind after an ensure block has run.
@@ -393,7 +383,7 @@ enum UnwindOutcome {
 }
 
 /// Release a method or block activation's runtime resources: pop its `self`
-/// binding, restore `current_block_home`, and pop its owned env and slot frames.
+/// binding, restore `current_block_home`, and pop its slot frame.
 ///
 /// The single source of truth for frame teardown, shared by normal completion
 /// (`handle_method_frame` / `handle_block_frame`) and the unwind / error / TCO
@@ -619,7 +609,6 @@ fn handle_step_error(
 fn handle_eval_expr(
     ev: &Evaluator,
     expr: Expr,
-    mut env: Env,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
@@ -729,9 +718,7 @@ fn handle_eval_expr(
                 let selector = message.selector();
                 match message {
                     Message::Unary(_) => {
-                        if let Err(e) =
-                            dispatch_super_to_stack(ev, selector, vec![], &mut env, stack, acc)
-                        {
+                        if let Err(e) = dispatch_super_to_stack(ev, selector, vec![], stack, acc) {
                             handle_step_error(e, ev, stack, acc)?;
                         }
                     }
@@ -740,9 +727,8 @@ fn handle_eval_expr(
                             selector,
                             done: vec![],
                             pending: VecDeque::new(),
-                            env: env.clone(),
                         });
-                        stack.push(Cont::EvalExpr { expr: *arg, env });
+                        stack.push(Cont::EvalExpr { expr: *arg });
                     }
                     Message::Keyword { parts } => {
                         let mut exprs: VecDeque<Expr> = parts.into_iter().map(|(_, e)| e).collect();
@@ -751,36 +737,25 @@ fn handle_eval_expr(
                             selector,
                             done: vec![],
                             pending: exprs,
-                            env: env.clone(),
                         });
-                        stack.push(Cont::EvalExpr { expr: first, env });
+                        stack.push(Cont::EvalExpr { expr: first });
                     }
                 }
             } else {
                 // Push AfterReceiver first (below in stack), then receiver eval.
-                stack.push(Cont::AfterReceiver {
-                    message,
-                    env: env.clone(),
-                });
-                stack.push(Cont::EvalExpr {
-                    expr: *receiver,
-                    env,
-                });
+                stack.push(Cont::AfterReceiver { message });
+                stack.push(Cont::EvalExpr { expr: *receiver });
             }
         }
         Expr::Cascade { receiver, messages } => {
             stack.push(Cont::CascadeStep {
                 receiver: None,
                 pending: messages.into_iter().collect(),
-                env: env.clone(),
             });
-            stack.push(Cont::EvalExpr {
-                expr: *receiver,
-                env,
-            });
+            stack.push(Cont::EvalExpr { expr: *receiver });
         }
         Expr::ArrayLiteral(elements) => {
-            *acc = eval_array_literal_iterative(ev, &elements, &mut env)?;
+            *acc = eval_array_literal_iterative(ev, &elements)?;
         }
         Expr::DynamicArray(elements) => {
             let array_handle = ev
@@ -797,9 +772,8 @@ fn handle_eval_expr(
                     array_class: array_handle,
                     done: vec![],
                     pending: exprs,
-                    env: env.clone(),
                 });
-                stack.push(Cont::EvalExpr { expr: first, env });
+                stack.push(Cont::EvalExpr { expr: first });
             }
         }
     }
@@ -808,8 +782,8 @@ fn handle_eval_expr(
 
 /// Drive the iterative evaluator to completion starting from `initial_cont`.
 ///
-/// Requires: any frame in `initial_cont` has already had its env
-///   frame pushed and, for method frames, its self binding pushed to
+/// Requires: any method/block frame in `initial_cont` has already had its slot
+///   frame pushed onto `ev.frames` and its self binding pushed onto
 ///   `ev.method_stack`.
 /// Ensures: returns the value accumulated when the continuation stack
 ///   is empty, or propagates the first terminal error.
@@ -851,7 +825,7 @@ fn step(
 ) -> Result<(), EvalError> {
     match cont {
         // ── Leaf expressions ─────────────────────────────────────────
-        Cont::EvalExpr { expr, env } => handle_eval_expr(ev, expr, env, stack, acc)?,
+        Cont::EvalExpr { expr } => handle_eval_expr(ev, expr, stack, acc)?,
 
         // ── Assignment ───────────────────────────────────────────────
         Cont::Assign { name, res } => {
@@ -878,7 +852,6 @@ fn step(
         Cont::MethodFrame {
             depth,
             pending,
-            env,
             implicit_self,
             saved_block_home,
         } => {
@@ -886,7 +859,6 @@ fn step(
                 ev,
                 depth,
                 pending,
-                env,
                 implicit_self,
                 saved_block_home,
                 stack,
@@ -897,20 +869,18 @@ fn step(
         // ── BlockFrame dispatch ───────────────────────────────────────
         Cont::BlockFrame {
             pending,
-            env,
             saved_block_home,
             sync,
         } => {
-            handle_block_frame(ev, pending, env, saved_block_home, sync, stack, acc)?;
+            handle_block_frame(ev, pending, saved_block_home, sync, stack, acc)?;
         }
 
         // ── ChunkFrame dispatch ─────────────────────────────────────
         Cont::ChunkFrame {
             pending,
-            env,
             saved_block_home,
         } => {
-            handle_chunk_frame(ev, pending, env, saved_block_home, stack, acc)?;
+            handle_chunk_frame(ev, pending, saved_block_home, stack, acc)?;
         }
 
         // ── ForceAcc ──────────────────────────────────────────────────
@@ -943,11 +913,7 @@ fn step(
         }
 
         // ── ThenCheckOrElse (then:orElse: receiver-block completed) ────
-        Cont::ThenCheckOrElse {
-            cont_blk,
-            else_val,
-            mut env,
-        } => {
+        Cont::ThenCheckOrElse { cont_blk, else_val } => {
             let recv_result = std::mem::replace(acc, Value::Nil);
             match recv_result {
                 Value::Future(_) => {
@@ -956,7 +922,6 @@ fn step(
                         recv_result,
                         Arc::from("then:orElse:"),
                         vec![Value::Block(cont_blk), else_val],
-                        &mut env,
                     )?;
                 }
                 // Non-future: receiver resolved; run then-block with its value,
@@ -1023,8 +988,8 @@ fn step(
         }
 
         // ── AfterReceiver ─────────────────────────────────────────────
-        Cont::AfterReceiver { message, env } => {
-            handle_after_receiver(ev, message, env, stack, acc)?;
+        Cont::AfterReceiver { message } => {
+            handle_after_receiver(ev, message, stack, acc)?;
         }
 
         // ── CollectArgs ───────────────────────────────────────────────
@@ -1033,10 +998,9 @@ fn step(
             selector,
             done,
             pending,
-            env,
         } => {
             handle_collect_args(
-                ev, receiver, selector, done, pending, env, stack, acc, reductions,
+                ev, receiver, selector, done, pending, stack, acc, reductions,
             )?;
         }
 
@@ -1045,18 +1009,13 @@ fn step(
             selector,
             done,
             pending,
-            env,
         } => {
-            handle_super_collect_args(ev, selector, done, pending, env, stack, acc, reductions)?;
+            handle_super_collect_args(ev, selector, done, pending, stack, acc, reductions)?;
         }
 
         // ── CascadeStep ───────────────────────────────────────────────
-        Cont::CascadeStep {
-            receiver,
-            pending,
-            env,
-        } => {
-            handle_cascade_step(ev, receiver, pending, env, stack, acc)?;
+        Cont::CascadeStep { receiver, pending } => {
+            handle_cascade_step(ev, receiver, pending, stack, acc)?;
         }
 
         // ── DynArrayElem ──────────────────────────────────────────────
@@ -1064,7 +1023,6 @@ fn step(
             array_class,
             mut done,
             mut pending,
-            env,
         } => {
             done.push(acc.clone());
             if let Some(next) = pending.pop_front() {
@@ -1072,9 +1030,8 @@ fn step(
                     array_class,
                     done,
                     pending,
-                    env: env.clone(),
                 });
-                stack.push(Cont::EvalExpr { expr: next, env });
+                stack.push(Cont::EvalExpr { expr: next });
             } else {
                 *acc = build_array(array_class.0.class.clone(), done);
             }
@@ -1085,12 +1042,10 @@ fn step(
 
 /// `Cont::MethodFrame` handler — see the variant docs. Extracted `#[inline(never)]`.
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn handle_method_frame(
     ev: &Evaluator,
     depth: usize,
     mut pending: VecDeque<TaggedStmt>,
-    env: Env,
     implicit_self: Value,
     saved_block_home: Option<usize>,
     stack: &mut Vec<Cont>,
@@ -1107,22 +1062,19 @@ fn handle_method_frame(
         stack.push(Cont::MethodFrame {
             depth,
             pending,
-            env: env.clone(),
             implicit_self,
             saved_block_home,
         });
-        dispatch_stmt(ev, stmt, &env, depth, stack, acc)?;
+        dispatch_stmt(ev, stmt, depth, stack, acc)?;
     }
     Ok(())
 }
 
 /// `Cont::BlockFrame` handler — see the variant docs. Extracted `#[inline(never)]`.
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn handle_block_frame(
     ev: &Evaluator,
     mut pending: VecDeque<TaggedStmt>,
-    env: Env,
     saved_block_home: Option<usize>,
     sync: bool,
     stack: &mut Vec<Cont>,
@@ -1136,7 +1088,6 @@ fn handle_block_frame(
         let stmt = pending.pop_front().unwrap();
         stack.push(Cont::BlockFrame {
             pending,
-            env: env.clone(),
             saved_block_home,
             sync,
         });
@@ -1146,7 +1097,7 @@ fn handle_block_frame(
         }
         // Blocks match `^`-returns against `current_block_home` (always set during a
         // block), so the frame depth here is irrelevant.
-        dispatch_stmt(ev, stmt, &env, 0, stack, acc)?;
+        dispatch_stmt(ev, stmt, 0, stack, acc)?;
     }
     Ok(())
 }
@@ -1156,24 +1107,22 @@ fn handle_block_frame(
 fn handle_chunk_frame(
     ev: &Evaluator,
     mut pending: VecDeque<TaggedStmt>,
-    env: Env,
     saved_block_home: Option<usize>,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
     if pending.is_empty() {
-        // Top-level frame: restore home only (no self binding, no owned env or
-        // slot frame).
+        // Top-level frame: restore home only (no self binding, no owned slot
+        // frame).
         ev.current_block_home.set(saved_block_home);
         // acc stays as the last expression result.
     } else {
         let stmt = pending.pop_front().unwrap();
         stack.push(Cont::ChunkFrame {
             pending,
-            env: env.clone(),
             saved_block_home,
         });
-        dispatch_stmt(ev, stmt, &env, 0, stack, acc)?;
+        dispatch_stmt(ev, stmt, 0, stack, acc)?;
     }
     Ok(())
 }
@@ -1184,7 +1133,6 @@ fn handle_chunk_frame(
 fn handle_after_receiver(
     ev: &Evaluator,
     message: Message,
-    mut env: Env,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
@@ -1192,8 +1140,7 @@ fn handle_after_receiver(
     let selector = message.selector();
     match message {
         Message::Unary(_) => {
-            if let Err(e) = dispatch_to_stack(ev, receiver, selector, vec![], &mut env, stack, acc)
-            {
+            if let Err(e) = dispatch_to_stack(ev, receiver, selector, vec![], stack, acc) {
                 handle_step_error(e, ev, stack, acc)?;
             }
         }
@@ -1203,9 +1150,8 @@ fn handle_after_receiver(
                 selector,
                 done: vec![],
                 pending: VecDeque::new(), // first arg already being pushed
-                env: env.clone(),
             });
-            stack.push(Cont::EvalExpr { expr: *arg, env });
+            stack.push(Cont::EvalExpr { expr: *arg });
         }
         Message::Keyword { parts } => {
             let mut exprs: VecDeque<Expr> = parts.into_iter().map(|(_, e)| e).collect();
@@ -1215,9 +1161,8 @@ fn handle_after_receiver(
                 selector,
                 done: vec![],
                 pending: exprs,
-                env: env.clone(),
             });
-            stack.push(Cont::EvalExpr { expr: first, env });
+            stack.push(Cont::EvalExpr { expr: first });
         }
     }
     Ok(())
@@ -1233,7 +1178,6 @@ fn handle_collect_args(
     selector: Arc<str>,
     mut done: Vec<Value>,
     mut pending: VecDeque<Expr>,
-    mut env: Env,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
     reductions: &mut u32,
@@ -1245,12 +1189,11 @@ fn handle_collect_args(
             selector,
             done,
             pending,
-            env: env.clone(),
         });
-        stack.push(Cont::EvalExpr { expr: next, env });
+        stack.push(Cont::EvalExpr { expr: next });
     } else {
         bump_reductions(reductions);
-        if let Err(e) = dispatch_to_stack(ev, receiver, selector, done, &mut env, stack, acc) {
+        if let Err(e) = dispatch_to_stack(ev, receiver, selector, done, stack, acc) {
             handle_step_error(e, ev, stack, acc)?;
         }
     }
@@ -1260,13 +1203,11 @@ fn handle_collect_args(
 /// `Cont::SuperCollectArgs` handler — like `handle_collect_args` but dispatches
 /// to the superclass (`self` receiver). Extracted `#[inline(never)]`.
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn handle_super_collect_args(
     ev: &Evaluator,
     selector: Arc<str>,
     mut done: Vec<Value>,
     mut pending: VecDeque<Expr>,
-    mut env: Env,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
     reductions: &mut u32,
@@ -1277,12 +1218,11 @@ fn handle_super_collect_args(
             selector,
             done,
             pending,
-            env: env.clone(),
         });
-        stack.push(Cont::EvalExpr { expr: next, env });
+        stack.push(Cont::EvalExpr { expr: next });
     } else {
         bump_reductions(reductions);
-        if let Err(e) = dispatch_super_to_stack(ev, selector, done, &mut env, stack, acc) {
+        if let Err(e) = dispatch_super_to_stack(ev, selector, done, stack, acc) {
             handle_step_error(e, ev, stack, acc)?;
         }
     }
@@ -1296,7 +1236,6 @@ fn handle_cascade_step(
     ev: &Evaluator,
     receiver: Option<Value>,
     mut pending: VecDeque<Message>,
-    mut env: Env,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
@@ -1307,13 +1246,11 @@ fn handle_cascade_step(
         stack.push(Cont::CascadeStep {
             receiver: Some(recv.clone()),
             pending,
-            env: env.clone(),
         });
         let selector = msg.selector();
         match msg {
             Message::Unary(_) => {
-                if let Err(e) = dispatch_to_stack(ev, recv, selector, vec![], &mut env, stack, acc)
-                {
+                if let Err(e) = dispatch_to_stack(ev, recv, selector, vec![], stack, acc) {
                     handle_step_error(e, ev, stack, acc)?;
                 }
             }
@@ -1323,9 +1260,8 @@ fn handle_cascade_step(
                     selector,
                     done: vec![],
                     pending: VecDeque::new(),
-                    env: env.clone(),
                 });
-                stack.push(Cont::EvalExpr { expr: *arg, env });
+                stack.push(Cont::EvalExpr { expr: *arg });
             }
             Message::Keyword { parts } => {
                 let mut exprs: VecDeque<Expr> = parts.into_iter().map(|(_, e)| e).collect();
@@ -1335,9 +1271,8 @@ fn handle_cascade_step(
                     selector,
                     done: vec![],
                     pending: exprs,
-                    env: env.clone(),
                 });
-                stack.push(Cont::EvalExpr { expr: first, env });
+                stack.push(Cont::EvalExpr { expr: first });
             }
         }
     }
@@ -1362,7 +1297,6 @@ fn bump_reductions(reductions: &mut u32) {
 fn dispatch_stmt(
     ev: &Evaluator,
     stmt: TaggedStmt,
-    env: &Env,
     frame_depth: usize,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
@@ -1373,27 +1307,18 @@ fn dispatch_stmt(
             // Pre-bound during frame setup; nothing to do at runtime.
         }
         Stmt::Expr(expr) => {
-            stack.push(Cont::EvalExpr {
-                expr,
-                env: env.clone(),
-            });
+            stack.push(Cont::EvalExpr { expr });
         }
         Stmt::Assign { name, res, value } => {
             stack.push(Cont::Assign { name, res });
-            stack.push(Cont::EvalExpr {
-                expr: value,
-                env: env.clone(),
-            });
+            stack.push(Cont::EvalExpr { expr: value });
         }
         Stmt::Return(expr) => {
             // The target depth for a ^-return is the block home, or this frame's
             // depth when not inside any block.
             let target_depth = ev.current_block_home.get().unwrap_or(frame_depth);
             stack.push(Cont::ReturnUnwind { target_depth });
-            stack.push(Cont::EvalExpr {
-                expr,
-                env: env.clone(),
-            });
+            stack.push(Cont::EvalExpr { expr });
         }
         Stmt::MethodDef(def) => {
             install_method_def(ev, def)?;
@@ -1491,7 +1416,6 @@ pub(crate) fn push_block_frame(
     ev.current_block_home.set(Some(block.home_depth));
     stack.push(Cont::BlockFrame {
         pending: block.body.iter().cloned().collect(),
-        env: Env::new(),
         saved_block_home: saved_home,
         sync,
     });
@@ -1626,7 +1550,6 @@ pub(crate) fn push_method_frame(
     stack.push(Cont::MethodFrame {
         depth,
         pending: method.body.iter().cloned().collect(),
-        env: Env::new(),
         implicit_self: self_value,
         saved_block_home,
     });
@@ -1664,7 +1587,6 @@ fn dispatch_super_to_stack(
     ev: &Evaluator,
     selector: Arc<str>,
     args: Vec<Value>,
-    env: &mut Env,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
@@ -1714,8 +1636,7 @@ fn dispatch_super_to_stack(
                     push_class_method_frame(ev, handle, def_class, method, args, stack)?;
                 }
                 None => {
-                    *acc =
-                        crate::builtins::dispatch_class_builtin(ev, handle, selector, args, env)?;
+                    *acc = crate::builtins::dispatch_class_builtin(ev, handle, selector, args)?;
                 }
             }
         }
@@ -1815,7 +1736,6 @@ fn dispatch_to_stack(
     receiver: Value,
     selector: Arc<str>,
     mut args: Vec<Value>,
-    env: &mut Env,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
@@ -1854,15 +1774,10 @@ fn dispatch_to_stack(
                     receiver,
                     selector,
                     vec![Value::Block(cont_blk), else_val],
-                    env,
                 )?;
             }
             Value::Block(ref blk) => {
-                stack.push(Cont::ThenCheckOrElse {
-                    cont_blk,
-                    else_val,
-                    env: env.clone(),
-                });
+                stack.push(Cont::ThenCheckOrElse { cont_blk, else_val });
                 push_block_frame(ev, blk, vec![], false, stack)?;
             }
             other => {
@@ -1905,7 +1820,7 @@ fn dispatch_to_stack(
         } else {
             vec![]
         };
-        return dispatch_to_stack(ev, receiver, target_sel, target_args, env, stack, acc);
+        return dispatch_to_stack(ev, receiver, target_sel, target_args, stack, acc);
     }
 
     // (1) User-defined method lookup (covers Bool, Block, Int, Nil, ValueObject, entity self-send).
@@ -2243,7 +2158,7 @@ fn dispatch_to_stack(
     // error. Only receivers that route through `lookup_user_method`
     // (ValueObject/Entity/Int/Bool/Nil/Block) get the hook; primitive types that
     // return `None` there (Str/Symbol/Float/LargeInt) re-raise the raw miss.
-    match crate::builtins::dispatch(ev, receiver.clone(), selector.clone(), args.clone(), env) {
+    match crate::builtins::dispatch(ev, receiver.clone(), selector.clone(), args.clone()) {
         Ok(v) => {
             *acc = v;
             Ok(())
@@ -2266,7 +2181,7 @@ fn dispatch_to_stack(
 /// Build and push a `CallFrame` for a user-defined method call.
 ///
 /// Requires: `args.len() == method.pattern.params().len()`.
-/// Ensures: a `CallFrame` is pushed onto `stack` with the method env set up;
+/// Ensures: a `MethodFrame` is pushed onto `stack` with its slot frame set up;
 ///   `ev.method_stack` is updated (push_self called).
 pub(crate) fn push_method_call_frame(
     ev: &Evaluator,
@@ -2397,7 +2312,6 @@ fn build_array(array_class: Arc<Class>, elements: Vec<Value>) -> Value {
 fn eval_array_literal_iterative(
     ev: &Evaluator,
     elements: &[crate::ast::Literal],
-    env: &mut Env,
 ) -> Result<Value, EvalError> {
     let array_handle = ev
         .registry
@@ -2407,7 +2321,7 @@ fn eval_array_literal_iterative(
     let array_class = array_handle.0.class.clone();
     let mut values = Vec::with_capacity(elements.len());
     for lit in elements {
-        values.push(ev.eval_literal_as_value(lit, env)?);
+        values.push(ev.eval_literal_as_value(lit)?);
     }
     Ok(build_array(array_class, values))
 }

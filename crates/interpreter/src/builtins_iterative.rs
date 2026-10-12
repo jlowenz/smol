@@ -12,7 +12,6 @@ use crate::entity::{
     EntityId, FutureHandle, InstanceHandle, InstanceKind, InstanceState, send_to_entity,
     spawn_class_entity, spawn_entity_bare,
 };
-use crate::env::Env;
 use crate::eval::{EvalError, Evaluator};
 use crate::namespace::Namespace;
 use crate::object::{IndexedStorage, Object};
@@ -28,7 +27,6 @@ pub fn dispatch(
     recv: Value,
     selector: Arc<str>,
     args: Vec<Value>,
-    env: &mut Env,
 ) -> Result<Value, EvalError> {
     // `yourself` is universal — every value returns itself.
     if selector.as_ref() == "yourself" {
@@ -146,7 +144,6 @@ pub fn dispatch(
             Value::Instance(assoc_class),
             Arc::from("key:value:"),
             vec![recv, value],
-            env,
         );
     }
     // `then:orElse:` — chains a block after this value resolves, with an explicit
@@ -156,30 +153,30 @@ pub fn dispatch(
         let mut it = args.into_iter();
         let then_val = it.next().unwrap();
         let else_val = it.next().unwrap();
-        return dispatch_then_or_else(ev, recv, then_val, else_val, &selector, env);
+        return dispatch_then_or_else(ev, recv, then_val, else_val, &selector);
     }
 
     match recv {
-        Value::Int(n) => dispatch_int(ev, n, &selector, args, env),
-        Value::Float(f) => dispatch_float(ev, f, &selector, args, env),
+        Value::Int(n) => dispatch_int(ev, n, &selector, args),
+        Value::Float(f) => dispatch_float(ev, f, &selector, args),
         Value::Bool(b) => dispatch_primitive_fallback(ev, Value::Bool(b), "Bool", &selector, args),
         Value::Nil => dispatch_primitive_fallback(ev, Value::Nil, "Nil", &selector, args),
-        Value::Str(s) => dispatch_str(ev, s, &selector, args, env),
+        Value::Str(s) => dispatch_str(ev, s, &selector, args),
         Value::Symbol(s) => {
             dispatch_primitive_fallback(ev, Value::Symbol(s), "Symbol", &selector, args)
         }
-        Value::Block(blk) => dispatch_block(ev, blk, &selector, args, env),
-        Value::LargeInt(n) => dispatch_largeint(ev, n, &selector, args, env),
+        Value::Block(blk) => dispatch_block(ev, blk, &selector, args),
+        Value::LargeInt(n) => dispatch_largeint(ev, n, &selector, args),
         Value::Instance(handle) => match &handle.0.kind {
-            InstanceKind::ValueObject(_) => dispatch_object_value(ev, handle, selector, args, env),
-            InstanceKind::Entity(_) => dispatch_entity(ev, handle, selector, args, env),
-            InstanceKind::ClassEntity(_) => dispatch_class(ev, handle, selector, args, env),
+            InstanceKind::ValueObject(_) => dispatch_object_value(ev, handle, selector, args),
+            InstanceKind::Entity(_) => dispatch_entity(ev, handle, selector, args),
+            InstanceKind::ClassEntity(_) => dispatch_class(ev, handle, selector, args),
         },
         Value::Future(_) => unreachable!(
             "dispatch() called with unresolved Future; dispatch_to_stack forces futures before \
              calling dispatch(), and then: intercepts Futures before force_value"
         ),
-        Value::Namespace(ns) => dispatch_namespace(ev, ns, selector, args, env),
+        Value::Namespace(ns) => dispatch_namespace(ev, ns, selector, args),
         Value::Handle(_) => Err(EvalError::MessageNotUnderstood {
             receiver_kind: "Handle",
             selector,
@@ -216,12 +213,10 @@ fn run_reject_arm(ev: &Evaluator, else_val: Value, err: EvalError, result_reply:
         Value::Symbol(s) if &*s == "reject" => result_reply.resolve_err(err),
         Value::Symbol(s) if &*s == "value" => result_reply.resolve_ok(cond),
         Value::Symbol(s) if &*s == "signal" => {
-            let mut env = Env::new();
-            settle(signal_condition(ev, cond, &mut env), result_reply);
+            settle(signal_condition(ev, cond), result_reply);
         }
         Value::Block(b) => {
-            let mut env = Env::new();
-            settle(ev.eval_block(&b, vec![cond], &mut env), result_reply);
+            settle(ev.eval_block(&b, vec![cond]), result_reply);
         }
         // Unknown symbol / non-block else arg: fail loudly rather than silently drop.
         other => result_reply.resolve_err(EvalError::TypeError(format!(
@@ -242,7 +237,6 @@ fn dispatch_then_or_else(
     then_val: Value,
     else_val: Value,
     selector: &Arc<str>,
-    env: &mut Env,
 ) -> Result<Value, EvalError> {
     match recv {
         Value::Future(future) => {
@@ -255,24 +249,21 @@ fn dispatch_then_or_else(
                 let then_ev = ctx.into_evaluator();
                 match future.wait() {
                     Err(e) => run_reject_arm(&then_ev, else_val, e, &result_reply),
-                    Ok(v) => {
-                        let mut dummy_env = crate::env::Env::new();
-                        match then_ev.eval_block(&blk, vec![v], &mut dummy_env) {
-                            Ok(v) => match force_value(&then_ev, v) {
-                                Ok(forced) => result_reply.resolve_ok(forced),
-                                Err(e) => result_reply.resolve_err(e),
-                            },
-                            Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
+                    Ok(v) => match then_ev.eval_block(&blk, vec![v]) {
+                        Ok(v) => match force_value(&then_ev, v) {
+                            Ok(forced) => result_reply.resolve_ok(forced),
                             Err(e) => result_reply.resolve_err(e),
-                        }
-                    }
+                        },
+                        Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
+                        Err(e) => result_reply.resolve_err(e),
+                    },
                 }
             });
             Ok(Value::Future(result_future))
         }
         Value::Block(recv_blk) => {
             let then_blk = as_block(ev, then_val, selector)?;
-            let result = ev.eval_block(&recv_blk, vec![], env)?;
+            let result = ev.eval_block(&recv_blk, vec![])?;
             match result {
                 Value::Future(future) => {
                     let result_future = crate::entity::FutureHandle::new();
@@ -283,29 +274,26 @@ fn dispatch_then_or_else(
                         let then_ev = ctx.into_evaluator();
                         match future.wait() {
                             Err(e) => run_reject_arm(&then_ev, else_val, e, &result_reply),
-                            Ok(v) => {
-                                let mut dummy_env = crate::env::Env::new();
-                                match then_ev.eval_block(&then_blk, vec![v], &mut dummy_env) {
-                                    Ok(v) => match force_value(&then_ev, v) {
-                                        Ok(forced) => result_reply.resolve_ok(forced),
-                                        Err(e) => result_reply.resolve_err(e),
-                                    },
-                                    Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
+                            Ok(v) => match then_ev.eval_block(&then_blk, vec![v]) {
+                                Ok(v) => match force_value(&then_ev, v) {
+                                    Ok(forced) => result_reply.resolve_ok(forced),
                                     Err(e) => result_reply.resolve_err(e),
-                                }
-                            }
+                                },
+                                Err(EvalError::Return(v, _)) => result_reply.resolve_ok(v),
+                                Err(e) => result_reply.resolve_err(e),
+                            },
                         }
                     });
                     Ok(Value::Future(result_future))
                 }
                 // Receiver already resolved (no rejection possible): run then-block.
-                other => ev.eval_block(&then_blk, vec![other], env),
+                other => ev.eval_block(&then_blk, vec![other]),
             }
         }
         // Already-resolved value: run then-block; else arm cannot fire.
         already_resolved => {
             let blk = as_block(ev, then_val, selector)?;
-            ev.eval_block(&blk, vec![already_resolved], env)
+            ev.eval_block(&blk, vec![already_resolved])
         }
     }
 }
@@ -499,8 +487,7 @@ pub(crate) fn force_value(ev: &Evaluator, v: Value) -> Result<Value, EvalError> 
         Value::Future(f) => match f.wait() {
             Ok(inner) => force_value(ev, inner),
             Err(EvalError::Signal(cond)) => {
-                let mut env = Env::new();
-                let handled = signal_condition(ev, cond, &mut env)?;
+                let handled = signal_condition(ev, cond)?;
                 force_value(ev, handled)
             }
             Err(e) => Err(e),
@@ -1144,8 +1131,8 @@ fn dispatch_primitive_fallback(
     sel: &Arc<str>,
     mut args: Vec<Value>,
 ) -> Result<Value, EvalError> {
-    // NOTE: primitive types (Int, Float, etc.) don't carry an Env — handler_chain
-    // checking is skipped here. Use dispatch_object_primitive for Condition instances.
+    // NOTE: handler_chain checking is skipped for primitive types (Int, Float,
+    // etc.). Use dispatch_object_primitive for Condition instances.
     match sel.as_ref() {
         // Grounding for `Object >> ==` (C34 S2). Lives here rather than in each
         // per-variant dispatcher so there is exactly ONE identity implementation
@@ -1232,7 +1219,6 @@ fn dispatch_int(
     n: i64,
     sel: &Arc<str>,
     mut args: Vec<Value>,
-    _env: &mut Env,
 ) -> Result<Value, EvalError> {
     // Note: user-defined Int methods are routed via lookup_user_method in the
     // evaluator; this dispatcher only grounds `_prim` selectors and the remaining
@@ -1272,7 +1258,6 @@ fn dispatch_largeint(
     n: Arc<BigInt>,
     sel: &Arc<str>,
     mut args: Vec<Value>,
-    _env: &mut Env,
 ) -> Result<Value, EvalError> {
     match sel.as_ref() {
         "_primLt:" => {
@@ -1309,7 +1294,6 @@ fn dispatch_float(
     f: f64,
     sel: &Arc<str>,
     mut args: Vec<Value>,
-    _env: &mut Env,
 ) -> Result<Value, EvalError> {
     match sel.as_ref() {
         "_primLt:" => {
@@ -1348,7 +1332,6 @@ fn dispatch_str(
     s: Arc<str>,
     sel: &Arc<str>,
     mut args: Vec<Value>,
-    _env: &mut Env,
 ) -> Result<Value, EvalError> {
     // The public String protocol lives in `kernel.smol` (C34 S4); what remains here
     // is the irreducible grounding it sends to. Indexing is 0-based and char-based
@@ -1465,7 +1448,6 @@ fn dispatch_block(
     blk: Arc<Block>,
     sel: &Arc<str>,
     args: Vec<Value>,
-    _env: &mut Env,
 ) -> Result<Value, EvalError> {
     // The iterative evaluator intercepts value/value:/whileTrue:/whileFalse:/etc. in
     // dispatch_to_stack (via push_block_frame or lookup_user_method + TCO) before
@@ -1480,11 +1462,10 @@ fn dispatch_object_value(
     handle: InstanceHandle,
     selector: Arc<str>,
     args: Vec<Value>,
-    env: &mut Env,
 ) -> Result<Value, EvalError> {
     // User-defined methods are intercepted by lookup_user_method in dispatch_to_stack
     // before dispatch() is called, so class.lookup() here would always return None.
-    dispatch_object_primitive(ev, handle, &selector, args, env)
+    dispatch_object_primitive(ev, handle, &selector, args)
 }
 
 /// Dispatch a message to an actor entity. Checks for sync self-send
@@ -1498,7 +1479,6 @@ fn dispatch_entity(
     handle: InstanceHandle,
     selector: Arc<str>,
     args: Vec<Value>,
-    env: &mut Env,
 ) -> Result<Value, EvalError> {
     let entity_id = match &handle.0.kind {
         InstanceKind::Entity(d) => d.id,
@@ -1511,7 +1491,7 @@ fn dispatch_entity(
     // always return None here; only builtins remain.
     let current = ev.current_entity_id.get();
     if current == Some(entity_id) {
-        return dispatch_object_primitive(ev, handle, &selector, args, env);
+        return dispatch_object_primitive(ev, handle, &selector, args);
     }
 
     // Cross-entity or non-entity-context send: enqueue and return Future.
@@ -1612,7 +1592,6 @@ pub(crate) fn dispatch_object_primitive(
     handle: InstanceHandle,
     sel: &Arc<str>,
     mut args: Vec<Value>,
-    env: &mut Env,
 ) -> Result<Value, EvalError> {
     let entity_id = match &handle.0.kind {
         InstanceKind::Entity(d) => Some(d.id),
@@ -1649,7 +1628,7 @@ pub(crate) fn dispatch_object_primitive(
     if let Some(v) = obj_prim_indexed(&cx, sel, &mut args)? {
         return Ok(v);
     }
-    if let Some(v) = obj_prim_conditions(&cx, sel, &mut args, env)? {
+    if let Some(v) = obj_prim_conditions(&cx, sel, &mut args)? {
         return Ok(v);
     }
     if let Some(v) = obj_prim_history(&cx, sel, &mut args)? {
@@ -2005,7 +1984,6 @@ fn obj_prim_conditions(
     cx: &ObjPrim,
     sel: &Arc<str>,
     args: &mut Vec<Value>,
-    env: &mut Env,
 ) -> Result<Option<Value>, EvalError> {
     let ev = cx.ev;
     Ok(Some(match sel.as_ref() {
@@ -2017,7 +1995,7 @@ fn obj_prim_conditions(
                     "_primSignalCondition: requires a Condition instance".into(),
                 ));
             }
-            signal_condition(ev, condition, env)?
+            signal_condition(ev, condition)?
         }
         "_primResume:" => {
             expect_arity(sel, 1, args.len())?;
@@ -2052,7 +2030,7 @@ fn obj_prim_conditions(
 
             // Execute body in a loop (for Retry). Always truncate chain on exit.
             let result = loop {
-                match ev.eval_block(&body, vec![], env) {
+                match ev.eval_block(&body, vec![]) {
                     Ok(v) => break Ok(v),
                     Err(EvalError::ReturnFromBlock(v)) => break Ok(v),
                     Err(EvalError::Retry) => continue,
@@ -2594,11 +2572,7 @@ pub(crate) fn extract_handler_pairs(
 /// Ensures: if a matching non-unwinding handler is found its return value is returned;
 ///   if none match, applies unhandled policy (Condition → nil, Warning → log+nil,
 ///   Error → raise EvalError::Signal).
-pub(crate) fn signal_condition(
-    ev: &Evaluator,
-    condition: Value,
-    env: &mut Env,
-) -> Result<Value, EvalError> {
+pub(crate) fn signal_condition(ev: &Evaluator, condition: Value) -> Result<Value, EvalError> {
     #[cfg(feature = "step_probe")]
     {
         let sp_probe = 0u8;
@@ -2627,7 +2601,7 @@ pub(crate) fn signal_condition(
             (removed[0].0.clone(), removed[0].1.clone(), removed)
         };
         let resumable = class_is_resumable(ev, &handler_class);
-        let outcome = ev.eval_block(&handler_block, vec![condition], env);
+        let outcome = ev.eval_block(&handler_block, vec![condition]);
         ev.handler_chain.borrow_mut().extend(removed);
         // Disposition (docs/condition_system_guide.md §2): an explicit `resume:`
         // always resumes; `return:`/`retry`/re-signal propagate. On *normal*
@@ -2830,7 +2804,6 @@ fn build_array(ev: &Evaluator, values: Vec<Value>) -> Result<Value, EvalError> {
     let arr = spawn_entity_bare(
         array_class,
         ev.registry.clone(),
-        crate::env::Env::new(),
         Some(values.len()),
         ev.store.clone_handle(),
     );
@@ -2916,7 +2889,6 @@ fn dispatch_namespace(
     ns: Arc<Namespace>,
     selector: Arc<str>,
     mut args: Vec<Value>,
-    env: &mut Env,
 ) -> Result<Value, EvalError> {
     match selector.as_ref() {
         "do:" => {
@@ -2935,7 +2907,7 @@ fn dispatch_namespace(
                 home_namespace: Some(ns),
                 ..(*block).clone()
             };
-            ev.eval_block(&rehomed, vec![], env)
+            ev.eval_block(&rehomed, vec![])
         }
         "name" => {
             expect_arity(&selector, 0, args.len())?;
@@ -2963,7 +2935,6 @@ fn dispatch_class(
     handle: InstanceHandle,
     selector: Arc<str>,
     args: Vec<Value>,
-    env: &mut Env,
 ) -> Result<Value, EvalError> {
     let entity_id = match &handle.0.kind {
         InstanceKind::ClassEntity(d) => d.id,
@@ -2971,8 +2942,8 @@ fn dispatch_class(
     };
 
     // Self-send or structural class-definition message: dispatch synchronously.
-    // `subclass:*` must run in the caller's context so that env bindings and
-    // namespace registration are immediately visible to the next statement.
+    // `subclass:*` must run in the caller's context so that the namespace
+    // registration is immediately visible to the next statement.
     // Value-class methods (classes whose instances are passive ValueObjects) are also
     // dispatched synchronously: they carry no actor-mailbox semantics, so
     // cross-entity dispatch would be wrong.
@@ -2995,7 +2966,7 @@ fn dispatch_class(
         if let Some((method, def_class)) = class.lookup_class_method(&selector) {
             return ev.invoke_class_method(handle, def_class, method, args);
         }
-        return dispatch_class_builtin(ev, handle, selector, args, env);
+        return dispatch_class_builtin(ev, handle, selector, args);
     }
 
     // Cross-entity behavioral send: enqueue and return Future.
@@ -3027,7 +2998,6 @@ pub(crate) fn dispatch_class_builtin(
     handle: InstanceHandle,
     selector: Arc<str>,
     mut args: Vec<Value>,
-    env: &mut Env,
 ) -> Result<Value, EvalError> {
     let class = handle.0.class.clone();
     let self_val = Value::Instance(handle);
@@ -3071,7 +3041,6 @@ pub(crate) fn dispatch_class_builtin(
                 let inst = spawn_entity_bare(
                     class.clone(),
                     ev.registry.clone(),
-                    crate::env::Env::new(),
                     indexed_size,
                     ev.store.clone_handle(),
                 );
@@ -3101,7 +3070,7 @@ pub(crate) fn dispatch_class_builtin(
                 None
             };
             let inst = make_value_instance(class, indexed);
-            ev.eval_block(&blk, vec![Value::Instance(inst.clone())], env)?;
+            ev.eval_block(&blk, vec![Value::Instance(inst.clone())])?;
             freeze_value_instance(&inst);
             Ok(Value::Instance(inst))
         }
@@ -3126,7 +3095,7 @@ pub(crate) fn dispatch_class_builtin(
             let n = as_int(ev, args.remove(0), &selector)?;
             let blk = as_block(ev, args.remove(0), &selector)?;
             let inst = make_value_instance(class, Some(n.max(0) as usize));
-            ev.eval_block(&blk, vec![Value::Instance(inst.clone())], env)?;
+            ev.eval_block(&blk, vec![Value::Instance(inst.clone())])?;
             freeze_value_instance(&inst);
             Ok(Value::Instance(inst))
         }
@@ -3179,7 +3148,7 @@ pub(crate) fn dispatch_class_builtin(
             let callback = Box::new(move || {
                 may::go!(move || {
                     let ev = ctx.into_evaluator();
-                    let _ = ev.eval_block(&blk, vec![], &mut Env::new());
+                    let _ = ev.eval_block(&blk, vec![]);
                 });
             });
             let handle = ev.os.schedule_timer(ms, callback);
@@ -3221,7 +3190,6 @@ pub(crate) fn dispatch_class_builtin(
                 let inst = spawn_entity_bare(
                     class.clone(),
                     ev.registry.clone(),
-                    crate::env::Env::new(),
                     Some(n.max(0) as usize),
                     ev.store.clone_handle(),
                 );
@@ -3429,7 +3397,6 @@ fn handle_subclass(
     let class_handle = spawn_class_entity(
         new_class.clone(),
         ev.registry.clone(),
-        Env::new(),
         ev.store.clone_handle(),
     );
     new_class

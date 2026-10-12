@@ -12,7 +12,6 @@ pub mod class;
 pub mod class_registry;
 pub mod coverage;
 pub mod entity;
-pub mod env;
 pub mod eval;
 pub(crate) mod eval_iterative;
 pub mod lexer;

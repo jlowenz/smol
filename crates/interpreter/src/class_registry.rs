@@ -6,7 +6,6 @@ use parking_lot::{Mutex, RwLock};
 use crate::class::Class;
 use crate::coverage::CoverageCollector;
 use crate::entity::{EntityId, InstanceHandle, InstanceKind, InstanceState, spawn_class_entity};
-use crate::env::Env;
 use crate::namespace::Namespace;
 use crate::value::Value;
 use triple_store::predicate_registry::Visibility;
@@ -72,9 +71,8 @@ impl ClassRegistry {
     ///   2. Spawn a `ClassEntity` actor for each bootstrap class, then register it
     ///      in the kernel namespace and set `class_object`.
     ///
-    /// The class actors start with an empty env: methods resolve free names through
-    /// their defining class's namespace, read live, so no env snapshot of the
-    /// registry is needed.
+    /// The class actors need no snapshot of the registry: methods resolve free
+    /// names through their defining class's namespace, read live.
     pub fn new_arc() -> Arc<Self> {
         let store = Store::in_memory();
         let indexed_slots_pred = store
@@ -143,16 +141,11 @@ impl ClassRegistry {
             coverage: OnceLock::new(),
         });
 
-        // Phase 2: spawn actors with an empty initial env. Class-side methods resolve
-        // other classes through their defining namespace, not the env.
-        let bootstrap_env = Env::new();
+        // Phase 2: spawn the class actors. Class-side methods resolve other classes
+        // through their defining namespace.
 
-        let object_handle = spawn_class_entity(
-            object_class.clone(),
-            arc.clone(),
-            bootstrap_env.clone(),
-            store.clone_handle(),
-        );
+        let object_handle =
+            spawn_class_entity(object_class.clone(), arc.clone(), store.clone_handle());
         let object_id = match &object_handle.0.kind {
             InstanceKind::ClassEntity(d) => d.id,
             _ => unreachable!(),
@@ -166,12 +159,8 @@ impl ClassRegistry {
             .ok();
         kernel.register(object_handle);
 
-        let value_handle = spawn_class_entity(
-            value_class.clone(),
-            arc.clone(),
-            bootstrap_env.clone(),
-            store.clone_handle(),
-        );
+        let value_handle =
+            spawn_class_entity(value_class.clone(), arc.clone(), store.clone_handle());
         let value_id = match &value_handle.0.kind {
             InstanceKind::ClassEntity(d) => d.id,
             _ => unreachable!(),
@@ -185,12 +174,7 @@ impl ClassRegistry {
             .ok();
         kernel.register(value_handle);
 
-        let nil_handle = spawn_class_entity(
-            nil_class.clone(),
-            arc.clone(),
-            bootstrap_env.clone(),
-            store.clone_handle(),
-        );
+        let nil_handle = spawn_class_entity(nil_class.clone(), arc.clone(), store.clone_handle());
         let nil_id = match &nil_handle.0.kind {
             InstanceKind::ClassEntity(d) => d.id,
             _ => unreachable!(),
@@ -204,12 +188,8 @@ impl ClassRegistry {
             .ok();
         kernel.register(nil_handle);
 
-        let block_handle = spawn_class_entity(
-            block_class.clone(),
-            arc.clone(),
-            bootstrap_env,
-            store.clone_handle(),
-        );
+        let block_handle =
+            spawn_class_entity(block_class.clone(), arc.clone(), store.clone_handle());
         let block_id = match &block_handle.0.kind {
             InstanceKind::ClassEntity(d) => d.id,
             _ => unreachable!(),

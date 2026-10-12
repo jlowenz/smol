@@ -277,7 +277,6 @@ fn handle_commit_error_faults_entity_drains_mailbox() {
 fn nlr_with_failing_commit_faults_entity() {
     use crate::ast::{Expr, Literal, Stmt};
     use crate::entity::spawn_entity_bare;
-    use crate::env::Env;
     use crate::value::Block;
     use triple_store::store::Store;
     use triple_store::test_support::AlwaysFailingStore;
@@ -315,7 +314,6 @@ fn nlr_with_failing_commit_faults_entity() {
     let inst = spawn_entity_bare(
         class,
         base_ev.registry.clone(),
-        Env::new(),
         None,
         Store::new(Arc::new(AlwaysFailingStore)),
     );
@@ -406,7 +404,6 @@ actor noop.
 #[test]
 fn type_error_crash_drains_queued_mailbox() {
     use crate::entity::spawn_entity_bare;
-    use crate::env::Env;
     use triple_store::store::Store;
 
     crate::entity::init_coroutine_stack();
@@ -430,13 +427,7 @@ fn type_error_crash_drains_queued_mailbox() {
         .class
         .clone();
 
-    let inst = spawn_entity_bare(
-        class,
-        ev.registry.clone(),
-        Env::new(),
-        None,
-        Store::in_memory(),
-    );
+    let inst = spawn_entity_bare(class, ev.registry.clone(), None, Store::in_memory());
 
     let reply_bad = FutureHandle::new();
     let reply_a = FutureHandle::new();
@@ -1817,8 +1808,7 @@ mod tx_primitives {
         sel: &str,
         args: Vec<Value>,
     ) -> Result<Value, EvalError> {
-        let mut env = crate::env::Env::new();
-        dispatch_object_primitive(ev, recv.clone(), &Arc::from(sel), args, &mut env)
+        dispatch_object_primitive(ev, recv.clone(), &Arc::from(sel), args)
     }
 
     fn entity_data(h: &InstanceHandle) -> &crate::entity::EntityData {

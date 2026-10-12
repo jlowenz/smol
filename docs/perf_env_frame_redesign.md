@@ -844,6 +844,16 @@ criterion phases ran one after the other rather than interleaved, so the interle
 This is the allocation cost the 2026-08-05 profile attributed to the env (an `Arc`'d,
 `Mutex`-guarded `HashMap` frame plus one insert per name on every call).
 
+**d4 landed (2026-10-11); P2.1d is complete.** The `Env` type and `env.rs` are
+deleted, along with every `env` field on a `Cont` variant, every handler and
+dispatch parameter that carried one, `eval_block`'s outer-env argument, and the
+entity actors' base env (`spawn_class_entity` / `spawn_entity_bare` /
+`run_entity_loop`). Three `#[allow(clippy::too_many_arguments)]` attributes
+became unnecessary and were removed. Behaviour is unchanged: 1120 tests pass and
+kernel coverage stays at 96.4%. Same-session `alloc_probe` A/B against d3 (three
+interleaved runs per side) is within ±2%, as expected, since `Env` was already
+zero-sized after d3.
+
 ### 11.8 Risks
 
 - The `Cont`-carries-frame-index change touches every `Cont` variant and all their

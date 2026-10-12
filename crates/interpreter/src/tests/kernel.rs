@@ -216,14 +216,8 @@ fn timer_fires_in_entity() {
             // the reply may be a nested Future — force twice.
             let result = crate::builtins_iterative::force_value(
                 &ev,
-                crate::builtins::dispatch(
-                    &ev,
-                    actor.clone(),
-                    Arc::from("getResult"),
-                    vec![],
-                    &mut crate::env::Env::new(),
-                )
-                .unwrap(),
+                crate::builtins::dispatch(&ev, actor.clone(), Arc::from("getResult"), vec![])
+                    .unwrap(),
             )
             .unwrap();
             final_result = crate::builtins_iterative::force_value(&ev, result).unwrap();

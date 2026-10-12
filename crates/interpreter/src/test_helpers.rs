@@ -63,7 +63,7 @@ pub(crate) fn eval(src: &str) -> Value {
 }
 
 /// Evaluate each source in `srcs` as a separate top-level chunk on one evaluator
-/// and one workspace env — the REPL shape. Each chunk's outcome is returned in
+/// and one workspace — the REPL shape. Each chunk's outcome is returned in
 /// order (futures resolved); a failing chunk does not stop later ones.
 ///
 /// Requires: every source parses.

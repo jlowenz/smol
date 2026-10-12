@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::class::Class;
 use crate::class_registry::ClassRegistry;
-use crate::env::Env;
 use crate::eval::EvalError;
 use crate::object::Object;
 use crate::shared_tx::{AtomicFrame, GenTx, StmFrame, TxCtxId, TxFrame};
@@ -681,16 +680,12 @@ pub(crate) fn new_entity_data(class: &Arc<Class>, store: Store) -> EntityData {
 
 /// Spawn a class-side singleton actor for `class`.
 ///
-/// `global_env` is the actor's base env. It holds no globals: methods resolve free
-/// names through their defining class's namespace (env-frame redesign d2a), so
-/// callers pass an empty `Env` (the parameter goes away with the env in d3/d4).
 /// Requires: `store` is a handle to the shared store for this session.
 /// Ensures: the returned handle has `InstanceKind::ClassEntity`; `class.class_object`
 ///   is NOT set here — the caller must set it after this call returns.
 pub fn spawn_class_entity(
     class: Arc<Class>,
     registry: Arc<ClassRegistry>,
-    global_env: Env,
     store: Store,
 ) -> InstanceHandle {
     let data = new_entity_data(&class, store);
@@ -702,10 +697,9 @@ pub fn spawn_class_entity(
 
     let state_clone = state;
     let registry_clone = registry;
-    let env_clone = global_env;
     init_coroutine_stack();
     may::go!(move || {
-        run_entity_loop(state_clone, registry_clone, env_clone);
+        run_entity_loop(state_clone, registry_clone);
     });
 
     handle
@@ -720,7 +714,6 @@ pub fn spawn_class_entity(
 pub fn spawn_entity_bare(
     class: Arc<Class>,
     registry: Arc<ClassRegistry>,
-    global_env: Env,
     indexed_size: Option<usize>,
     store: Store,
 ) -> InstanceHandle {
@@ -750,10 +743,9 @@ pub fn spawn_entity_bare(
 
     let state_clone = state.clone();
     let registry_clone = registry.clone();
-    let env_clone = global_env.clone();
     init_coroutine_stack();
     may::go!(move || {
-        run_entity_loop(state_clone, registry_clone, env_clone);
+        run_entity_loop(state_clone, registry_clone);
     });
 
     handle
@@ -1068,7 +1060,7 @@ fn reject_parked_message_for_ctx(
     true
 }
 
-fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, global_env: Env) {
+fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>) {
     use crate::builtins::make_error_value;
     use crate::eval::EvalError;
     use crate::eval::Evaluator;
@@ -1087,8 +1079,6 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
     // `Evaluator::ensure_tx_enrolled` (lazy enrollment), keyed on Transaction
     // identity, alongside the born-in-tx exclusion. Tag propagation still happens
     // below so nested coordinators see the outer ctx.
-
-    let mut env = global_env;
 
     loop {
         // Wait for an envelope (or shutdown signal).
@@ -1200,14 +1190,12 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
                     handle.clone(),
                     &envelope.selector,
                     envelope.args.clone(),
-                    &mut env,
                 ),
                 InstanceKind::ClassEntity(_) => dispatch_class_envelope(
                     &ev,
                     handle.clone(),
                     &envelope.selector,
                     envelope.args.clone(),
-                    &mut env,
                 ),
                 InstanceKind::ValueObject(_) => unreachable!(),
             };
@@ -1310,7 +1298,6 @@ fn dispatch_envelope(
     handle: InstanceHandle,
     selector: &Arc<str>,
     args: Vec<Value>,
-    env: &mut Env,
 ) -> Result<Value, crate::eval::EvalError> {
     if let Some((method, def_class)) = handle.0.class.lookup(selector) {
         return ev.invoke_method(handle.clone(), def_class, method, args);
@@ -1323,15 +1310,9 @@ fn dispatch_envelope(
     // condition, so an unhandled miss still surfaces as an error.
     let dnu = handle.0.class.lookup("doesNotUnderstand:");
     if dnu.is_none() {
-        return crate::builtins::dispatch_object_primitive(ev, handle, selector, args, env);
+        return crate::builtins::dispatch_object_primitive(ev, handle, selector, args);
     }
-    match crate::builtins::dispatch_object_primitive(
-        ev,
-        handle.clone(),
-        selector,
-        args.clone(),
-        env,
-    ) {
+    match crate::builtins::dispatch_object_primitive(ev, handle.clone(), selector, args.clone()) {
         Err(crate::eval::EvalError::MessageNotUnderstood { .. }) => {
             let (dnu_method, dnu_class) = dnu.expect("dnu is Some");
             let msg = crate::builtins::build_message(ev, selector.clone(), args)?;
@@ -1346,12 +1327,11 @@ fn dispatch_class_envelope(
     handle: InstanceHandle,
     selector: &Arc<str>,
     args: Vec<Value>,
-    env: &mut Env,
 ) -> Result<Value, crate::eval::EvalError> {
     if let Some((method, def_class)) = handle.0.class.lookup_class_method(selector) {
         return ev.invoke_class_method(handle.clone(), def_class, method, args);
     }
-    crate::builtins::dispatch_class_builtin(ev, handle, selector.clone(), args, env)
+    crate::builtins::dispatch_class_builtin(ev, handle, selector.clone(), args)
 }
 
 #[cfg(test)]

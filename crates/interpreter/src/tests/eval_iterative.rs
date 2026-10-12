@@ -793,7 +793,6 @@ fn cleanup_frames_top_level_block_frame_pops_no_receiver() {
     ev.current_block_home.set(Some(99));
     let mut stack = vec![Cont::BlockFrame {
         pending: std::collections::VecDeque::new(),
-        env: crate::env::Env::new(),
         saved_block_home: Some(3),
         sync: false,
     }];
@@ -831,7 +830,6 @@ fn cleanup_frames_method_frame_pops_self() {
     let mut stack = vec![Cont::MethodFrame {
         depth: 1,
         pending: std::collections::VecDeque::new(),
-        env: crate::env::Env::new(),
         implicit_self: Value::Nil,
         saved_block_home: None,
     }];
@@ -869,7 +867,6 @@ fn cleanup_frames_block_frame_pops_home_binding() {
     ev.current_block_home.set(Some(5));
     let mut stack = vec![Cont::BlockFrame {
         pending: std::collections::VecDeque::new(),
-        env: crate::env::Env::new(),
         saved_block_home: Some(2),
         sync: false,
     }];
@@ -922,7 +919,6 @@ fn cleanup_frames_multiple_mixed_frames() {
     let make_frame = |saved: Option<usize>| Cont::MethodFrame {
         depth: 1,
         pending: std::collections::VecDeque::new(),
-        env: crate::env::Env::new(),
         implicit_self: Value::Nil,
         saved_block_home: saved,
     };
@@ -1070,8 +1066,8 @@ fn push_class_method_frame_unary_fields() {
 }
 
 #[test]
-fn push_class_method_frame_params_bound_in_env() {
-    // Keyword method: params must be accessible in the frame's env.
+fn push_class_method_frame_params_fill_the_slot_frame() {
+    // Keyword method: params must occupy the frame's first slots, in order.
     use std::sync::Arc;
     let ev = crate::eval::Evaluator::new_without_kernel();
     let class = make_class("MyClass");
