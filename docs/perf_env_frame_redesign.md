@@ -1,6 +1,11 @@
 # Env-frame redesign — slot resolution + snapshot capture
 
-**Status:** design, written 2026-08-08. Opened from `next_steps_after_c34.md` §4.
+**Status: COMPLETE (2026-10-11).** P1–P2.1d implemented. P2.1e closed as a
+profile only: ≈360–390 ns/send, down from ~1.2 µs. Results and the remaining cost
+breakdown are in "P2.1e closed" (end of §11.7c). Next: triage the uncovered
+kernel lines, then the compiler/VM.
+
+**Original status:** design, written 2026-08-08. Opened from `next_steps_after_c34.md` §4.
 The verify step is complete (§1); the semantic decision (**single-assignment
 locals** + snapshot capture) is taken (§2), grounded in the audit (§2.3). **Not yet
 implemented.** This doc specifies the target design, the interaction points that
@@ -517,6 +522,8 @@ rewrite each method/block body into a resolved copy (once, at install — not ho
     self/params/locals); drop `Block.env`.
   - **d4** — drop `env: Env` from the ~20 Cont variants + the handler params.
 - **P2.1e** — re-profile (`alloc_probe soak`); TCO frame reuse; `SmallVec` decision.
+  *(Closed 2026-10-11 as profile-only; TCO reuse and `SmallVec` dropped — see "P2.1e
+  closed" below §11.7c.)*
 
 ### 11.7a P2.1d-d2 revised — Globals vs Workspace (DECIDED 2026-10-10)
 
@@ -853,6 +860,67 @@ became unnecessary and were removed. Behaviour is unchanged: 1120 tests pass and
 kernel coverage stays at 96.4%. Same-session `alloc_probe` A/B against d3 (three
 interleaved runs per side) is within ±2%, as expected, since `Env` was already
 zero-sized after d3.
+
+**P2.1e closed (2026-10-11): profile only.** Decision (with the user): tail-call
+frame reuse and the `SmallVec` slot-frame decision are **dropped**. Both tune this
+tree-walker's `Cont` stack and `Frame` vectors, which the bytecode VM replaces with
+its own frame layout. This evaluator will serve as the VM's reference oracle, so it
+needs to be correct rather than fast. P2.1e is closed by one profile that separates
+evaluator overhead (the VM removes it) from runtime overhead (the VM inherits it).
+
+*Send cost.* `alloc_probe --features send_count`, three runs, same session:
+`pvtSpin` ≈ 364 ns/send (12 sends/iter), `timesRepeat: [1 + 1]` ≈ 361 (17),
+`fib` ≈ 390 (17). That meets the §10 candidate target (< 500 ns), but it is still
+≈ 3× the ~120 ns of a typical tree-walker (§1).
+
+*Profile.* samply, `alloc_probe soak` (`100000 pvtSpin` × 8), 4 kHz, 15,267
+main-thread samples, release build with debug info (workflow as in August). Self
+time by category:
+
+| category | share | August (pre-redesign) |
+|---|---|---|
+| allocation / free | 31.4% | 34% |
+| evaluator logic (step loop, handlers, frame push/teardown) | 31.1% | ~35% (all logic) |
+| AST clone / drop (self time only) | 12.4% | ~2% |
+| hashing (SipHash) | 8.9% | 10% |
+| method lookup + namespace resolve (own logic) | 5.1% | — |
+| `memset`/`memcmp`/`memmove` | 3.9% | 4% |
+| lock / yield | 3.6% | 7% |
+| `Value` / `SelfBinding` / `Cont` clone + drop | 3.0% | 9% (with AST) |
+
+Attributing allocation, hashing and `mem*` samples (44% of all samples) to the
+nearest non-library caller shows that the env cost is gone and three other sources
+remain:
+
+1. **AST cloned into continuations (evaluator-specific; the VM removes it).**
+   - `push_method_frame` copies the method body into `pending: VecDeque<Stmt>`
+     (16.6% inclusive).
+   - `EvalExpr { expr: Expr }` clones each sub-expression (`Expr::clone` 12.2%
+     inclusive), in `handle_eval_expr`, `handle_after_receiver` and
+     `handle_collect_args`.
+   - A block created in a loop clones its body AST and frees it when the block
+     dies (`Arc<Block>::drop_slow` 5.0% inclusive, under `release_frame`).
+
+   August's "lever 2", then ~8–10%, is now the largest single cost. Bytecode
+   referenced by index has no per-activation copy.
+2. **Selector strings and method lookup (runtime; the VM inherits it unless the
+   design addresses it).**
+   - `Message::selector` concatenates the keyword parts into a new string on every
+     send (5.0% inclusive).
+   - `Class::lookup` hashes that string with SipHash into the method dictionary
+     (9.4% inclusive; 15.3% for `lookup_user_method` as a whole), with no caching.
+
+   VM implications: the compiler interns selectors as constants; lookup should
+   key on an interned symbol (pointer equality, cheap hash) behind inline caches.
+3. **Free-name resolution (runtime).** `Namespace::resolve` hashes the name and
+   walks the namespace chain on every global or class reference (4.6% inclusive).
+   VM implication: cache the binding at the reference site (the Smalltalk
+   literal-association pattern), invalidated when the namespace changes, to keep
+   live redefinition.
+
+Inputs for the VM design, then: interned selectors, symbol-keyed method
+dictionaries with inline caches, cached global bindings. Any `Value` representation
+choice should keep clone/drop off the send path.
 
 ### 11.8 Risks
 
