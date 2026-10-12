@@ -100,7 +100,6 @@ fn block_maps_to_skip() {
         locals: vec![],
         body: vec![],
         snapshot: Arc::from(Vec::new()),
-        env: crate::env::Env::new(),
         home_depth: 0,
         home_entity: None,
         home_binding: crate::eval::SelfBinding::NoReceiver,

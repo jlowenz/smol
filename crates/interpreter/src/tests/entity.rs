@@ -330,7 +330,6 @@ fn nlr_with_failing_commit_faults_entity() {
             Stmt::Return(Expr::Lit(Literal::Int(77))),
         )],
         snapshot: Arc::from(Vec::new()),
-        env: Env::new(),
         home_depth: 2,
         home_entity: None,
         home_binding: crate::eval::SelfBinding::NoReceiver,

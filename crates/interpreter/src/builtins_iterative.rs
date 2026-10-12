@@ -2993,7 +2993,7 @@ fn dispatch_class(
     {
         let class = handle.0.class.clone();
         if let Some((method, def_class)) = class.lookup_class_method(&selector) {
-            return ev.invoke_class_method(handle, def_class, method, args, env);
+            return ev.invoke_class_method(handle, def_class, method, args);
         }
         return dispatch_class_builtin(ev, handle, selector, args, env);
     }
@@ -3179,8 +3179,7 @@ pub(crate) fn dispatch_class_builtin(
             let callback = Box::new(move || {
                 may::go!(move || {
                     let ev = ctx.into_evaluator();
-                    let mut env = blk.env.clone();
-                    let _ = ev.eval_block(&blk, vec![], &mut env);
+                    let _ = ev.eval_block(&blk, vec![], &mut Env::new());
                 });
             });
             let handle = ev.os.schedule_timer(ms, callback);

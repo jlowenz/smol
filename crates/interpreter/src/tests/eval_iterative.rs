@@ -787,16 +787,13 @@ fn cleanup_frames_empty_stack() {
 #[test]
 fn cleanup_frames_top_level_block_frame_pops_no_receiver() {
     // A top-level block pushed the `NoReceiver` marker as its home binding →
-    // teardown pops it; saved_block_home is restored. (Block frames always own an
-    // env frame.)
+    // teardown pops it; saved_block_home is restored.
     let ev = crate::eval::Evaluator::new_without_kernel();
     ev.push_self(crate::eval::SelfBinding::NoReceiver);
     ev.current_block_home.set(Some(99));
-    let mut env = crate::env::Env::new();
-    env.push_frame();
     let mut stack = vec![Cont::BlockFrame {
         pending: std::collections::VecDeque::new(),
-        env,
+        env: crate::env::Env::new(),
         saved_block_home: Some(3),
         sync: false,
     }];
@@ -831,12 +828,10 @@ fn cleanup_frames_method_frame_pops_self() {
         self_value: Value::Nil,
     });
     ev.current_block_home.set(Some(7));
-    let mut env = crate::env::Env::new();
-    env.push_frame();
     let mut stack = vec![Cont::MethodFrame {
         depth: 1,
         pending: std::collections::VecDeque::new(),
-        env,
+        env: crate::env::Env::new(),
         implicit_self: Value::Nil,
         saved_block_home: None,
     }];
@@ -872,11 +867,9 @@ fn cleanup_frames_block_frame_pops_home_binding() {
         self_value: Value::Nil,
     });
     ev.current_block_home.set(Some(5));
-    let mut env = crate::env::Env::new();
-    env.push_frame();
     let mut stack = vec![Cont::BlockFrame {
         pending: std::collections::VecDeque::new(),
-        env,
+        env: crate::env::Env::new(),
         saved_block_home: Some(2),
         sync: false,
     }];
@@ -888,24 +881,6 @@ fn cleanup_frames_block_frame_pops_home_binding() {
         "pop_self must have been called for the re-pushed home binding"
     );
     assert_eq!(ev.current_block_home.get(), Some(2));
-}
-
-#[test]
-fn cleanup_frames_pops_env_frame_when_flagged() {
-    // A BlockFrame owns an env frame → env.pop_frame() is called without panic
-    // (requires ≥2 frames).
-    let ev = crate::eval::Evaluator::new_without_kernel();
-    ev.push_self(crate::eval::SelfBinding::NoReceiver);
-    let mut env = crate::env::Env::new();
-    env.push_frame();
-    let mut stack = vec![Cont::BlockFrame {
-        pending: std::collections::VecDeque::new(),
-        env,
-        saved_block_home: None,
-        sync: false,
-    }];
-    super::cleanup_frames(&ev, &mut stack);
-    assert!(stack.is_empty());
 }
 
 #[test]
@@ -944,16 +919,12 @@ fn cleanup_frames_multiple_mixed_frames() {
         defining_class: nil_class.clone(),
         self_value: Value::Nil,
     });
-    let make_frame = |saved: Option<usize>| {
-        let mut env = crate::env::Env::new();
-        env.push_frame();
-        Cont::MethodFrame {
-            depth: 1,
-            pending: std::collections::VecDeque::new(),
-            env,
-            implicit_self: Value::Nil,
-            saved_block_home: saved,
-        }
+    let make_frame = |saved: Option<usize>| Cont::MethodFrame {
+        depth: 1,
+        pending: std::collections::VecDeque::new(),
+        env: crate::env::Env::new(),
+        implicit_self: Value::Nil,
+        saved_block_home: saved,
     };
     // Stack bottom→top: frame(saved=None), ForceAcc, frame(saved=Some(1))
     // Pop order: frame(saved=Some(1)), ForceAcc (skipped), frame(saved=None)
@@ -1018,7 +989,6 @@ fn push_class_method_frame_arity_mismatch() {
     let class = make_class("MyClass");
     let handle = make_class_handle(class.clone());
     let method = make_method("foo", vec![], vec![]);
-    let env = crate::env::Env::new();
     let mut stack = vec![];
     let err = super::push_class_method_frame(
         &ev,
@@ -1026,7 +996,6 @@ fn push_class_method_frame_arity_mismatch() {
         class,
         method,
         vec![Value::Int(1)], // 1 arg, 0 expected
-        &env,
         &mut stack,
     )
     .unwrap_err();
@@ -1055,7 +1024,6 @@ fn push_class_method_frame_unary_fields() {
     let class = make_class("MyClass");
     let handle = make_class_handle(class.clone());
     let method = make_method("foo", vec![], vec![]);
-    let env = crate::env::Env::new();
     let mut stack = vec![];
 
     super::push_class_method_frame(
@@ -1064,7 +1032,6 @@ fn push_class_method_frame_unary_fields() {
         class.clone(),
         method,
         vec![],
-        &env,
         &mut stack,
     )
     .unwrap();
@@ -1119,7 +1086,6 @@ fn push_class_method_frame_params_bound_in_env() {
         locals: vec![],
         body: vec![],
     });
-    let env = crate::env::Env::new();
     let mut stack = vec![];
 
     super::push_class_method_frame(
@@ -1128,35 +1094,32 @@ fn push_class_method_frame_params_bound_in_env() {
         class,
         method,
         vec![Value::Int(3), Value::Int(4)],
-        &env,
         &mut stack,
     )
     .unwrap();
 
-    let Cont::MethodFrame { env: frame_env, .. } = stack.pop().unwrap() else {
-        panic!("expected MethodFrame");
-    };
-    assert_eq!(frame_env.get("x"), Some(Value::Int(3)));
-    assert_eq!(frame_env.get("y"), Some(Value::Int(4)));
+    assert!(matches!(stack.pop(), Some(Cont::MethodFrame { .. })));
+    let frames = ev.frames.borrow();
+    assert_eq!(
+        frames.last().unwrap().slots,
+        vec![Value::Int(3), Value::Int(4)],
+        "params occupy the first slots, in order"
+    );
 }
 
 #[test]
-fn push_class_method_frame_self_bound_in_env() {
-    // `self` must be bound to `Value::Instance(handle)` in the frame's env.
+fn push_class_method_frame_self_is_the_class_handle() {
+    // `self` must answer `Value::Instance(handle)` while the frame is active.
     let ev = crate::eval::Evaluator::new_without_kernel();
     let class = make_class("MyClass");
     let handle = make_class_handle(class.clone());
     let method = make_method("foo", vec![], vec![]);
-    let env = crate::env::Env::new();
     let mut stack = vec![];
 
-    super::push_class_method_frame(&ev, handle.clone(), class, method, vec![], &env, &mut stack)
-        .unwrap();
+    super::push_class_method_frame(&ev, handle.clone(), class, method, vec![], &mut stack).unwrap();
 
-    let Cont::MethodFrame { env: frame_env, .. } = stack.pop().unwrap() else {
-        panic!("expected MethodFrame");
-    };
-    assert_eq!(frame_env.get("self"), Some(Value::Instance(handle)));
+    assert!(matches!(stack.pop(), Some(Cont::MethodFrame { .. })));
+    assert_eq!(ev.self_value(), Some(Value::Instance(handle)));
 }
 
 #[test]
@@ -1172,23 +1135,16 @@ fn push_class_method_frame_locals_initialized_nil() {
         locals: vec![Arc::from("a")],
         body: vec![ts(Stmt::LocalDecl(vec![Arc::from("b")]))],
     });
-    let env = crate::env::Env::new();
     let mut stack = vec![];
 
-    super::push_class_method_frame(&ev, handle, class, method, vec![], &env, &mut stack).unwrap();
+    super::push_class_method_frame(&ev, handle, class, method, vec![], &mut stack).unwrap();
 
-    let Cont::MethodFrame { env: frame_env, .. } = stack.pop().unwrap() else {
-        panic!("expected MethodFrame");
-    };
+    assert!(matches!(stack.pop(), Some(Cont::MethodFrame { .. })));
+    let frames = ev.frames.borrow();
     assert_eq!(
-        frame_env.get("a"),
-        Some(Value::Nil),
-        "method.locals must be Nil"
-    );
-    assert_eq!(
-        frame_env.get("b"),
-        Some(Value::Nil),
-        "Stmt::LocalDecl must be Nil"
+        frames.last().unwrap().slots,
+        vec![Value::Nil, Value::Nil],
+        "method.locals then Stmt::LocalDecl slots must start Nil"
     );
 }
 
@@ -1201,10 +1157,9 @@ fn push_class_method_frame_saves_block_home() {
     let class = make_class("MyClass");
     let handle = make_class_handle(class.clone());
     let method = make_method("foo", vec![], vec![]);
-    let env = crate::env::Env::new();
     let mut stack = vec![];
 
-    super::push_class_method_frame(&ev, handle, class, method, vec![], &env, &mut stack).unwrap();
+    super::push_class_method_frame(&ev, handle, class, method, vec![], &mut stack).unwrap();
 
     assert_eq!(
         ev.current_block_home.get(),
@@ -1237,10 +1192,9 @@ fn push_class_method_frame_depth_with_existing_method_stack() {
 
     let handle = make_class_handle(class.clone());
     let method = make_method("bar", vec![], vec![]);
-    let env = crate::env::Env::new();
     let mut stack = vec![];
 
-    super::push_class_method_frame(&ev, handle, class, method, vec![], &env, &mut stack).unwrap();
+    super::push_class_method_frame(&ev, handle, class, method, vec![], &mut stack).unwrap();
 
     let Cont::MethodFrame { depth, .. } = stack.pop().unwrap() else {
         panic!("expected MethodFrame");

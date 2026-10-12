@@ -300,7 +300,7 @@ impl EntityData {
     // ── Transaction lock + shadow frames (C31) ────────────────────────────────
     //
     // These methods are the single place that manipulates `tx_frames`. The
-    // evaluator (`assign_var`/`lookup_var`) and the tx primitives call them
+    // evaluator (`assign_var`/`lookup_dynamic`) and the tx primitives call them
     // rather than locking the stack directly, so the shadow-vs-live and
     // merge/discard rules live in one spot. They concern the *shared*
     // transaction's in-memory visibility only — durable store ops still flow
@@ -1154,7 +1154,7 @@ fn run_entity_loop(state: Arc<InstanceState>, registry: Arc<ClassRegistry>, glob
         // C32: enrollment is *lazy* — an entity becomes a participant of a tagged
         // transaction on first access to its own transactional state (ivar
         // read/write), handled in `Evaluator::ensure_tx_enrolled` via
-        // `assign_var`/`lookup_var`. Merely receiving a tagged message no longer
+        // `assign_var`/`lookup_dynamic`. Merely receiving a tagged message no longer
         // enrolls (that over-enrolled class entities and pure-computation
         // helpers). The tag is still propagated below so writes route to the frame
         // buffer and outgoing sends inherit it. See
@@ -1313,7 +1313,7 @@ fn dispatch_envelope(
     env: &mut Env,
 ) -> Result<Value, crate::eval::EvalError> {
     if let Some((method, def_class)) = handle.0.class.lookup(selector) {
-        return ev.invoke_method(handle.clone(), def_class, method, args, env);
+        return ev.invoke_method(handle.clone(), def_class, method, args);
     }
     // On a primitive miss, route through `doesNotUnderstand:` (reified-message
     // forwarding) if the class defines one. This is the entity/actor counterpart
@@ -1335,7 +1335,7 @@ fn dispatch_envelope(
         Err(crate::eval::EvalError::MessageNotUnderstood { .. }) => {
             let (dnu_method, dnu_class) = dnu.expect("dnu is Some");
             let msg = crate::builtins::build_message(ev, selector.clone(), args)?;
-            ev.invoke_method(handle, dnu_class, dnu_method, vec![msg], env)
+            ev.invoke_method(handle, dnu_class, dnu_method, vec![msg])
         }
         other => other,
     }
@@ -1349,7 +1349,7 @@ fn dispatch_class_envelope(
     env: &mut Env,
 ) -> Result<Value, crate::eval::EvalError> {
     if let Some((method, def_class)) = handle.0.class.lookup_class_method(selector) {
-        return ev.invoke_class_method(handle.clone(), def_class, method, args, env);
+        return ev.invoke_class_method(handle.clone(), def_class, method, args);
     }
     crate::builtins::dispatch_class_builtin(ev, handle, selector.clone(), args, env)
 }

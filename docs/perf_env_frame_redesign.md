@@ -812,6 +812,38 @@ temps are now slot reads instead of env hash lookups), and the rest showed no
 significant change (`timesRepeat`, `array do:`, `object new` within noise). Pushing
 `NoReceiver` per top-level block call costs nothing measurable.
 
+**d3 landed (2026-10-11).** No activation builds a name → value map any more.
+`push_method_frame` and `push_block_frame` fill only the slot frame. `Block.env`,
+`Evaluator::lookup_var`, the env-write fallback in `assign_var` and the
+`Cont::Assign` env field are gone. Reaching `VarRef::Unresolved` in the evaluator is
+now `unreachable!`, because every body is resolved before it runs. `Env` is an empty
+placeholder type, still threaded through the remaining `Cont` variants and
+handlers; d4 deletes it. Parameters that went unused were dropped now rather than
+renamed `_env`: `push_method_frame` lost its base env, along with the `env` argument
+of `push_method_call_frame`, `push_class_method_frame`, `invoke_method`,
+`invoke_class_method` and `release_frame`. That resolves open question Q16
+(class-side `super` rooted at `env.clone()`); a regression test pins it.
+`install_method_def` resolves its receiver with `resolve_in_active_namespace`,
+which is what `lookup_var` reduced to for chunk code.
+
+Same-session A/B against c3 (scratch worktree at `0a552bc`), `alloc_probe`, three
+interleaved runs per side:
+
+| workload | c3 ns/iter | d3 ns/iter | change |
+|---|---|---|---|
+| `pvtSpin` (tail-recursive loop) | 11,388–12,508 | 6,928–7,144 | ≈ −39% |
+| `timesRepeat: [1 + 1]` | 15,568–15,976 | 9,765–10,017 | ≈ −37% |
+| `fib` (iterative) | 17,080–17,181 | 10,707–10,809 | ≈ −37% |
+
+Criterion against a saved c3 baseline improved every bench by 31–39% (`timesRepeat`
+−38.9%, `fibonacci 20 iterative` −36.8%, `to:do:` −35.0%, `to:by:do:` −34.6%, nested
+`to:do:` −32.0%, `object new` −32.0%, `array do:` −35% with wide variance). The
+criterion phases ran one after the other rather than interleaved, so the interleaved
+`alloc_probe` runs above are the primary evidence; the two agree.
+
+This is the allocation cost the 2026-08-05 profile attributed to the env (an `Arc`'d,
+`Mutex`-guarded `HashMap` frame plus one insert per name on every call).
+
 ### 11.8 Risks
 
 - The `Cont`-carries-frame-index change touches every `Cont` variant and all their

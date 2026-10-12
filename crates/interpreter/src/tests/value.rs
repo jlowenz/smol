@@ -4,7 +4,6 @@ use std::sync::Arc;
 use super::*;
 use crate::class::Class;
 use crate::entity::{InstanceHandle, InstanceKind, InstanceState, new_entity_data};
-use crate::env::Env;
 use crate::object::Object;
 
 fn make_class(name: &str) -> Arc<Class> {
@@ -68,7 +67,6 @@ fn kind_remaining_variants() {
         locals: vec![],
         body: vec![],
         snapshot: Arc::from(Vec::new()),
-        env: Env::new(),
         home_depth: 0,
         home_entity: None,
         home_binding: crate::eval::SelfBinding::NoReceiver,
@@ -121,7 +119,6 @@ fn display_composite_variants() {
         locals: vec![],
         body: vec![],
         snapshot: Arc::from(Vec::new()),
-        env: Env::new(),
         home_depth: 0,
         home_entity: None,
         home_binding: crate::eval::SelfBinding::NoReceiver,
@@ -150,7 +147,6 @@ fn eq_block_uses_pointer_identity() {
         locals: vec![],
         body: vec![],
         snapshot: Arc::from(Vec::new()),
-        env: Env::new(),
         home_depth: 0,
         home_entity: None,
         home_binding: crate::eval::SelfBinding::NoReceiver,
@@ -162,7 +158,6 @@ fn eq_block_uses_pointer_identity() {
         locals: vec![],
         body: vec![],
         snapshot: Arc::from(Vec::new()),
-        env: Env::new(),
         home_depth: 0,
         home_entity: None,
         home_binding: crate::eval::SelfBinding::NoReceiver,
@@ -211,7 +206,6 @@ fn hash_does_not_panic() {
         locals: vec![],
         body: vec![],
         snapshot: Arc::from(Vec::new()),
-        env: Env::new(),
         home_depth: 0,
         home_entity: None,
         home_binding: crate::eval::SelfBinding::NoReceiver,

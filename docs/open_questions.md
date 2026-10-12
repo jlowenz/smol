@@ -49,8 +49,7 @@ Note: `historyOf:` (C27) is read-only temporal access and is distinct from this.
 All implementation questions resolved except OQ-TX-6 (saga/condition system,
 deferred to saga implementation). Key decisions: `Transaction` is an entity; shadow
 writes for reversible ivar changes; lazy participant discovery with wait-for graph
-deadlock detection; `#atomic` = mailbox lock + shadow writes; `#stm` = shadow writes
-+ optimistic version conflict; nested transactions via savepoints; `OpaqueTransaction`
+deadlock detection; `#atomic` = mailbox lock + shadow writes; `#stm` = shadow writes + optimistic version conflict; nested transactions via savepoints; `OpaqueTransaction`
 default / `ObservableTransaction` opt-in. See `docs/tx_design.md` for full analysis
 and minimal primitive set.
 
@@ -348,6 +347,7 @@ end-of-definition point to hook (method extensions from other files are coming, 
 "when the source file finishes" hook would be wrong too).
 
 **What the MVP does instead (per-selector send-time):**
+
 - Trait methods are flattened into the class dict at `uses:` time.
 - A conflict flattens as a **sentinel method** (`Object >> pvtTraitConflictFor:`) that
   raises `TraitConflict` *when the conflicting selector is actually sent*. A later
@@ -531,7 +531,13 @@ Related: numeric tower plan §2a (Ordered requires `=`), §4g/S6.
 
 ## Q16: Class-side `super` uses `env.clone()` as its method base scope, not `global_scope()`
 
-**Status:** Open — surfaced during the env-frame redesign P2.1b-0 setup/teardown
+**Status:** Resolved 2026-10-11 (env-frame redesign P2.1d-d3) — moot. Since d2a a
+method's free names resolve as `Dynamic` (receiver, then defining class's namespace)
+and never consult the env, so the `env.clone()` rooting could no longer leak; d3
+removed the env map and the base-env parameter from `push_method_frame` entirely.
+Pinned by `class_side_super_method_cannot_see_callers_temp` (`tests/eval.rs`).
+
+**Original status:** Open — surfaced during the env-frame redesign P2.1b-0 setup/teardown
 consolidation; behavior preserved, deferred for a dedicated look.
 
 **What:** Every method activation is rooted at a *base env* before its frame is
@@ -542,11 +548,11 @@ The fourth, `push_class_method_frame` (the class-side **`super`** send path in
 `eval_iterative.rs`), roots at `env.clone()` instead, which keeps the *caller's*
 frames live as outer scope.
 
-| entry point | base env |
-|---|---|
+| entry point                                               | base env         |
+| --------------------------------------------------------- | ---------------- |
 | `push_method_call_frame` (instance / primitive self-send) | `global_scope()` |
 | `Evaluator::invoke_class_method` (direct class-side call) | `global_scope()` |
-| `push_class_method_frame` (class-side `super`) | `env.clone()` |
+| `push_class_method_frame` (class-side `super`)            | `env.clone()`    |
 
 **Why it matters:** with `env.clone()`, a name unresolved in a class-side `super`
 method's own frame/classvars can fall through `lookup_var`'s
@@ -556,6 +562,7 @@ unobserved today (a `super` method body rarely reads a name that shadows a calle
 local), which is why the suite is green either way.
 
 **Tensions / options:**
+
 1. **Bug — unify on `global_scope()`.** Most likely correct; makes all four method
    entry points consistent. Needs a test that would actually catch the leak
    (class-side `super` reading a name that exists as a caller local) to confirm
@@ -604,6 +611,7 @@ trait methods, the trait's namespace and the using class's namespace should be
 merged, so a trait's implementation cannot break just because it is used elsewhere.
 
 Sub-questions:
+
 - **Where the scope lives.** A flattened method probably needs to carry the namespace
   it was *written* in (`Method` gains a defining-namespace link) rather than relying
   on `defining_class`.
@@ -630,6 +638,7 @@ anything defined in it is still in use: live instances of its classes, classes
 referenced elsewhere, blocks.
 
 Observations:
+
 - Something must create workspaces: a REPL session, a notebook, a test harness. That
   implies a **root object or environment** above them. Today the de facto root is
   `ClassRegistry`. It owns Kernel, the root namespaces, and every class and instance
@@ -668,6 +677,7 @@ Value/Object split (D3), async-by-default sends with late-resolved futures (D2),
 live redefinition (P1)?
 
 **What already overlaps:**
+
 - **Polymorphic dispatch is already a match on the receiver's class.** A visitor or
   double dispatch covers most uses of a `match` on a closed hierarchy, though only
   over the receiver.
@@ -676,6 +686,7 @@ live redefinition (P1)?
 - **`on:do:` already matches by class**, for conditions.
 
 **Tensions to resolve:**
+
 - **Closed vs open.** Exhaustiveness requires a *closed* set of alternatives, but
   classes are open: anyone can subclass, and live redefinition can add a variant at
   any time. Any "sealed" notion has to say what happens when the live system adds a
@@ -694,6 +705,7 @@ live redefinition (P1)?
   slots like any other local.
 
 **Directions to evaluate (none chosen):**
+
 1. Library only: visitor or double-dispatch conventions plus a `caseOf:`-style
    message. No language change.
 2. A "sealed Value family" declaration used only by tooling, so the observable
@@ -703,3 +715,12 @@ live redefinition (P1)?
 
 Revisit after the compiler/VM front half (resolved AST), since pattern bindings would
 flow through the same resolver.
+
+---
+
+## Q21: Reifying _typed_ messages for a form of static checking
+
+**Status**: Open
+**Raised**: 2026-10-11
+
+Not quite sure how this would work. The idea is something like: maybe we don't/can't know the receiver, but we can allow the system to specify a message/selector that requires certain capabilities for the args. E.g. if a class implements such a message, we can proactively check at both the method def site and any call sites that the arg requirements are met. This almost certainly needs to be fleshed out more, but is a route to support more declarative type-checking even in the context of such a late binding language. 

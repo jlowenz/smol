@@ -414,34 +414,6 @@ impl Evaluator {
 
     // ── Variable lookup & assignment ──────────────────────────────────────────
 
-    /// Resolve an `Unresolved` name (top-level code, and blocks created at top
-    /// level) by name: the activation's own env frame, then the receiver-scoped
-    /// variables of the current `method_stack` binding, then the outer env frames
-    /// (workspace temps), then the active namespace
-    /// (`resolve_in_active_namespace`).
-    ///
-    /// Since d2c-c3 chunks are resolved, so no `Unresolved` reference reaches the
-    /// evaluator from a chunk or a method; this path remains until d3 drops the env.
-    #[inline]
-    pub fn lookup_var(&self, name: &str, env: &Env) -> Option<Value> {
-        let lexical = if self.method_depth.get() == 0 {
-            // Fast path: no active method context — skip the RefCell borrow.
-            env.get(name)
-        } else {
-            // Clone the top binding to avoid holding the RefCell borrow across
-            // further ops.
-            let top = self.method_stack.borrow().last().cloned();
-            match top {
-                Some(binding) => env
-                    .lookup_top_frame(name)
-                    .or_else(|| self.lookup_receiver_scoped(&binding, name))
-                    .or_else(|| env.lookup_outer_frames(name)),
-                None => env.get(name),
-            }
-        };
-        lexical.or_else(|| self.resolve_in_active_namespace(name))
-    }
-
     /// Resolve a `Dynamic` name — a free name in resolved code. In a method or a
     /// method's block: the receiver's ivars and classvars, then the defining
     /// class's namespace chain (`resolve_global`). In top-level code — a chunk
@@ -540,24 +512,18 @@ impl Evaluator {
     ///   resolution from the resolve pass.
     /// Ensures: a `Local` target writes the current activation's slot; a `Dynamic`
     ///   target writes an ivar or classvar of the current binding, or is an error
-    ///   (a namespace definition is never assignable); an `Unresolved` (top-level)
-    ///   target writes an ivar/classvar of the current binding or an existing env
-    ///   binding; assigning a name with no binding is an error (never an implicit
-    ///   declaration).
+    ///   (a namespace definition is never assignable, and assignment never
+    ///   declares).
     #[inline]
     pub(crate) fn assign_var(
         &self,
         name: &Arc<str>,
         res: &VarRef,
         value: Value,
-        env: &mut Env,
     ) -> Result<Value, EvalError> {
-        // Scope-local: write the slot directly (no ivar/classvar hash walk). Since
-        // P2.1c, no reader consults the env's local entries — `Local` reads come from
-        // slots, `Upvalue` from the block snapshot, and `Dynamic`/`SelfRef` never
-        // name a local — so there is no env mirror to maintain here (one clone).
-        // `Local` shadows any same-named ivar, consistent with `lookup_var`, whose
-        // local frame is checked first.
+        // Scope-local: write the slot directly (no ivar/classvar hash walk). A
+        // `Local` shadows any same-named ivar: the resolver binds the name to the
+        // scope before it could become a free (`Dynamic`) name.
         if let VarRef::Local(i) = res {
             let mut frames = self.frames.borrow_mut();
             let slot = frames
@@ -654,31 +620,14 @@ impl Evaluator {
                 // No receiver: no ivars or classvars to assign.
                 Some(SelfBinding::NoReceiver) | None => {}
             }
-            // A resolved free name that is neither an ivar nor a classvar names a
-            // namespace definition (or nothing): never assignable, and never routed
-            // to an env binding (env-frame redesign d2a).
-            if matches!(res, VarRef::Dynamic(_)) {
-                return Err(EvalError::TypeError(format!(
-                    "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
-                )));
-            }
-            // Unresolved code (none since d2c-c3; removed in d3): the target must
-            // already exist in the env. Never silently create a new local: that
-            // swallowed typos (`perf_env_frame_redesign.md` §2.1 / P1b).
-            let ret = value.clone();
-            if env.set(name.as_ref(), value) {
-                return Ok(ret);
-            }
-            return Err(EvalError::TypeError(format!(
-                "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
-            )));
         }
-        // Unresolved code outside any method (none since d2c-c3, whose chunk
-        // assignments are `Local`; removed in d3).
-        let ret = value.clone();
-        if env.set(name.as_ref(), value) {
-            return Ok(ret);
-        }
+        // A free name that is neither an ivar nor a classvar of the current binding
+        // names a namespace definition (or nothing): never assignable, and never an
+        // implicit declaration (`perf_env_frame_redesign.md` §2.1 / P1b).
+        debug_assert!(
+            matches!(res, VarRef::Dynamic(_)),
+            "assign_var: unexpected resolution {res:?} for `{name}`"
+        );
         Err(EvalError::TypeError(format!(
             "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
         )))
@@ -882,7 +831,6 @@ impl Evaluator {
         defining_class: Arc<Class>,
         method: Arc<Method>,
         args: Vec<Value>,
-        env: &mut Env,
     ) -> Result<Value, EvalError> {
         let found = crate::builtins::UserMethodFound::Instance {
             handle,
@@ -890,7 +838,7 @@ impl Evaluator {
             def_class: defining_class,
         };
         let mut stack = Vec::new();
-        push_method_call_frame(self, found, args, env, &mut stack)?;
+        push_method_call_frame(self, found, args, &mut stack)?;
         let initial = stack
             .pop()
             .expect("push_method_call_frame must push exactly one frame");
@@ -908,7 +856,6 @@ impl Evaluator {
         defining_class: Arc<Class>,
         method: Arc<Method>,
         args: Vec<Value>,
-        env: &mut Env,
     ) -> Result<Value, EvalError> {
         let self_val = Value::Instance(handle.clone());
         let binding = SelfBinding::ClassSide {
@@ -916,15 +863,7 @@ impl Evaluator {
             defining_class,
         };
         let mut stack = Vec::new();
-        push_method_frame(
-            self,
-            env.global_scope(),
-            binding,
-            self_val,
-            &method,
-            args,
-            &mut stack,
-        )?;
+        push_method_frame(self, binding, self_val, &method, args, &mut stack)?;
         let initial = stack
             .pop()
             .expect("push_method_frame must push exactly one frame");

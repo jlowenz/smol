@@ -1515,7 +1515,7 @@ fn eval_program_sync_with_locals() {
 #[test]
 fn class_variable_read_write() {
     // Class-side methods reading and writing class variables exercise the
-    // SelfBinding::ClassSide branches in lookup_var and assign_var.
+    // SelfBinding::ClassSide branches in lookup_dynamic and assign_var.
     let src = r#"
 Object subclass: #Counter classVariableNames: 'count'.
 Counter class >> setCount: n [ count := n ].
@@ -4036,13 +4036,12 @@ fn s6_equality_bounce_always_terminates() {
 
 // ── Method scope is lexical, not dynamic (C34 S1a) ───────────────────────────
 //
-// A method activation's env is rooted at the GLOBAL frame plus one frame of its
-// own (`Env::global_scope` + `push_frame` in `push_method_call_frame`), never at
-// the caller's env. Before S1a it was `caller_env.clone()`, which made step 4 of
-// `lookup_var` ("outer env (globals)") reach the whole dynamic call chain: a
-// callee could read its caller's temporaries, and env depth — hence the cost of
-// every variable lookup and every `Env::clone` — grew with call depth, making
-// each tail-recursive loop O(n^2) in time and O(n) in memory.
+// A method body sees its own slot frame, its receiver's variables, and its
+// defining class's namespace — never the caller's scope. Before S1a a method's
+// env was `caller_env.clone()`, so a callee could read its caller's temporaries,
+// and env depth grew with call depth, making each tail-recursive loop O(n^2) in
+// time and O(n) in memory. Names are now resolved before they run (env-frame
+// redesign P2.1), which rules this out structurally; these tests pin it.
 
 #[test]
 fn method_cannot_see_callers_temp() {
@@ -4065,6 +4064,21 @@ fn method_cannot_see_callers_argument() {
 }
 
 #[test]
+fn class_side_super_method_cannot_see_callers_temp() {
+    // A class-side `super` send once rooted the callee at the caller's env, so a
+    // name free in the superclass method could read the caller's temp
+    // (open_questions.md Q16).
+    let src = "
+        Object subclass: #LeakBase.
+        LeakBase class >> peek [ ^hidden ]
+        LeakBase subclass: #LeakChild.
+        LeakChild class >> peek [ | hidden | hidden := 42. ^super peek ]
+        LeakChild peek
+    ";
+    assert!(matches!(eval_err(src), EvalError::UndefinedVariable(n) if &*n == "hidden"));
+}
+
+#[test]
 fn method_still_sees_globals() {
     // Rooting at the global frame must keep class names (and other globals)
     // reachable from a method body.
@@ -4077,9 +4091,9 @@ fn method_still_sees_globals() {
 
 #[test]
 fn block_still_captures_defining_method_scope_across_a_call() {
-    // The closure case is the OPPOSITE of the method case: `push_block_frame`
-    // clones `block.env`, so a block invoked inside an unrelated method still
-    // sees the temps and arguments of the method that DEFINED it.
+    // The closure case is the OPPOSITE of the method case: a block carries a
+    // snapshot of the locals it captures, so a block invoked inside an unrelated
+    // method still sees the temps and arguments of the method that DEFINED it.
     let temp = "
         Integer >> apply: aBlock [ ^aBlock value ]
         Integer >> test [ | x | x := 5. ^self apply: [ x + 1 ] ]
@@ -4262,9 +4276,9 @@ fn p21b_local_write_then_read_round_trips_through_slot() {
 
 #[test]
 fn p21b_block_captures_outer_local_via_dual_write() {
-    // `x` is a method Local (slot + env dual-write); the block reads it as an
-    // Upvalue, which in P2.1b still resolves by name through the env. This fails
-    // if the Local write updated only the slot and not the env map.
+    // `x` is a method Local; the block reads it as an Upvalue from the capture
+    // snapshot taken from the method's slot frame. This fails if the Local write
+    // and the snapshot disagree on the slot.
     assert_eq!(
         eval(
             "Object subclass: #SlotCap instanceVariableNames: ''.

@@ -5,7 +5,6 @@ use num_bigint::BigInt;
 
 use crate::ast::TaggedStmt;
 use crate::entity::{EntityId, FutureHandle, InstanceHandle};
-use crate::env::Env;
 use crate::eval::SelfBinding;
 use crate::namespace::Namespace;
 
@@ -42,7 +41,8 @@ pub enum Value {
     Handle(Arc<dyn Any + Send + Sync>),
 }
 
-/// A block (closure). Captures its defining environment via shared frames.
+/// A block (closure). Captures its free locals by value (`snapshot`) and its
+/// home's `self` binding (`home_binding`).
 #[derive(Debug, Clone)]
 pub struct Block {
     pub params: Vec<Arc<str>>,
@@ -54,10 +54,6 @@ pub struct Block {
     /// reference, and being `Arc<[Value]>` it is `Send` — the block can outlive its
     /// creating frame and cross entity boundaries self-contained.
     pub snapshot: Arc<[Value]>,
-    /// Captured lexical environment. Retained alongside `snapshot` (dual storage)
-    /// so `Dynamic` (ivar/classvar/global) name lookups still resolve until P2.1d
-    /// removes it; `Upvalue` reads use `snapshot`, not this.
-    pub env: Env,
     /// Method-stack depth of the frame a `^`-return inside this block should
     /// target. Equal to the method depth at the block's creation site, so that
     /// non-local returns propagate past intermediate method calls and are caught
