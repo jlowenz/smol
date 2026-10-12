@@ -255,9 +255,9 @@ pub(crate) enum Cont {
     /// An active block invocation (`value`, `ifTrue:` arm, `on:do:` body, …).
     ///
     /// Pushed by `push_block_frame`. A block re-pushes its captured `home_binding`
-    /// (the lexical home's `SelfBinding`, any kind) when it has one; `pushed_self`
-    /// records whether to pop it on teardown. A block answers its last
-    /// expression's value, so there is no implicit-return override.
+    /// (the lexical home's `SelfBinding`, any kind, `NoReceiver` at top level), so
+    /// teardown always pops it. A block answers its last expression's value, so
+    /// there is no implicit-return override.
     BlockFrame {
         /// Remaining statements to run.
         pending: VecDeque<TaggedStmt>,
@@ -265,9 +265,6 @@ pub(crate) enum Cont {
         env: Env,
         /// `current_block_home` before this frame; restored on teardown.
         saved_block_home: Option<usize>,
-        /// `true` if the block re-pushed its `home_binding` onto `method_stack`
-        /// (i.e. `home_binding.is_some()`) and it must be popped on teardown.
-        pushed_self: bool,
         /// When `true`, a `ForceAcc` is pushed after each statement so that
         /// `Value::Future` results resolve before the next statement runs.
         /// Used by `syncValue`, `on:do:` body, and `ensure:` body.
@@ -276,13 +273,15 @@ pub(crate) enum Cont {
 
     /// The top-level chunk frame pushed by `eval_chunk`.
     ///
-    /// Unlike method/block frames it does not own an env frame (`eval_chunk`
-    /// evaluates in the caller's env) and pushes no self binding, so teardown
-    /// only restores `current_block_home`. Answers its last expression's value.
+    /// Unlike method/block frames it pushes no self binding and owns neither an
+    /// env frame nor its slot frame (`run_chunk` pushes and pops that, and
+    /// publishes the chunk's temps from it), so teardown only restores
+    /// `current_block_home`. Answers its last expression's value.
     ChunkFrame {
         /// Remaining statements to run.
         pending: VecDeque<TaggedStmt>,
-        /// Chunk environment (not `push_frame`d; not popped on teardown).
+        /// A fresh, empty env (not `push_frame`d; not popped on teardown); kept
+        /// only for the continuations' env plumbing until d4 removes it.
         env: Env,
         /// `current_block_home` before this frame; restored on teardown.
         saved_block_home: Option<usize>,
@@ -399,26 +398,15 @@ enum UnwindOutcome {
 }
 
 /// Release a method or block activation's runtime resources: pop its `self`
-/// binding if it pushed one, restore `current_block_home`, and pop its owned env
-/// frame.
+/// binding, restore `current_block_home`, and pop its owned env and slot frames.
 ///
 /// The single source of truth for frame teardown, shared by normal completion
 /// (`handle_method_frame` / `handle_block_frame`) and the unwind / error / TCO
 /// path (`teardown_frame`). Callers layer their own concerns on top (setting
-/// `acc`, returning the `^`-match depth).
-///
-/// `pushed_self` is the one point of variation between the two frame kinds: a
-/// method frame always pushes a `self` binding (`true`); a block frame pushes one
-/// only when it captured a `home_binding`.
-fn release_frame(
-    ev: &Evaluator,
-    env: &mut Env,
-    saved_block_home: Option<usize>,
-    pushed_self: bool,
-) {
-    if pushed_self {
-        ev.pop_self();
-    }
+/// `acc`, returning the `^`-match depth). Both frame kinds pushed exactly one
+/// `self` binding: a method its receiver's, a block its `home_binding`.
+fn release_frame(ev: &Evaluator, env: &mut Env, saved_block_home: Option<usize>) {
+    ev.pop_self();
     ev.current_block_home.set(saved_block_home);
     env.pop_frame();
     // Pop this activation's slot frame (env-frame redesign P2.1b). Every
@@ -444,16 +432,15 @@ fn teardown_frame(ev: &Evaluator, frame: Cont) -> Option<usize> {
             saved_block_home,
             ..
         } => {
-            release_frame(ev, &mut env, saved_block_home, true);
+            release_frame(ev, &mut env, saved_block_home);
             Some(depth)
         }
         Cont::BlockFrame {
             mut env,
             saved_block_home,
-            pushed_self,
             ..
         } => {
-            release_frame(ev, &mut env, saved_block_home, pushed_self);
+            release_frame(ev, &mut env, saved_block_home);
             Some(0)
         }
         Cont::ChunkFrame {
@@ -679,7 +666,10 @@ fn handle_eval_expr(
                     .clone(),
                 // `self`: reconstruct the receiver from `method_stack` (a block
                 // re-pushes its captured `home_binding`), no env lookup (P2.1d).
-                VarRef::SelfRef => ev.self_value(),
+                // Top-level code has no receiver, so `self` is undefined there.
+                VarRef::SelfRef => ev
+                    .self_value()
+                    .ok_or_else(|| EvalError::UndefinedVariable(crate::eval::self_sym()))?,
                 // Free name in a resolved method/method-block body: ivar → classvar
                 // → defining class's namespace, read live (env-frame redesign d2a).
                 VarRef::Dynamic(_) => ev
@@ -703,11 +693,19 @@ fn handle_eval_expr(
                 .unwrap_or_else(|| ev.method_depth.get());
             // Capture the lexical home's `self` binding (any kind), so the block
             // answers `self` — and accesses ivars/classvars — from `method_stack`
-            // even after its home frame is gone (env-frame redesign P2.1d).
-            let home_binding = ev.method_stack.borrow().last().cloned();
+            // even after its home frame is gone (env-frame redesign P2.1d). A block
+            // written at top level (in a chunk, or in another top-level block) has
+            // no receiver (§11.7c D4).
+            let home_binding = ev
+                .method_stack
+                .borrow()
+                .last()
+                .cloned()
+                .unwrap_or(SelfBinding::NoReceiver);
             // A block created at top level resolves through the namespace it was
             // written in, wherever it later runs (§11.7c D3).
-            let home_namespace = home_binding.is_none().then(|| ev.active_namespace());
+            let home_namespace =
+                matches!(home_binding, SelfBinding::NoReceiver).then(|| ev.active_namespace());
             // Snapshot the captured upvalues from the creating (current) frame:
             // `ParentLocal` from its slots, `ParentUpvalue` from its own snapshot
             // (env-frame redesign P2.1c). Empty for a block that captures nothing.
@@ -728,7 +726,7 @@ fn handle_eval_expr(
             namespace_path,
             name,
         } => {
-            *acc = ev.eval_namespace_ref(&namespace_path, &name, &mut env)?;
+            *acc = ev.eval_namespace_ref(&namespace_path, &name)?;
         }
         Expr::Super => {
             return Err(EvalError::TypeError(
@@ -836,271 +834,262 @@ pub(crate) fn step_loop(ev: &Evaluator, initial_cont: Cont) -> Result<Value, Eva
     let mut acc: Value = Value::Nil;
     let mut reductions: u32 = 0;
 
-    loop {
-        let cont = match stack.pop() {
-            Some(c) => c,
-            None => return Ok(acc),
-        };
+    while let Some(cont) = stack.pop() {
+        // Every error, whether a send's or one raised by the step itself, unwinds
+        // through `handle_step_error`: frames are torn down (restoring
+        // `method_stack`, slot frames, block home, namespace, handler chain) and
+        // `ensure:` blocks run, so the evaluator is clean when an error escapes.
+        if let Err(e) = step(ev, cont, &mut stack, &mut acc, &mut reductions) {
+            handle_step_error(e, ev, &mut stack, &mut acc)?;
+        }
+    }
+    Ok(acc)
+}
 
-        match cont {
-            // ── Leaf expressions ─────────────────────────────────────────
-            Cont::EvalExpr { expr, env } => handle_eval_expr(ev, expr, env, &mut stack, &mut acc)?,
+/// Run one continuation popped from the step-loop stack.
+///
+/// Ensures: `Ok(())` when the continuation completed or pushed its follow-ups;
+///   `Err(e)` when it raised `e`, with the stack left for `step_loop` to unwind.
+#[inline(always)]
+fn step(
+    ev: &Evaluator,
+    cont: Cont,
+    stack: &mut Vec<Cont>,
+    acc: &mut Value,
+    reductions: &mut u32,
+) -> Result<(), EvalError> {
+    match cont {
+        // ── Leaf expressions ─────────────────────────────────────────
+        Cont::EvalExpr { expr, env } => handle_eval_expr(ev, expr, env, stack, acc)?,
 
-            // ── Assignment ───────────────────────────────────────────────
-            Cont::Assign { name, res, mut env } => {
-                acc = ev.assign_var(&name, &res, acc.clone(), &mut env)?;
-            }
+        // ── Assignment ───────────────────────────────────────────────
+        Cont::Assign { name, res, mut env } => {
+            *acc = ev.assign_var(&name, &res, acc.clone(), &mut env)?;
+        }
 
-            // ── Non-local return ─────────────────────────────────────────
-            Cont::ReturnUnwind { target_depth } => {
-                let return_val = acc.clone();
-                match unwind_stack_to_depth(ev, &mut stack, return_val.clone(), target_depth)? {
-                    UnwindOutcome::Reached => {
-                        acc = return_val;
-                    }
-                    UnwindOutcome::Interrupted => {
-                        // EnsureGuard hit; ContinueUnwind + ensure frame pushed; step_loop continues.
-                    }
-                    UnwindOutcome::Exhausted => {
-                        return Err(EvalError::Return(return_val, target_depth));
-                    }
+        // ── Non-local return ─────────────────────────────────────────
+        Cont::ReturnUnwind { target_depth } => {
+            let return_val = acc.clone();
+            match unwind_stack_to_depth(ev, stack, return_val.clone(), target_depth)? {
+                UnwindOutcome::Reached => {
+                    *acc = return_val;
+                }
+                UnwindOutcome::Interrupted => {
+                    // EnsureGuard hit; ContinueUnwind + ensure frame pushed; step_loop continues.
+                }
+                UnwindOutcome::Exhausted => {
+                    return Err(EvalError::Return(return_val, target_depth));
                 }
             }
+        }
 
-            // ── MethodFrame dispatch ──────────────────────────────────────
-            Cont::MethodFrame {
+        // ── MethodFrame dispatch ──────────────────────────────────────
+        Cont::MethodFrame {
+            depth,
+            pending,
+            env,
+            implicit_self,
+            saved_block_home,
+        } => {
+            handle_method_frame(
+                ev,
                 depth,
                 pending,
                 env,
                 implicit_self,
                 saved_block_home,
-            } => {
-                handle_method_frame(
-                    ev,
-                    depth,
-                    pending,
-                    env,
-                    implicit_self,
-                    saved_block_home,
-                    &mut stack,
-                    &mut acc,
-                )?;
-            }
+                stack,
+                acc,
+            )?;
+        }
 
-            // ── BlockFrame dispatch ───────────────────────────────────────
-            Cont::BlockFrame {
-                pending,
-                env,
-                saved_block_home,
-                pushed_self,
-                sync,
-            } => {
-                handle_block_frame(
-                    ev,
-                    pending,
-                    env,
-                    saved_block_home,
-                    pushed_self,
-                    sync,
-                    &mut stack,
-                    &mut acc,
-                )?;
-            }
+        // ── BlockFrame dispatch ───────────────────────────────────────
+        Cont::BlockFrame {
+            pending,
+            env,
+            saved_block_home,
+            sync,
+        } => {
+            handle_block_frame(ev, pending, env, saved_block_home, sync, stack, acc)?;
+        }
 
-            // ── ChunkFrame dispatch ─────────────────────────────────────
-            Cont::ChunkFrame {
-                pending,
-                env,
-                saved_block_home,
-            } => {
-                handle_chunk_frame(ev, pending, env, saved_block_home, &mut stack, &mut acc)?;
-            }
+        // ── ChunkFrame dispatch ─────────────────────────────────────
+        Cont::ChunkFrame {
+            pending,
+            env,
+            saved_block_home,
+        } => {
+            handle_chunk_frame(ev, pending, env, saved_block_home, stack, acc)?;
+        }
 
-            // ── ForceAcc ──────────────────────────────────────────────────
-            Cont::ForceAcc => {
-                let v = std::mem::replace(&mut acc, Value::Nil);
-                match force_value(ev, v) {
-                    Ok(forced) => acc = forced,
-                    // A forced Future may resolve to an error (e.g. a signal raised in an
-                    // entity). Route through handle_step_error so HCRunGuard/EnsureGuard
-                    // on the stack can intercept it.
-                    Err(e) => handle_step_error(e, ev, &mut stack, &mut acc)?,
+        // ── ForceAcc ──────────────────────────────────────────────────
+        Cont::ForceAcc => {
+            let v = std::mem::replace(acc, Value::Nil);
+            match force_value(ev, v) {
+                Ok(forced) => *acc = forced,
+                // A forced Future may resolve to an error (e.g. a signal raised in an
+                // entity). Route through handle_step_error so HCRunGuard/EnsureGuard
+                // on the stack can intercept it.
+                Err(e) => handle_step_error(e, ev, stack, acc)?,
+            }
+        }
+
+        // ── RestoreAcc ────────────────────────────────────────────────
+        Cont::RestoreAcc { value } => {
+            *acc = value;
+        }
+
+        // ── Rethrow ───────────────────────────────────────────────────
+        Cont::Rethrow { error } => {
+            handle_step_error(error, ev, stack, acc)?;
+        }
+
+        // ── EnsureGuard (success path) ────────────────────────────────
+        Cont::EnsureGuard { ensure_blk } => {
+            let body_result = acc.clone();
+            stack.push(Cont::RestoreAcc { value: body_result });
+            push_block_frame(ev, &ensure_blk, vec![], false, stack)?;
+        }
+
+        // ── ThenCheckOrElse (then:orElse: receiver-block completed) ────
+        Cont::ThenCheckOrElse {
+            cont_blk,
+            else_val,
+            mut env,
+        } => {
+            let recv_result = std::mem::replace(acc, Value::Nil);
+            match recv_result {
+                Value::Future(_) => {
+                    *acc = crate::builtins::dispatch(
+                        ev,
+                        recv_result,
+                        Arc::from("then:orElse:"),
+                        vec![Value::Block(cont_blk), else_val],
+                        &mut env,
+                    )?;
                 }
-            }
-
-            // ── RestoreAcc ────────────────────────────────────────────────
-            Cont::RestoreAcc { value } => {
-                acc = value;
-            }
-
-            // ── Rethrow ───────────────────────────────────────────────────
-            Cont::Rethrow { error } => {
-                handle_step_error(error, ev, &mut stack, &mut acc)?;
-            }
-
-            // ── EnsureGuard (success path) ────────────────────────────────
-            Cont::EnsureGuard { ensure_blk } => {
-                let body_result = acc.clone();
-                stack.push(Cont::RestoreAcc { value: body_result });
-                push_block_frame(ev, &ensure_blk, vec![], false, &mut stack)?;
-            }
-
-            // ── ThenCheckOrElse (then:orElse: receiver-block completed) ────
-            Cont::ThenCheckOrElse {
-                cont_blk,
-                else_val,
-                mut env,
-            } => {
-                let recv_result = std::mem::replace(&mut acc, Value::Nil);
-                match recv_result {
-                    Value::Future(_) => {
-                        acc = crate::builtins::dispatch(
-                            ev,
-                            recv_result,
-                            Arc::from("then:orElse:"),
-                            vec![Value::Block(cont_blk), else_val],
-                            &mut env,
-                        )?;
-                    }
-                    // Non-future: receiver resolved; run then-block with its value,
-                    // else can't fire.
-                    other => {
-                        push_block_frame(ev, &cont_blk, vec![other], false, &mut stack)?;
-                    }
-                }
-            }
-
-            // ── HCRunGuard (success path) ─────────────────────────────────
-            Cont::HCRunGuard {
-                chain_start_len, ..
-            } => {
-                // Body completed normally; drop this HC's handlers, pass acc through.
-                ev.handler_chain.borrow_mut().truncate(chain_start_len);
-            }
-
-            // ── SignalGuard (handler completed normally) ──────────────────
-            Cont::SignalGuard { removed, resumable } => {
-                // Re-enable the disabled handlers.
-                ev.handler_chain.borrow_mut().extend(removed);
-                if !resumable {
-                    // Non-resumable (Error): normal completion ABORTS — an implicit
-                    // local `return:` of the handler's value. Unwind to the nearest
-                    // enclosing HCRunGuard on this stack (or the fork top).
-                    let v = std::mem::replace(&mut acc, Value::Nil);
-                    handle_step_error(EvalError::ReturnFromBlock(v), ev, &mut stack, &mut acc)?;
-                }
-                // resumable: acc (handler result) becomes the signal expression's
-                // value and the continuation resumes.
-            }
-
-            // ── NewValueGuard (init block completed) ──────────────────────
-            Cont::NewValueGuard { inst } => {
-                // Init block finished; freeze the instance and answer it.
-                crate::builtins_iterative::freeze_value_instance(&inst);
-                acc = Value::Instance(inst);
-            }
-
-            // ── NamespaceGuard (Namespace do: block completed) ────────────
-            Cont::NamespaceGuard { saved_ns } => {
-                // Restore the active namespace; acc (block result) passes through.
-                *ev.active_namespace.borrow_mut() = saved_ns;
-            }
-
-            // ── ContinueUnwind ────────────────────────────────────────────
-            Cont::ContinueUnwind {
-                return_val,
-                target_depth,
-            } => {
-                // Ensure block just ran (acc = ensure result, discard it); resume unwind.
-                match unwind_stack_to_depth(ev, &mut stack, return_val.clone(), target_depth)? {
-                    UnwindOutcome::Reached => {
-                        acc = return_val;
-                    }
-                    UnwindOutcome::Interrupted => {
-                        // Another EnsureGuard was hit; step_loop continues.
-                    }
-                    UnwindOutcome::Exhausted => {
-                        return Err(EvalError::Return(return_val, target_depth));
-                    }
-                }
-            }
-
-            // ── AfterReceiver ─────────────────────────────────────────────
-            Cont::AfterReceiver { message, env } => {
-                handle_after_receiver(ev, message, env, &mut stack, &mut acc)?;
-            }
-
-            // ── CollectArgs ───────────────────────────────────────────────
-            Cont::CollectArgs {
-                receiver,
-                selector,
-                done,
-                pending,
-                env,
-            } => {
-                handle_collect_args(
-                    ev,
-                    receiver,
-                    selector,
-                    done,
-                    pending,
-                    env,
-                    &mut stack,
-                    &mut acc,
-                    &mut reductions,
-                )?;
-            }
-
-            // ── SuperCollectArgs ──────────────────────────────────────────
-            Cont::SuperCollectArgs {
-                selector,
-                done,
-                pending,
-                env,
-            } => {
-                handle_super_collect_args(
-                    ev,
-                    selector,
-                    done,
-                    pending,
-                    env,
-                    &mut stack,
-                    &mut acc,
-                    &mut reductions,
-                )?;
-            }
-
-            // ── CascadeStep ───────────────────────────────────────────────
-            Cont::CascadeStep {
-                receiver,
-                pending,
-                env,
-            } => {
-                handle_cascade_step(ev, receiver, pending, env, &mut stack, &mut acc)?;
-            }
-
-            // ── DynArrayElem ──────────────────────────────────────────────
-            Cont::DynArrayElem {
-                array_class,
-                mut done,
-                mut pending,
-                env,
-            } => {
-                done.push(acc.clone());
-                if let Some(next) = pending.pop_front() {
-                    stack.push(Cont::DynArrayElem {
-                        array_class,
-                        done,
-                        pending,
-                        env: env.clone(),
-                    });
-                    stack.push(Cont::EvalExpr { expr: next, env });
-                } else {
-                    acc = build_array(array_class.0.class.clone(), done);
+                // Non-future: receiver resolved; run then-block with its value,
+                // else can't fire.
+                other => {
+                    push_block_frame(ev, &cont_blk, vec![other], false, stack)?;
                 }
             }
         }
+
+        // ── HCRunGuard (success path) ─────────────────────────────────
+        Cont::HCRunGuard {
+            chain_start_len, ..
+        } => {
+            // Body completed normally; drop this HC's handlers, pass acc through.
+            ev.handler_chain.borrow_mut().truncate(chain_start_len);
+        }
+
+        // ── SignalGuard (handler completed normally) ──────────────────
+        Cont::SignalGuard { removed, resumable } => {
+            // Re-enable the disabled handlers.
+            ev.handler_chain.borrow_mut().extend(removed);
+            if !resumable {
+                // Non-resumable (Error): normal completion ABORTS — an implicit
+                // local `return:` of the handler's value. Unwind to the nearest
+                // enclosing HCRunGuard on this stack (or the fork top).
+                let v = std::mem::replace(acc, Value::Nil);
+                handle_step_error(EvalError::ReturnFromBlock(v), ev, stack, acc)?;
+            }
+            // resumable: acc (handler result) becomes the signal expression's
+            // value and the continuation resumes.
+        }
+
+        // ── NewValueGuard (init block completed) ──────────────────────
+        Cont::NewValueGuard { inst } => {
+            // Init block finished; freeze the instance and answer it.
+            crate::builtins_iterative::freeze_value_instance(&inst);
+            *acc = Value::Instance(inst);
+        }
+
+        // ── NamespaceGuard (Namespace do: block completed) ────────────
+        Cont::NamespaceGuard { saved_ns } => {
+            // Restore the active namespace; acc (block result) passes through.
+            *ev.active_namespace.borrow_mut() = saved_ns;
+        }
+
+        // ── ContinueUnwind ────────────────────────────────────────────
+        Cont::ContinueUnwind {
+            return_val,
+            target_depth,
+        } => {
+            // Ensure block just ran (*acc = ensure result, discard it); resume unwind.
+            match unwind_stack_to_depth(ev, stack, return_val.clone(), target_depth)? {
+                UnwindOutcome::Reached => {
+                    *acc = return_val;
+                }
+                UnwindOutcome::Interrupted => {
+                    // Another EnsureGuard was hit; step_loop continues.
+                }
+                UnwindOutcome::Exhausted => {
+                    return Err(EvalError::Return(return_val, target_depth));
+                }
+            }
+        }
+
+        // ── AfterReceiver ─────────────────────────────────────────────
+        Cont::AfterReceiver { message, env } => {
+            handle_after_receiver(ev, message, env, stack, acc)?;
+        }
+
+        // ── CollectArgs ───────────────────────────────────────────────
+        Cont::CollectArgs {
+            receiver,
+            selector,
+            done,
+            pending,
+            env,
+        } => {
+            handle_collect_args(
+                ev, receiver, selector, done, pending, env, stack, acc, reductions,
+            )?;
+        }
+
+        // ── SuperCollectArgs ──────────────────────────────────────────
+        Cont::SuperCollectArgs {
+            selector,
+            done,
+            pending,
+            env,
+        } => {
+            handle_super_collect_args(ev, selector, done, pending, env, stack, acc, reductions)?;
+        }
+
+        // ── CascadeStep ───────────────────────────────────────────────
+        Cont::CascadeStep {
+            receiver,
+            pending,
+            env,
+        } => {
+            handle_cascade_step(ev, receiver, pending, env, stack, acc)?;
+        }
+
+        // ── DynArrayElem ──────────────────────────────────────────────
+        Cont::DynArrayElem {
+            array_class,
+            mut done,
+            mut pending,
+            env,
+        } => {
+            done.push(acc.clone());
+            if let Some(next) = pending.pop_front() {
+                stack.push(Cont::DynArrayElem {
+                    array_class,
+                    done,
+                    pending,
+                    env: env.clone(),
+                });
+                stack.push(Cont::EvalExpr { expr: next, env });
+            } else {
+                *acc = build_array(array_class.0.class.clone(), done);
+            }
+        }
     }
+    Ok(())
 }
 
 /// `Cont::MethodFrame` handler — see the variant docs. Extracted `#[inline(never)]`.
@@ -1118,7 +1107,7 @@ fn handle_method_frame(
 ) -> Result<(), EvalError> {
     if pending.is_empty() {
         // Frame exhausted — release resources (a method frame always pushed self).
-        release_frame(ev, &mut env, saved_block_home, true);
+        release_frame(ev, &mut env, saved_block_home);
         // Methods answer `self` absent an explicit `^`.
         *acc = implicit_self;
     } else {
@@ -1144,15 +1133,13 @@ fn handle_block_frame(
     mut pending: VecDeque<TaggedStmt>,
     mut env: Env,
     saved_block_home: Option<usize>,
-    pushed_self: bool,
     sync: bool,
     stack: &mut Vec<Cont>,
     acc: &mut Value,
 ) -> Result<(), EvalError> {
     if pending.is_empty() {
-        // Frame exhausted — release resources (self popped only if the block
-        // re-pushed its home binding).
-        release_frame(ev, &mut env, saved_block_home, pushed_self);
+        // Frame exhausted — release resources.
+        release_frame(ev, &mut env, saved_block_home);
         // acc stays as the last expression result.
     } else {
         let stmt = pending.pop_front().unwrap();
@@ -1160,7 +1147,6 @@ fn handle_block_frame(
             pending,
             env: env.clone(),
             saved_block_home,
-            pushed_self,
             sync,
         });
         // For sync frames, force the statement result before the frame resumes.
@@ -1185,7 +1171,8 @@ fn handle_chunk_frame(
     acc: &mut Value,
 ) -> Result<(), EvalError> {
     if pending.is_empty() {
-        // Top-level frame: restore home only (no self binding, no owned env).
+        // Top-level frame: restore home only (no self binding, no owned env or
+        // slot frame).
         ev.current_block_home.set(saved_block_home);
         // acc stays as the last expression result.
     } else {
@@ -1432,7 +1419,7 @@ fn dispatch_stmt(
 /// A shared zero-length snapshot for scopes that capture nothing (every method,
 /// and blocks with no upvalues). Cached so a capture-free activation allocates no
 /// snapshot; cloning it is a refcount bump.
-fn empty_snapshot() -> Arc<[Value]> {
+pub(crate) fn empty_snapshot() -> Arc<[Value]> {
     static EMPTY: std::sync::OnceLock<Arc<[Value]>> = std::sync::OnceLock::new();
     EMPTY.get_or_init(|| Arc::from(Vec::<Value>::new())).clone()
 }
@@ -1520,11 +1507,9 @@ pub(crate) fn push_block_frame(
     }
     // Re-push the block's captured home `self` binding (any kind) so `self`,
     // ivars, and classvars resolve from method_stack even after the home frame
-    // is gone (env-frame redesign P2.1d).
-    let pushed_self = block.home_binding.is_some();
-    if let Some(binding) = &block.home_binding {
-        ev.push_self(binding.clone());
-    }
+    // is gone (env-frame redesign P2.1d), and so a top-level block's
+    // `NoReceiver` hides any calling method's receiver (§11.7c D4).
+    ev.push_self(block.home_binding.clone());
     // The running block carries the snapshot captured at its creation, so
     // `Upvalue(i)` reads resolve against `frames.last().snapshot`.
     ev.frames.borrow_mut().push(Frame {
@@ -1537,7 +1522,6 @@ pub(crate) fn push_block_frame(
         pending: block.body.iter().cloned().collect(),
         env: block_env,
         saved_block_home: saved_home,
-        pushed_self,
         sync,
     });
     Ok(())
@@ -1804,7 +1788,7 @@ fn dispatch_super_to_stack(
                 });
             }
         },
-        None => {
+        Some(SelfBinding::NoReceiver) | None => {
             return Err(EvalError::TypeError(
                 "super used outside method context".into(),
             ));

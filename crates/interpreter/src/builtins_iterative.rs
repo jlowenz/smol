@@ -1050,7 +1050,7 @@ fn conflict_sentinel_method(
     Ok(crate::class::Method {
         pattern: pattern.clone(),
         locals: vec![],
-        body: prog.stmts,
+        body: crate::resolve::resolve_and_rewrite(&pattern.params(), &[], &prog.stmts),
     })
 }
 

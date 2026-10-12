@@ -770,6 +770,48 @@ active namespace. Benches evaluate each benchmark in one workspace (setup and
 iterations share it) instead of a fresh workspace per iteration. Same-session A/B
 against c1: no measurable difference (±1%).
 
+**c3 landed (2026-10-11).** D1 and D4 as designed, plus three things found while
+building it:
+
+- **Chunks are slot scopes.** `resolve::resolve_chunk` resolves a chunk like a method
+  body with no `self`. Its temps are slots `0..n`. A name the chunk does not bind but
+  the workspace holds is imported, on first reference, into an extra slot that the
+  prologue fills from the workspace. `run_chunk` owns the chunk's slot frame (the
+  `ChunkFrame` does not), so the epilogue publishes the temps on every exit path,
+  including an error: values assigned before the error stay visible to later chunks,
+  as before. `Workspace` now holds its published temps by name instead of an `Env`.
+  The capture-before-assignment check covers chunks, with imported slots counting as
+  already assigned. No `Unresolved` read reaches the evaluator any more (verified by
+  making that path panic over the whole suite); d3 deletes it. The trait-conflict
+  sentinel method was the last unresolved body and is now resolved like every other
+  installed method.
+- **D4 marker.** `SelfBinding::NoReceiver`. `Block.home_binding` is no longer an
+  `Option`: a top-level block captures `NoReceiver` and pushes it whenever it runs,
+  so `BlockFrame.pushed_self` is gone. With no receiver, `self` is an
+  `UndefinedVariable`, `super` is a type error, and `Dynamic` names resolve through
+  the active namespace. Chunk-level code pushes nothing (`eval_chunk` is only entered
+  from the root, so `method_stack` is empty there).
+- **Names that are never locals.** The receiver of a method definition
+  (`X >> sel [...]`) and the first segment of `Ns::Name` resolve as free names
+  through the namespace chain (the class's in a method, the active one at top level),
+  never as a local or a workspace temp.
+- **Bug fix (pre-existing): step-loop errors skipped frame teardown.** Most
+  `step_loop` arms passed errors out with a bare `?`. Only send errors went through
+  `handle_step_error`; an error raised by a step itself (an undefined name, a bad
+  assignment, …) dropped the continuation stack. The evaluator was left with the dead
+  method's binding, slot frames, block home, namespace and handler-chain changes, and
+  `ensure:` blocks did not run. Now the per-continuation match is an
+  `#[inline(always)] step` function and `step_loop` routes every error through
+  `handle_step_error`. Two regression tests fail on c2 and pass now.
+
+Same-session A/B against c2 (scratch worktree at `519958c`): `alloc_probe`, three
+interleaved runs per side, shows no difference beyond ±3%. Criterion benches against
+a saved c2 baseline: the top-level loop benches improved ~4% (`fibonacci 20
+iterative` −4.7%, `to:do:` −4.4%, `to:by:do:` −4.4%, nested `to:do:` −3.9%; chunk
+temps are now slot reads instead of env hash lookups), and the rest showed no
+significant change (`timesRepeat`, `array do:`, `object new` within noise). Pushing
+`NoReceiver` per top-level block call costs nothing measurable.
+
 ### 11.8 Risks
 
 - The `Cont`-carries-frame-index change touches every `Cont` variant and all their

@@ -1574,8 +1574,17 @@ Object new rootSuper.
 #[test]
 fn method_def_non_class_receiver_errors() {
     // If the name before >> resolves to a non-class value, eval_method_def errors.
-    let err = eval_err_diff("| Foo | Foo := 42. Foo >> bar [ ^1 ]");
+    // `Kernel` resolves (as a root namespace name) to a namespace, not a class.
+    let err = eval_err_diff("Kernel >> bar [ ^1 ]");
     assert!(matches!(err, EvalError::TypeError(_)));
+}
+
+#[test]
+fn method_def_receiver_is_not_a_temp() {
+    // The name before >> names a class or trait through the namespace chain, like
+    // the first segment of `Ns::Name`; a chunk temp is not consulted.
+    let err = eval_err_diff("| Foo | Foo := 42. Foo >> bar [ ^1 ]");
+    assert!(matches!(err, EvalError::UndefinedVariable(n) if &*n == "Foo"));
 }
 
 // ── Namespace reference errors ────────────────────────────────────────────────
@@ -4595,4 +4604,106 @@ fn toplevel_trait_lives_in_workspace_namespace_not_kernel() {
     ev.eval_chunk(&chunk, &mut workspace).expect("eval");
     assert!(workspace.namespace().resolve("WsTrait").is_some());
     assert!(ev.registry.kernel().resolve("WsTrait").is_none());
+}
+
+// ── Chunks as slot scopes; top-level blocks have no receiver (d2c/c3, §11.7c) ──
+
+#[test]
+fn toplevel_block_reads_earlier_chunks_temp() {
+    // An earlier chunk's temp is imported into a slot and captured by snapshot.
+    let rs = eval_chunks(&["| x | x := 3.", "[:a | x + a] value: 1"]);
+    assert_eq!(rs[1].as_ref().unwrap(), &Value::Int(4));
+}
+
+#[test]
+fn toplevel_block_keeps_its_chunks_binding_after_redeclaration() {
+    // A block from chunk N never sees chunk N+1's redeclared `x` (§11.7c D1).
+    let rs = eval_chunks(&[
+        "| x | x := 1.",
+        "| b | b := [x].",
+        "| x | x := 2.",
+        "b value",
+        "x",
+    ]);
+    assert_eq!(rs[3].as_ref().unwrap(), &Value::Int(1));
+    assert_eq!(rs[4].as_ref().unwrap(), &Value::Int(2));
+}
+
+#[test]
+fn toplevel_block_capturing_unassigned_temp_is_rejected_before_running() {
+    // The capture-before-assignment check now covers chunks; nothing runs.
+    let rs = eval_chunks(&["| y x b | y := 5. b := [x]. x := 1.", "y"]);
+    assert_type_error_contains(rs[0].clone(), "captures local `x` before it is assigned");
+    assert!(matches!(&rs[1], Err(EvalError::UndefinedVariable(n)) if &**n == "y"));
+}
+
+#[test]
+fn chunk_temps_are_published_when_the_chunk_errors() {
+    // Values assigned before an error stay visible to later chunks (REPL).
+    let rs = eval_chunks(&["| x | x := 5. 1 noSuchSelector", "x"]);
+    assert!(rs[0].is_err());
+    assert_eq!(rs[1].as_ref().unwrap(), &Value::Int(5));
+}
+
+#[test]
+fn toplevel_self_is_undefined() {
+    assert!(matches!(eval_err("self"), EvalError::UndefinedVariable(n) if &*n == "self"));
+}
+
+#[test]
+fn toplevel_block_does_not_see_calling_methods_ivars() {
+    // A block written at top level has no receiver (§11.7c D4): run by a method,
+    // its free names never fall through to that method's receiver.
+    let src = "
+Object subclass: #Runner instanceVariableNames: 'secret'.
+Runner >> run: aBlock [ secret := 42. ^aBlock value ]
+(Runner new run: [ secret ]) await
+";
+    assert!(matches!(eval_err(src), EvalError::UndefinedVariable(n) if &*n == "secret"));
+}
+
+#[test]
+fn toplevel_block_does_not_see_calling_methods_self() {
+    let src = "
+Object subclass: #Runner instanceVariableNames: ''.
+Runner >> run: aBlock [ ^aBlock value ]
+(Runner new run: [ self ]) await
+";
+    assert!(matches!(eval_err(src), EvalError::UndefinedVariable(n) if &*n == "self"));
+}
+
+#[test]
+fn toplevel_block_super_is_an_error_even_inside_a_method() {
+    let src = "
+Integer >> run: aBlock [ ^aBlock value ]
+3 run: [ super printString ]
+";
+    assert_type_error_contains(Err(eval_err(src)), "super used outside method context");
+}
+
+// ── Step-loop errors unwind through frame teardown ────────────────────────────
+
+#[test]
+fn error_inside_method_leaves_no_stale_binding_for_the_next_chunk() {
+    // An error raised directly by a step (here an undefined name) used to leave
+    // the dead method's `self` binding on the evaluator, so the next chunk's
+    // top-level `super` dispatched instead of erroring.
+    let rs = eval_chunks(&[
+        "Integer >> boom [ ^noSuchName ]",
+        "3 boom",
+        "super printString",
+    ]);
+    assert!(matches!(&rs[1], Err(EvalError::UndefinedVariable(n)) if &**n == "noSuchName"));
+    assert_type_error_contains(rs[2].clone(), "super used outside method context");
+}
+
+#[test]
+fn ensure_block_runs_when_the_body_raises_directly() {
+    let rs = eval_chunks(&[
+        "| a | a := OrderedCollection new.",
+        "[ noSuchName ] ensure: [ a add: 1 ]",
+        "a includes: 1",
+    ]);
+    assert!(matches!(&rs[1], Err(EvalError::UndefinedVariable(n)) if &**n == "noSuchName"));
+    assert_eq!(rs[2].as_ref().unwrap(), &Value::Bool(true));
 }

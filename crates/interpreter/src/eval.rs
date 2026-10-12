@@ -18,6 +18,7 @@ use crate::namespace::Namespace;
 use crate::object::{IndexedStorage, Object};
 use crate::os_interface::{DefaultOsInterface, OsInterface};
 use crate::parser::Parser;
+use crate::resolve::{ResolvedChunk, resolve_chunk};
 use crate::value::{Block, Value};
 use crate::workspace::Workspace;
 
@@ -74,15 +75,23 @@ pub enum SelfBinding {
         defining_class: Arc<Class>,
         self_value: Value,
     },
+    /// A block written at top level, running: there is no receiver, so `self` and
+    /// `super` are errors and free names resolve through the active namespace (the
+    /// block's home namespace) — never through whichever method called the block
+    /// (env-frame redesign §11.7c D4).
+    NoReceiver,
 }
 
 impl SelfBinding {
     /// The class whose method this binding's activation is running.
-    pub(crate) fn defining_class(&self) -> &Arc<Class> {
+    ///
+    /// Ensures: `None` exactly for `NoReceiver`.
+    pub(crate) fn defining_class(&self) -> Option<&Arc<Class>> {
         match self {
             SelfBinding::Instance { defining_class, .. }
             | SelfBinding::ClassSide { defining_class, .. }
-            | SelfBinding::Primitive { defining_class, .. } => defining_class,
+            | SelfBinding::Primitive { defining_class, .. } => Some(defining_class),
+            SelfBinding::NoReceiver => None,
         }
     }
 }
@@ -95,6 +104,7 @@ impl std::fmt::Debug for SelfBinding {
             SelfBinding::Instance { .. } => "Instance",
             SelfBinding::ClassSide { .. } => "ClassSide",
             SelfBinding::Primitive { .. } => "Primitive",
+            SelfBinding::NoReceiver => "NoReceiver",
         };
         write!(f, "SelfBinding::{kind}")
     }
@@ -366,23 +376,9 @@ impl Evaluator {
 
     /// Returns the `defining_class` of the top method frame (for `super` dispatch).
     pub(crate) fn current_defining_class(&self) -> Option<Arc<Class>> {
-        match self.method_stack.borrow().last() {
-            Some(SelfBinding::Instance { defining_class, .. }) => Some(defining_class.clone()),
-            Some(SelfBinding::ClassSide { defining_class, .. }) => Some(defining_class.clone()),
-            Some(SelfBinding::Primitive { defining_class, .. }) => Some(defining_class.clone()),
-            None => None,
-        }
+        self.method_stack.borrow().last()?.defining_class().cloned()
     }
 
-    /// Reconstruct the receiver (`self`) from the top of `method_stack` — the
-    /// resolution for `VarRef::SelfRef` (env-frame redesign P2.1d).
-    ///
-    /// Requires: called from resolved method/block code, where a `SelfBinding` is
-    ///   active — a block re-pushes its captured `home_binding`, so this holds even
-    ///   after the block outlives its home frame.
-    /// Ensures: `Instance`/`ClassSide` → `Value::Instance(handle)`; `Primitive` →
-    ///   its `self_value`; no active binding (only reachable outside any method,
-    ///   where `self` is not a `SelfRef`) → `Value::Nil`.
     /// Total message sends this evaluator has dispatched: every syntactic send
     /// (including cascade parts and `super` sends) plus each `perform:` target.
     /// Sends handled by other evaluators (entity coroutines, async continuations)
@@ -392,13 +388,21 @@ impl Evaluator {
         self.sends.get()
     }
 
-    pub(crate) fn self_value(&self) -> Value {
-        match self.method_stack.borrow().last() {
-            Some(SelfBinding::Instance { handle, .. } | SelfBinding::ClassSide { handle, .. }) => {
-                Value::Instance(handle.clone())
+    /// Reconstruct the receiver (`self`) from the top of `method_stack` — the
+    /// resolution for `VarRef::SelfRef` (env-frame redesign P2.1d).
+    ///
+    /// Ensures: `Instance`/`ClassSide` → `Some(Value::Instance(handle))`;
+    ///   `Primitive` → `Some(self_value)`; `NoReceiver` or no active binding
+    ///   (top-level code) → `None`. A block re-pushes its captured `home_binding`,
+    ///   so a method's block answers its home receiver even after the home frame
+    ///   is gone.
+    pub(crate) fn self_value(&self) -> Option<Value> {
+        match self.method_stack.borrow().last()? {
+            SelfBinding::Instance { handle, .. } | SelfBinding::ClassSide { handle, .. } => {
+                Some(Value::Instance(handle.clone()))
             }
-            Some(SelfBinding::Primitive { self_value, .. }) => self_value.clone(),
-            None => Value::Nil,
+            SelfBinding::Primitive { self_value, .. } => Some(self_value.clone()),
+            SelfBinding::NoReceiver => None,
         }
     }
 
@@ -416,10 +420,8 @@ impl Evaluator {
     /// (workspace temps), then the active namespace
     /// (`resolve_in_active_namespace`).
     ///
-    /// Note: a top-level block invoked from inside a method runs with the *calling*
-    /// method's binding on top of `method_stack` (it has no `home_binding`), so this
-    /// path can see that receiver's ivars — a latent dynamic-scoping leak that goes
-    /// away when top-level code is resolved (env-frame redesign §11.7b, d2c).
+    /// Since d2c-c3 chunks are resolved, so no `Unresolved` reference reaches the
+    /// evaluator from a chunk or a method; this path remains until d3 drops the env.
     #[inline]
     pub fn lookup_var(&self, name: &str, env: &Env) -> Option<Value> {
         let lexical = if self.method_depth.get() == 0 {
@@ -440,22 +442,26 @@ impl Evaluator {
         lexical.or_else(|| self.resolve_in_active_namespace(name))
     }
 
-    /// Resolve a `Dynamic` name — a free name in a resolved method or method-block
-    /// body: the receiver's ivars and classvars, then the defining class's
-    /// namespace (own entries, then imports), then the root namespace names.
+    /// Resolve a `Dynamic` name — a free name in resolved code. In a method or a
+    /// method's block: the receiver's ivars and classvars, then the defining
+    /// class's namespace chain (`resolve_global`). In top-level code — a chunk
+    /// (no binding) or a top-level block (`NoReceiver`): the active namespace's
+    /// chain (`resolve_in_active_namespace`).
     ///
-    /// Requires: called while executing a resolved method body or one of its
-    ///   blocks, so `method_stack`'s top is that code's home binding (a block
-    ///   re-pushes its `home_binding`).
+    /// Requires: `method_stack`'s top is the running code's home binding (a block
+    ///   re-pushes its `home_binding`; a chunk pushes none).
     /// Ensures: reads are live — a class defined after this activation's entity
     ///   was spawned is visible; no per-entity snapshot of globals is consulted.
     pub(crate) fn lookup_dynamic(&self, name: &str) -> Option<Value> {
         let top = self.method_stack.borrow().last().cloned();
-        let binding = top?;
-        if let Some(v) = self.lookup_receiver_scoped(&binding, name) {
-            return Some(v);
+        match top {
+            None | Some(SelfBinding::NoReceiver) => self.resolve_in_active_namespace(name),
+            Some(binding) => self.lookup_receiver_scoped(&binding, name).or_else(|| {
+                binding
+                    .defining_class()
+                    .and_then(|class| self.resolve_global(class, name))
+            }),
         }
-        self.resolve_global(binding.defining_class(), name)
     }
 
     /// Resolve `name` relative to `class`'s defining namespace
@@ -523,6 +529,7 @@ impl Evaluator {
                 let owner = defining_class.lookup_class_var_owner(name)?;
                 owner.class_var_storage.read().get(name).cloned()
             }
+            SelfBinding::NoReceiver => None,
         }
     }
 
@@ -644,7 +651,8 @@ impl Evaluator {
                         return Ok(ret);
                     }
                 }
-                None => {}
+                // No receiver: no ivars or classvars to assign.
+                Some(SelfBinding::NoReceiver) | None => {}
             }
             // A resolved free name that is neither an ivar nor a classvar names a
             // namespace definition (or nothing): never assignable, and never routed
@@ -654,10 +662,9 @@ impl Evaluator {
                     "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
                 )));
             }
-            // Unresolved (top-level) code: the target must already exist — a declared
-            // local (defined `Nil` by `push_*_frame`) or an existing outer binding.
-            // Never silently create a new local: that swallowed typos (the implicit-
-            // declaration wart; `perf_env_frame_redesign.md` §2.1 / P1b).
+            // Unresolved code (none since d2c-c3; removed in d3): the target must
+            // already exist in the env. Never silently create a new local: that
+            // swallowed typos (`perf_env_frame_redesign.md` §2.1 / P1b).
             let ret = value.clone();
             if env.set(name.as_ref(), value) {
                 return Ok(ret);
@@ -666,9 +673,8 @@ impl Evaluator {
                 "cannot assign to undeclared variable `{name}`; declare it in `| ... |`"
             )));
         }
-        // Top-level (REPL/script) scope: `eval_chunk` has already rejected any
-        // assignment to a name the chunk does not declare, and declared temps
-        // are bound (to `Nil`) before the chunk runs — so the binding exists.
+        // Unresolved code outside any method (none since d2c-c3, whose chunk
+        // assignments are `Local`; removed in d3).
         let ret = value.clone();
         if env.set(name.as_ref(), value) {
             return Ok(ret);
@@ -694,44 +700,78 @@ impl Evaluator {
     /// Evaluate a top-level chunk (a script, or one REPL input) in `workspace`, via
     /// the step-loop evaluator.
     ///
-    /// A chunk is a scope nested in the workspace (env-frame redesign §11.7b):
-    /// its `| ... |` temps are fresh bindings (shadowing any earlier chunk's
-    /// same-named temps), bound once, and the chunk may assign only the temps it
-    /// declares itself.
+    /// A chunk is a scope nested in the workspace (env-frame redesign §11.7b), and
+    /// is resolved like a method body with no `self` (§11.7c D1): its `| ... |`
+    /// temps are slots — fresh bindings that shadow any earlier chunk's
+    /// same-named temps — each bound once, and the chunk may assign only the
+    /// temps it declares itself. Earlier chunks' temps it reads are copied in when
+    /// it starts; its own temps are published to `workspace` when it ends.
     ///
     /// Ensures: if any temp — of the chunk or of a block within it — is assigned
-    ///   more than once, or the chunk assigns a name it does not declare,
-    ///   returns `Err(EvalError::TypeError)` before executing any statement.
-    ///   Otherwise returns the value of the last statement, or `Value::Nil` if
-    ///   `stmts` is empty. `EvalError::Return` propagates to the caller.
+    ///   more than once, the chunk assigns a name it does not declare, or a block
+    ///   captures a temp before the temp is assigned, returns
+    ///   `Err(EvalError::TypeError)` before executing any statement. Otherwise the
+    ///   chunk runs; its temps are published to `workspace` with the values they
+    ///   held when it ended (normally or with an error), and the result is the
+    ///   value of the last statement, or `Value::Nil` if the chunk is empty.
+    ///   `EvalError::Return` propagates to the caller.
     pub fn eval_chunk(&self, chunk: &Chunk, workspace: &mut Workspace) -> Result<Value, EvalError> {
-        let stmts = &chunk.stmts;
-        check_chunk_assignments(stmts)?;
+        check_chunk_assignments(&chunk.stmts)?;
+        let resolved = resolve_chunk(&chunk.stmts, &|name| workspace.temp(name).is_some());
+        check_chunk_captures(&resolved)?;
         // The chunk's lexical namespace is its workspace's: definitions register
         // there and free names resolve through it (§11.7c D3).
         let saved_ns = std::mem::replace(
             &mut *self.active_namespace.borrow_mut(),
             workspace.namespace().clone(),
         );
-        let result = self.run_chunk(stmts, workspace.env_mut());
+        let result = self.run_chunk(resolved, workspace);
         *self.active_namespace.borrow_mut() = saved_ns;
         result
     }
 
-    fn run_chunk(&self, stmts: &[TaggedStmt], env: &mut Env) -> Result<Value, EvalError> {
-        for stmt in stmts {
-            if let Stmt::LocalDecl(names) = &stmt.node {
-                for name in names {
-                    env.define(name.clone(), Value::Nil);
-                }
-            }
-        }
+    /// Run a resolved chunk in its own slot frame: the prologue fills its import
+    /// slots from `workspace`, the epilogue publishes its temps there.
+    fn run_chunk(
+        &self,
+        chunk: ResolvedChunk,
+        workspace: &mut Workspace,
+    ) -> Result<Value, EvalError> {
+        let ResolvedChunk {
+            body,
+            temps,
+            imports,
+        } = chunk;
+        let mut slots = vec![Value::Nil; temps.len()];
+        slots.extend(imports.iter().map(|name| {
+            workspace
+                .temp(name)
+                .cloned()
+                .expect("resolve_chunk imports only names the workspace holds")
+        }));
+        let base = self.frames.borrow().len();
+        self.frames.borrow_mut().push(Frame {
+            slots,
+            snapshot: crate::eval_iterative::empty_snapshot(),
+        });
         let frame = Cont::ChunkFrame {
-            pending: stmts.iter().cloned().collect(),
-            env: env.clone(),
+            pending: body.into_iter().collect(),
+            env: Env::new(),
             saved_block_home: self.current_block_home.get(),
         };
-        step_loop(self, frame)
+        let result = step_loop(self, frame);
+        // The chunk owns its slot frame (`ChunkFrame` teardown leaves it alone), so
+        // every exit path — normal, error, a tail call that drained the
+        // `ChunkFrame` — publishes from it here.
+        let frame = {
+            let mut frames = self.frames.borrow_mut();
+            debug_assert_eq!(frames.len(), base + 1, "chunk slot frame not on top");
+            frames.pop().expect("chunk slot frame missing")
+        };
+        for (name, value) in temps.into_iter().zip(frame.slots) {
+            workspace.publish(name, value);
+        }
+        result
     }
 
     fn eval_array_literal(&self, elements: &[Literal], env: &mut Env) -> Result<Value, EvalError> {
@@ -773,21 +813,19 @@ impl Evaluator {
     }
 
     /// Evaluate `Expr::NamespaceRef`: resolve a `Ns::ClassName` path.
+    ///
+    /// Ensures: the first segment resolves as a free name (`lookup_dynamic`) — via
+    ///   the defining class's namespace chain in a method, the active namespace's
+    ///   at top level — never as a local or workspace temp.
     pub(crate) fn eval_namespace_ref(
         &self,
         namespace_path: &[Arc<str>],
         name: &Arc<str>,
-        env: &mut Env,
     ) -> Result<Value, EvalError> {
         let first = namespace_path
             .first()
             .ok_or_else(|| EvalError::TypeError("empty namespace path".into()))?;
-        // By name first (top-level env); inside a method, fall back to the defining
-        // class's namespace and the root namespace names (env-frame redesign d2a).
-        let found = self.lookup_var(first.as_ref(), env).or_else(|| {
-            let class = self.method_stack.borrow().last()?.defining_class().clone();
-            self.resolve_global(&class, first.as_ref())
-        });
+        let found = self.lookup_dynamic(first.as_ref());
         let mut ns = match found {
             Some(Value::Namespace(ns)) => ns,
             Some(other) => {
@@ -1218,7 +1256,19 @@ pub(crate) fn check_capture_before_assignment(
     body: &[TaggedStmt],
 ) -> Result<(), EvalError> {
     let slots = scope_slot_names(params, locals, body);
-    check_captures_scope(&slots, params.len(), body)
+    check_captures_scope(&slots, (0..params.len() as u16).collect(), body)
+}
+
+/// [`check_capture_before_assignment`] for a resolved chunk.
+///
+/// Requires: `chunk` came from `resolve::resolve_chunk`.
+/// Ensures: as for a method, with the chunk's temps as its locals and its import
+///   slots as already assigned (they hold earlier chunks' published values from
+///   the chunk's start).
+fn check_chunk_captures(chunk: &ResolvedChunk) -> Result<(), EvalError> {
+    let slots: Vec<Arc<str>> = chunk.temps.iter().chain(&chunk.imports).cloned().collect();
+    let imported = (chunk.temps.len() as u16..slots.len() as u16).collect();
+    check_captures_scope(&slots, imported, &chunk.body)
 }
 
 /// Slot names in resolver order — params, then declared locals, then mid-body
@@ -1241,14 +1291,12 @@ fn scope_slot_names(
 
 /// Walk one scope's body in source order, tracking which slots are assigned, and
 /// validate each nested block's `ParentLocal` captures against that set.
+/// `assigned` starts as the slots bound on entry (params; a chunk's imports).
 fn check_captures_scope(
     slots: &[Arc<str>],
-    nparams: usize,
+    mut assigned: HashSet<u16>,
     body: &[TaggedStmt],
 ) -> Result<(), EvalError> {
-    // Params are bound on entry → assigned from the start. Slot indices align with
-    // `slots` (params occupy `0..nparams`).
-    let mut assigned: HashSet<u16> = (0..nparams as u16).collect();
     for s in body {
         match &s.node {
             Stmt::Assign { res, value, .. } => {
@@ -1296,7 +1344,7 @@ fn check_captures_expr(
             }
             // Recurse into the block's own scope (fresh `assigned` = its params).
             let inner = scope_slot_names(params, locals, body);
-            check_captures_scope(&inner, params.len(), body)
+            check_captures_scope(&inner, (0..params.len() as u16).collect(), body)
         }
         Expr::Send { receiver, message } => {
             check_captures_expr(slots, assigned, receiver)?;

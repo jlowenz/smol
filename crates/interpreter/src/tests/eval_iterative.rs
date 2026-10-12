@@ -785,10 +785,12 @@ fn cleanup_frames_empty_stack() {
 }
 
 #[test]
-fn cleanup_frames_plain_block_frame_no_pop_self() {
-    // BlockFrame with pushed_self=false → pop_self must NOT be called;
-    // saved_block_home is restored. (Block frames always own an env frame.)
+fn cleanup_frames_top_level_block_frame_pops_no_receiver() {
+    // A top-level block pushed the `NoReceiver` marker as its home binding →
+    // teardown pops it; saved_block_home is restored. (Block frames always own an
+    // env frame.)
     let ev = crate::eval::Evaluator::new_without_kernel();
+    ev.push_self(crate::eval::SelfBinding::NoReceiver);
     ev.current_block_home.set(Some(99));
     let mut env = crate::env::Env::new();
     env.push_frame();
@@ -796,7 +798,6 @@ fn cleanup_frames_plain_block_frame_no_pop_self() {
         pending: std::collections::VecDeque::new(),
         env,
         saved_block_home: Some(3),
-        pushed_self: false,
         sync: false,
     }];
     super::cleanup_frames(&ev, &mut stack);
@@ -804,7 +805,7 @@ fn cleanup_frames_plain_block_frame_no_pop_self() {
     assert_eq!(
         ev.method_stack.borrow().len(),
         0,
-        "pop_self must not have been called"
+        "the NoReceiver marker must have been popped"
     );
     assert_eq!(
         ev.current_block_home.get(),
@@ -854,9 +855,9 @@ fn cleanup_frames_method_frame_pops_self() {
 }
 
 #[test]
-fn cleanup_frames_block_with_pushed_self_pops_self() {
-    // A block that re-pushed its home binding (pushed_self=true) → pop_self is
-    // called on teardown; saved_block_home restored.
+fn cleanup_frames_block_frame_pops_home_binding() {
+    // A block re-pushed its method home's binding → pop_self is called on
+    // teardown; saved_block_home restored.
     let ev = crate::eval::Evaluator::new_without_kernel();
     let nil_class = ev
         .registry
@@ -877,7 +878,6 @@ fn cleanup_frames_block_with_pushed_self_pops_self() {
         pending: std::collections::VecDeque::new(),
         env,
         saved_block_home: Some(2),
-        pushed_self: true,
         sync: false,
     }];
     super::cleanup_frames(&ev, &mut stack);
@@ -895,13 +895,13 @@ fn cleanup_frames_pops_env_frame_when_flagged() {
     // A BlockFrame owns an env frame → env.pop_frame() is called without panic
     // (requires ≥2 frames).
     let ev = crate::eval::Evaluator::new_without_kernel();
+    ev.push_self(crate::eval::SelfBinding::NoReceiver);
     let mut env = crate::env::Env::new();
     env.push_frame();
     let mut stack = vec![Cont::BlockFrame {
         pending: std::collections::VecDeque::new(),
         env,
         saved_block_home: None,
-        pushed_self: false,
         sync: false,
     }];
     super::cleanup_frames(&ev, &mut stack);

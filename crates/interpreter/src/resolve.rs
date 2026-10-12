@@ -1,7 +1,7 @@
 //! Variable resolution — env-frame redesign (`docs/perf_env_frame_redesign.md`
 //! §5, §11).
 //!
-//! Classifies every variable reference in a method and its nested blocks into a
+//! Classifies every variable reference in a method or chunk and its nested blocks into a
 //! [`VarRef`], assigns each lexical scope a flat set of frame slots, and computes
 //! each block's capture plan (with proper upvalue chaining — a name a nested block
 //! reads is captured by every scope between it and the binder). This is the
@@ -16,6 +16,8 @@
 //! `SelfRef` / `Dynamic` still resolve by name via the env (dual storage) until
 //! P2.1d removes it. [`resolve_method`] remains the `ResolvedScope` analysis view
 //! (validation/tooling); `resolve_and_rewrite` is now the authoritative rewrite.
+//! Since d2c-c3 [`resolve_chunk`] resolves top-level chunks the same way (a method
+//! body with no `self`, importing earlier chunks' temps into extra slots).
 
 // `resolve_and_rewrite` is wired into method installation (P2.1a). The
 // `ResolvedScope` analysis view (`resolve_method` + its walk) stays test/tooling-only
@@ -60,7 +62,7 @@ pub(crate) fn resolve_method(
     body: &[TaggedStmt],
 ) -> ResolvedScope {
     let slots = scope_slots(params, locals, body);
-    let mut stack: Vec<ScopeCtx> = Vec::new();
+    let mut stack: Vec<ScopeCtx<'_>> = Vec::new();
     resolve_scope(&mut stack, slots, body)
 }
 
@@ -81,37 +83,80 @@ pub(crate) fn resolve_and_rewrite(
     body: &[TaggedStmt],
 ) -> Vec<TaggedStmt> {
     let slots = scope_slots(params, locals, body);
-    let mut stack: Vec<ScopeCtx> = Vec::new();
-    let (out, sources) = rewrite_scope(&mut stack, slots, body);
+    let mut stack: Vec<ScopeCtx<'_>> = Vec::new();
+    let (out, ctx) = rewrite_scope(&mut stack, ScopeCtx::new(slots), body);
     debug_assert!(
-        sources.is_empty(),
+        ctx.sources.is_empty(),
         "a method scope never captures (no enclosing lexical scope)"
     );
     out
 }
 
-/// Rewrite one scope's body, returning the rewritten statements and the scope's
-/// capture plan (`sources[i]` fills `Upvalue(i)` / snapshot slot `i`). The plan is
-/// empty for a method scope; a block scope attaches it to its `Expr::Block`.
-fn rewrite_scope(
-    stack: &mut Vec<ScopeCtx>,
-    slots: Vec<Arc<str>>,
+/// A chunk resolved for evaluation in a workspace (env-frame redesign §11.7c D1).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedChunk {
+    /// The chunk's statements, every reference resolved.
+    pub body: Vec<TaggedStmt>,
+    /// The chunk's own `| … |` temps: slots `0..temps.len()`, in declaration order.
+    pub temps: Vec<Arc<str>>,
+    /// Temps of earlier chunks that this chunk reads: slot `temps.len() + i` holds
+    /// the workspace's `imports[i]`.
+    pub imports: Vec<Arc<str>>,
+}
+
+/// Resolve a chunk like a method body with no `self` (env-frame redesign §11.7c
+/// D1): its temps are slots and its blocks capture by snapshot.
+///
+/// Requires: `is_workspace_temp(n)` is true iff the workspace holds a temp `n`
+///   published by an earlier chunk; `body` passed the chunk assignment check, so
+///   every assignment target is one of the chunk's own temps.
+/// Ensures: a chunk temp resolves to `Local(i)` with `i < temps.len()`. A name the
+///   chunk does not bind but the workspace holds resolves — in the chunk and in
+///   every block within it — through the import slot `temps.len() + j` with
+///   `imports[j] == name`, each imported once. `self` is `SelfRef`; every other
+///   free name is `Dynamic`.
+pub(crate) fn resolve_chunk(
     body: &[TaggedStmt],
-) -> (Vec<TaggedStmt>, Vec<CaptureSource>) {
-    stack.push(ScopeCtx {
-        slots,
-        captures: Vec::new(),
-        sources: Vec::new(),
-    });
+    is_workspace_temp: &dyn Fn(&str) -> bool,
+) -> ResolvedChunk {
+    let temps = scope_slots(&[], &[], body);
+    let root = ScopeCtx {
+        workspace: Some(is_workspace_temp),
+        ..ScopeCtx::new(temps.clone())
+    };
+    let mut stack: Vec<ScopeCtx<'_>> = Vec::new();
+    let (body, ctx) = rewrite_scope(&mut stack, root, body);
+    debug_assert!(
+        ctx.sources.is_empty(),
+        "a chunk scope never captures (no enclosing lexical scope)"
+    );
+    let imports = ctx.slots[temps.len()..].to_vec();
+    ResolvedChunk {
+        body,
+        temps,
+        imports,
+    }
+}
+
+/// Rewrite one scope's body, returning the rewritten statements and the scope's
+/// final context. Its `sources` is the capture plan (`sources[i]` fills
+/// `Upvalue(i)` / snapshot slot `i`): empty for a method or chunk scope; a block
+/// scope attaches it to its `Expr::Block`.
+fn rewrite_scope<'a>(
+    stack: &mut Vec<ScopeCtx<'a>>,
+    ctx: ScopeCtx<'a>,
+    body: &[TaggedStmt],
+) -> (Vec<TaggedStmt>, ScopeCtx<'a>) {
+    stack.push(ctx);
     let out = body
         .iter()
         .map(|s| TaggedStmt::new(s.span, rewrite_stmt(stack, &s.node)))
         .collect();
     let ctx = stack.pop().expect("scope stack underflow");
-    (out, ctx.sources)
+    (out, ctx)
 }
 
-fn rewrite_stmt(stack: &mut Vec<ScopeCtx>, s: &Stmt) -> Stmt {
+fn rewrite_stmt(stack: &mut Vec<ScopeCtx<'_>>, s: &Stmt) -> Stmt {
     match s {
         Stmt::Expr(e) => Stmt::Expr(rewrite_expr(stack, e)),
         Stmt::Return(e) => Stmt::Return(rewrite_expr(stack, e)),
@@ -133,7 +178,7 @@ fn rewrite_stmt(stack: &mut Vec<ScopeCtx>, s: &Stmt) -> Stmt {
     }
 }
 
-fn rewrite_expr(stack: &mut Vec<ScopeCtx>, e: &Expr) -> Expr {
+fn rewrite_expr(stack: &mut Vec<ScopeCtx<'_>>, e: &Expr) -> Expr {
     match e {
         Expr::Var { name, .. } => {
             let depth = stack.len() - 1;
@@ -150,12 +195,12 @@ fn rewrite_expr(stack: &mut Vec<ScopeCtx>, e: &Expr) -> Expr {
             ..
         } => {
             let slots = scope_slots(params, locals, body);
-            let (new_body, captures) = rewrite_scope(stack, slots, body);
+            let (new_body, ctx) = rewrite_scope(stack, ScopeCtx::new(slots), body);
             Expr::Block {
                 params: params.clone(),
                 locals: locals.clone(),
                 body: new_body,
-                captures,
+                captures: ctx.sources,
             }
         }
         Expr::Send { receiver, message } => Expr::Send {
@@ -173,7 +218,7 @@ fn rewrite_expr(stack: &mut Vec<ScopeCtx>, e: &Expr) -> Expr {
     }
 }
 
-fn rewrite_message(stack: &mut Vec<ScopeCtx>, msg: &Message) -> Message {
+fn rewrite_message(stack: &mut Vec<ScopeCtx<'_>>, msg: &Message) -> Message {
     match msg {
         Message::Unary(s) => Message::Unary(s.clone()),
         Message::Binary { op, arg } => Message::Binary {
@@ -190,10 +235,24 @@ fn rewrite_message(stack: &mut Vec<ScopeCtx>, msg: &Message) -> Message {
 }
 
 /// A scope's mutable resolution state while its subtree is being walked.
-struct ScopeCtx {
+struct ScopeCtx<'a> {
     slots: Vec<Arc<str>>,
     captures: Vec<Arc<str>>,
     sources: Vec<CaptureSource>,
+    /// For a chunk's root scope only: whether the workspace holds a published temp
+    /// of a given name, which the chunk then imports into an extra slot.
+    workspace: Option<&'a dyn Fn(&str) -> bool>,
+}
+
+impl ScopeCtx<'_> {
+    fn new(slots: Vec<Arc<str>>) -> Self {
+        Self {
+            slots,
+            captures: Vec::new(),
+            sources: Vec::new(),
+            workspace: None,
+        }
+    }
 }
 
 /// Slots of a scope: params, then declared locals, then mid-body `| … |` locals,
@@ -211,15 +270,11 @@ fn scope_slots(params: &[Arc<str>], locals: &[Arc<str>], body: &[TaggedStmt]) ->
 }
 
 fn resolve_scope(
-    stack: &mut Vec<ScopeCtx>,
+    stack: &mut Vec<ScopeCtx<'_>>,
     slots: Vec<Arc<str>>,
     body: &[TaggedStmt],
 ) -> ResolvedScope {
-    stack.push(ScopeCtx {
-        slots,
-        captures: Vec::new(),
-        sources: Vec::new(),
-    });
+    stack.push(ScopeCtx::new(slots));
     let mut refs = Vec::new();
     let mut children = Vec::new();
     for s in body {
@@ -236,7 +291,7 @@ fn resolve_scope(
 }
 
 fn walk_stmt(
-    stack: &mut Vec<ScopeCtx>,
+    stack: &mut Vec<ScopeCtx<'_>>,
     s: &Stmt,
     refs: &mut Vec<VarRef>,
     children: &mut Vec<ResolvedScope>,
@@ -257,7 +312,7 @@ fn walk_stmt(
 }
 
 fn walk_expr(
-    stack: &mut Vec<ScopeCtx>,
+    stack: &mut Vec<ScopeCtx<'_>>,
     e: &Expr,
     refs: &mut Vec<VarRef>,
     children: &mut Vec<ResolvedScope>,
@@ -298,7 +353,7 @@ fn walk_expr(
 }
 
 fn walk_message(
-    stack: &mut Vec<ScopeCtx>,
+    stack: &mut Vec<ScopeCtx<'_>>,
     msg: &Message,
     refs: &mut Vec<VarRef>,
     children: &mut Vec<ResolvedScope>,
@@ -319,8 +374,10 @@ fn walk_message(
 /// Ensures: a name bound in an enclosing scope resolves to `Upvalue`, and every
 ///   scope between the reference and the binder gains a capture entry whose
 ///   `source` points one level out (`ParentLocal` at the binder, `ParentUpvalue`
-///   through intermediates). A name bound nowhere lexically is `Dynamic`.
-fn resolve_name(stack: &mut [ScopeCtx], depth: usize, name: &Arc<str>) -> VarRef {
+///   through intermediates). A chunk's root scope binds, on first reference, a
+///   name its workspace holds (a new import slot). A name bound nowhere lexically
+///   is `Dynamic`.
+fn resolve_name(stack: &mut [ScopeCtx<'_>], depth: usize, name: &Arc<str>) -> VarRef {
     if name.as_ref() == "self" {
         return VarRef::SelfRef;
     }
@@ -331,7 +388,15 @@ fn resolve_name(stack: &mut [ScopeCtx], depth: usize, name: &Arc<str>) -> VarRef
         return VarRef::Upvalue(i);
     }
     if depth == 0 {
-        // Method scope: no enclosing lexical scope to capture from.
+        // Chunk scope: an earlier chunk's temp is imported into a new slot, which
+        // the chunk's prologue fills from the workspace.
+        if stack[0].workspace.is_some_and(|has| has(name)) {
+            let i = stack[0].slots.len() as u16;
+            stack[0].slots.push(name.clone());
+            return VarRef::Local(i);
+        }
+        // Method scope, or a name the workspace does not hold: no enclosing
+        // lexical scope to capture from.
         return VarRef::Dynamic(name.clone());
     }
     match resolve_name(stack, depth - 1, name) {
@@ -347,7 +412,7 @@ fn resolve_name(stack: &mut [ScopeCtx], depth: usize, name: &Arc<str>) -> VarRef
 }
 
 fn add_capture(
-    stack: &mut [ScopeCtx],
+    stack: &mut [ScopeCtx<'_>],
     depth: usize,
     name: &Arc<str>,
     source: CaptureSource,

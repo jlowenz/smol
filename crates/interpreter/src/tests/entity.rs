@@ -333,7 +333,7 @@ fn nlr_with_failing_commit_faults_entity() {
         env: Env::new(),
         home_depth: 2,
         home_entity: None,
-        home_binding: None,
+        home_binding: crate::eval::SelfBinding::NoReceiver,
         home_namespace: None,
     });
 

@@ -103,7 +103,7 @@ fn block_maps_to_skip() {
         env: crate::env::Env::new(),
         home_depth: 0,
         home_entity: None,
-        home_binding: None,
+        home_binding: crate::eval::SelfBinding::NoReceiver,
         home_namespace: None,
     }));
     assert!(matches!(value_to_bridge(&blk), BridgeResult::Skip));

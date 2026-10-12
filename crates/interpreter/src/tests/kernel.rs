@@ -221,7 +221,7 @@ fn timer_fires_in_entity() {
                     actor.clone(),
                     Arc::from("getResult"),
                     vec![],
-                    workspace.env_mut(),
+                    &mut crate::env::Env::new(),
                 )
                 .unwrap(),
             )

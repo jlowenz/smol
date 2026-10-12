@@ -67,17 +67,18 @@ pub struct Block {
     /// created outside any entity context. Used to detect cross-entity block
     /// invocations for write-guard enforcement.
     pub home_entity: Option<EntityId>,
-    /// The home scope's `self` binding at the point the block was captured, if
-    /// any (`None` only outside any method — e.g. a top-level block).
+    /// The home scope's `self` binding at the point the block was captured.
     ///
     /// Captured as `method_stack.last()` — the lexical home's binding, of *any*
     /// kind (`Instance`/`ClassSide`/`Primitive`) — so the block answers `self`
-    /// correctly for all receivers, not just instances. `push_block_frame`
-    /// re-pushes it for the block's duration, which makes `SelfRef` resolve from
-    /// `method_stack` and keeps ivar/classvar access correct even after TCO has
-    /// removed the enclosing method frame.
-    pub home_binding: Option<SelfBinding>,
-    /// The namespace a block created at top level (`home_binding` is `None`)
+    /// correctly for all receivers, not just instances; `NoReceiver` for a block
+    /// written at top level. `push_block_frame` re-pushes it for the block's
+    /// duration, which makes `SelfRef` resolve from `method_stack`, keeps
+    /// ivar/classvar access correct even after TCO has removed the enclosing
+    /// method frame, and keeps a top-level block from seeing the receiver of
+    /// whichever method calls it.
+    pub home_binding: SelfBinding,
+    /// The namespace a block created at top level (`home_binding` is `NoReceiver`)
     /// resolves free names through and defines into: the active namespace at its
     /// creation — its chunk's workspace namespace, or the one a `Namespace do:`
     /// made active. `push_block_frame` makes it active while the block runs, so the
