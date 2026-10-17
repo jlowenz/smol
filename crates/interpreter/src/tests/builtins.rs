@@ -1512,12 +1512,12 @@ fn if_nil_on_nil_runs_block() {
 }
 
 #[test]
-fn if_nil_on_non_nil_returns_nil() {
-    assert_eq!(eval_diff("7 ifNil: [42]"), Value::Nil);
-    assert_eq!(eval_diff("'hi' ifNil: [42]"), Value::Nil);
-    assert_eq!(eval_diff("true ifNil: [42]"), Value::Nil);
-    assert_eq!(eval_diff("3.14 ifNil: [42]"), Value::Nil);
-    assert_eq!(eval_diff("#sym ifNil: [42]"), Value::Nil);
+fn if_nil_on_non_nil_answers_the_receiver() {
+    assert_eq!(eval_diff("7 ifNil: [42]"), Value::Int(7));
+    assert_eq!(eval_diff("'hi' ifNil: [42]"), Value::Str(Arc::from("hi")));
+    assert_eq!(eval_diff("true ifNil: [42]"), Value::Bool(true));
+    assert_eq!(eval_diff("3.14 ifNil: [42]"), eval_diff("3.14"));
+    assert_eq!(eval_diff("#sym ifNil: [42]"), Value::Symbol("sym".into()));
 }
 
 #[test]

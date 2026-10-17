@@ -569,7 +569,7 @@ fn ifnil_fires_on_nil() {
 fn ifnil_skips_on_non_nil() {
     let src = "42 ifNil: ['was nil']";
     let v = eval(src);
-    assert_eq!(v, Value::Nil);
+    assert_eq!(v, Value::Int(42));
 }
 
 #[test]

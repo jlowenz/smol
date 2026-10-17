@@ -598,10 +598,10 @@ Dictionary >> initialize [
 
 "Returns the slot index for key — nil slot means absent, matching slot means present."
 Dictionary >> pvtSlotFor: key [
-    | cap h i |
+    | cap i |
     cap := table size.
-    h := key hash \\ cap.
-    i := h < 0 ifTrue: [h + cap] ifFalse: [h].
+    "`\\` is a floored remainder, so with cap > 0 the start index is never negative."
+    i := key hash \\ cap.
     i to: (i + table size - 1) do: [ :i | 
         |slot j|
         j := i \\ cap. 
@@ -775,7 +775,13 @@ Condition >> pvtFindRestart: name in: node [
 ]
 
 Condition >> hasRestart: name [ ^(self pvtFindRestart: name in: restarts) notNil ]
-Condition >> availableRestarts [ ^#() ]
+"The names of the restarts this condition carries, most recently added first."
+Condition >> availableRestarts [
+    | names |
+    names := Array new: (restarts inject: 0 into: [:n :assoc | n + 1]).
+    restarts inject: 0 into: [:i :assoc | names at: i put: assoc key. i + 1].
+    ^names
+]
 
 "Run the named restart block, passing it the condition so it may perform its own
 transfer (`c return:` / `c resume:` / `c retry`). A transfer unwinds before the
@@ -784,14 +790,14 @@ normally defaults to resuming with its value."
 Condition >> invokeRestart: name [
     | blk |
     blk := self pvtFindRestart: name in: restarts.
-    blk isNil ifTrue: [self error: 'no restart named: ', name].
+    blk isNil ifTrue: [self error: 'no restart named: ', name asString].
     ^self resume: (blk value: self)
 ]
 
 Condition >> invokeRestart: name with: arg [
     | blk |
     blk := self pvtFindRestart: name in: restarts.
-    blk isNil ifTrue: [self error: 'no restart named: ', name].
+    blk isNil ifTrue: [self error: 'no restart named: ', name asString].
     ^self resume: (blk value: self value: arg)
 ]
 
@@ -816,9 +822,9 @@ Condition subclass: #Warning
     classVariableNames: 'LoggingPolicy'
     indexedSlots: #none.
 
-Warning class >> initialize         [ LoggingPolicy := #stderr ]
+"Unset means #stderr, the default `apply_unhandled_policy` applies (builtins_iterative.rs)."
 Warning class >> loggingPolicy: sym [ LoggingPolicy := sym ]
-Warning class >> loggingPolicy      [ ^LoggingPolicy ]
+Warning class >> loggingPolicy      [ ^LoggingPolicy ifNil: [#stderr] ]
 
 Condition subclass: #Error
     instanceVariableNames: ''
@@ -1468,7 +1474,7 @@ False >> ifFalse: f ifTrue: t       [ ^f value ]
 False >> and: aBlock                [ ^false ]
 False >> or: aBlock                 [ ^aBlock value ]
 False >> not                        [ ^true ]
-False >> xor: aBool                 [ ^aBool not ]
+False >> xor: aBool                 [ ^aBool ]
 False >> asString                   [ ^'false' ]
 False >> = other                    [ ^other isKindOf: False ]
 False >> & other                    [ ^false ]

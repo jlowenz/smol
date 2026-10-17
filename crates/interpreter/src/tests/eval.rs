@@ -4721,3 +4721,198 @@ fn ensure_block_runs_when_the_body_raises_directly() {
     assert!(matches!(&rs[1], Err(EvalError::UndefinedVariable(n)) if &**n == "noSuchName"));
     assert_eq!(rs[2].as_ref().unwrap(), &Value::Bool(true));
 }
+
+// ── Kernel coverage triage (2026-10-11) ──────────────────────────────────────
+//
+// One test per kernel method body or branch that `just cov-suite` reported as
+// never executed.
+
+#[test]
+fn print_answers_the_receiver() {
+    assert_eq!(eval("(3 print) = 3"), Value::Bool(true));
+    assert_eq!(eval("('x' print) = 'x'"), Value::Bool(true));
+}
+
+#[test]
+fn object_is_empty_is_false() {
+    assert_eq!(eval("3 isEmpty"), Value::Bool(false));
+}
+
+#[test]
+fn ordered_max_and_min_pick_by_comparison() {
+    assert_eq!(eval("('a' max: 'b') = 'b'"), Value::Bool(true));
+    assert_eq!(eval("('b' max: 'a') = 'b'"), Value::Bool(true));
+    assert_eq!(eval("('a' min: 'b') = 'a'"), Value::Bool(true));
+    assert_eq!(eval("('b' min: 'a') = 'a'"), Value::Bool(true));
+}
+
+#[test]
+fn boolean_xor_truth_table() {
+    assert_eq!(eval("true xor: true"), Value::Bool(false));
+    assert_eq!(eval("true xor: false"), Value::Bool(true));
+    assert_eq!(eval("false xor: true"), Value::Bool(true));
+    assert_eq!(eval("false xor: false"), Value::Bool(false));
+}
+
+#[test]
+fn condition_available_restarts_lists_names_newest_first() {
+    let src = r#"
+| c names |
+c := (Error new addRestart: #a block: [1]) addRestart: #b block: [2].
+names := c availableRestarts.
+(names size = 2) and: [((names at: 0) = #b) and: [(names at: 1) = #a]]
+"#;
+    assert_eq!(eval(src), Value::Bool(true));
+    assert_eq!(eval("Error new availableRestarts size"), Value::Int(0));
+}
+
+#[test]
+fn condition_finds_a_restart_that_is_not_the_newest() {
+    let src = r#"
+| c |
+c := (Error new addRestart: #a block: [1]) addRestart: #b block: [2].
+(c hasRestart: #a) and: [(c hasRestart: #zz) not]
+"#;
+    assert_eq!(eval(src), Value::Bool(true));
+}
+
+#[test]
+fn invoke_restart_with_an_unknown_name_is_an_error() {
+    assert_signal_contains(
+        &eval_err("Error new invokeRestart: #nope"),
+        "no restart named: nope",
+    );
+    assert_signal_contains(
+        &eval_err("Error new invokeRestart: #nope with: 1"),
+        "no restart named: nope",
+    );
+}
+
+#[test]
+fn condition_resumability_follows_the_class() {
+    assert_eq!(eval("Condition new isResumable"), Value::Bool(true));
+    assert_eq!(eval("Warning new isResumable"), Value::Bool(true));
+    assert_eq!(eval("Error new isResumable"), Value::Bool(false));
+}
+
+#[test]
+fn warning_logging_policy_defaults_to_stderr() {
+    assert_eq!(
+        eval("Warning loggingPolicy"),
+        Value::Symbol("stderr".into())
+    );
+    assert_eq!(
+        eval("Warning loggingPolicy: #stdout. Warning loggingPolicy"),
+        Value::Symbol("stdout".into())
+    );
+}
+
+#[test]
+fn trait_conflict_carries_the_selector() {
+    let src = r#"
+        Trait named: #A.
+        A >> foo [ ^1 ].
+        Trait named: #B.
+        B >> foo [ ^2 ].
+        Value subclass: #C uses: (A + B) instanceVariableNames: ''.
+        [C new foo] on: TraitConflict do: [:e | e return: e selector]
+    "#;
+    assert_eq!(eval(src), Value::Symbol("foo".into()));
+}
+
+#[test]
+fn handler_context_pairs_and_on_run() {
+    assert_eq!(
+        eval("(HandlerContext new on: Error do: [:e | 1]) pairs head key = Error"),
+        Value::Bool(true)
+    );
+    let src = r#"
+| arr |
+arr := Array new: 1.
+arr at: 0 put: (Error -> [:e | e return: 7]).
+HandlerContext new on: arr run: [Error signal: 'x']
+"#;
+    assert_eq!(eval(src), Value::Int(7));
+}
+
+/// `S5_BOXED` plus a second wrapper, `Money`, that implements no coercion, so a
+/// mixed-wrapper operation reaches `pvtAdapt:send:` and is refused.
+fn triage_two_wrappers() -> String {
+    format!(
+        "{S5_BOXED} \
+         Integer subclass: #Money instanceVariableNames: 'm' \
+             classVariableNames: '' indexedSlots: #none. \
+         Money class >> of: x [ ^self _primNewValue: [:b | b setM: x] ]. \
+         Money >> setM: x [ m := x ]. \
+         Money >> value [ ^m ]. "
+    )
+}
+
+#[test]
+fn mixed_wrapper_arithmetic_is_refused_for_every_operator() {
+    let src = triage_two_wrappers();
+    for op in ["*", "/", "//", "\\\\"] {
+        assert_eq!(
+            eval(&format!(
+                "{src} [(Boxed of: 6) {op} (Money of: 2)] \
+                 on: NoCoercion do: [:e | e selector]"
+            )),
+            Value::Symbol(op.into()),
+            "Boxed {op} Money"
+        );
+    }
+}
+
+#[test]
+fn large_integer_receiver_adapts_to_a_wrapper_argument() {
+    for op in ["-", "*", "/", "//", "\\\\"] {
+        let src = format!(
+            "{S5_BOXED} | big r | big := 9223372036854775807 + 1. \
+             r := big {op} (Boxed of: 3). \
+             (r class = Boxed) and: [r value = (big {op} 3)]"
+        );
+        assert_eq!(eval(&src), Value::Bool(true), "big {op} Boxed");
+    }
+}
+
+#[test]
+fn float_receiver_adapts_to_a_wrapper_argument() {
+    for op in ["-", "/"] {
+        let src = format!(
+            "{S5_BOXED} | r | r := 1.5 {op} (Boxed of: 3). \
+             (r class = Boxed) and: [r value = (1.5 {op} 3)]"
+        );
+        assert_eq!(eval(&src), Value::Bool(true), "1.5 {op} Boxed");
+    }
+}
+
+#[test]
+fn large_integer_equals_a_wrapper_by_value() {
+    let src = format!(
+        "{S5_BOXED} | big | big := 9223372036854775807 + 1. \
+         (big = (Boxed of: 3)) not and: [big = (Boxed of: big)]"
+    );
+    assert_eq!(eval(&src), Value::Bool(true));
+}
+
+#[test]
+fn leaf_adapt_selectors_name_their_domain() {
+    // Public double-dispatch protocol: the kernel's own leaf operators send the
+    // adapt selectors directly, so only a direct send exercises these.
+    assert_eq!(
+        eval("3 adaptSelector = #adaptToInteger:andSend:"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval("(9223372036854775807 + 1) adaptSelector = #adaptToInteger:andSend:"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval("1.5 adaptSelector = #adaptToFloat:andSend:"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval("(1.5 adaptToInteger: 3 andSend: #+) = 4.5"),
+        Value::Bool(true)
+    );
+}

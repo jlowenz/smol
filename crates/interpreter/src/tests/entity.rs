@@ -777,6 +777,26 @@ fn atomic_no_participants_commits_and_resolves_result() {
 }
 
 #[test]
+fn atomic_result_reports_a_committed_transaction() {
+    // Kernel coverage triage (2026-10-11): the TxResult / Transaction status
+    // accessors.
+    let src = r#"
+        | tr t |
+        tr := (Transaction atomic: [:tx | 42]) await.
+        t := tr transaction.
+        ((tr status await = #committed) and: [t isCommitted await])
+            and: [(t isAborted await) not]
+    "#;
+    assert_eq!(run_in_coroutine(src), Value::Bool(true));
+}
+
+#[test]
+fn transaction_deadlock_timeout_is_readable() {
+    let v = run_in_coroutine("Transaction deadlockTimeoutMs await");
+    assert!(matches!(v, Value::Int(ms) if ms > 0), "got {v:?}");
+}
+
+#[test]
 fn atomic_transfer_commits_on_both_participants() {
     // Two accounts; an atomic block moves 30 from a to b. After commit both live
     // balances reflect the transfer.

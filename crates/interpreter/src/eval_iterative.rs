@@ -1730,6 +1730,8 @@ fn dispatch_signal(
 ///       `HCRunGuard { sync: true }`, then `push_block_frame(sync=true)` for body.
 ///   (6) `Bool >> ifTrue:` family → `push_block_frame(false)` for selected branch.
 ///   (7) Universal nil-guard family (`ifNil:` / `ifNotNil:` / combined) → inline.
+///       A guard whose block does not run answers the receiver (so `x ifNil: [d]`
+///       answers `x` when `x` is not nil, and `nil ifNotNil: [..]` answers nil).
 ///   (8) All other selectors → `builtins::dispatch`.
 fn dispatch_to_stack(
     ev: &Evaluator,
@@ -2090,7 +2092,7 @@ fn dispatch_to_stack(
             if matches!(forced, Value::Nil) {
                 push_block_frame(ev, &blk, vec![], false, stack)?;
             } else {
-                *acc = Value::Nil;
+                *acc = forced;
             }
             return Ok(());
         }
