@@ -67,6 +67,10 @@ It is intended to be iterated on as design stabilizes.
 - Inter-process message passing: copy semantics (owned objects copied
   on send, values structurally shared)
 - Reachability tracking feeds ownership/sharing determination
+- *(2026-10-17)* Mechanism decided in `vm_compiler_plan.md` VD8: an immutable
+  value is copied once into the shared heap when it escapes its process
+  (promote-on-escape), and large immutable values are allocated shared from
+  birth, so they are never copied.
 
 ### 2.6 Synchronization / Transaction Coordinator
 - Transaction protocol dispatch based on declared semantics
