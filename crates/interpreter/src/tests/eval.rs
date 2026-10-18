@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_helpers::{
-    assert_signal_contains, eval, eval_chunks, eval_diff, eval_err, eval_err_diff, signal_message,
+    assert_signal_contains, eval, eval_chunks, eval_diff, eval_err, eval_err_diff, eval_unresolved,
+    signal_message,
 };
 use crate::workspace::Workspace;
 
@@ -4915,4 +4916,87 @@ fn leaf_adapt_selectors_name_their_domain() {
         eval("(1.5 adaptToInteger: 3 andSend: #+) = 4.5"),
         Value::Bool(true)
     );
+}
+
+// ── Nil protocol: Smol-defined and overridable (2026-10-18) ──────────────────
+//
+// `isNil`, `notNil` and the `ifNil:` family are kernel methods on Object and Nil,
+// so a class may override them (a Null Object); only `== nil` tests the reference.
+// Another entity whose class keeps the kernel defaults is answered in place; one
+// that overrides is sent a message.
+
+const NULL_THING: &str = "Value subclass: #NullThing instanceVariableNames: ''. \
+     NullThing >> isNil [ ^true ]. \
+     NullThing >> notNil [ ^false ]. \
+     NullThing >> ifNil: aBlock [ ^aBlock value ]. ";
+
+const PROBE: &str = "Object subclass: #Probe instanceVariableNames: ''. \
+     Probe >> nothing [ ^nil ]. \
+     Probe >> selfIsNil [ ^self isNil ]. ";
+
+#[test]
+fn null_object_overrides_the_nil_protocol() {
+    for (expr, expected) in [
+        ("NullThing new isNil", Value::Bool(true)),
+        ("NullThing new notNil", Value::Bool(false)),
+        ("NullThing new ifNil: [7]", Value::Int(7)),
+        ("NullThing new ifNotNil: [:x | 5]", Value::Int(5)),
+        ("NullThing new == nil", Value::Bool(false)),
+    ] {
+        assert_eq!(eval(&format!("{NULL_THING} {expr}")), expected, "{expr}");
+    }
+}
+
+#[test]
+fn nil_protocol_defaults_follow_the_receiver() {
+    for (expr, expected) in [
+        ("3 isNil", Value::Bool(false)),
+        ("nil isNil", Value::Bool(true)),
+        ("3 notNil", Value::Bool(true)),
+        ("nil notNil", Value::Bool(false)),
+        ("'ab' ifNotNil: [:s | s size]", Value::Int(2)),
+        ("3 ifNil: [1] ifNotNil: [:x | x + 1]", Value::Int(4)),
+        ("nil ifNotNil: [:x | 1] ifNil: [2]", Value::Int(2)),
+        ("3 ifNotNil: [:x | x * 2] ifNil: [0]", Value::Int(6)),
+    ] {
+        assert_eq!(eval(expr), expected, "{expr}");
+    }
+}
+
+#[test]
+fn entity_with_kernel_nil_protocol_is_answered_in_place() {
+    let v = eval_unresolved(&format!("{PROBE} | p | p := Probe new. p isNil"));
+    assert_eq!(v, Value::Bool(false));
+    let v = eval_unresolved(&format!(
+        "{PROBE} | p | p := Probe new. p ifNotNil: [:x | 5]"
+    ));
+    assert_eq!(v, Value::Int(5));
+    let v = eval_unresolved(&format!("{PROBE} | p | p := Probe new. p ifNil: [1]"));
+    assert!(matches!(v, Value::Instance(_)), "got {v:?}");
+}
+
+#[test]
+fn entity_overriding_the_nil_protocol_is_sent_a_message() {
+    let src = "Object subclass: #NullEntity instanceVariableNames: ''. \
+               NullEntity >> isNil [ ^true ]. \
+               | p | p := NullEntity new. p isNil";
+    assert!(matches!(eval_unresolved(src), Value::Future(_)));
+    assert_eq!(eval(src), Value::Bool(true));
+}
+
+#[test]
+fn nil_protocol_on_a_future_and_a_class_and_a_self_send() {
+    for (expr, expected) in [
+        ("(p nothing) ifNil: [3]", Value::Int(3)),
+        ("(p nothing) isNil", Value::Bool(true)),
+        ("Probe isNil", Value::Bool(false)),
+        ("(Probe ifNil: [1]) == Probe", Value::Bool(true)),
+        ("p selfIsNil", Value::Bool(false)),
+    ] {
+        assert_eq!(
+            eval(&format!("{PROBE} | p | p := Probe new. {expr}")),
+            expected,
+            "{expr}"
+        );
+    }
 }

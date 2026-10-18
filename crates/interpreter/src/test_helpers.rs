@@ -62,6 +62,27 @@ pub(crate) fn eval(src: &str) -> Value {
     rx.recv().expect("eval coroutine panicked")
 }
 
+/// Evaluate `src` like `eval`, but answer the chunk's value as produced, without
+/// resolving a Future. Use it to observe whether a send was answered in place or
+/// became a message (a cross-entity message answers a `Value::Future`).
+///
+/// Requires: `src` is valid Smol and the chunk does not error.
+/// Ensures: no Future in the result is forced.
+pub(crate) fn eval_unresolved(src: &str) -> Value {
+    let src = src.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::entity::init_coroutine_stack();
+    let _ = may::go_with!(TEST_COROUTINE_STACK, move || {
+        let prog = Parser::parse(&src).expect("parse");
+        let ev = Evaluator::new();
+        let mut workspace = Workspace::new(&ev);
+        let v = ev.eval_chunk(&prog, &mut workspace).expect("eval");
+        ev.shutdown();
+        tx.send(v).unwrap();
+    });
+    rx.recv().expect("eval coroutine panicked")
+}
+
 /// Evaluate each source in `srcs` as a separate top-level chunk on one evaluator
 /// and one workspace — the REPL shape. Each chunk's outcome is returned in
 /// order (futures resolved); a failing chunk does not stop later ones.

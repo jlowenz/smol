@@ -1717,6 +1717,33 @@ fn dispatch_signal(
     }
 }
 
+/// Whether a nil-protocol send (`isNil`, `notNil`, the `ifNil:` family) that found
+/// no Smol method in `lookup_user_method` may be answered without sending it.
+///
+/// Requires: `selector` is a nil-protocol selector; `receiver` is not a
+///   `Value::Future` (the caller forced it).
+/// Ensures: `true` for receivers with no Smol class to override the protocol in
+///   (classes, namespaces, handles), and for another entity whose class resolves
+///   `selector` to the kernel's `Object` method: that method reads no entity
+///   state, so answering here is the same as sending, minus the mailbox round
+///   trip. `false` for an entity whose class overrides `selector`; the caller then
+///   sends it as an ordinary message.
+fn nil_protocol_answers_locally(ev: &Evaluator, receiver: &Value, selector: &str) -> bool {
+    let Value::Instance(handle) = receiver else {
+        return true;
+    };
+    if !matches!(handle.0.kind, InstanceKind::Entity(_)) {
+        return true;
+    }
+    let Some(object) = ev.registry.kernel().lookup_class("Object") else {
+        return true;
+    };
+    match handle.0.class.lookup(selector) {
+        Some((_, def_class)) => Arc::ptr_eq(&def_class, &object.0.class),
+        None => true,
+    }
+}
+
 /// Dispatch a message send to the iterative stack.
 ///
 /// Requires: `args` are fully evaluated in left-to-right order.
@@ -1729,9 +1756,11 @@ fn dispatch_signal(
 ///   (5) `Block >> on:do:` → register handler pair in `handler_chain`, push
 ///       `HCRunGuard { sync: true }`, then `push_block_frame(sync=true)` for body.
 ///   (6) `Bool >> ifTrue:` family → `push_block_frame(false)` for selected branch.
-///   (7) Universal nil-guard family (`ifNil:` / `ifNotNil:` / combined) → inline.
-///       A guard whose block does not run answers the receiver (so `x ifNil: [d]`
-///       answers `x` when `x` is not nil, and `nil ifNotNil: [..]` answers nil).
+///   (7) Nil protocol (`isNil`, `notNil`, `ifNil:` / `ifNotNil:` / combined) for a
+///       receiver with no Smol method found in (1) → answered inline when
+///       `nil_protocol_answers_locally`, else falls through to (8) as a message.
+///       Matches the kernel's `Object`/`Nil` methods: a guard whose block does not
+///       run answers the receiver.
 ///   (8) All other selectors → `builtins::dispatch`.
 fn dispatch_to_stack(
     ev: &Evaluator,
@@ -2078,8 +2107,25 @@ fn dispatch_to_stack(
         }
     }
 
-    // (6) Universal nil-guard family — checked after user methods so user overrides win.
+    // (7) Nil protocol for receivers that found no Smol method in (1).
+    let nil_protocol = matches!(
+        selector.as_ref(),
+        "isNil" | "notNil" | "ifNil:" | "ifNotNil:" | "ifNil:ifNotNil:" | "ifNotNil:ifNil:"
+    );
+    let answer_here = nil_protocol && nil_protocol_answers_locally(ev, &receiver, &selector);
     match selector.as_ref() {
+        _ if !answer_here => {}
+        "isNil" | "notNil" => {
+            if !args.is_empty() {
+                return Err(EvalError::ArityMismatch {
+                    expected: 0,
+                    got: args.len(),
+                });
+            }
+            let is_nil = matches!(receiver, Value::Nil);
+            *acc = Value::Bool(is_nil == (selector.as_ref() == "isNil"));
+            return Ok(());
+        }
         "ifNil:" => {
             if args.len() != 1 {
                 return Err(EvalError::ArityMismatch {
@@ -2151,7 +2197,7 @@ fn dispatch_to_stack(
         _ => {}
     }
 
-    // (7) All other selectors fall through to builtins. On a
+    // (8) All other selectors fall through to builtins. On a
     // `MessageNotUnderstood` miss, give the receiver a chance to handle the send
     // via `doesNotUnderstand:` (reified-message forwarding): reify the failed
     // send as a `Message` and invoke the method on the same Cont stack (no Rust

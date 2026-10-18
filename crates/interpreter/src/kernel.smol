@@ -431,6 +431,16 @@ Object >> initialize []
 "Default isEmpty returns false; collection subclasses override."
 Object >> isEmpty [ ^false ]
 
+"The nil protocol. These are messages, so a class may override them (a Null
+Object answering isNil true); only `== nil` tests the reference itself. A guard
+whose block does not run answers the receiver."
+Object >> isNil                      [ ^false ]
+Object >> notNil                     [ ^true ]
+Object >> ifNil: nilBlock            [ ^self ]
+Object >> ifNotNil: aBlock           [ ^aBlock value: self ]
+Object >> ifNil: nilBlock ifNotNil: aBlock [ ^aBlock value: self ]
+Object >> ifNotNil: aBlock ifNil: nilBlock [ ^aBlock value: self ]
+
 Object >> class [ ^self _primClass ]
 Object >> isKindOf: aClass [ ^self _primIsKindOf: aClass ]
 
@@ -563,6 +573,12 @@ the printString family in S5."
 Nil >> asString [ ^'nil' ]
 
 Nil >> isEmpty [ ^true ]
+Nil >> isNil                      [ ^true ]
+Nil >> notNil                     [ ^false ]
+Nil >> ifNil: nilBlock            [ ^nilBlock value ]
+Nil >> ifNotNil: aBlock           [ ^nil ]
+Nil >> ifNil: nilBlock ifNotNil: aBlock [ ^nilBlock value ]
+Nil >> ifNotNil: aBlock ifNil: nilBlock [ ^nilBlock value ]
 Nil >> do: aBlock [ ^nil ]
 Nil >> inject: aValue into: aBlock [ ^aValue ]
 

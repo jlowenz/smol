@@ -38,15 +38,6 @@ pub fn dispatch(
         expect_arity(&selector, 0, args.len())?;
         return force_value(ev, recv);
     }
-    // `isNil` / `notNil` are universal.
-    if selector.as_ref() == "isNil" {
-        expect_arity(&selector, 0, args.len())?;
-        return Ok(Value::Bool(matches!(force_value(ev, recv)?, Value::Nil)));
-    }
-    if selector.as_ref() == "notNil" {
-        expect_arity(&selector, 0, args.len())?;
-        return Ok(Value::Bool(!matches!(force_value(ev, recv)?, Value::Nil)));
-    }
     // C31 S5c: deadlock-detection timeout (ms). Universal so `Transaction class`
     // sends reach it regardless of class-side vs instance dispatch. Stored in a VM
     // global read by the entity park loop.
