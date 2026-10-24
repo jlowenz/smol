@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::ast::{CaptureSource, Expr, Message, MethodDef, Stmt, TaggedStmt, VarRef};
 use crate::builtins::{UserMethodFound, as_block, force_value, lookup_user_method};
 use crate::class::{Class, Method};
+use crate::class_registry::STATELESS_OBJECT_DEFAULTS;
 use crate::entity::{InstanceHandle, InstanceKind};
 use crate::eval::{
     EvalError, Evaluator, Frame, SelfBinding, check_prim_sends_in_body, eval_literal,
@@ -1717,31 +1718,36 @@ fn dispatch_signal(
     }
 }
 
-/// Whether a nil-protocol send (`isNil`, `notNil`, the `ifNil:` family) that found
-/// no Smol method in `lookup_user_method` may be answered without sending it.
+/// Whether a send of one of `STATELESS_OBJECT_DEFAULTS` that found no Smol method
+/// in `lookup_user_method` may be answered here instead of being sent.
 ///
-/// Requires: `selector` is a nil-protocol selector; `receiver` is not a
+/// Requires: `selector` is in `STATELESS_OBJECT_DEFAULTS`; `receiver` is not a
 ///   `Value::Future` (the caller forced it).
-/// Ensures: `true` for receivers with no Smol class to override the protocol in
-///   (classes, namespaces, handles), and for another entity whose class resolves
-///   `selector` to the kernel's `Object` method: that method reads no entity
-///   state, so answering here is the same as sending, minus the mailbox round
-///   trip. `false` for an entity whose class overrides `selector`; the caller then
-///   sends it as an ordinary message.
-fn nil_protocol_answers_locally(ev: &Evaluator, receiver: &Value, selector: &str) -> bool {
-    let Value::Instance(handle) = receiver else {
-        return true;
-    };
-    if !matches!(handle.0.kind, InstanceKind::Entity(_)) {
-        return true;
+/// Ensures:
+///   - another entity: `true` iff its class resolves `selector` to the kernel's
+///     own `Object` method (`ClassRegistry::is_stateless_default`). That method
+///     reads no entity state, so answering here equals sending, minus the
+///     mailbox round trip. An override or a redefinition answers `false`, and
+///     the caller sends an ordinary message.
+///   - classes, namespaces, handles: `true` for the nil protocol, which has no
+///     Smol class to override it in; `false` otherwise, leaving identity,
+///     equality and `class` to `builtins::dispatch` as before.
+fn stateless_default_answers_here(ev: &Evaluator, receiver: &Value, selector: &str) -> bool {
+    match receiver {
+        Value::Instance(handle) if matches!(handle.0.kind, InstanceKind::Entity(_)) => handle
+            .0
+            .class
+            .lookup(selector)
+            .is_some_and(|(method, _)| ev.registry.is_stateless_default(selector, &method)),
+        _ => is_nil_protocol(selector),
     }
-    let Some(object) = ev.registry.kernel().lookup_class("Object") else {
-        return true;
-    };
-    match handle.0.class.lookup(selector) {
-        Some((_, def_class)) => Arc::ptr_eq(&def_class, &object.0.class),
-        None => true,
-    }
+}
+
+fn is_nil_protocol(selector: &str) -> bool {
+    matches!(
+        selector,
+        "isNil" | "notNil" | "ifNil:" | "ifNotNil:" | "ifNil:ifNotNil:" | "ifNotNil:ifNil:"
+    )
 }
 
 /// Dispatch a message send to the iterative stack.
@@ -1756,11 +1762,11 @@ fn nil_protocol_answers_locally(ev: &Evaluator, receiver: &Value, selector: &str
 ///   (5) `Block >> on:do:` → register handler pair in `handler_chain`, push
 ///       `HCRunGuard { sync: true }`, then `push_block_frame(sync=true)` for body.
 ///   (6) `Bool >> ifTrue:` family → `push_block_frame(false)` for selected branch.
-///   (7) Nil protocol (`isNil`, `notNil`, `ifNil:` / `ifNotNil:` / combined) for a
-///       receiver with no Smol method found in (1) → answered inline when
-///       `nil_protocol_answers_locally`, else falls through to (8) as a message.
-///       Matches the kernel's `Object`/`Nil` methods: a guard whose block does not
-///       run answers the receiver.
+///   (7) `STATELESS_OBJECT_DEFAULTS` (identity, default equality, `class`, the nil
+///       protocol) for a receiver with no Smol method found in (1) → answered
+///       inline when `stateless_default_answers_here`, else falls through to (8)
+///       as a message. Matches the kernel's `Object`/`Nil` methods: a nil guard
+///       whose block does not run answers the receiver.
 ///   (8) All other selectors → `builtins::dispatch`.
 fn dispatch_to_stack(
     ev: &Evaluator,
@@ -2107,14 +2113,38 @@ fn dispatch_to_stack(
         }
     }
 
-    // (7) Nil protocol for receivers that found no Smol method in (1).
-    let nil_protocol = matches!(
-        selector.as_ref(),
-        "isNil" | "notNil" | "ifNil:" | "ifNotNil:" | "ifNil:ifNotNil:" | "ifNotNil:ifNil:"
-    );
-    let answer_here = nil_protocol && nil_protocol_answers_locally(ev, &receiver, &selector);
+    // (7) Stateless kernel defaults for receivers that found no Smol method in (1).
+    let answer_here = STATELESS_OBJECT_DEFAULTS.contains(&selector.as_ref())
+        && stateless_default_answers_here(ev, &receiver, &selector);
     match selector.as_ref() {
         _ if !answer_here => {}
+        "==" | "~~" | "=" | "~=" => {
+            if args.len() != 1 {
+                return Err(EvalError::ArityMismatch {
+                    expected: 1,
+                    got: args.len(),
+                });
+            }
+            let other = force_value(ev, args.remove(0))?;
+            let identical = receiver == other;
+            *acc = Value::Bool(identical == matches!(selector.as_ref(), "==" | "="));
+            return Ok(());
+        }
+        "class" => {
+            if !args.is_empty() {
+                return Err(EvalError::ArityMismatch {
+                    expected: 0,
+                    got: args.len(),
+                });
+            }
+            *acc = crate::builtins_iterative::value_to_class_handle(ev, &receiver)
+                .map(Value::Instance)
+                .ok_or_else(|| EvalError::MessageNotUnderstood {
+                    receiver_kind: "Object",
+                    selector: selector.clone(),
+                })?;
+            return Ok(());
+        }
         "isNil" | "notNil" => {
             if !args.is_empty() {
                 return Err(EvalError::ArityMismatch {

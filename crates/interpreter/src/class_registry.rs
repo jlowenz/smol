@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::class::Class;
+use crate::class::{Class, Method};
 use crate::coverage::CoverageCollector;
 use crate::entity::{EntityId, InstanceHandle, InstanceKind, InstanceState, spawn_class_entity};
 use crate::namespace::Namespace;
@@ -48,7 +48,28 @@ pub struct ClassRegistry {
     /// entity coroutines — records executed statement spans into it. See
     /// [`crate::coverage`].
     pub(crate) coverage: OnceLock<Arc<Mutex<CoverageCollector>>>,
+    /// The kernel's `Object` methods for `STATELESS_OBJECT_DEFAULTS`, recorded once
+    /// kernel.smol is loaded, so a later redefinition of any of them is detectable.
+    stateless_defaults: OnceLock<HashMap<&'static str, Arc<Method>>>,
 }
+
+/// Selectors whose kernel `Object` method reads no receiver state: identity,
+/// class, default equality, and the nil protocol. While a receiver's class
+/// resolves one of these to the kernel method, the answer depends only on the
+/// reference, so it can be computed without sending a message.
+pub(crate) const STATELESS_OBJECT_DEFAULTS: &[&str] = &[
+    "==",
+    "~~",
+    "=",
+    "~=",
+    "class",
+    "isNil",
+    "notNil",
+    "ifNil:",
+    "ifNotNil:",
+    "ifNil:ifNotNil:",
+    "ifNotNil:ifNil:",
+];
 
 impl ClassRegistry {
     /// Enable execution-coverage collection on this registry (idempotent).
@@ -139,6 +160,7 @@ impl ClassRegistry {
             indexed_slots_pred,
             instance_of_pred,
             coverage: OnceLock::new(),
+            stateless_defaults: OnceLock::new(),
         });
 
         // Phase 2: spawn the class actors. Class-side methods resolve other classes
@@ -206,6 +228,32 @@ impl ClassRegistry {
         arc.register_class_predicates(&object_class);
         arc.register_class_predicates(&value_class);
         arc
+    }
+
+    /// Record the kernel's `Object` methods for `STATELESS_OBJECT_DEFAULTS`.
+    ///
+    /// Requires: kernel.smol has been loaded into this registry.
+    /// Ensures: `is_stateless_default` answers by method identity; a second call
+    ///   is a no-op, so the first (kernel) definitions stay the reference.
+    pub(crate) fn record_stateless_defaults(&self) {
+        let Some(object) = self.kernel.lookup_class("Object") else {
+            return;
+        };
+        let _ = self.stateless_defaults.get_or_init(|| {
+            STATELESS_OBJECT_DEFAULTS
+                .iter()
+                .filter_map(|&sel| object.0.class.lookup(sel).map(|(m, _)| (sel, m)))
+                .collect()
+        });
+    }
+
+    /// Ensures: `true` iff `method` is the kernel's own `Object` method recorded
+    ///   for `selector` (so not an override, and not a redefinition of it).
+    pub(crate) fn is_stateless_default(&self, selector: &str, method: &Arc<Method>) -> bool {
+        self.stateless_defaults
+            .get()
+            .and_then(|defaults| defaults.get(selector))
+            .is_some_and(|kernel_method| Arc::ptr_eq(kernel_method, method))
     }
 
     pub fn kernel(&self) -> Arc<Namespace> {

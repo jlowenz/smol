@@ -262,6 +262,7 @@ impl Evaluator {
             .expect("kernel.smol: parse error");
         ev.eval_chunk(&chunk, &mut kernel_workspace)
             .expect("kernel.smol: eval error");
+        ev.registry.record_stateless_defaults();
         ev
     }
 

@@ -2715,7 +2715,7 @@ fn is_kind_of(class: &Arc<Class>, target: &Arc<Class>) -> bool {
 /// Requires: `v` is not a `Value::Future` (caller must force first).
 /// Ensures: returns `Some(handle)` where handle is the class entity for `v`'s type,
 ///   or `None` if no kernel class is available (ClassEntity receiver, Namespace).
-fn value_to_class_handle(ev: &Evaluator, v: &Value) -> Option<InstanceHandle> {
+pub(crate) fn value_to_class_handle(ev: &Evaluator, v: &Value) -> Option<InstanceHandle> {
     let class_name = match v {
         Value::Bool(b) => {
             if *b {

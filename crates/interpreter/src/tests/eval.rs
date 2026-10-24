@@ -5000,3 +5000,62 @@ fn nil_protocol_on_a_future_and_a_class_and_a_self_send() {
         );
     }
 }
+
+// ── Identity, default equality and class on another entity (2026-10-18) ──────
+//
+// While an entity's class resolves these to the kernel's own `Object` methods,
+// the answer depends only on the reference and is computed in place; an override
+// or a redefinition makes it an ordinary message.
+
+#[test]
+fn entity_identity_equality_and_class_are_answered_in_place() {
+    for (expr, expected) in [
+        ("p == p", Value::Bool(true)),
+        ("p ~~ p", Value::Bool(false)),
+        ("p = p", Value::Bool(true)),
+        ("p ~= 3", Value::Bool(true)),
+        ("p == Probe new", Value::Bool(false)),
+    ] {
+        let src = format!("{PROBE} | p | p := Probe new. {expr}");
+        assert_eq!(eval_unresolved(&src), expected, "{expr}");
+    }
+    let class = eval_unresolved(&format!("{PROBE} | p | p := Probe new. p class"));
+    assert!(matches!(class, Value::Instance(_)), "got {class:?}");
+    assert_eq!(
+        eval(&format!("{PROBE} | p | p := Probe new. p class == Probe")),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn entity_overriding_equality_is_sent_a_message() {
+    let src = "Object subclass: #Agreeable instanceVariableNames: ''. \
+               Agreeable >> = other [ ^true ]. \
+               | p | p := Agreeable new.";
+    assert!(matches!(
+        eval_unresolved(&format!("{src} p = 3")),
+        Value::Future(_)
+    ));
+    assert_eq!(eval(&format!("{src} p = 3")), Value::Bool(true));
+    assert_eq!(
+        eval_unresolved(&format!("{src} p == 3")),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn redefining_a_kernel_default_is_honoured_for_every_receiver() {
+    let src = format!("{PROBE} Object >> notNil [ ^#redefined ]. | p | p := Probe new.");
+    assert!(matches!(
+        eval_unresolved(&format!("{src} p notNil")),
+        Value::Future(_)
+    ));
+    assert_eq!(
+        eval(&format!("{src} p notNil")),
+        Value::Symbol("redefined".into())
+    );
+    assert_eq!(
+        eval(&format!("{src} 3 notNil")),
+        Value::Symbol("redefined".into())
+    );
+}
