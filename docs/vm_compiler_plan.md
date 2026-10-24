@@ -1,7 +1,7 @@
 # Compiler + VM plan
 
-**Status: DRAFT for review (2026-10-16).** Decided so far: VD8 (2026-10-17); VD1, VD2, VD4 and VD5 (2026-10-18).
-VD3 is leaning (b). The other decisions in §2 are open. Opened after the env-frame redesign
+**Status: DRAFT for review (2026-10-16).** Decided so far: VD8 (2026-10-17); VD1, VD2, VD4 and VD5 (2026-10-18); VD3, VD6 except item 4, and VD7 (2026-10-24).
+VD6 item 4 (persisting compiled code) is open. Opened after the env-frame redesign
 (`perf_env_frame_redesign.md`, COMPLETE) and the kernel coverage triage
 (kernel.smol at 100%, `a280290`).
 
@@ -48,17 +48,17 @@ own and is checked against the tree-walker.
 
 ### 1.2 What the VM replaces
 
-| Today (tree-walker) | Cost / limit | VM replacement |
-|---|---|---|
-| AST cloned into `Cont` per activation | largest single cost in the P2.1e profile | bytecode by index; frames hold a `pc` |
-| `Message::selector` builds a string per send (`ast.rs:40-50`) | allocation + hash per send | selector is an interned constant |
-| `Class::lookup(&str)`, SipHash per level, read lock per level (`class.rs:163-172`) | no cache | inline cache per send site |
-| `Dynamic` names (ivars, globals) resolved by name at runtime | hash per reference | ivar by index; global via cached binding cell |
-| ivars in `Mutex<HashMap<Arc<str>, Value>>` (`object.rs:37`) | lock + hash per access | indexed slots by class layout |
-| `_prim*` matched by string compare chains (`builtins_iterative.rs` :1590-1663) | ~82 string compares on the slow path | numbered primitive table |
-| one stackful `may` coroutine per entity (64 KB release) | 10k connections ≈ 640 MB of stacks (`web_server_readiness.md` :70-73) | stackless processes: heap frame stack, a few hundred bytes |
-| `may::coroutine::yield_now` every 1024 dispatches | cooperative; arithmetic loops don't yield | reductions counted in the VM loop; preempt at any safe point |
-| a timer is one OS thread + sleep (`os_interface.rs` :101-118) | thread per timer | timer wheel in the scheduler |
+| Today (tree-walker)                                                                | Cost / limit                                                          | VM replacement                                               |
+| ---------------------------------------------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------ |
+| AST cloned into `Cont` per activation                                              | largest single cost in the P2.1e profile                              | bytecode by index; frames hold a `pc`                        |
+| `Message::selector` builds a string per send (`ast.rs:40-50`)                      | allocation + hash per send                                            | selector is an interned constant                             |
+| `Class::lookup(&str)`, SipHash per level, read lock per level (`class.rs:163-172`) | no cache                                                              | inline cache per send site                                   |
+| `Dynamic` names (ivars, globals) resolved by name at runtime                       | hash per reference                                                    | ivar by index; global via cached binding cell                |
+| ivars in `Mutex<HashMap<Arc<str>, Value>>` (`object.rs:37`)                        | lock + hash per access                                                | indexed slots by class layout                                |
+| `_prim*` matched by string compare chains (`builtins_iterative.rs` :1590-1663)     | ~82 string compares on the slow path                                  | numbered primitive table                                     |
+| one stackful `may` coroutine per entity (64 KB release)                            | 10k connections ≈ 640 MB of stacks (`web_server_readiness.md` :70-73) | stackless processes: heap frame stack, a few hundred bytes   |
+| `may::coroutine::yield_now` every 1024 dispatches                                  | cooperative; arithmetic loops don't yield                             | reductions counted in the VM loop; preempt at any safe point |
+| a timer is one OS thread + sleep (`os_interface.rs` :101-118)                      | thread per timer                                                      | timer wheel in the scheduler                                 |
 
 ---
 
@@ -81,6 +81,7 @@ own.
 **Status: DECIDED (user, 2026-10-18).**
 
 **Machine:**
+
 - A register machine with fixed-width 32-bit instructions, in Lua's
   `op:8 | A:8 | B:8 | C:8` / `op:8 | A:8 | Bx:16` formats.
 - That caps a frame at 256 registers, the same as Lua; a method that exceeds it
@@ -89,6 +90,7 @@ own.
   store.
 
 **Dispatch: `loop { match op { … } }` on stable Rust.** The alternatives:
+
 - **Computed goto / direct threading:** Rust has none.
 - **Closure compilation** (bytecode turned into a tree of Rust closures):
   executes by Rust recursion, so a process can't be suspended at an arbitrary
@@ -100,6 +102,7 @@ own.
   Rohou et al. [R27].
 
 **Tail-call dispatch is the revisit item.**
+
 - Each handler tail-calls the next one, so every handler gets its own copy of
   the dispatch branch and hot state stays in registers.
 - CPython 3.14 reports about 3–5% from this [R28], and Wasmtime's Pulley [R29]
@@ -115,25 +118,33 @@ own.
 
 **Granularity: fewer instructions per unit of Smol work**, since every
 instruction pays dispatch overhead in a `match` interpreter. Three layers:
+
 1. **Base set (V2):**
+   
    - fine-grained data movement and coarse sends (one `Send` does the lookup,
      the inline-cache check, frame setup and the transfer of control);
+   
    - fused compare-and-branch (`LtJump A B sBx` rather than `Lt` +
      `JumpIfTrue`);
+   
    - `ForPrep`/`ForLoop` (Lua's pair), the target of guarded inline `to:do:`
      (VD4);
+   
    - immediate-operand arithmetic (`AddImm A B sC`).
 2. **Quick methods (V2):** the compiler marks trivial methods (`^self`,
    `^ivar`, `^constant`, a plain setter). A send to one runs without building a
    frame, like Pharo's quick-return primitives. This is a property of the
    compiled method, not an instruction.
 3. **Quickening and specialization (V4):**
+   
    - instructions are rewritten in place after they first run, e.g. `Send` →
      `SendMono` once the inline cache settles, and `Add` → `AddInt` when the
      operands keep being Ints (Brunthaler [R31]; CPython's PEP 659 [R32]);
+   
    - bytecode is shared by all scheduler threads (VD2), so a rewrite is one
      relaxed `AtomicU32` store, and a thread sees either the old or the new
      instruction, both of them valid;
+   
    - the inline-cache side tables need the same care; that design is part of
      V4.
 
@@ -163,25 +174,30 @@ BEAM-like processes changes that, so it needs an explicit decision.
 VM never runs on `may`.
 
 **Rejected sequencings, and why:**
+
 - **Run the VM on `may` coroutines first (V2–V4), scheduler in V5.**
+  
   - `may` hides violations. A primitive that calls a block re-entrantly, or
     blocks on a Future, still works on a coroutine with a real stack, so code
     that breaks under the real scheduler would build up unseen.
   - The waits (tx mailbox locking, deadlock timers, TCP) would be written twice.
   - Collections are entities, so even V2 sends between processes. Processes are
     core from the start.
+
 - **A single-threaded scheduler first, parallel in V5.** This hides threading
   assumptions the way `may` hides blocking:
+  
   - a status read and then acted on as if no race were possible;
   - a mailbox push and a wake that "obviously" happen in that order;
   - two processes resolving or awaiting the same Future at once.
-
+  
   The evaluator surfaced bugs of this kind early because `may` was parallel from
   the start, and the tree-walker oracle is itself parallel. The goal is
   correctness under non-deterministic parallel execution; determinism is a
   debugging aid, not a development phase.
 
 **Built in V2:**
+
 - The process core:
   - `Process`;
   - `run(proc, budget) -> RunOutcome { Yield | Wait(WaitReason) | Done | Error }`,
@@ -195,6 +211,7 @@ VM never runs on `may`.
 
 **Deferred to V5:** the efficiency and I/O parts. Their interfaces exist from
 V2, so deferring them hides no assumptions.
+
 - Timers: a simple timer thread that resolves Futures through the injector,
   until the timer wheel.
 - I/O: helper threads that resolve Futures through the injector, until `mio`.
@@ -202,6 +219,7 @@ V2, so deferring them hides no assumptions.
   tuning.
 
 **Guards that make violations fail loudly, whatever the thread count:**
+
 - Blocking on a scheduler thread panics in debug builds. Scheduler threads mark
   themselves, and any Condvar wait or forced Future reached from one panics, as
   Tokio does ("Cannot block the current thread from within a runtime").
@@ -209,6 +227,7 @@ V2, so deferring them hides no assumptions.
   the VM) an assertion failure.
 
 **Testing modes:**
+
 - **Default: parallel with schedule perturbation.** Random steal choices,
   jittered reduction budgets and forced yields push tests into more
   interleavings. This is the idea behind PCT [R24] and `shuttle` [R25].
@@ -233,12 +252,15 @@ The options:
 - **(c)** 8-byte NaN-boxing or tagged pointers, which need `unsafe` in one
   contained module.
 
-**Status: leaning (b), not decided (2026-10-17).**
+**Status: DECIDED (user, 2026-10-24). (b) behind an accessor/constructor
+layer.** Leaning (b) since 2026-10-17. The layer comes first in V1; (c) is
+reconsidered only with per-process GC (VD8), under the principle below.
 
 **Principle (user):** VM encoding choices must not leak into what a developer
 has to know about the language. Full i64 integers and full f64 floats need 64
 payload bits plus a tag, so honouring this makes 16 bytes the minimum and rules
 out the range-reducing forms of (c):
+
 - tagged pointers: 61-bit SmallIntegers, as in Pharo, and boxed or
   range-reduced floats;
 - NaN-boxing: ~48–51-bit integers and canonicalised NaN payloads.
@@ -248,6 +270,7 @@ performance cliff, not a semantic change. That is still the hidden knowledge
 the principle rules out.
 
 **Size versus reference counting.**
+
 - **Size.** A 64-byte line holds 2.7 values at 24 bytes, 4 at 16 and 8 at 8.
   Density matters most in large arrays and numeric loops, and typed collections
   (unboxed IntArray, FloatArray, ByteArray; the SoA direction in Q9) recover it
@@ -274,6 +297,7 @@ the principle above. (b) behind an accessor layer doesn't carry this risk.
 
 **Size of the change.** Outside tests, 509 sites construct or match `Value`
 variants (1,317 in tests).
+
 - (b) touches the `Str`, `Handle` and `Symbol` sites, about 120.
 - (c) touches all of them, because `Value` becomes opaque. That includes the
   tree-walker oracle, since both engines share `Value`.
@@ -282,6 +306,7 @@ variants (1,317 in tests).
   therefore land in V1, before the VM, checked by the existing suite.
 
 **Recommendation:**
+
 - **V1, regardless of the option chosen:** put `Value` behind
   constructor/accessor functions, so a later layout change touches one module.
   The accessor layer can later also enforce VD8's invariant at the type level,
@@ -336,15 +361,19 @@ redefinitions are always honoured.
 
 **What unguarded inlining (Smalltalk-80, Pharo) bypasses.** The compiler turns
 `x ifTrue: [...]` into a conditional jump, so no method is looked up:
+
 1. **Redefinition of the kernel method itself**, e.g. `True >> ifTrue:` edited
    to add tracing. This is the main concern for Smol: these methods live in
    kernel.smol (Smol-first), and live code modification and observability are
    core goals.
 2. **Objects that are not the expected class but answer the selector.**
+   
    - In Pharo, a Null Object overriding `ifNil:` is bypassed, because `ifNil:`
      compiles to `== nil`.
+   
    - A proxy answering `ifTrue:` survives only through the `mustBeBoolean`
      recompile path.
+   
    - In Smol, the important case is a Future receiver.
 3. **Subclasses.** Bool and Nil are encoded leaves, closed by construction
    (`numeric_tower_plan.md`), so this concerns only the numeric loops and
@@ -359,6 +388,7 @@ overridden" (`chunk_34_plan.md` :776-790).
 
 **Inlined selectors.** Each is inlined only when the block arguments (and, for
 the `while` family, the receiver) are literal blocks:
+
 - `ifTrue:`, `ifFalse:`, `ifTrue:ifFalse:`, `ifFalse:ifTrue:`, `and:`, `or:`
   (`True`/`False`, kernel.smol :1457-1475);
 - `whileTrue:`, `whileFalse:`, `whileTrue`, `whileFalse` (`Block`,
@@ -374,6 +404,7 @@ the `while` family, the receiver) are literal blocks:
 shows it is hot.
 
 **Guard 1: the receiver check (runtime), against cases 2 and 3.**
+
 - `ifTrue:`/`and:` family: the inlined jump already examines the value, so
   confirming it is a Bool (`JumpIfNotBool → full send`) is nearly free.
 - `to:do:` family: both bounds (and the step) must be Ints. Anything else (a
@@ -386,12 +417,14 @@ shows it is hot.
 
 **The general form of guard 1:** the receiver's class resolves the selector
 to the kernel method being inlined.
+
 - For closed leaves (Bool, Int, Nil) this reduces to a tag check.
 - For instances, the guard loads the class and checks a cached resolution
-  result, like an inline cache. The method epoch (VD6) invalidates it.
+  result, like an inline cache. The class version tag (VD6) invalidates it.
 - A class that overrides the selector fails the guard and gets a full send.
 
 **Nil: identity versus protocol** (user, 2026-10-18):
+
 - **Identity** (`x == nil`): is the reference nil? This is language-level and
   cannot be faked; a Null Object is not nil.
 - **Protocol** (`isNil`, `notNil`, the `ifNil:` family): messages, defined in
@@ -408,6 +441,7 @@ to the kernel method being inlined.
 
 **Guard 2: dependency-tracked recompilation (no runtime cost), against
 case 1.**
+
 - The compiler records which inlined selectors each compiled method depends on.
 - Redefining an inlined selector on its guarded class (`True`, `False`,
   `Block`, `Number` or a superclass, or the nil-guard family) recompiles every
@@ -415,12 +449,13 @@ case 1.**
 - Activations already running finish on their old code (the usual Smalltalk
   rule for method replacement).
 - Redefinition is rare, so the cost falls on the edit rather than on every
-  execution. This shares machinery with VD6's method epoch.
+  execution. It sits beside VD6's class version tags, which only make caches miss.
 
 ### VD5 — Primitive binding
 
 **Status: DECIDED (user, 2026-10-18).** Keep the source syntax (`self _primAdd: x`). The compiler
 resolves `_prim` selectors to a `Prim id` instruction at compile time.
+
 - The ids come from a primitive table registered at startup (§4).
 - An unknown `_prim` selector is a compile error. Today it's a runtime
   `doesNotUnderstand:`.
@@ -428,20 +463,65 @@ resolves `_prim` selectors to a `Prim id` instruction at compile time.
 
 ### VD6 — Where compiled code lives
 
-**Recommendation:**
-- `Method` gains a compiled form that is built when the method is installed.
-  Redefining a method recompiles it and bumps a global method epoch, which
-  invalidates the inline caches.
-- The class/object/entity runtime structures stay shared by both engines, so
-  the tree-walker remains a working oracle on the same objects.
+**Status: DECIDED (user, 2026-10-24)**, except for persisting compiled code,
+which is open (item 4).
+
+1. **Compile at install.** `Method` gains a compiled form, built when the
+   method is installed rather than on first call.
+   - VD5 makes an unknown `_prim` a compile error, and it should surface when
+     the method is defined.
+   - Until the compiler covers the whole language (V1–V3), a method it cannot
+     compile is marked uncompiled. The VM refuses to run it; it never falls
+     back silently.
+   - The class/object/entity runtime structures stay shared by both engines,
+     so the tree-walker remains a working oracle on the same objects.
+2. **Invalidation: a version tag per class, not a global epoch.**
+   - The system is live and asynchronous, with many lightweight processes.
+     Classes are defined at runtime (REPL chunks, programs that build classes,
+     live edits to running servers). With a global epoch, any install
+     anywhere would flush every inline cache in the system, so an edit would
+     slow down every running process.
+   - Each class carries a `version: AtomicU64`. An inline cache or a VD4
+     guard records `(class, version)` and hits only while both still match.
+   - Anything that can change what a lookup through the class resolves to
+     bumps the version of that class **and of every subclass**: installing or
+     removing a method, changing the superclass, or applying a trait. An ivar
+     layout change bumps it too (see the layout epoch in §6).
+   - So each class keeps a list of its subclasses, held weakly so that a
+     dropped class is not kept alive. It has none today (`class.rs:73`). This
+     is CPython's `tp_version_tag` with `PyType_Modified`, which invalidates
+     a type and all of its subtypes [R33]. A 64-bit tag avoids the overflow
+     that CPython's 32-bit tags have to handle.
+   - VD4's dependency-tracked recompilation stays separate: it re-emits code
+     that inlined a selector. Version tags only make caches miss.
+3. **Concurrency (VD2).**
+   - Compiled code is an immutable `Arc`, swapped in by an install.
+   - A running activation keeps the `Arc` it started with (VD4: running
+     activations finish on their old code).
+   - Bumping a version is a Release store; an inline-cache check loads it with
+     Acquire, so a thread that sees the new version also sees the new method.
+4. **Persisting compiled code: OPEN.** The source is the source of truth, and
+   compiled code is always derivable from it. A persisted cache of compiled
+   code, outside the triple store, is not ruled out; it would cut startup cost
+   as the image grows. Anything cached has to be keyed on everything the
+   compiled form depends on, and discarded on any mismatch:
+   - a hash of the method source (as in CPython's hash-based `.pyc` files
+     [R34]);
+   - the compiler and ISA version;
+   - the PrimTable, since VD5 binds `_prim` sends to ids at compile time;
+   - the layout of the defining class, since `GetIvar`/`SetIvar` use slot
+     indices that depend on the superclass chain's ivars.
+
+   Dependency registrations (VD4) and inline caches are rebuilt on load,
+   never persisted. The decision waits until startup cost is measured.
 
 ### VD7 — Milestone order (§9)
 
-With VD2 decided, the scheduler core is in V2, so the per-process footprint win
-arrives with V2. V5 is reduced to I/O and tuning.
+**Status: DECIDED (user, 2026-10-24). V4 before V5.**
 
-The remaining question is V4 (inline caches, speed) before or after V5 (timer
-wheel, `mio`, blocking pool). Recommended: V4 first, so V5's I/O work is
+With VD2 decided, the scheduler core is in V2, so the per-process footprint win
+arrives with V2. V5 is reduced to I/O and tuning. V4 (inline caches, speed)
+comes before V5 (timer wheel, `mio`, blocking pool), so V5's I/O work is
 profiled on the fast send path.
 
 ---
@@ -452,20 +532,20 @@ Notation: `R[x]` is a frame register, `K[x]` a constant in the method's
 constant pool, `U[x]` a block's captured value (from its snapshot), `IC[x]` an
 inline-cache slot owned by the instruction.
 
-| Group | Instructions | Notes |
-|---|---|---|
-| Load/move | `Move A B`; `LoadK A Bx`; `LoadInt A sBx`; `LoadNil/True/False A`; `LoadSelf A` | `LoadInt` keeps small ints out of the constant pool |
-| Variables | `GetUpval A B`; `GetIvar A B`; `SetIvar A B`; `GetGlobal A Bx`; `SetGlobal A Bx` | ivar by layout index; `SetIvar` also buffers the store fact (§6). `GetGlobal` reads a binding cell (`K[Bx]`) that holds the resolved `Arc<Binding>`, invalidated when the namespace changes |
-| Sends | `Send A B C` (receiver and args in `R[A..]`, selector `K[B]`, argc `C`, IC alongside); `SuperSend`; `Prim A B C` (primitive id `B`) | the result lands in `R[A]` |
-| Special sends | `Add Sub Mul Lt Le Gt Ge Eq` … `A B C` | fast path for Int/Float operands; anything else (wrappers, LargeInt, a Future) does a full send of the same selector, as Pharo's special selectors do |
-| Arithmetic with immediates | `AddImm A B sC`, `SubImm A B sC` | `i + 1` without loading a constant; same fallback as the special sends |
-| Control | `Jump sBx`; `JumpIfTrue/False A sBx`; `JumpIfNil/NotNil A sBx`; `JumpIfNotBool A sBx` | the targets of guarded inlining (VD4). A backward jump costs a reduction |
-| Fused compare-branch | `LtJump`, `LeJump`, `EqJump` … `A B` | one dispatch for `a < b ifTrue:` and loop tests. The 32-bit word has no room for two registers and an offset, so the encoding is either Lua's "compare, then skip the next `Jump`" or a trailing offset word; it is settled when the encoder is written |
-| Loops | `ForPrep A sBx`; `ForLoop A sBx` | Lua's numeric for pair: the guarded inline `to:do:` / `to:by:do:` costs one instruction per iteration plus the body. Non-Int bounds take the full-send path |
-| Blocks | `MakeBlock A Bx` (prototype `Bx`; capture list in the prototype, copied from `R`/`U`) | snapshot capture, matching `CaptureSource` |
-| Return | `Return A`; `ReturnSelf`; `NonLocalReturn A` | a non-local `^` from a block unwinds to the home frame through `ensure:` frames; it is an error if the home frame is dead |
-| Literals | `NewArray A B C` | `{...}` dynamic array |
-| Async | `Await A B` | explicit `await`. The VM never forces a value implicitly: an implicit force happens only where the tree-walker forces (`force_value` sites), and is compiled as an `Await` at that site |
+| Group                      | Instructions                                                                                                                        | Notes                                                                                                                                                                                                                                                   |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Load/move                  | `Move A B`; `LoadK A Bx`; `LoadInt A sBx`; `LoadNil/True/False A`; `LoadSelf A`                                                     | `LoadInt` keeps small ints out of the constant pool                                                                                                                                                                                                     |
+| Variables                  | `GetUpval A B`; `GetIvar A B`; `SetIvar A B`; `GetGlobal A Bx`; `SetGlobal A Bx`                                                    | ivar by layout index; `SetIvar` also buffers the store fact (§6). `GetGlobal` reads a binding cell (`K[Bx]`) that holds the resolved `Arc<Binding>`, invalidated when the namespace changes                                                             |
+| Sends                      | `Send A B C` (receiver and args in `R[A..]`, selector `K[B]`, argc `C`, IC alongside); `SuperSend`; `Prim A B C` (primitive id `B`) | the result lands in `R[A]`                                                                                                                                                                                                                              |
+| Special sends              | `Add Sub Mul Lt Le Gt Ge Eq` … `A B C`                                                                                              | fast path for Int/Float operands; anything else (wrappers, LargeInt, a Future) does a full send of the same selector, as Pharo's special selectors do                                                                                                   |
+| Arithmetic with immediates | `AddImm A B sC`, `SubImm A B sC`                                                                                                    | `i + 1` without loading a constant; same fallback as the special sends                                                                                                                                                                                  |
+| Control                    | `Jump sBx`; `JumpIfTrue/False A sBx`; `JumpIfNil/NotNil A sBx`; `JumpIfNotBool A sBx`                                               | the targets of guarded inlining (VD4). A backward jump costs a reduction                                                                                                                                                                                |
+| Fused compare-branch       | `LtJump`, `LeJump`, `EqJump` … `A B`                                                                                                | one dispatch for `a < b ifTrue:` and loop tests. The 32-bit word has no room for two registers and an offset, so the encoding is either Lua's "compare, then skip the next `Jump`" or a trailing offset word; it is settled when the encoder is written |
+| Loops                      | `ForPrep A sBx`; `ForLoop A sBx`                                                                                                    | Lua's numeric for pair: the guarded inline `to:do:` / `to:by:do:` costs one instruction per iteration plus the body. Non-Int bounds take the full-send path                                                                                             |
+| Blocks                     | `MakeBlock A Bx` (prototype `Bx`; capture list in the prototype, copied from `R`/`U`)                                               | snapshot capture, matching `CaptureSource`                                                                                                                                                                                                              |
+| Return                     | `Return A`; `ReturnSelf`; `NonLocalReturn A`                                                                                        | a non-local `^` from a block unwinds to the home frame through `ensure:` frames; it is an error if the home frame is dead                                                                                                                               |
+| Literals                   | `NewArray A B C`                                                                                                                    | `{...}` dynamic array                                                                                                                                                                                                                                   |
+| Async                      | `Await A B`                                                                                                                         | explicit `await`. The VM never forces a value implicitly: an implicit force happens only where the tree-walker forces (`force_value` sites), and is compiled as an `Await` at that site                                                                 |
 
 - **Quick methods** (VD1) need no instruction: the compiled method carries a
   `QuickKind` (`Self`, `Ivar(n)`, `Const(k)`, `Setter(n)`), and `Send` runs it
@@ -514,6 +594,7 @@ Modelled on BEAM ([R8], [R10]), using Rust's standard work-stealing parts
 bullet says V5.
 
 **Process:**
+
 - `{ id, frames: Vec<Frame>, regs: Vec<Value>, mailbox, status, reductions,
   tx_frames, … }`.
 - An entity is a process. Value objects, blocks and Futures are not.
@@ -521,6 +602,7 @@ bullet says V5.
   WaitingIo | Done`.
 
 **Scheduler threads:**
+
 - One per core.
 - Each has a local `crossbeam_deque::Worker`.
 - *(V5)* A LIFO slot for the most recently woken process; this is Tokio's
@@ -530,6 +612,7 @@ bullet says V5.
   then parks.
 
 **Reductions:**
+
 - Every send, primitive call and backward jump costs 1.
 - The budget is `REDUCTIONS_PER_SLICE`; BEAM uses 4000 ([R8]).
 - When the budget runs out the loop returns `Yield`, and the process goes to
@@ -537,6 +620,7 @@ bullet says V5.
   plain return, which is the preemption `may` couldn't give.
 
 **Message send:**
+
 - Enqueue an `Envelope`, which keeps its current shape: selector (now an
   interned id), args, reply Future, inherited handler chain, tx tag.
 - If the receiver is waiting on its mailbox, mark it runnable (an atomic
@@ -550,15 +634,18 @@ bullet says V5.
   This differs from BEAM, which copies every message.
 
 **Futures:**
+
 - `FutureState` gains a waiter list.
 - Resolving a Future re-queues its waiters. Late resolution is preserved,
   because only an explicit `Await` site parks.
 
 **Timers:**
+
 - V2/V3: one timer thread that resolves Futures through the injector.
 - *(V5)* A hierarchical timer wheel per scheduler ([R13]).
 
 **I/O:**
+
 - V3: TCP primitives return `Suspend(WaitingFuture)`; helper threads do the
   blocking call and resolve the Future through the injector.
 - *(V5)* A `mio` poller ([R14]), with TCP primitives returning
@@ -566,17 +653,20 @@ bullet says V5.
 - *(V5)* The blocking-call pool (§4).
 
 **Atomic and STM transactions:**
+
 - The transaction protocol itself (`tx_design.md`) is unchanged.
 - Waiting on an entity's mailbox lock becomes a park instead of a Condvar wait,
   built in V3 and written once.
 - Deadlock detection keeps its timer, from the timer thread (the wheel from V5).
 
 **`may`:**
+
 - The VM never uses it.
 - The tree-walker oracle keeps `may`, `COROUTINE_STACK_SIZE` and the C31.5
   stack-depth machinery for as long as it runs.
 
 Open:
+
 - process priorities (BEAM has four);
 - fairness under stealing (`web_server_readiness.md` :82-83);
 - whether a scheduler can migrate a process holding a transaction frame
@@ -616,18 +706,25 @@ triple-store crate) stays the only API. What changes is how the VM reaches it:
 Staged, following `web_server_readiness.md` :107-109:
 
 1. **Native modules (V7a).**
+   
    - A Rust crate registers primitives into `PrimTable` through a small
      registration API (name, arity, `blocking` flag, fn).
+   
    - It is statically linked, needs no `unsafe` in the VM core, and covers
      sockets, crypto and TLS through existing crates.
+   
    - This is BEAM's NIF shape without the dynamic loading.
 2. **Dynamic C FFI (V7b).**
+   
    - A separate `smol-ffi` crate is the only place `unsafe` lives, contained and
      tested as the PRD requires.
+   
    - It uses `libloading` + `libffi` ([R15]).
+   
    - Signatures are declared in Smol and checked when the call is bound, in the
      style of Pharo's uFFI ([R16]). Every call runs on the dirty pool unless it
      is marked `fast`.
+   
    - Foreign memory lives behind `Value::Handle`, with an explicit free.
 
 ---
@@ -660,17 +757,17 @@ Staged, following `web_server_readiness.md` :107-109:
 
 Each milestone gets its own `docs/vm_vN_plan.md` before work starts.
 
-| # | Milestone | Done when |
-|---|---|---|
-| **V0** | Decisions VD1–VD7 taken (VD1, VD2, VD4, VD5, VD8 decided); ISA spec frozen for V2 | this doc updated to DECIDED |
-| **V1** | Interning and identities: the `Value` accessor/constructor layer (VD3), a global selector/symbol interner (`Value::Symbol` keyed by id), class ids, `Value` to 16 bytes with a size assert if VD3 settles on (b), method dictionaries keyed by interned id | full suite green; tree-walker A/B no slower |
+| #      | Milestone                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Done when                                                                                                                          |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| **V0** | Decisions VD1–VD8 taken (all decided except VD6 item 4); ISA spec frozen for V2                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | this doc updated to DECIDED                                                                                                        |
+| **V1** | Interning and identities: the `Value` accessor/constructor layer (VD3), a global selector/symbol interner (`Value::Symbol` keyed by id), class ids, `Value` to 16 bytes with a size assert (VD3 (b)), method dictionaries keyed by interned id                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | full suite green; tree-walker A/B no slower                                                                                        |
 | **V2** | Compiler, VM core and parallel scheduler core. Compiler and VM: codegen from the resolved AST, frames, sends (no IC yet), blocks and snapshot capture, local and non-local returns, the `PrimTable` with arithmetic/string/collection prims, the kernel compiled at load, the VD1 base set (fused compare-branch, `ForPrep`/`ForLoop`, immediates), quick methods, guarded inlining with both guards and dependency-tracked recompilation (VD4), and the instruction-pair histogram feature. Scheduler (VD2): `Process`, stackless `run`, atomic park/wake, Future waiter lists, reductions, N work-stealing threads, debug guards against blocking and re-entrancy, `loom` tests, perturbed and seeded test modes. Never runs on `may` | differential suite green (parallel, perturbed) on everything without conditions or transactions; `loom` green; cov-suite on the VM |
-| **V3** | Unwinding and the rest of the primitive surface: frame markers for `on:do:`/`ensure:`/HC, signal/resume/retry, DNU/`perform:`, transaction and STM prims with mailbox-lock waits as park/wake, timer and TCP prims via a timer thread and helper threads, indexed ivars + predicate cache, layout migration | whole differential suite green; the VM becomes the default engine (the tree-walker stays as the oracle) |
-| **V4** | Speed: monomorphic inline caches + method epoch, cached global bindings, special-selector fast paths, quickening/specialization with atomic rewrites and superinstructions chosen from the histogram (VD1) | A/B results recorded against the §8 targets |
-| **V5** | Scheduler I/O and tuning: timer wheel, `mio` I/O, blocking-call pool, LIFO slot, priorities, fairness and stealing tuning | differential suite green; ring/skynet and 10k-entity numbers recorded |
-| **V6** | Polish and observability: debugger hooks (frame inspection by register name), coverage and profiling on the VM, polymorphic inline caches if the profile asks for them | — |
-| **V7** | FFI: (a) native modules, (b) dynamic C FFI in `smol-ffi` | a TLS listener via a native module; a libc call via the FFI |
-| later | GC per VD8 (per-process heaps, promote-on-escape, shared heap for large and escaped values; Q3/Q11/Q19); `Value` representation revisited under the VD3 principle; JIT (Project_Summary phase 6) | — |
+| **V3** | Unwinding and the rest of the primitive surface: frame markers for `on:do:`/`ensure:`/HC, signal/resume/retry, DNU/`perform:`, transaction and STM prims with mailbox-lock waits as park/wake, timer and TCP prims via a timer thread and helper threads, indexed ivars + predicate cache, layout migration                                                                                                                                                                                                                                                                                                                                                                                                                             | whole differential suite green; the VM becomes the default engine (the tree-walker stays as the oracle)                            |
+| **V4** | Speed: monomorphic inline caches keyed on per-class version tags (VD6), cached global bindings, special-selector fast paths, quickening/specialization with atomic rewrites and superinstructions chosen from the histogram (VD1)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | A/B results recorded against the §8 targets                                                                                        |
+| **V5** | Scheduler I/O and tuning: timer wheel, `mio` I/O, blocking-call pool, LIFO slot, priorities, fairness and stealing tuning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | differential suite green; ring/skynet and 10k-entity numbers recorded                                                              |
+| **V6** | Polish and observability: debugger hooks (frame inspection by register name), coverage and profiling on the VM, polymorphic inline caches if the profile asks for them                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | —                                                                                                                                  |
+| **V7** | FFI: (a) native modules, (b) dynamic C FFI in `smol-ffi`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | a TLS listener via a native module; a libc call via the FFI                                                                        |
+| later  | GC per VD8 (per-process heaps, promote-on-escape, shared heap for large and escaped values; Q3/Q11/Q19); `Value` representation revisited under the VD3 principle; JIT (Project_Summary phase 6)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | —                                                                                                                                  |
 
 ---
 
@@ -736,5 +833,10 @@ Each milestone gets its own `docs/vm_vN_plan.md` before work starts.
 - [R31] Brunthaler. "Inline Caching Meets Quickening." ECOOP 2010.
 - [R32] PEP 659, "Specializing Adaptive Interpreter."
   https://peps.python.org/pep-0659/
+- [R33] CPython C API, `PyType_Modified`: "Invalidate the internal lookup
+  cache for the type and all of its subtypes."
+  https://docs.python.org/3/c-api/type.html#c.PyType_Modified
+- [R34] PEP 552, "Deterministic pycs" (hash-based `.pyc` validation).
+  https://peps.python.org/pep-0552/
 - [R18] Nystrom. *Crafting Interpreters*, part III (clox: bytecode,
   closures/upvalues). https://craftinginterpreters.com
