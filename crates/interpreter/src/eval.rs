@@ -857,11 +857,13 @@ impl Evaluator {
         step_loop(self, initial)
     }
 
-    /// Create an evaluator from an existing `ClassRegistry`, loading `kernel.smol`.
+    /// Create an evaluator that shares an existing `ClassRegistry`. It does not
+    /// load `kernel.smol`; the registry already holds the kernel classes.
     ///
-    /// Ensures: same post-conditions as `new()` but shares the given registry
-    ///   instead of creating a fresh one. Intended for entity message loops so
-    ///   that all entities share a single registry and kernel class set.
+    /// Requires: `registry` was produced by `new()`, so the kernel is loaded.
+    /// Ensures: the evaluator uses `registry` itself, not a copy. Intended for
+    ///   entity message loops, so that all entities share a single registry and
+    ///   kernel class set.
     pub fn with_registry(registry: Arc<ClassRegistry>) -> Self {
         let store = registry.store.clone_handle();
         let kernel = registry.kernel();
