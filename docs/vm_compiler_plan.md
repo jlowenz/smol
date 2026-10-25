@@ -256,7 +256,7 @@ The options:
 layer.** Leaning (b) since 2026-10-17. The layer comes first in V1; (c) is
 reconsidered only with per-process GC (VD8), under the principle below.
 
-**Principle (user):** VM encoding choices must not leak into what a developer
+**Principle (user; P10 in `Design_Principles_and_Key_Decisions.md`):** VM encoding choices must not leak into what a developer
 has to know about the language. Full i64 integers and full f64 floats need 64
 payload bits plus a tag, so honouring this makes 16 bytes the minimum and rules
 out the range-reducing forms of (c):
@@ -313,46 +313,6 @@ variants (1,317 in tests).
   as a process-local value versus a shared value.
 - **Then (b):** add a `size_of::<Value>() == 16` assert, and measure the
   24 → 16 gain by A/B rather than assuming it.
-
-### VD8 — Per-process GC and promote-on-escape
-
-**Status: DECIDED (user, 2026-10-17).** Large immutable values are never copied.
-
-This refines `High-level_Components.md` §2.5 ("values structurally shared") with
-the mechanism that makes sharing work under per-process collection. The GC
-itself is still post-VM work (§9 "later"); this decision constrains everything
-before it.
-
-- **Per-process heaps** with a generational copying collector. A collection
-  happens at the process's own yield points, roots are only its frames and
-  registers, and there is no stop-the-world. A stackless process (VD2) moves
-  between scheduler threads together with its heap.
-- **Invariant:** nothing outside a process points into its heap. That covers
-  other processes, the shared heap, and the store.
-- **Promote-on-escape.**
-  - An immutable value is born in the process heap.
-  - When it escapes it is copied once into the shared heap. It escapes when it
-    is sent in a message, is a Future's resolution, is stored into another
-    entity, or is published as a global.
-  - Later sends pass the pointer.
-  - Immutability makes the copy indistinguishable from the original. This
-    follows Doligez–Leroy [R22] and OCaml 5's minor heaps [R23].
-  - It is not BEAM's model: BEAM copies every message.
-- **Large values are born shared.** Above a size threshold, an immutable value
-  is allocated directly in the shared heap, so it is never copied, not even on
-  escape. BEAM does the same for binaries over 64 bytes, and OCaml allocates
-  large objects directly in its major heap. The threshold is tuned later.
-- **Write barriers.** Values are immutable, so new data only points at older
-  data. Only mutation (`SetIvar`, indexed `at:put:`) can create an old-to-young
-  pointer, so only those instructions carry a barrier.
-- **Entities** travel as handles and are never copied.
-- **Open:**
-  - reclaiming the shared heap: reference counting, with immortal kernel
-    objects, or a concurrent tracer;
-  - entity liveness, i.e. when a process itself is dead (BEAM never collects
-    processes, Pony's ORCA [R17] does; tied to Q19);
-  - how content-hashed stored values in the triple store relate to the shared
-    heap.
 
 ### VD4 — Inlining control structures
 
@@ -524,6 +484,46 @@ arrives with V2. V5 is reduced to I/O and tuning. V4 (inline caches, speed)
 comes before V5 (timer wheel, `mio`, blocking pool), so V5's I/O work is
 profiled on the fast send path.
 
+### VD8 — Per-process GC and promote-on-escape
+
+**Status: DECIDED (user, 2026-10-17).** Large immutable values are never copied.
+
+This refines `High-level_Components.md` §2.5 ("values structurally shared") with
+the mechanism that makes sharing work under per-process collection. The GC
+itself is still post-VM work (§9 "later"); this decision constrains everything
+before it.
+
+- **Per-process heaps** with a generational copying collector. A collection
+  happens at the process's own yield points, roots are only its frames and
+  registers, and there is no stop-the-world. A stackless process (VD2) moves
+  between scheduler threads together with its heap.
+- **Invariant:** nothing outside a process points into its heap. That covers
+  other processes, the shared heap, and the store.
+- **Promote-on-escape.**
+  - An immutable value is born in the process heap.
+  - When it escapes it is copied once into the shared heap. It escapes when it
+    is sent in a message, is a Future's resolution, is stored into another
+    entity, or is published as a global.
+  - Later sends pass the pointer.
+  - Immutability makes the copy indistinguishable from the original. This
+    follows Doligez–Leroy [R22] and OCaml 5's minor heaps [R23].
+  - It is not BEAM's model: BEAM copies every message.
+- **Large values are born shared.** Above a size threshold, an immutable value
+  is allocated directly in the shared heap, so it is never copied, not even on
+  escape. BEAM does the same for binaries over 64 bytes, and OCaml allocates
+  large objects directly in its major heap. The threshold is tuned later.
+- **Write barriers.** Values are immutable, so new data only points at older
+  data. Only mutation (`SetIvar`, indexed `at:put:`) can create an old-to-young
+  pointer, so only those instructions carry a barrier.
+- **Entities** travel as handles and are never copied.
+- **Open:**
+  - reclaiming the shared heap: reference counting, with immortal kernel
+    objects, or a concurrent tracer;
+  - entity liveness, i.e. when a process itself is dead (BEAM never collects
+    processes, Pony's ORCA [R17] does; tied to Q19);
+  - how content-hashed stored values in the triple store relate to the shared
+    heap.
+
 ---
 
 ## 3. Instruction set (draft)
@@ -563,6 +563,88 @@ inline-cache slot owned by the instruction.
 Open: whether `Send` should carry the argument count in the selector constant
 rather than in `C`, which would free a field for the IC index. That will be
 decided when the encoder is written.
+
+### 3.1 Review findings (2026-10-24)
+
+The table above is unchanged; these findings are applied to it once decided.
+Checked against the tree-walker: tail calls are eliminated
+(`drain_tail_frames`, `eval_iterative.rs:1435`); the strict block-assignment
+rule holds (`resolve.rs:54`); `==` is an ordinary kernel method today
+(`kernel.smol:370`).
+
+**Decided:**
+
+- **`==` and `~~` are language-level identity, not overridable** (user,
+  2026-10-24). In Smol, as in Smalltalk, `==` is identity and `=` is equality;
+  `=` stays overridable. Without this, a Null Object could define
+  `== other [ ^other isNil ]` and fake `x == nil`, which VD4's
+  identity-versus-protocol rule assumes cannot happen. The compiler emits an
+  `Identical` / `JumpIfIdentical` instruction with no send, as Pharo's special
+  selector `==` does. This is a language change, so it lands in the
+  tree-walker first, as the nil protocol did (`cf6ce0d`).
+
+**Proposed, not yet decided:**
+
+1. **`TailSend` / `TailSuperSend`.** The tree-walker eliminates tail calls, and
+   recursive Smol code (user recursion, the `whileTrue:` fallback when a guard
+   fails) depends on it; without them the VM grows frames where the oracle
+   doesn't. Emitted only when the frame being replaced carries no
+   `ensure:`/`on:do:` marker, as `drain_tail_frames` drains only empty frames.
+   Cost: elided frames are missing in the debugger (P3), which the tree-walker
+   already accepts.
+2. **A guard for overridable inlined selectors:** `JumpIfNotDefault A IC sBx`
+   continues when R[A]'s class resolves the selector to the kernel method
+   (cached on class plus VD6 version tag) and otherwise jumps to the full send.
+   `JumpIfNil` alone is wrong for `x ifNil: [...]` now that the nil protocol is
+   overridable. The same guard covers `f312f00`'s in-place answers for `=`,
+   `~=` and `class` on another entity. The `ifTrue:` family needs only the
+   `JumpIfNotBool` tag check (True and False are closed; redefinition is
+   guard 2).
+3. **Self in `R[0]`, arguments in `R[1..n]`**, which removes `LoadSelf`.
+   `ReturnSelf` stays (implicit self-return is common).
+4. **`Eq` fast path only for operands of the same encoding** (Int/Int,
+   Float/Float); mixed operands take the numeric-tower send (`2 = 2.0`).
+5. **Clean blocks:** a block with no captures and no `^` becomes a constant
+   (`LoadK`), as Pharo's clean blocks do, so it isn't allocated per evaluation.
+6. **Every send costs a reduction**, as in BEAM, not only backward jumps.
+7. **No `SetUpval`**, confirmed by the strict block-assignment rule; the table
+   should say so.
+
+**Open: class variables** (to explore further, user 2026-10-24). How they work
+today:
+
+- No metaclasses: a `Class` carries `methods` and `class_methods`
+  (`class.rs:73-110`); the class object at runtime is a `ClassEntity`, a
+  singleton with its own mailbox (`entity.rs:602-606`). There is no syntax for
+  class-side instance variables.
+- Class variables (`classVariableNames:`; one kernel use, `Warning`'s
+  `LoggingPolicy`, `kernel.smol:838`) live in `Class.class_var_storage`, a
+  locked map on the shared Rust struct. Any instance's process reads and
+  writes it directly (`eval.rs:485-499`, `592-613`), as does Rust
+  (`builtins_iterative.rs:2669`), bypassing the class entity: no mailbox, no
+  transaction/STM shadowing, no store fact. `entity.rs:603` records the
+  unification with ivar storage as deferred.
+
+An earlier draft of this review proposed `GetClassVar`/`SetClassVar` through a
+shared binding cell, like globals. That carried the current implementation
+over without questioning it, and is withdrawn.
+
+Smalltalk distinguishes instance variables, class-instance variables (ivars of
+the class object, one per subclass) and class variables (one slot shared by
+the declaring class's whole subtree, readable by bare name from instance-side
+methods). With classes as entities, class-instance variables are just ivars of
+the class entity. Class variables differ only by subtree sharing and
+bare-name access, and under the entity model both become messages to the
+class entity: a bare-name read from an instance method would be a hidden
+message answering a Future (a P3 concern).
+
+Leading option: drop class variables as a separate concept (P2). Class state
+becomes ivars of the class entity, accessed through class-side methods;
+instance-side code sends to the class explicitly. The VM then needs no
+class-variable instructions, and class state gets the transaction and store
+treatment of any ivar. Costs: class-side ivar declaration syntax, migrating
+`LoggingPolicy`, and losing subtree sharing unless a class-side method
+forwards to the declaring class.
 
 ---
 

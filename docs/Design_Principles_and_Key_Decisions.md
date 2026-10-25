@@ -57,6 +57,18 @@ Familiarity is a genuine asset; fidelity to any prior language is not a goal.
 When a syntax question arises, the right question is: "does this serve the
 model?" — not: "did Smalltalk (or any other language) do this?"
 
+### P10: The VM Does Not Set the Language's Limits
+Choices made for how the VM encodes values must not become facts a developer
+has to know. In particular, no numeric range is forced by the representation:
+an integer is a full 64-bit integer (promoting to LargeInt beyond that), and
+a float is a full IEEE 754 double. A boundary that moves with the encoding
+(Pharo's 61-bit SmallInteger, NaN-boxing's ~48–51-bit integers) is ruled out
+even when promotion hides it semantically, because it still shows up as a
+performance cliff that only arcane knowledge explains. Where density matters,
+it is recovered with explicit, named types (typed collections such as
+IntArray or FloatArray), not by narrowing the general value. See
+`vm_compiler_plan.md` VD3.
+
 ---
 
 ## Key Design Decisions
@@ -271,8 +283,9 @@ determination. A custom VM allows all of these as first-class design constraints
 
 **Phased implementation**: Bootstrap interpreter first, then incrementally
 replace components. The bootstrap interpreter serves as executable specification.
+The compiler/VM plan and its decisions are in `vm_compiler_plan.md`.
 
-**Principle**: P1, P4
+**Principle**: P1, P4, P10
 
 ---
 
