@@ -724,3 +724,126 @@ flow through the same resolver.
 **Raised**: 2026-10-11
 
 Not quite sure how this would work. The idea is something like: maybe we don't/can't know the receiver, but we can allow the system to specify a message/selector that requires certain capabilities for the args. E.g. if a class implements such a message, we can proactively check at both the method def site and any call sites that the arg requirements are met. This almost certainly needs to be fleshed out more, but is a route to support more declarative type-checking even in the context of such a late binding language. 
+
+---
+
+## Q22: Dynamic variables and aspects
+
+**Status**: Open — design discussion started
+**Raised**: 2026-10-26 (user), from the class-variables discussion
+(`namespace_design_exploration.md` §9)
+
+Some configuration is neither instance state nor a definition: it is ambient for a
+*scope of execution*. The motivating case is `Warning`'s logging policy
+(`kernel.smol:838`), today a class variable that a test sets globally
+(`Warning loggingPolicy: #suppress`) when what it means is "suppress warnings while
+this runs". With class variables gone, this needs a home that is not a global.
+
+**Prior art:** CL special variables; Racket `parameterize`; Java `ScopedValue`
+(JEP 506: no mutation, only rebinding in a nested extent); Clojure dynamic Vars
+(`binding`); OpenTelemetry context propagation across process boundaries.
+
+**What Smol already has:** two pieces of dynamic context that travel with every
+message, the inherited handler chain (`Envelope.inherited_chain`, C28b) and the
+transaction tag. A dynamic variable could travel the same way.
+
+**Questions:**
+
+- **What a dynamic variable is.** A special class (as `Value` is), instantiated or
+  subclassed as the declaration? Is the variable itself data (an object) rather
+  than a definition, and if so, where does a reference to it live without becoming
+  a global?
+- **Binding form.** Rebinding only in a nested extent (no mutation), consistent with
+  single-assignment locals. Is the binding an ordinary message
+  (`(policy bind: #suppress) during: [...]`), and what does `during:` answer if the
+  block's work is asynchronous?
+- **Propagation.** Which bindings apply to work started inside an extent but run
+  later or elsewhere: messages sent to other entities, `then:` continuations, timer
+  callbacks, entities spawned inside the extent.
+- **Interaction** with STM retry, conditions, and whether bindings are recorded in
+  store facts so they can be inspected (P3, P5).
+
+**Aspects.** Behavior that varies with context, or concerns kept apart from the code
+they apply to. Candidates: CLOS-style `:before`/`:after`/`:around` method
+combination; context-oriented programming layers activated for a dynamic extent
+(Costanza & Hirschfeld, "Language Constructs for Context-oriented Programming", DLS
+2005), which would make dynamic variables (data) and layers (behavior) one
+mechanism; AspectJ-style pointcuts and advice (Kiczales et al., ECOOP 2001), which
+are declarative but modify code at a distance. Requirement (user): whatever is
+chosen must be inspectable. Where an aspect applies must be visible from the code
+it applies to (P3).
+
+**Discussion 2026-10-26:**
+
+- *Shape considered and set aside:* the binding activation as an entity
+  (`(var bind: x) during: [...]` as an async send, with the block run in the
+  entity's process). It gives the extent identity, but it moves the code: `self`
+  sends in the block become cross-entity sends, and the caller continues before
+  the block has run. `Transaction atomic:` has this shape today
+  (`kernel.smol:1988`), and its contract that the block "must sequence the
+  participant work it wants included" (`kernel.smol:1898`) shows the cost.
+- *Guiding rule (proposed):* a context construct changes the context code runs
+  under, not the process it runs in.
+- *Two block-evaluation modes exist today, and the word "synchronous" covers
+  both:*
+  - **in-process, non-forcing:** `value` and `HandlerContext run:` run the
+    statements in the caller's process, in order, without awaiting Futures between
+    statements (`push_block_frame(..., sync=false)`, `eval_iterative.rs:1897`,
+    `2049`). The answer is the last statement's value, possibly a Future.
+  - **forcing:** `syncValue`, `ensure:` and `on:do:` insert `ForceAcc` after each
+    statement, so each statement's Future is resolved before the next runs
+    (`eval_iterative.rs:1366-1369`). This serializes the block's work.
+  A binding construct would use the in-process, non-forcing mode, as
+  `HandlerContext run:` does. Then wrapping code changes only its context, plus
+  the lexical rules any block imposes (block-assignment rule, non-local `^`).
+  The two modes need distinct names (input to the naming-conventions pass).
+- *Decided (user):* handler contexts and dynamic bindings merge into **one
+  execution-context Value**, built functionally and run with an in-process `run:`.
+  Whether the transaction tag joins it is open.
+- *Decided (user):* work ownership (structured concurrency, supervision) is a
+  separate concept, likely its own entity, as Erlang supervisors are.
+- *Gap found:* `Block` is a `Value::Block` in Rust (immutable, snapshot capture)
+  but is registered as a subclass of `Object` (`class_registry.rs:138`), so the
+  kernel does not say a Block is a Value. The scalars were reparented under
+  `Value` by the numeric tower work; Block should probably follow. To discuss
+  before changing.
+
+**Discussion 2026-10-27:**
+
+- *Terminology (user):* Smol objects are either **Values** or **entities**; there is
+  no third kind. A message to a non-entity receiver is a message to a Value and runs
+  in the sender's process. So the two block-evaluation modes are:
+  - **normal**: `value`, a message to a Value, in the sender's process, with no
+    forcing between statements;
+  - **sequential**: `syncValue`, each statement's Future resolved before the next.
+    `ensure:` and `on:do:` use this mode because they need to observe completion
+    (cleanup after the body's work; errors from async work).
+- *Classification audit:* Block is a Value but is not declared one in the kernel.
+  Other kernel objects may also be unclassified or misplaced (Future is the first to
+  check: resolved once, later). Expect more of these during the move from the
+  evaluator to the compiler/VM, along with more Rust that should move to Smol.
+- *An activation is state (user).* A binding activation sets one or more named
+  bindings for a context: it is the configuration in effect, which is state (of the
+  execution, immutable within its extent), even if it does not by itself answer
+  *why* something changed. Recording it is therefore a P5 question.
+- *Recording in the store.* Options: (a) nothing; (b) every commit records the
+  context it ran under (extent id plus bindings); (c) as (b), only for dynamic
+  variables declared as recorded; (d) only in a tracing mode. Prior art: Datomic's
+  reified transactions, which carry annotation facts. Constraint (user): avoid
+  "more than one way to do it". The store already has an open fact mode for
+  entities; whatever is chosen should reuse an existing mechanism rather than add
+  one. `enrollment_provenance_design.md` also records provenance for enrollment, so
+  check whether one mechanism serves both.
+- *Transactions stay as they are (user).* `Transaction` is a coordinator that owns
+  its work (it waits for it, commits or aborts, collects failures, re-runs it under
+  `stm:`). That is the work-ownership category, so running the block in the
+  coordinator's process is consistent with the rule that *pure* context constructs
+  do not move code. Moving the block into the caller would need an in-process
+  shadow-write path, would split error collection, and would re-open a protocol
+  that took C31, C32 and the enrollment redesign to get right.
+- *Likely (user):* the transaction tag becomes a field of the unified
+  execution-context Value instead of the separate `current_tx_ctx`. An internal
+  change to how the tag travels, not to the protocol; do it when the unified
+  context is built.
+- *Next:* aspects (CLOS method combination, ContextL layers, AspectJ pointcuts),
+  with inspectability as the requirement.

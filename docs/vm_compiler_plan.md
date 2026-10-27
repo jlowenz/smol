@@ -646,6 +646,23 @@ treatment of any ivar. Costs: class-side ivar declaration syntax, migrating
 `LoggingPolicy`, and losing subtree sharing unless a class-side method
 forwards to the declaring class.
 
+**Update (user, 2026-10-26): decided, further than the leading option.**
+Classes are immutable, versioned values with an implicit metaclass, not
+entities: no class variables and no class-instance variables. Constants are
+class-side methods: the compiler folds literal answers, and the VM may cache a
+constructed answer when it observes an effect-free evaluation that answered a
+Value, guarded by VD6 version tags. Namespaces hold definitions only. Record and
+rationale: `namespace_design_exploration.md` §9. Consequences for this plan:
+
+- No class-variable instructions, and no `ClassEntity` dispatch path. A
+  class-side send is an ordinary send whose receiver's class is the implicit
+  metaclass, so it uses the same inline caches.
+- **Open: Value `==`.** Caching a constructed constant is observable while
+  `==` on Values is allocation identity (`kernel.smol:359`). Either identity
+  of Values becomes unobservable and `==` on Values compares state, as Java's
+  value objects do (JEP 401); or identity of Values is left unspecified.
+  Leaning to the first. This qualifies the `==` decision above for Values.
+
 ---
 
 ## 4. Primitives
