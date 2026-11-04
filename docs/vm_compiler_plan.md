@@ -696,7 +696,10 @@ bullet says V5.
 
 - `{ id, frames: Vec<Frame>, regs: Vec<Value>, mailbox, status, reductions,
   tx_frames, … }`.
-- An entity is a process. Value objects, blocks and Futures are not.
+- An entity is a process. Value objects, blocks and Futures are not. A
+  registered continuation (`then:orElse:`, timer callback) runs as a
+  short-lived continuation entity, so it is a process too (Q23 decision B2).
+  "Process" is the VM's term for an entity, not a second concept.
 - Status is one of `Runnable | Running | WaitingMailbox | WaitingFuture(f) |
   WaitingIo | Done`.
 
@@ -720,8 +723,12 @@ bullet says V5.
 
 **Message send:**
 
-- Enqueue an `Envelope`, which keeps its current shape: selector (now an
-  interned id), args, reply Future, inherited handler chain, tx tag.
+- Enqueue an `Envelope`: selector (now an interned id), args, reply Future,
+  one opaque **context** slot, and the id of the sending turn (Q23 decision D,
+  2026-11-03). The context slot replaces the separate inherited handler chain
+  and tx tag fields (Q22: handler contexts, dynamic bindings and the tx tag merge
+  into one execution-context Value), so new context kinds need no new field. The
+  sending turn's id records the causal graph (P3).
 - If the receiver is waiting on its mailbox, mark it runnable (an atomic
   status transition, VD2) and push it to the current scheduler's queue (its
   LIFO slot from V5).
@@ -734,7 +741,9 @@ bullet says V5.
 
 **Futures:**
 
-- `FutureState` gains a waiter list.
+- `FutureState` gains a waiter list, and records the process that will settle
+  it (Q23 decision D), so a process waiting on a Future is a wait-for edge and
+  deadlock detection covers Future waits (issue I2).
 - Resolving a Future re-queues its waiters. Late resolution is preserved,
   because only an explicit `Await` site parks.
 

@@ -729,7 +729,9 @@ Not quite sure how this would work. The idea is something like: maybe we don't/c
 
 ## Q22: Dynamic variables and aspects
 
-**Status**: Open — design discussion started
+**Status**: Open — design discussion started. Propagation (which work a binding
+reaches) is continued in **Q23** (contexts and the causal graph), of which
+dynamic constants are one client.
 **Raised**: 2026-10-26 (user), from the class-variables discussion
 (`namespace_design_exploration.md` §9)
 
@@ -793,10 +795,10 @@ it applies to (P3).
   - **forcing:** `syncValue`, `ensure:` and `on:do:` insert `ForceAcc` after each
     statement, so each statement's Future is resolved before the next runs
     (`eval_iterative.rs:1366-1369`). This serializes the block's work.
-  A binding construct would use the in-process, non-forcing mode, as
-  `HandlerContext run:` does. Then wrapping code changes only its context, plus
-  the lexical rules any block imposes (block-assignment rule, non-local `^`).
-  The two modes need distinct names (input to the naming-conventions pass).
+    A binding construct would use the in-process, non-forcing mode, as
+    `HandlerContext run:` does. Then wrapping code changes only its context, plus
+    the lexical rules any block imposes (block-assignment rule, non-local `^`).
+    The two modes need distinct names (input to the naming-conventions pass).
 - *Decided (user):* handler contexts and dynamic bindings merge into **one
   execution-context Value**, built functionally and run with an in-process `run:`.
   Whether the transaction tag joins it is open.
@@ -847,3 +849,264 @@ it applies to (P3).
   context is built.
 - *Next:* aspects (CLOS method combination, ContextL layers, AspectJ pointcuts),
   with inspectability as the requirement.
+
+**Discussion 2026-10-27 (aspects):**
+
+- *Obliviousness is not the problem by itself (user).* Code never knows how it is
+  used, and Smol is already oblivious by design: what `x foo` runs is decided by
+  `x`'s class, what a `signal:` leads to is decided by a handler, what a dvar read
+  answers is decided by a binding. P3 asks that inspectability be the norm, not that
+  every influence be declared at the target.
+- *Criterion: explicit vs implicit variation points.* A send, a `signal:`, or a dvar
+  read is an *explicit* variation point: the code shows that something else decides
+  here, and the decider is found by following the receiver's class, the handler
+  chain, or the binding. AspectJ makes every join point an *implicit* variation
+  point: nothing in the code marks it, and finding what applies needs a whole-system
+  query. That is the residue of Steimann's critique ("The Paradoxical Success of
+  Aspect-Oriented Programming", OOPSLA 2006). Kiczales & Mezini ("Aspect-Oriented
+  Programming and Modular Reasoning", ICSE 2005) answer it with tool-computed
+  interfaces that depend on the deployed configuration; a live, queryable system
+  makes that answer stronger. So implicit variation points are not ruled out by P3,
+  but "what affects this method?" must always be answerable. The concern (user) is
+  making the implicit variation already present in most code worse.
+- *Single dispatch does not exclude layers.* ContextS (Squeak) and ContextJ are
+  single-dispatch (Hirschfeld, Costanza & Nierstrasz, "Context-oriented
+  Programming", JOT 2008). What each mechanism varies:
+  - a **proxy** (C33 DNU) varies one *reference*; explicit to its holder; no
+    quantification over classes. Fits ocap attenuation and per-entity tracing.
+  - an **annotation/pragma** marks a definition for a system tool to find and act
+    on; declared at the target, interpreted elsewhere.
+  - a **layer** varies a (class, selector) pair for a dynamic extent, including
+    methods written without a hook. The only one of the three that changes behavior
+    at unmarked points.
+    The plain OO alternative to a layer is a dvar holding a policy object, with the
+    code sending to it (`(Display current) render: self`). It needs a hook written in
+    advance; layers exist for the case where nobody wrote one.
+- *Three tiers of what "aspects" covers:*
+  - **Tier 0:** vary behavior at explicit hooks: the execution-context Value
+    (dvars holding Values or policy objects) plus conditions. Already decided.
+  - **Tier 1:** observe without changing behavior (tracing, probes, coverage):
+    environment tooling, as Pharo MetaLinks (Denker et al., "Sub-method
+    Reflection", JOT 2007) or the coverage collector. Not a language concept.
+  - **Tier 2:** change behavior at unmarked points, across many places: layers, or
+    definition-time transforms selected by a query. If done as transforms, the
+    query produces explicit new definitions and is recorded as their provenance, so
+    the code stays explicit and "why does this method contain X?" is answered from
+    the store.
+- *Decision (user):* do not design Tier 2 yet. Build Tier 0. The first concrete
+  case Tier 0 cannot handle cleanly triggers Tier 2. Display modalities (views added
+  to classes their authors did not anticipate, as GT's `<gtView>` methods) were the
+  likeliest candidate; see 2026-10-28 for why they may not be.
+- *If layers exist (user):* they cross entity boundaries, travelling with the
+  execution context as handlers and the transaction tag do.
+- *Other concerns placed:* validation is value invariants (a constrained value type
+  checked at construction). Security follows object capabilities (Miller, *Robust
+  Composition*, 2006); removing class variables and keeping namespaces
+  definitions-only removed the main sources of ambient authority.
+- *Tension (open):* a dvar holding a capability is ambient authority. The
+  execution-context Value may need a rule about what bindings may carry.
+
+**Discussion 2026-10-28 (dynamic constants):**
+
+- *Constants are not re-run per call.* §9 item 3 of
+  `namespace_design_exploration.md` already says so: semantics never depend on
+  caching. A dynamic-variable declaration must answer an equal Value on every
+  evaluation, which a name-based identity gives.
+
+- *Identity is the FQN, supplied by the system (user).* The context's bindings are
+  keyed by the variable's fully qualified name, not by its other contents. Two
+  variables created with the same default are distinct if their names differ.
+
+- *Name: `DynamicConstant` (user).* Relates it to CL's dynamic variable and marks
+  the difference: a CL special variable can be assigned at any time (`setq` changes
+  the innermost binding, or the global value), while a `DynamicConstant` is never
+  assigned, only rebound for a nested extent (as Java `ScopedValue`, JEP 506, and
+  Racket `parameterize`). *Binding* names one entry in a context (this name to this
+  value in this extent).
+
+- *Working shape (user sketch):*
+  
+  ```smalltalk
+  Warning class >> *policy* [^DynamicConstant named: ~ withDefault: #stderr]
+  
+  Warning class >> withPolicy: p run: aBlock [
+      ^Warning *policy* bind: p in: aBlock
+  ]
+  
+  Context let: { Warning *policy* -> #suppress. Warning *frob* -> 11 } in: aBlock
+  ```
+  
+  - No place concept: the method answers an ordinary Value; reading
+    (`Warning *policy* value`) and rebinding (`bind:in:`) are messages to it.
+  - `Context let:in:` sets several bindings at once in the execution-context Value.
+    Every key must be a `DynamicConstant`, and holding one is the authority to
+    rebind it: a class can keep its constant private and publish only
+    `withPolicy:run:`. This addresses the ambient-authority tension for rebinding.
+  - `bind:in:` and `let:in:` answer whatever the block answers (possibly a Future),
+    in normal mode, as `HandlerContext run:`.
+
+- *`~` (user):* intended as a general token for the enclosing definition's FQN,
+  usable anywhere. Spelling open (`thisDefinition fqn` is the spelled-out form;
+  `thisDefinition` alone would answer the definition object, as Pharo's
+  `thisContext`). `~` in primary position is unambiguous to the parser, since a
+  binary operator cannot appear there; it can stay a binary-operator character
+  elsewhere (`lexer.rs:277`).
+
+- *Marker for dynamic constants (open).* A read site should show that it consults
+  something dynamic. Earmuffs recall CL but need a whitespace-sensitive lexer rule:
+  `x *y* z` is legal binary arithmetic today. Alternatives: another delimiter that
+  is not an operator character, or a `dyn` prefix (user: changes how the selector
+  reads). The environment can also render dynamic constants distinctly, as a
+  complement. For the naming/syntax pass.
+
+- *Who can create one (user).* Anyone, with explicit names allowed, but a name
+  resolves in the creator's lexical namespace (and class, inside a class
+  definition), so names cannot be forged into another namespace. Restricting names
+  to literals was rejected as arbitrary for a dynamic language.
+
+- *Same-name collisions within a namespace (open).* CL precedent: `defvar` takes an
+  unevaluated symbol, but `proclaim` and `progv` take computed ones, and a second
+  `defvar` of the same symbol names the *same* variable (it does not re-initialize
+  a bound one; SBCL is silent). The package boundary is the only guard. Options:
+  accept aliasing within a namespace as CL does, with the environment able to list
+  every definition that creates a given name and warn on visible duplicates; or
+  find a better registration scheme. Explicit sharing needs no second constructor:
+  code that wants the variable asks its owner for it (by reference).
+
+- *Views (deferred).* GT finds views by querying the `<gtView>` pragma
+  (`#gtView gtPragmas`), and they are often Pharo extension methods (a
+  `*PackageName` protocol) that add to a class its package does not own (Chiș,
+  Gîrba, Syrel & Nierstrasz, "The Moldable Inspector", Onward! 2015). The part
+  that matters may be declarative registration plus query-based discovery, not
+  changing the class; a view declared elsewhere would see only public protocol. A
+  view that needs internals points at a design problem (user). Not designed; wait
+  for a real case. It may mean display does not trigger Tier 2.
+
+- *Dependency (open):* whether code in one namespace may add definitions to a class
+  in another (class extensions), and what `~` answers inside one. The namespace
+  naming rules must answer this.
+
+**Discussion 2026-10-29 to 2026-10-31 (propagation, and what "scope" means):**
+
+- *Decided (user):* a `DynamicConstant`'s default is mandatory; `nil` is allowed.
+- *Propagation is not settled; it reopened a larger question.* Attempts to define
+  which work a binding reaches all failed to be mechanical:
+  - "A send carries the sender's context" works for messages, but a timer
+    callback or a `then:orElse:` continuation is started by the runtime, not sent.
+  - Implicitly wrapping block arguments at each send (`[Context current runBlock:
+    aBlock]`) runs backwards: the captured context replaces any binding the
+    receiver sets around the call, so `bind:in:` would cancel itself. A send cannot
+    tell a block called during the send from one stored and called later.
+  - Restricting wrapping to cross-process sends, or making callback capture a
+    library decision, was not what the user wants.
+  - Prior art does not derive it from a general rule either: CL closures do not
+    capture dynamic bindings and SBCL threads do not inherit them; Java
+    `ScopedValue` inherits only through `StructuredTaskScope`; Racket threads
+    inherit the parameterization at creation; the TC39 AsyncContext proposal
+    decides registration vs dispatch context per host API.
+- *The evaluator is not precedent (user).* `fork_context` (`eval.rs:896`) already
+  captures the handler chain and transaction context at registration for
+  `then:orElse:` (`builtins_iterative.rs:237`) and timers (`:3138`). That is
+  expedient, bespoke handling, not a principle; the VM needs a principled answer.
+- *Kinds of "scope" that coincide in CL but not in Smol:* lexical scope; the
+  activation extent (one turn: one entity processing one message, E's term);
+  the causal extent (all work a turn causes, unbounded under async sends); the
+  ownership extent (work something waits for and answers for; today only
+  `Transaction`); entity lifetime.
+- *Framing (not a design):* the structure Smol always has is the **causal graph of
+  turns**, with edges for send, reply (a future settles into a continuation),
+  schedule (timer) and spawn. Handler search, transactions, dynamic bindings and
+  ownership are each a property that flows along some edges and stops at some
+  boundary. The call stack is the special case of a single chain.
+- *Structured concurrency (Smith, "Notes on structured concurrency, or: Go
+  statement considered harmful", 2018). User's reading:* good points and worth
+  attention, but thread-oriented, starting from a sequential language; actors are
+  not considered. An async send is not a "go statement": it triggers work on a
+  sovereign entity with its own lifetime, and work outliving the caller is by
+  design. P4 means concurrency is inherent in the language and environment, not
+  added to a sequential base; related to, but different from, structured
+  concurrency. Smith's ideas may apply to resource management, not yet discussed.
+- *Ownership (user, open):* an actor cannot own a request to another actor, yet
+  Smol needs transactions and condition handling without a call stack and without
+  ceremony. Smol separates contexts (message-passing actors) and these features
+  add context back. Parent/child (lifetime and failure, as Erlang supervisors),
+  reparenting, and short- vs long-lived entities are open.
+- *Gabriel, "The Design of Parallel Programming Languages" (1991).* Brands are
+  structureless tags on objects, used to record provenance (a value produced by
+  process `p1` carries `p1`'s brand) and to dispatch on it. They are the dual of
+  context: context flows with work along sends; provenance flows with data from
+  the turn that produced it. A continuation could dispatch on a value's provenance
+  instead of relying on a hidden registration-or-trigger rule. The essay's ideas
+  also touch process environments (ownership as data), triggered functions
+  (aspects), process-qualified names, and temporal abstraction (P5). Costs for
+  Smol: whether brands take part in Value equality; a per-value tag (P10);
+  overlap with fact provenance in the store (D5). Colors (function coloring,
+  taint) are special cases; information flow control (Myers & Liskov, SOSP 1997)
+  is the security version.
+- *Prior art to read:* Miller, Tribble & Shapiro, "Concurrency Among Strangers"
+  (TGC 2005) for E's turns, eventual sends and patterns; Stanley, Close & Miller,
+  "Causeway" (HP Labs 2009) for presenting the causal graph in place of a stack;
+  Garnock-Jones, *Conversational Concurrency* (PhD, Northeastern 2017) for facets,
+  structured scopes inside actors; Orleans `RequestContext` for ambient data on
+  calls between actors.
+- *Next (user):* formalize terminology in a glossary (turn; send, reply, schedule
+  and spawn edges; causal graph; context vs provenance; the properties that flow
+  and their boundaries; extent; ownership; entity lifetime). The user has
+  observations and open questions to bring to that session.
+
+---
+
+## Q23: Contexts and the causal graph
+
+**Status**: Open — terminology first
+**Raised**: 2026-11-01 (user), split from Q22 (discussion 2026-10-29 to 2026-10-31)
+
+Q22's propagation question (which work a dynamic binding reaches) turned out to be
+an instance of a more general one: what a *context* is in Smol, how contexts are
+bounded, and how each flows along the causal graph of turns. Handler search,
+transactions, dynamic constants, ownership and resource lifetime are each a context
+of this kind; under pervasive concurrency they no longer coincide with the call
+stack as they do in a sequential language.
+
+**Working material:**
+
+- `docs/20261031 Thoughts on concurrent theory and contexts.md` (user's notes:
+  context vs scope, terminating and non-terminating contexts, turns, causal-graph
+  edges, leaf turns, non-termination).
+- `docs/glossary.md` (terms as they are defined; status per entry).
+- Q22, discussion 2026-10-29 to 2026-10-31 (failed attempts at a mechanical
+  propagation rule; prior art; extents; Gabriel's brands; structured concurrency).
+
+**Questions** (to be sharpened once the glossary settles):
+
+- What the edges of the causal graph are, and whether the list is complete.
+- How a context's bounds follow from its originating event, and when (whether) it
+  terminates.
+- For each context kind: along which edges it flows, and where it stops.
+- How Smol relates to, and differs from, prior work (E turns, structured
+  concurrency, CL dynamic extent), and why.
+
+**Decisions 2026-11-03** (from asking which choices would be hard to reverse once
+VM work starts):
+
+- *A. Turns may block, and turns are exclusive* (decided). A send to a future
+  waits, and an entity processes one message at a time ("single-threaded").
+  Consequence: deadlock between entities is possible (issue I2); the response is
+  fewer blocking points, detection that covers future waits, and coordination
+  through a coordinator entity, not a non-blocking language (contrast E, which
+  never blocks inside a turn: `related_work.md` R1).
+- *B2. A registered continuation runs as its own short-lived entity* (decided).
+  Registration (`then:orElse:`, timers) is a send to a newborn continuation
+  entity, delivered when the trigger fires (settlement, timer expiry). Its context
+  comes from the registering turn. The causal graph keeps one kind of edge, the
+  send; spawn is birth plus a send, registration is birth plus a deferred send.
+  Rejected: B1, running the continuation as a turn of the registering entity
+  (E's `when`), because a registrant that forces the result in the same turn
+  (`(b foo then: [...]) syncValue`) would wait on itself, and that pattern is
+  expected to be common. Open inside B2: ivar reads from the continuation's
+  block (issue I4).
+- *C. No provenance tag inside the `Value`* (decided). Brands or provenance, if
+  adopted, are wrapper values or a side table; how they would be used is open.
+- *D. Envelope and Future fields for V2* (accepted): one opaque context slot and
+  the sending turn's id on the envelope; each future records its settler.
+  Recorded in `vm_compiler_plan.md` §5.
