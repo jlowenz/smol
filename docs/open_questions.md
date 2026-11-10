@@ -1200,7 +1200,7 @@ a closed wait cycle.
 
 ## Q24: Control flow without non-local return
 
-**Status**: Open, brainstorm pending
+**Status**: Partly decided (2026-11-10): `^` is the explicit method answer only. Library protocols still open.
 **Raised**: 2026-11-09, from I5
 
 I5 showed that `^` in a block has no coherent meaning once the block can run on
@@ -1337,5 +1337,38 @@ cases.
 - **Correction:** a `cond` on an `Array` forced by the home inside its own turn did
   *not* hang on the current tree. The reason was not traced, and it differs from
   I6's `do:` row.
+
+**Decision (user, 2026-11-10): `^` marks the method's answer, and only that.**
+
+- `^` may appear only as the last statement of a method body. A `^` inside a block
+  is a parse error, like D13's `NonLocalBlockAssignment`. (A top-level `^` before
+  the last statement only creates dead code, so this rule is the same as "no `^` in
+  blocks".)
+- A method without `^` answers `self`, so C2 (`chunk_21_plan.md`) stands. This
+  supersedes the 2026-11-09 position "a method answers its last expression".
+
+*Why:*
+- In the async-everywhere model, answering `self` by default keeps a procedure-like
+  call decoupled. Under last-expression answering, a method whose last statement
+  sends to another entity answers that send's future. A caller that forces the reply
+  then also waits on the other entity, and an internal collaborator's result leaks
+  as the public answer, with nothing in the syntax to show it. That is a worse
+  failure than forgetting `^` on a method meant to answer a value.
+- A trailing `self` on every procedure-like method would be ceremony. Smol is not a
+  functional language, even though it leans that way.
+
+*Consequences (not yet done):*
+- VM plan: remove `NonLocalReturn A` and its unwinding through `ensure:`. Keep
+  `Return A` and `ReturnSelf`. A clean block is then one with no captures.
+- Parser: reject `^` in a block, and `^` before the last statement of a method.
+- Kernel: rewrite the conditional `^` inside blocks and `detect:` / `includes:`.
+  This needs the library pieces below first.
+- I5 can close. Relabel the three `#[ignore]`d `red_*` tests in
+  `nonlocal_return.rs`, which assert that `^` is delivered across entities.
+
+*Still open:* the shape of the named-loop and stop-value protocols (`recur:`,
+Continue/Break), `cond:`, the missing query methods, records or tuples, and whether
+a guard statement at method level is wanted. That last one is likely moot: under
+this decision a method-level `^` cannot be conditional.
 
 **Related**: I5, Q21, Q23, R10, D13, P8, P9.
