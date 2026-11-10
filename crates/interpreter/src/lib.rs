@@ -5,6 +5,10 @@ mod test_helpers;
 #[path = "tests/kernel.rs"]
 mod kernel_tests;
 
+#[cfg(test)]
+#[path = "tests/nonlocal_return.rs"]
+mod nonlocal_return_tests;
+
 pub mod ast;
 pub mod builtins;
 pub(crate) mod builtins_iterative;

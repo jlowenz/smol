@@ -176,8 +176,9 @@ kernel (2026-11-06); the general fix is blocked on the "missing target" decision
 `:1317`, depth match in `unwind_stack_to_depth` `:487`); on a miss the escaping
 `EvalError::Return` is caught by the entity loop in
 `crates/interpreter/src/entity.rs:1228` and settled as the receiver's reply.
-**Tests**: `crates/interpreter/src/tests/nonlocal_return.rs` (E-labelled; 4 `red_*`
-fail by design, 4 `ignored_*` characterize the undecided cases). Runnable
+**Tests**: `crates/interpreter/src/tests/nonlocal_return.rs` (E-labelled; 3 `red_*`
+assert delivering `^` and are `#[ignore]`d pending Q24, 4 `ignored_*` characterize
+the undecided cases). Runnable
 companion: `docs/experiments/i5_nonlocal_return.smol`.
 
 `^` in a block should return from the method that lexically encloses the block

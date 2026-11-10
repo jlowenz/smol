@@ -166,9 +166,22 @@ Calc4 >> close: toks ops: ops out: out [
    - tuple values instead of Associations;
    - avoiding the `again` block allocated per iteration.
 
-   Unexplained and not chased: the S4b tokenizer on `'1 '` repeated n times takes
-   2.6 s at n = 2×10⁴ and 44 s at n = 2×10⁵, which is superlinear (the space there
-   is dominated by the token lists).
+   **Unexplained and not chased: the loop combinators scale badly on long input.**
+   Tokenizers only, on `'1 '` repeated n times:
+
+   | Style | n = 5×10³ | n = 2×10⁴ | n = 2×10⁵ |
+   |---|---|---|---|
+   | S2 | 0.44 s | 1.88 s | – |
+   | S3 | 0.55 s | 1.50 s | – |
+   | S4 (`loop:`) | over 10 min, killed | – | – |
+   | S4b (`recur:`) | – | 2.6 s | 44 s |
+
+   A nested `recur:` that keeps no data is linear in time and flat in space (finding
+   4). The cause is therefore something about the combinators combined with the
+   calculator's code, not the loops themselves. Suspected to be in the evaluator
+   (continuations or frames accumulating per iteration); not verified. Whether it also
+   leaks memory, which would make it a correctness issue for long-running entities
+   rather than only speed, was not measured.
 
 ## Open
 

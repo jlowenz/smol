@@ -724,9 +724,14 @@ Dictionary >> values [
 Dictionary >> = other [
     self class = other class ifFalse: [^false].
     size = other size ifFalse: [^false].
+    "`other` is a separate entity, so each query is a cross-entity send. Await
+     the reply to bring the answer onto *this* coroutine before the `^false`, so
+     the non-local return targets this `=` frame and not `other`'s turn (I5). A
+     `^` inside a block passed to `other` (e.g. `ifAbsent: [^false]`) would
+     instead settle `other`'s reply and leave this method running."
     self associationsDo: [:assoc |
-        (other at: assoc key ifAbsent: [^false]) = assoc value
-            ifFalse: [^false]
+        (other includesKey: assoc key) await ifFalse: [^false].
+        ((other at: assoc key) await = assoc value) ifFalse: [^false]
     ].
     ^true
 ]
