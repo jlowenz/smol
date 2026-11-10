@@ -1110,3 +1110,232 @@ VM work starts):
 - *D. Envelope and Future fields for V2* (accepted): one opaque context slot and
   the sending turn's id on the envelope; each future records its settler.
   Recorded in `vm_compiler_plan.md` §5.
+
+**Positions 2026-11-06** (from I4; leaning, not final, and decision A is not yet
+amended):
+
+- *Send to the entity whose turn is running:* inline (I6).
+- *Forced cycle within a turn's own wait chain:* re-enter. The parked turn serves
+  the message on its own coroutine, nested inside the force, then parks again.
+  Unrelated senders still wait. This would change decision A to "exclusive except
+  for your own wait chain".
+- *Unrelated cycles:* traditional deadlock detection, signaling a condition. They
+  have no sequential meaning.
+- *Ivars in blocks:* forbid without explicit capture; accessors for live reads (I4).
+- *Help with bad design:* environment tooling, not language rules. A compile-time
+  lint for the shape "result of a send held in a temp, ivar written, then a send to
+  the temp" (false positives acceptable), and a run-time report of re-entries
+  actually taken: method, force, chain, ivars changed since the send, and a rollup
+  of which entity classes re-enter each other. Ideas only.
+
+**Design test:** a send that is forced immediately means what it means
+sequentially. Bugs that are also bugs in sequential code are out of scope.
+
+**Which messages re-enter:** only one that closes a wait cycle (the sender waits on
+it, and the parked turn transitively waits on the sender), not any causal
+descendant. Arguments on paper, nothing built or modeled:
+
+- *No data races:* nested code runs on the entity's own coroutine while the outer
+  turn is suspended.
+- *Programs that finish today are unchanged:* a closed cycle cannot otherwise make
+  progress, apart from entity shutdown and the transaction deadlock detector.
+- *No new deadlocks from stack order:* the outer turn cannot resume until the nested
+  one finishes, which is already true because it waits on it. A coroutine waits on
+  one thing at a time, so there is one path to follow. A descendant tag loses this
+  and the previous point: a fire-and-forget message would block the outer turn for
+  no reason.
+
+**Evidence, run 2026-11-06.** Examples with mutual dependencies between classes
+mostly dissolved under design review (data should be a value, the responsibility
+was misplaced, or the object would be owned and run inline). The cases that held:
+
+- `self rate` in a block under the I4 rule (table in I4).
+- A cycle-protected Visitor whose nodes only dispatch (`accept: v [ ^v visitFolder:
+  self ]`), forcing `size > 50` in `visitFolder:`. Value nodes answer correctly and
+  entity nodes hang, with the visitor unchanged. Its nested `seen add:` must persist
+  for later visits, so correct code can rely on mutation during re-entry.
+
+No realistic sequentially correct program broken by re-entry has been found, which
+is not proof that none exists. The one constructed needed a shared entity called
+with a function's job, plus a write placed between send and force.
+
+**Not recorded as an issue:** an unforced callback to a parked sender runs after the
+sender's turn, unlike sequential code (`Warehouse >> reserve: order [ order
+markReserved ]` while `Order >> submit` waits). Confirmed by a run, but judged
+unmotivated without a realistic reason for that design.
+
+**Transactions under re-entry:** nested transactions are unaffected; a child merges
+into its parent and only the root is durable (`tx_commit_frame`). The remaining
+requirement is that store order must match live order. Traced from the code, not
+run: a turn with no transaction does `x := 1` (live, and buffered in its private
+`current_tx`); a root transaction re-enters and commits `x := 2`; the turn ends and
+commits `x = 1`. `AssertSingle` supersedes whatever fact is open with no version
+check (`in_memory_store.rs:350`), so the store ends at 1 and live at 2, with both in
+history. Direction: commit the parked turn's buffer before a re-entrant root
+transaction can change the store, which splits that turn's store transaction in two.
+Nested turns with no transaction join the parked turn's buffer, like a sequential
+call, so they cause no split.
+
+**Still open:**
+
+- `^` across entities (I5).
+- Explicit capture syntax (I4).
+- The boundary between own chain and unrelated, which needs the sending-turn id from
+  decision D; not implemented.
+- Save and restore of per-turn state: `handler_chain` (its dispatch contract requires
+  it empty), `current_tx`, `current_tx_ctx`.
+- Nesting depth on the interpreter's Rust stack.
+- Whether re-entry reopens running blocks on their home entity, since a self-wait was
+  B1's rejection reason. Its conflict with condition handlers remains.
+
+**Precedents:** [MTS](https://discmaster.textfiles.com/file/29135/APC47-1.ISO/workshop/win95/pws/mts4.cab/mtxpg04_16.htm?html=true)
+re-enters on the same logical thread and warns objects to expect calls while blocked.
+[SE-0306](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0306-actors.md)
+left "task-chain reentrancy" as a future direction: not tried at scale, and no known
+efficient implementation. [Orleans](https://learn.microsoft.com/en-us/dotnet/orleans/grains/request-scheduling)
+offers `AllowCallChainReentrancy`. All three identify the chain by causal id, not by
+a closed wait cycle.
+
+---
+
+## Q24: Control flow without non-local return
+
+**Status**: Open, brainstorm pending
+**Raised**: 2026-11-09, from I5
+
+I5 showed that `^` in a block has no coherent meaning once the block can run on
+another entity. Rejecting it there, statically or at run time, makes `^` work in
+only a few blessed contexts, which is inconsistent. Supporting it across entities
+(even with an implicit await) needs large machinery, and non-local return is close
+to an arbitrary goto that breaks structure. The underlying cause: Smol dropped
+Smalltalk's guarantee that a block runs synchronously inside its home's dynamic
+extent, and has nothing uniform in its place (I5, "Diagnosis").
+
+The current lean is to drop `^` in blocks altogether. Nothing replaces it yet. The
+tradeoffs need to be understood (P8), and the result has to fit the model (P9).
+
+**Questions for the brainstorm:**
+
+1. When all computation happens, conceptually, through asynchronous message sends,
+   what does imperative programming mean?
+2. What ways are there to end a method body early? Are there any besides signaling
+   a condition or structuring the method as an expression?
+3. If methods become send expressions, what tools help keep code readable,
+   especially when translating very imperative algorithms?
+4. Blocks have been the main way to build control flow. Is another built-in object
+   with its own syntax needed, like blocks, to replace `^`?
+
+**Known so far:**
+
+- Without early return, a method body becomes an expression. Something like CL
+  `cond` would be wanted, and in CL that is a macro; Smol has no macros.
+- TCO might be harder (unverified).
+- Existing structured tools: conditions with restarts (their control operations
+  are local to the signaling coroutine, `condition_system_guide.md` §4); folds
+  that stop early by returning a value (Clojure `reduced`, Rust `ControlFlow`);
+  delimited constructs (Scala 3 `boundary`/`break`, which replaced non-local
+  returns). See R10.
+- Kernel use of `^` inside blocks today: inline control (`ifTrue:` and friends),
+  and `self do: [... ^each]` in `detect:` / `includes:`. All of it would need
+  rewriting.
+
+**Brainstorm (2026-11-09).** The lean is unchanged: drop `^` in blocks.
+
+*Findings:*
+
+- **D13 already removed imperative control from blocks.** A block cannot assign
+  method temps, so it affects the outside only through its value, its sends, and
+  `^`. `^` is the only one of these that assumes a shared stack. Without it the rule
+  is uniform: a block answers a value and sends messages, wherever it runs. It then
+  means the same thing inline or on another entity, which is P4 ("sequential
+  execution as an optimization of concurrent semantics").
+- **TCO is not harder in the current evaluator.** In
+  `docs/experiments/q24_tco_shapes.smol`, guard style
+  (`n = 0 ifTrue: [^0]. ^self guard: n - 1`) and expression style
+  (`^n = 0 ifTrue: [0] ifFalse: [self expr: n - 1]`) both run in constant space
+  (about 40 MB peak at depths 3×10⁵ and 3×10⁶, release build).
+- **A `cond` needs no macro.** Blocks already delay evaluation, so a multi-way
+  conditional is an ordinary message over block pairs (Squeak
+  `caseOf:otherwise:`). The cost is noise and allocation; VD4 can inline a literal
+  form.
+- **A condition is not an early exit under async.** In
+  `[coll do: [... signal]. nil] on: ... do: [:e | e return: ...]` the protected
+  block answers `nil` before `do:` has run, and `return:` unwinds `coll`'s
+  coroutine (`condition_system_guide.md` §4). Every sound early exit brings the
+  result back as the value of something the caller waits on.
+
+*The four questions:*
+
+1. A method body is a sequence of sends issued in order, with names bound to their
+   replies: a `let*` chain, or `do` notation over futures with implicit forcing.
+   What stays imperative is the order of effects, rebinding temps, and mutating
+   ivars at method level. Control flow as jumps goes. The actor model separates
+   *answering* from *finishing* (Erlang `gen_server:reply/2` answers and keeps
+   running). `^` fuses the two, and I5 is the two coming apart by accident.
+2. Sound ways to end early:
+   - write the method as an expression;
+   - let the block answer a stop value that the callee honors (Clojure `reduced`,
+     Rust `ControlFlow`);
+   - use query methods that keep the loop inside the receiver
+     (`detect:ifNone:`, `allSatisfy:`);
+   - add a guard statement at method level, not in a block.
+
+   Two candidates are not independent. A delimited escape object
+   (`boundary`/`break`) raises the I5 question again when `exit` is called on
+   another coroutine, unless escapes are tracked. "Reply now, keep running" is
+   not an exit at all.
+3. Readability tools: Composed Method; query methods; a multi-way conditional
+   message; a state-threading loop; `and:`/`or:` chains. Records or tuples with
+   sugar would reduce the ceremony of packing loop state (and are wanted anyway).
+   Cost (P8): algorithms with many interleaved exits read worse. Not yet measured.
+4. Lean: no new construct. Add a stop/continue protocol (a library matter: `loop:`
+   is plain double dispatch and needs nothing from the VM) and the missing query
+   methods. One syntax candidate is kept: a guard statement at method level.
+   Ranked last: non-closure "inline clauses" for the compiler's control selectors
+   (Kotlin `inline` lambdas). They are compile-time rejection made visible, and
+   user-defined control abstractions would need inline methods, which are macros by
+   another name.
+
+*Positions (user, 2026-11-09):*
+
+- **A method answers its last expression; answering `self` becomes explicit.** An
+  explicit `self` marks a procedure-like method. Consequences to work through:
+  - C2 is reversed. Implicit `self` was adopted so that `new`'s
+    `^self _primNew initialize` answers the instance (`chunk_21_plan.md` C2).
+  - A method whose last statement is a send to another entity answers that send's
+    future, so a caller that forces the reply also waits for that send.
+  - `^` may no longer be needed anywhere.
+- **Whether a callee may ignore a stop value is a contract question.** A method
+  that advertises stop/continue should honor it unless its contract says
+  otherwise. This belongs to the library, not the VM.
+
+*Next:* an experiment that translates a non-trivial imperative algorithm in several
+styles, to measure the cost.
+
+**Experiment (2026-11-09):** a calculator (tokenizer, shunting-yard, RPN) written in
+four styles. Details, metrics and run commands are in
+`docs/experiments/q24_calculator_results.md`. All runnable styles pass the same 17
+cases.
+
+- **Today's Smol already pays most of the cost, because of D13.** Loop variables
+  live in ivars changed by pvt methods, and errors are re-raised with `^err`. Without
+  `^` in blocks and with library support (`cond:`, `loop:`, a condition for errors),
+  the result is about the same size as today's style, with shallower nesting.
+- **Error exits fit a condition** signalled and handled on the same coroutine.
+  **Ordinary exits** fit recursion base cases or a loop's stopping value. Neither
+  needs a jump.
+- **Nested loops:** an anonymous `loop:` forces
+  `Break with: (Continue with: …)`. A *named* loop (Scheme named `let`, here
+  `recur:` with an `again` argument) lets the inner loop continue the outer one by
+  calling the outer `again`. These are plain tail calls, so they run in constant
+  space (measured) and mean the same thing wherever the block runs.
+
+  This suggests two protocols: named loops for loops the caller owns, and stop
+  values for iterators the callee owns.
+- **Records or tuple values are wanted:** for loop state now packed in Associations,
+  and as an immutable literal so a `cond:` need not allocate an `Array` entity.
+- **Correction:** a `cond` on an `Array` forced by the home inside its own turn did
+  *not* hang on the current tree. The reason was not traced, and it differs from
+  I6's `do:` row.
+
+**Related**: I5, Q21, Q23, R10, D13, P8, P9.

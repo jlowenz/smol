@@ -167,3 +167,61 @@ optimization.
 **Difference and why**: to write. This is where Smol has to justify the apparent
 added complexity of async everywhere; `Smol_Patterns.md` was a start and may be
 out of date. Deferred (user, 2026-11-01).
+
+## R10: Non-local return across entity boundaries
+
+**Smol's position** (open; tracked in I5 and Q23): `^` inside a block returns from
+its home method only when the block runs on the home entity's own coroutine — a
+`^` reached on another entity's coroutine has no coherent target, because only the
+home coroutine can unwind the home stack. Whether such a `^` is rejected (at
+compile time or run time) or delivered along the wait chain is undecided; the
+discussion leans toward treating cross-entity early-exit as a *value-returning*
+computation (a short-circuiting fold) rather than reached-in flow control, but
+this is not decided and the generality lost by dropping cross-entity `^` is not
+fully characterized.
+
+**Prior work**:
+
+- *Smalltalk.* A block's `^` returns from its home method context. Squeak/Pharo
+  raise `BlockCannotReturn` when the home context is already dead; Miranda
+  ("sideways returns", squeak vm-dev, 2012-04) argues a block evaluated in a
+  *different process* should likewise invoke a `cannotReturn:` error, since the
+  home context is not on the evaluating process's sender chain.
+- *Scala 3* deprecated non-local returns from nested functions (since 3.2): they
+  were implemented by throwing a `NonLocalReturnControl`, which a catch-all — the
+  `Future` machinery among them — can intercept and mis-handle. They are replaced
+  by `scala.util.boundary` / `boundary.break`, a *delimited*, value-carrying
+  construct with an explicit boundary.
+- *Kotlin* forbids a non-local `return` from a lambda unless the callee is inlined,
+  and `crossinline` bans it when the lambda may run "in another execution context."
+- *Clojure* `reduced` and *Rust* `ControlFlow` / `Iterator::try_fold` express early
+  termination as a *value* returned from the reducing step, not a stack-unwinding
+  control effect.
+
+**Difference and why**: Smol's entities are separate coroutines, so a `^` across an
+entity boundary is exactly the "sideways return" Smalltalk warns against and the
+control-effect-vs-`Future` mismatch Scala retreated from.
+
+The nearest in-codebase precedent is Smol's own condition system, and it cuts a
+specific way. It **propagates the handler chain across entity boundaries**
+(HandlerContext / the replayed `handler_chain`), so a handler authored in one
+entity handles a signal raised in another — cross-entity dynamic *scope* is
+embraced. But it runs that handler **at the signal point, on the signaling
+coroutine**, and its control transfers (`return:` / `resume:` / `retry`) act on
+*that* coroutine's local stack; §4 is explicit that none "reaches back into a
+different (possibly already-returned) coroutine's dynamic extent," unwinding to the
+fork top rather than chasing a boundary on another coroutine
+(`condition_system_guide.md` §1, §4). So the project has already met "a block
+authored in entity A must affect control in entity B's context" and answered it
+**without cross-coroutine stack unwinding** — by relocating execution to the point
+and supplying local control verbs. That unwinding is exactly what option C (deliver
+a `^` to its remote home along the wait chain) would reintroduce, which is a reason
+to weigh C carefully rather than a settled argument against it.
+
+The functional alternative carries early-exit intent as a value (Clojure/Rust),
+which composes with async; the multi-frame escape that a fold cannot replace (a `^`
+that exits several enclosing method frames at once) is also precisely the part that
+does not translate across a coroutine boundary. The condition system and the fold
+converge on the same principle — express cross-entity control as a local verb or a
+returned value, not as a remote unwind — but whether that principle should bind `^`
+is undecided. See I5 for the mechanism and failing cases, Q23 for the context design.

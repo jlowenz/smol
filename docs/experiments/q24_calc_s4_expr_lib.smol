@@ -1,0 +1,140 @@
+"Q24 calculator, style S4: expression style plus proposed library pieces. No ^ inside any block."
+"The library section below would live in the kernel; nothing in it needs evaluator or VM support."
+"Tools used, one per phase where it reads best:"
+"  tokenizer     - state-threading loop (`loop:` with Continue/Break)"
+"  shunting-yard - states as tail-recursive methods, flattened with a multi-way conditional (`cond:`)"
+"  RPN eval      - a fold (`inject:into:`) over the RPN list"
+"  errors        - a condition (CalcError), signalled and caught on this entity's own coroutine"
+"Where a loop carries more than one variable, the state is packed into an Association; a record or"
+"tuple with destructuring would replace that (marked 'record wanted')."
+
+"=== Proposed library ==="
+
+"`loop:` threads a state through aBlock. The block answers (Continue with: nextState) or (Break with: result)."
+Value subclass: #Continue instanceVariableNames: 'state' classVariableNames: '' indexedSlots: #none.
+Continue class >> with: s [ ^self _primNewValue: [:c | c pvtState: s] ]
+Continue >> pvtState: s [ state := s ]
+Continue >> pvtLoopStep: aBlock [ ^state loop: aBlock ]
+
+Value subclass: #Break instanceVariableNames: 'result' classVariableNames: '' indexedSlots: #none.
+Break class >> with: r [ ^self _primNewValue: [:b | b pvtResult: r] ]
+Break >> pvtResult: r [ result := r ]
+Break >> pvtLoopStep: aBlock [ ^result ]
+
+Object >> loop: aBlock [ ^(aBlock value: self) pvtLoopStep: aBlock ]
+
+"`cond:` takes { [test] -> [value]. ... } and answers the value of the first clause whose test is true"
+"(nil if none). `[true]` as the last test plays CL's `t`. Sent to self, so clause blocks run on this"
+"coroutine; sending it to the Array (an entity) would run them on the Array's coroutine (I6)."
+Object >> cond: clauses [ ^self pvtCond: clauses from: 0 ]
+Object >> pvtCond: clauses from: i [
+    ^i >= clauses size
+        ifTrue: [nil]
+        ifFalse: [(clauses at: i) key value
+            ifTrue: [(clauses at: i) value value]
+            ifFalse: [self pvtCond: clauses from: i + 1]]
+]
+
+Cons >> reversed [ ^self inject: nil into: [:acc :x | Cons with: x rest: acc] ]
+Nil >> reversed [ ^nil ]
+
+"=== Calculator ==="
+
+Error subclass: #CalcError instanceVariableNames: ''.
+
+Object subclass: #Calc4 instanceVariableNames: ''.
+
+Calc4 >> evaluate: s [
+    ^[self eval: (self rpnOf: (self tokensOf: s))]
+        on: CalcError do: [:e | 'error: ' , e messageText]
+]
+
+"--- tokenizer: loop state is pos -> reversed tokens   (record wanted: pos, toks) ---"
+Calc4 >> tokensOf: s [
+    ^(0 -> nil) loop: [:st | self scan: s at: st key toks: st value]
+]
+
+Calc4 >> scan: s at: i toks: toks [
+    ^i >= s size
+        ifTrue: [Break with: toks reversed]
+        ifFalse: [| c | c := s at: i.
+            self cond: {
+                [c isSpace] -> [Continue with: i + 1 -> toks].
+                [c isDigit] -> [self number: s at: i toks: toks].
+                ['+-*/()' includesSubString: c] -> [Continue with: i + 1 -> (Cons with: c rest: toks)].
+                [true] -> [CalcError signal: 'unexpected ' , c , ' at ' , i asString] }]
+]
+
+"Inner loop, state pos -> value   (record wanted). It ends by answering the outer loop's next step."
+Calc4 >> number: s at: i toks: toks [
+    ^(i -> 0) loop: [:st |
+        (st key < s size and: [(s at: st key) isDigit])
+            ifTrue: [Continue with: st key + 1 -> (st value * 10 + (s at: st key) digitValue)]
+            ifFalse: [Break with: (Continue with: st key -> (Cons with: st value rest: toks))]]
+]
+
+"--- shunting-yard: out is accumulated reversed ---"
+Calc4 >> rpnOf: toks [ ^self rpn: toks ops: nil out: nil ]
+
+Calc4 >> rpn: toks ops: ops out: out [
+    ^toks isNil
+        ifTrue: [self drain: ops out: out]
+        ifFalse: [| t | t := toks head.
+            self cond: {
+                [t isKindOf: Integer] -> [self rpn: toks tail ops: ops out: (Cons with: t rest: out)].
+                [t = '('] -> [self rpn: toks tail ops: (Cons with: t rest: ops) out: out].
+                [t = ')'] -> [self close: toks tail ops: ops out: out].
+                [true] -> [self push: t rest: toks tail ops: ops out: out] }]
+]
+
+Calc4 >> push: op rest: toks ops: ops out: out [
+    ^(ops notNil and: [ops head ~= '(' and: [(self prec: ops head) >= (self prec: op)]])
+        ifTrue: [self push: op rest: toks ops: ops tail out: (Cons with: ops head rest: out)]
+        ifFalse: [self rpn: toks ops: (Cons with: op rest: ops) out: out]
+]
+
+Calc4 >> close: toks ops: ops out: out [
+    ^self cond: {
+        [ops isNil] -> [CalcError signal: 'unmatched )'].
+        [ops head = '('] -> [self rpn: toks ops: ops tail out: out].
+        [true] -> [self close: toks ops: ops tail out: (Cons with: ops head rest: out)] }
+]
+
+Calc4 >> drain: ops out: out [
+    ^self cond: {
+        [ops isNil] -> [out reversed].
+        [ops head = '('] -> [CalcError signal: 'unmatched ('].
+        [true] -> [self drain: ops tail out: (Cons with: ops head rest: out)] }
+]
+
+Calc4 >> prec: op [ ^((op = '*') or: [op = '/']) ifTrue: [2] ifFalse: [1] ]
+
+"--- RPN evaluation: a fold over the RPN list; the accumulator is the operand stack ---"
+Calc4 >> eval: rpn [
+    ^self finish: (rpn inject: nil into: [:st :t | self step: t on: st])
+]
+
+Calc4 >> step: t on: st [
+    ^self cond: {
+        [t isKindOf: Integer] -> [Cons with: t rest: st].
+        [st isNil or: [st tail isNil]] -> [CalcError signal: 'missing operand'].
+        [t = '/' and: [st head = 0]] -> [CalcError signal: 'division by zero'].
+        [true] -> [Cons with: (self compute: t a: st tail head b: st head) rest: st tail tail] }
+]
+
+Calc4 >> finish: st [
+    ^self cond: {
+        [st isNil] -> [CalcError signal: 'empty expression'].
+        [st tail notNil] -> [CalcError signal: 'missing operator'].
+        [true] -> [st head] }
+]
+
+Calc4 >> compute: op a: a b: b [
+    ^self cond: {
+        [op = '+'] -> [a + b].
+        [op = '-'] -> [a - b].
+        [op = '*'] -> [a * b].
+        [true] -> [a / b] }
+]
+
+(CalcCheck new run: Calc4 new) await.

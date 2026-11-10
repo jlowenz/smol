@@ -1,0 +1,105 @@
+"Q24 calculator, style S2: Smol as it is today (D13 + ^ in blocks)."
+"Loop variables live in ivars and change only inside pvt methods (D13 Pattern 2)."
+"Each pvt step answers nil to continue or an error String to stop; callers re-raise it with ^ (Pattern 4)."
+"Loops index with `0 until: n do:` (Integer receiver, runs inline) rather than `coll do:`, so ^ stays on"
+"this coroutine; `coll do: [... ^err]` on an OrderedCollection would hit I5."
+
+Object subclass: #Calc2 instanceVariableNames: 'src pos acc tokens ops out stack'.
+
+Calc2 >> evaluate: s [
+    (self tokenize: s) ifNotNil: [:err | ^err].
+    self toRpn ifNotNil: [:err | ^err].
+    ^self evalRpn
+]
+
+"--- tokenizer ---"
+Calc2 >> tokenize: s [
+    src := s.
+    pos := 0.
+    tokens := OrderedCollection new.
+    [pos < src size] whileTrue: [
+        self pvtScanToken ifNotNil: [:err | ^err]].
+    ^nil
+]
+
+Calc2 >> pvtScanToken [
+    | c |
+    c := src at: pos.
+    c isSpace ifTrue: [^self pvtSkip].
+    c isDigit ifTrue: [^self pvtScanNumber].
+    ('+-*/()' includesSubString: c) ifTrue: [^self pvtEmit: c].
+    ^'error: unexpected ' , c , ' at ' , pos asString
+]
+
+Calc2 >> pvtSkip [ pos := pos + 1. ^nil ]
+Calc2 >> pvtEmit: tok [ tokens add: tok. pos := pos + 1. ^nil ]
+
+Calc2 >> pvtScanNumber [
+    acc := 0.
+    [pos < src size and: [(src at: pos) isDigit]] whileTrue: [self pvtTakeDigit].
+    tokens add: acc.
+    ^nil
+]
+
+Calc2 >> pvtTakeDigit [ acc := acc * 10 + (src at: pos) digitValue. pos := pos + 1 ]
+
+"--- shunting-yard: tokens -> out (RPN) ---"
+Calc2 >> toRpn [
+    ops := OrderedCollection new.
+    out := OrderedCollection new.
+    0 until: tokens size do: [:i |
+        (self pvtShunt: (tokens at: i)) ifNotNil: [:err | ^err]].
+    [ops isEmpty] whileFalse: [
+        ops last = '(' ifTrue: [^'error: unmatched ('].
+        out add: ops removeLast].
+    ^nil
+]
+
+Calc2 >> pvtShunt: t [
+    (t isKindOf: Integer) ifTrue: [out add: t. ^nil].
+    t = '(' ifTrue: [ops add: t. ^nil].
+    t = ')' ifTrue: [^self pvtCloseParen].
+    [ops notEmpty and: [ops last ~= '(' and: [(self prec: ops last) >= (self prec: t)]]]
+        whileTrue: [out add: ops removeLast].
+    ops add: t.
+    ^nil
+]
+
+Calc2 >> pvtCloseParen [
+    [ops isEmpty ifTrue: [^'error: unmatched )']. ops last ~= '(']
+        whileTrue: [out add: ops removeLast].
+    ops removeLast.
+    ^nil
+]
+
+Calc2 >> prec: op [ ((op = '*') or: [op = '/']) ifTrue: [^2]. ^1 ]
+
+"--- RPN evaluation ---"
+Calc2 >> evalRpn [
+    stack := OrderedCollection new.
+    0 until: out size do: [:i |
+        (self pvtApply: (out at: i)) ifNotNil: [:err | ^err]].
+    stack isEmpty ifTrue: [^'error: empty expression'].
+    stack size > 1 ifTrue: [^'error: missing operator'].
+    ^stack first
+]
+
+Calc2 >> pvtApply: t [
+    | a b |
+    (t isKindOf: Integer) ifTrue: [stack add: t. ^nil].
+    stack size < 2 ifTrue: [^'error: missing operand'].
+    b := stack removeLast.
+    a := stack removeLast.
+    (t = '/' and: [b = 0]) ifTrue: [^'error: division by zero'].
+    stack add: (self apply: t to: a and: b).
+    ^nil
+]
+
+Calc2 >> apply: op to: a and: b [
+    op = '+' ifTrue: [^a + b].
+    op = '-' ifTrue: [^a - b].
+    op = '*' ifTrue: [^a * b].
+    ^a / b
+]
+
+(CalcCheck new run: Calc2 new) await.

@@ -1,0 +1,151 @@
+"I5 experiments: what does ^ inside a block do, depending on who runs the block?"
+"Run from the repo root:  cargo build -p interpreter && target/debug/smol < docs/experiments/i5_nonlocal_return.smol"
+"The file is fed to the REPL. Each chunk prints its value after a '>' prompt. Every experiment prints a label first."
+"Each 'WANT' is what ordinary Smalltalk semantics would answer: ^ returns from the method that lexically contains the block."
+"Each 'GOT' is what the current tree answered on 2026-11-06."
+
+"--- Helper classes ---"
+
+"Slow answers a value from its own entity, so a send to it gives a genuine Future."
+Object subclass: #Slow instanceVariableNames: ''.
+Slow >> seven [ ^7 ]
+
+"Failer signals an error on its own entity."
+Object subclass: #Failer instanceVariableNames: ''.
+Failer >> fail [ ^self error: 'failed' ]
+
+"Counter records how many times a block body ran."
+Object subclass: #Counter instanceVariableNames: 'n'.
+Counter >> initialize [ n := 0 ]
+Counter >> tick [ n := n + 1 ]
+Counter >> n [ ^n ]
+
+"Worker runs a block two method-calls deep. Its method bodies add 100 and 1000 so the answer shows which frames finished."
+Object subclass: #Worker instanceVariableNames: ''.
+Worker >> run: aBlock [ | r | r := self helper: aBlock. ^r + 1000 ]
+Worker >> helper: aBlock [ | r | r := aBlock value. ^r + 100 ]
+
+"--- Home holds the methods under test. Each one contains a ^ inside a block. ---"
+Object subclass: #Home instanceVariableNames: ''.
+
+"Block runs on Home's own coroutine, through a self-send."
+Home >> each: aBlock [ aBlock value: 1. aBlock value: -1. aBlock value: 7 ]
+Home >> firstNegViaSelf [ self each: [:x | x < 0 ifTrue: [^x]]. ^nil ]
+
+"Does not wait for do: to finish. Line 2 is reached whether or not the block has run."
+Home >> firstNeg: coll [
+    coll do: [:x | x < 0 ifTrue: [^x]].
+    ^nil
+]
+
+"Waits for do: to finish before moving to line 2."
+Home >> firstNegAwaited: coll [
+    (coll do: [:x | x < 0 ifTrue: [^x]]) await.
+    ^nil
+]
+
+"Same as above, and counts how many elements the block saw."
+Home >> firstNegCounting: coll counter: c [
+    (coll do: [:x | c tick. x < 0 ifTrue: [^x]]) await.
+    ^nil
+]
+
+"then: block runs after the Future settles. Does not wait for it."
+Home >> thenNotAwaited: s [
+    (s seven) then: [:v | ^v + 1] orElse: #reject.
+    ^99
+]
+
+"then: block, and waits for it."
+Home >> thenAwaited: s [
+    ((s seven) then: [:v | ^v + 1] orElse: #reject) await.
+    ^99
+]
+
+"then: as the method's own answer."
+Home >> thenAsAnswer: s [
+    ^(s seven) then: [:v | ^v + 1] orElse: #reject
+]
+
+"Handler for an error signaled on this same entity."
+Home >> handlerLocal [
+    [self error: 'failed'. ^1] on: Error do: [:e | ^2].
+    ^3
+]
+
+"Handler for an error signaled on another entity. The handler runs on that entity."
+Home >> handlerRemote: f [
+    [(f fail) await. ^1] on: Error do: [:e | ^2].
+    ^3
+]
+
+"Probe for the case above: +100 shows whether await received the handler's ^ value as a normal answer."
+Home >> handlerRemoteProbe: f [
+    [^(f fail) await + 100] on: Error do: [:e | ^2].
+    ^3
+]
+
+"Answers a block whose home method has already returned by the time anyone runs it."
+Home >> makeBlock [ ^[^42] ]
+Home >> blockWithDeadHome [ | b | b := self makeBlock. ^b ]
+
+"Runs that dead-home block on Home itself, two calls deep."
+Home >> runDeadHere [ | b r | b := self makeBlock. r := self helper: b. ^r + 1000 ]
+Home >> helper: aBlock [ | r | r := aBlock value. ^r + 100 ]
+
+"--- Group 1: the block runs on Home's own coroutine ---"
+
+'E0 self-send. WANT -1 GOT -1'
+(Home new firstNegViaSelf) await
+
+'E3 receiver is a Cons, which is a Value, so do: runs on the caller. WANT -1 GOT -1'
+| c | c := Cons with: 1 rest: (Cons singleton: -1). (Home new firstNeg: c) await
+
+'E10 handler for a local signal. WANT 2 GOT 2'
+(Home new handlerLocal) await
+
+"--- Group 2: the block runs on another entity, and Home is waiting for it ---"
+
+'E1 receiver is an Array, which is an entity. Same block as E3, plus await. WANT -1 GOT nil'
+| a | a := Array new: 2. a at: 0 put: 1. a at: 1 put: -1. (Home new firstNegAwaited: a) await
+
+'E9 ^ does stop the do: loop: 3 elements, negative at index 1, ticks. WANT 2 GOT 2'
+| a c | a := Array new: 3. a at: 0 put: 1. a at: 1 put: -1. a at: 2 put: 7. c := Counter new. (Home new firstNegCounting: a counter: c) await. (c n) await
+
+'E5 then: block, awaited. WANT 8 GOT 99'
+(Home new thenAwaited: Slow new) await
+
+'E11 handler runs on the signaling entity. WANT 2 GOT 1'
+(Home new handlerRemote: Failer new) await
+
+'E11p probe: 102 means await received 2 as a normal value. GOT 102'
+(Home new handlerRemoteProbe: Failer new) await
+
+"--- Group 3: the block runs on another entity, and Home is NOT waiting for it ---"
+
+'E2 same as E3, but receiver is an Array. No await in the method. WANT -1 GOT nil'
+| a | a := Array new: 2. a at: 0 put: 1. a at: 1 put: -1. (Home new firstNeg: a) await
+
+'E4 then: block, not awaited. WANT 8 GOT 99'
+(Home new thenNotAwaited: Slow new) await
+
+'E5t then: block is the method answer. WANT 8 GOT 8'
+(Home new thenAsAnswer: Slow new) await
+
+"--- Group 4: the home method has already returned. Smalltalk raises cannotReturn: here. ---"
+
+'E8 dead home, run by a Worker. WANT an error GOT 1042: ^42 returned from Worker helper:, then run: added 1000'
+| b | b := (Home new blockWithDeadHome) await. (Worker new run: b) await
+
+'E12 dead home, run on Home itself. WANT an error GOT 1042: same frame mix-up without any other entity'
+(Home new runDeadHere) await
+
+"--- Group 5: the kernel bug that follows from Group 2 ---"
+"kernel.smol, Dictionary >> = :  (other at: assoc key ifAbsent: [^false]) = assoc value ifFalse: [^false]"
+"The ^false runs on 'other', so at:ifAbsent: just answers false, and the loop goes on to compare it with the value."
+
+'E7 keys differ, both values false. WANT false; kernel fixed 2026-11-06, now false'
+| d1 d2 | d1 := Dictionary new. d2 := Dictionary new. (d1 at: #a put: false) await. (d2 at: #b put: false) await. (d1 = d2) await
+
+'E7c control: keys differ, both values 1. WANT false GOT false'
+| d1 d2 | d1 := Dictionary new. d2 := Dictionary new. (d1 at: #a put: 1) await. (d2 at: #b put: 1) await. (d1 = d2) await

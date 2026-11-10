@@ -1,0 +1,124 @@
+"Q24 calculator, style S3: expression style, today's kernel only. No ^ inside any block."
+"Each method is `^` plus one expression (temps at method level act as let-bindings)."
+"Loops are tail-recursive methods whose parameters are the loop state (Steele: a tail call is a structured goto)."
+"State is immutable: token/operator/output lists are Cons lists (nil = empty)."
+"Errors are values: a phase answers an error String, and each later phase passes it through unchanged."
+
+Object subclass: #Calc3 instanceVariableNames: ''.
+
+Calc3 >> evaluate: s [
+    | toks rpn |
+    toks := self tokensOf: s from: 0.
+    rpn := (toks isKindOf: String) ifTrue: [toks] ifFalse: [self rpn: toks ops: nil out: nil].
+    ^(rpn isKindOf: String) ifTrue: [rpn] ifFalse: [self eval: rpn stack: nil]
+]
+
+"--- tokenizer ---"
+Calc3 >> tokensOf: s from: i [
+    ^i >= s size
+        ifTrue: [nil]
+        ifFalse: [self tokensOf: s from: i char: (s at: i)]
+]
+
+Calc3 >> tokensOf: s from: i char: c [
+    ^c isSpace
+        ifTrue: [self tokensOf: s from: i + 1]
+        ifFalse: [c isDigit
+            ifTrue: [self numberIn: s from: i value: 0]
+            ifFalse: [('+-*/()' includesSubString: c)
+                ifTrue: [self prepend: c to: (self tokensOf: s from: i + 1)]
+                ifFalse: ['error: unexpected ' , c , ' at ' , i asString]]]
+]
+
+Calc3 >> numberIn: s from: i value: n [
+    ^(i < s size and: [(s at: i) isDigit])
+        ifTrue: [self numberIn: s from: i + 1 value: n * 10 + (s at: i) digitValue]
+        ifFalse: [self prepend: n to: (self tokensOf: s from: i)]
+]
+
+"Error pass-through for the (non-tail) list build."
+Calc3 >> prepend: t to: rest [
+    ^(rest isKindOf: String) ifTrue: [rest] ifFalse: [Cons with: t rest: rest]
+]
+
+"--- shunting-yard: out is accumulated reversed, then reversed once at the end ---"
+Calc3 >> rpn: toks ops: ops out: out [
+    ^toks isNil
+        ifTrue: [self drain: ops out: out]
+        ifFalse: [self shunt: toks head rest: toks tail ops: ops out: out]
+]
+
+Calc3 >> shunt: t rest: toks ops: ops out: out [
+    ^(t isKindOf: Integer)
+        ifTrue: [self rpn: toks ops: ops out: (Cons with: t rest: out)]
+        ifFalse: [t = '('
+            ifTrue: [self rpn: toks ops: (Cons with: t rest: ops) out: out]
+            ifFalse: [t = ')'
+                ifTrue: [self close: toks ops: ops out: out]
+                ifFalse: [self push: t rest: toks ops: ops out: out]]]
+]
+
+Calc3 >> push: op rest: toks ops: ops out: out [
+    ^(ops notNil and: [ops head ~= '(' and: [(self prec: ops head) >= (self prec: op)]])
+        ifTrue: [self push: op rest: toks ops: ops tail out: (Cons with: ops head rest: out)]
+        ifFalse: [self rpn: toks ops: (Cons with: op rest: ops) out: out]
+]
+
+Calc3 >> close: toks ops: ops out: out [
+    ^ops isNil
+        ifTrue: ['error: unmatched )']
+        ifFalse: [ops head = '('
+            ifTrue: [self rpn: toks ops: ops tail out: out]
+            ifFalse: [self close: toks ops: ops tail out: (Cons with: ops head rest: out)]]
+]
+
+Calc3 >> drain: ops out: out [
+    ^ops isNil
+        ifTrue: [self reverse: out onto: nil]
+        ifFalse: [ops head = '('
+            ifTrue: ['error: unmatched (']
+            ifFalse: [self drain: ops tail out: (Cons with: ops head rest: out)]]
+]
+
+Calc3 >> reverse: list onto: acc [
+    ^list isNil
+        ifTrue: [acc]
+        ifFalse: [self reverse: list tail onto: (Cons with: list head rest: acc)]
+]
+
+Calc3 >> prec: op [ ^((op = '*') or: [op = '/']) ifTrue: [2] ifFalse: [1] ]
+
+"--- RPN evaluation ---"
+Calc3 >> eval: rpn stack: st [
+    ^rpn isNil
+        ifTrue: [self finish: st]
+        ifFalse: [(rpn head isKindOf: Integer)
+            ifTrue: [self eval: rpn tail stack: (Cons with: rpn head rest: st)]
+            ifFalse: [self apply: rpn head rest: rpn tail stack: st]]
+]
+
+Calc3 >> apply: op rest: rpn stack: st [
+    ^(st isNil or: [st tail isNil])
+        ifTrue: ['error: missing operand']
+        ifFalse: [(op = '/' and: [st head = 0])
+            ifTrue: ['error: division by zero']
+            ifFalse: [self eval: rpn stack: (Cons
+                with: (self compute: op a: st tail head b: st head)
+                rest: st tail tail)]]
+]
+
+Calc3 >> finish: st [
+    ^st isNil
+        ifTrue: ['error: empty expression']
+        ifFalse: [st tail isNil ifTrue: [st head] ifFalse: ['error: missing operator']]
+]
+
+Calc3 >> compute: op a: a b: b [
+    ^op = '+'
+        ifTrue: [a + b]
+        ifFalse: [op = '-'
+            ifTrue: [a - b]
+            ifFalse: [op = '*' ifTrue: [a * b] ifFalse: [a / b]]]
+]
+
+(CalcCheck new run: Calc3 new) await.

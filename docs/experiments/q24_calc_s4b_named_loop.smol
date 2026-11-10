@@ -1,0 +1,35 @@
+"Q24 calculator, style S4b: S4 with the tokenizer rewritten as a *named* loop (Scheme named let)."
+"Load after the prelude and S4:"
+"  cat docs/experiments/q24_calc_prelude.smol docs/experiments/q24_calc_s4_expr_lib.smol docs/experiments/q24_calc_s4b_named_loop.smol | target/release/smol"
+"(S4's own harness run also prints first.)"
+
+"=== Proposed library ==="
+"`recur:` hands the block the state and `again`, a block that runs the next iteration."
+"Continue = `again value: newState` (in tail position). Stop = answer any other value."
+"No Continue/Break classes: a loop the caller owns needs no protocol; Continue/Break remain for"
+"iterators the callee owns (do:, folds), where the caller can only ask the callee to stop."
+Object >> recur: aBlock [ ^aBlock value: self value: [:next | next recur: aBlock] ]
+
+"=== Calculator: only the tokenizer differs from S4 ==="
+Calc4 subclass: #Calc4b instanceVariableNames: ''.
+
+"Outer loop state: pos -> reversed tokens; inner loop state: pos -> value   (records wanted)."
+"The inner (number) loop ends by continuing the outer loop directly: `again value: ...`."
+Calc4b >> tokensOf: s [
+    ^(0 -> nil) recur: [:st :again | | i toks |
+        i := st key.
+        toks := st value.
+        i >= s size
+            ifTrue: [toks reversed]
+            ifFalse: [| c | c := s at: i.
+                self cond: {
+                    [c isSpace] -> [again value: i + 1 -> toks].
+                    [c isDigit] -> [(i -> 0) recur: [:num :more |
+                        (num key < s size and: [(s at: num key) isDigit])
+                            ifTrue: [more value: num key + 1 -> (num value * 10 + (s at: num key) digitValue)]
+                            ifFalse: [again value: num key -> (Cons with: num value rest: toks)]]].
+                    ['+-*/()' includesSubString: c] -> [again value: i + 1 -> (Cons with: c rest: toks)].
+                    [true] -> [CalcError signal: 'unexpected ' , c , ' at ' , i asString] }]]
+]
+
+(CalcCheck new run: Calc4b new) await.

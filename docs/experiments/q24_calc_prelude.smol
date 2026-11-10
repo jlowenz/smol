@@ -1,0 +1,44 @@
+"Q24 calculator experiment: shared prelude (character helpers + test harness)."
+"Each style file is run after this prelude, from the repo root:"
+"  cargo build -p interpreter --release"
+"  cat docs/experiments/q24_calc_prelude.smol docs/experiments/q24_calc_s2_today.smol | target/release/smol"
+"Each style defines a class whose `evaluate: aString` answers an Integer or a String 'error: ...'."
+
+"--- Character helpers. Library gaps: Smol has no Character class; `String at:` answers a 1-character String. ---"
+"These are only meaningful on 1-character Strings."
+String >> isDigit [ ^('0' <= self) and: [self <= '9'] ]
+String >> isSpace [ ^self = ' ' ]
+String >> digitValue [ ^self pvtDigitFrom: 0 ]
+String >> pvtDigitFrom: d [ ^d asString = self ifTrue: [d] ifFalse: [self pvtDigitFrom: d + 1] ]
+
+"--- Test harness: one line per case, PASS or FAIL with got/want. ---"
+Object subclass: #CalcCheck instanceVariableNames: ''.
+
+CalcCheck >> run: calc [
+    self check: calc on: '1 + 2' want: 3.
+    self check: calc on: '2 + 3 * 4' want: 14.
+    self check: calc on: '(2 + 3) * 4' want: 20.
+    self check: calc on: '100 / 7 / 2' want: 7.
+    self check: calc on: '10 - 4 - 3' want: 3.
+    self check: calc on: ' 42 ' want: 42.
+    self check: calc on: '2 * (3 + (4 - 1)) / 3' want: 4.
+    self check: calc on: '' want: 'error: empty expression'.
+    self check: calc on: '   ' want: 'error: empty expression'.
+    self check: calc on: '()' want: 'error: empty expression'.
+    self check: calc on: '2 $ 3' want: 'error: unexpected $ at 2'.
+    self check: calc on: '(1 + 2' want: 'error: unmatched ('.
+    self check: calc on: '1 + 2)' want: 'error: unmatched )'.
+    self check: calc on: '1 +' want: 'error: missing operand'.
+    self check: calc on: '* 2' want: 'error: missing operand'.
+    self check: calc on: '1 2' want: 'error: missing operator'.
+    self check: calc on: '4 / (2 - 2)' want: 'error: division by zero'.
+    'done' printNl
+]
+
+CalcCheck >> check: calc on: src want: want [
+    | got |
+    got := (calc evaluate: src) await.
+    got = want
+        ifTrue: [('PASS  [' , src , ']') printNl]
+        ifFalse: [('FAIL  [' , src , ']  got: ' , got asString , '  want: ' , want asString) printNl]
+]

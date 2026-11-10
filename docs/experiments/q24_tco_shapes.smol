@@ -1,0 +1,13 @@
+"Q24: does a tail call stay constant-space in expression style as well as in guard style?"
+"Run from the repo root:  cargo build -p interpreter --release && /usr/bin/time -l target/release/smol < docs/experiments/q24_tco_shapes.smol"
+"Run one shape per invocation (comment the other out) and compare 'maximum resident set size'."
+
+Object subclass: #Counter instanceVariableNames: ''.
+
+"Guard style: ^ inside the ifTrue: block, then a method-level tail send."
+Counter >> guard: n [ n = 0 ifTrue: [^0]. ^self guard: n - 1 ]
+
+"Expression style: no ^ in any block; the tail send is the value of the ifFalse: branch."
+Counter >> expr: n [ ^n = 0 ifTrue: [0] ifFalse: [self expr: n - 1] ]
+
+(Counter new SHAPE: 3000000) await

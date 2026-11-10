@@ -1,0 +1,86 @@
+"Q24 calculator, style S1: classic Smalltalk. READING REFERENCE ONLY, not legal Smol."
+"Blocks assign method temps (i, n, a, b, c), which D13 forbids (ParseError::NonLocalBlockAssignment)."
+"`tokens do: [... ^...]` would also hit I5, since OrderedCollection is an entity."
+"This is what the algorithm looks like when loops may rebind variables and ^ may exit from any block."
+
+Object subclass: #Calc1 instanceVariableNames: ''.
+
+Calc1 >> evaluate: s [
+    | tokens rpn |
+    tokens := self tokenize: s.
+    (tokens isKindOf: String) ifTrue: [^tokens].
+    rpn := self toRpn: tokens.
+    (rpn isKindOf: String) ifTrue: [^rpn].
+    ^self evalRpn: rpn
+]
+
+Calc1 >> tokenize: s [
+    | tokens i c n |
+    tokens := OrderedCollection new.
+    i := 0.
+    [i < s size] whileTrue: [
+        c := s at: i.
+        c isSpace
+            ifTrue: [i := i + 1]
+            ifFalse: [c isDigit
+                ifTrue: [
+                    n := 0.
+                    [i < s size and: [(s at: i) isDigit]] whileTrue: [
+                        n := n * 10 + (s at: i) digitValue.
+                        i := i + 1].
+                    tokens add: n]
+                ifFalse: [
+                    ('+-*/()' includesSubString: c)
+                        ifFalse: [^'error: unexpected ' , c , ' at ' , i asString].
+                    tokens add: c.
+                    i := i + 1]]].
+    ^tokens
+]
+
+Calc1 >> toRpn: tokens [
+    | ops out |
+    ops := OrderedCollection new.
+    out := OrderedCollection new.
+    tokens do: [:t |
+        (t isKindOf: Integer) ifTrue: [out add: t] ifFalse: [
+        t = '(' ifTrue: [ops add: t] ifFalse: [
+        t = ')'
+            ifTrue: [
+                [ops isEmpty ifTrue: [^'error: unmatched )']. ops last ~= '(']
+                    whileTrue: [out add: ops removeLast].
+                ops removeLast]
+            ifFalse: [
+                [ops notEmpty and: [ops last ~= '(' and: [(self prec: ops last) >= (self prec: t)]]]
+                    whileTrue: [out add: ops removeLast].
+                ops add: t]]]].
+    [ops isEmpty] whileFalse: [
+        ops last = '(' ifTrue: [^'error: unmatched ('].
+        out add: ops removeLast].
+    ^out
+]
+
+Calc1 >> evalRpn: rpn [
+    | stack a b |
+    stack := OrderedCollection new.
+    rpn do: [:t |
+        (t isKindOf: Integer)
+            ifTrue: [stack add: t]
+            ifFalse: [
+                stack size < 2 ifTrue: [^'error: missing operand'].
+                b := stack removeLast.
+                a := stack removeLast.
+                (t = '/' and: [b = 0]) ifTrue: [^'error: division by zero'].
+                stack add: (self apply: t to: a and: b)]].
+    stack isEmpty ifTrue: [^'error: empty expression'].
+    stack size > 1 ifTrue: [^'error: missing operator'].
+    ^stack first
+]
+
+Calc1 >> prec: op [ ^((op = '*') or: [op = '/']) ifTrue: [2] ifFalse: [1] ]
+
+Calc1 >> apply: op to: a and: b [
+    op = '+' ifTrue: [^a + b].
+    op = '-' ifTrue: [^a - b].
+    op = '*' ifTrue: [^a * b].
+    ^a / b
+]
