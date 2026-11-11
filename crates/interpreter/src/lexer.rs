@@ -52,8 +52,8 @@ pub enum Token {
 }
 
 /// A [`Token`] paired with its source [`Span`]. The parser holds a
-/// `Vec<SpannedToken>`; equality ignores the span (see [`SourceTagged`]).
-pub type SpannedToken = SourceTagged<Token>;
+/// `Vec<TaggedToken>`; equality ignores the span (see [`SourceTagged`]).
+pub type TaggedToken = SourceTagged<Token>;
 
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum LexError {
@@ -94,11 +94,11 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    /// Tokenize the entire source into a `Vec<SpannedToken>`, each token paired
+    /// Tokenize the entire source into a `Vec<TaggedToken>`, each token paired
     /// with its byte range.
     ///
     /// Ensures: the last token is always `Token::Eof`; each token's span carries `source`.
-    pub fn tokenize(source: SourceId, src: &'src str) -> Result<Vec<SpannedToken>, LexError> {
+    pub fn tokenize(source: SourceId, src: &'src str) -> Result<Vec<TaggedToken>, LexError> {
         let mut lexer = Self::new(src);
         let mut tokens = Vec::new();
         loop {

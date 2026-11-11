@@ -30,7 +30,7 @@ See memory `design_ast_source_tagging`. In short:
   ```
   `Span`, `SourceId`, and `SourceTagged<T>` live in a new **leaf module `span.rs`**, so the lexer
   can emit `SourceTagged<Token>` without depending on the AST. `TaggedStmt` is defined in `ast.rs`;
-  `SpannedToken = SourceTagged<Token>` in `lexer.rs`. `SourceTagged` equality **ignores `span`**.
+  `TaggedToken = SourceTagged<Token>` in `lexer.rs`. `SourceTagged` equality **ignores `span`**.
 - **Granularity = statement-level.** The `Expr` enum (`ast.rs:79`) is left **completely untouched**
   — name, data, internals. Only statement *containers* hold tagged nodes. Branch coverage still
   falls out: a conditional is `cond ifTrue: [b1] ifFalse: [b2]`, block bodies are statement lists,
@@ -73,12 +73,12 @@ Retype statement containers: `Program.stmts`, `Expr::Block.body` (`ast.rs:94`),
   `:1494`/`:1651`, body construction `:2390`/`:2415`), `eval.rs:634` (`&[Stmt]` → `&[TaggedStmt]`).
 
 ### S2 — Lexer emits spanned tokens (`lexer.rs`)
-Wrap each token with its source range: `tokenize` returns `Vec<SpannedToken>` where
-`SpannedToken = SourceTagged<Token>` (alias in `lexer.rs`). The lexer already tracks byte offsets
+Wrap each token with its source range: `tokenize` returns `Vec<TaggedToken>` where
+`TaggedToken = SourceTagged<Token>` (alias in `lexer.rs`). The lexer already tracks byte offsets
 (`self.pos`); capture `start` before and `end` after each `next_token`. The parser's token access
 centralizes in `peek`/`advance` (`parser.rs:63,79`), which unwrap `.node`; the ~10 direct-index
 lookahead sites gain `.node`. Token+span can't desync — structural alignment.
-- **Ensures:** every `SpannedToken.span` is the source range of its `.node`.
+- **Ensures:** every `TaggedToken.span` is the source range of its `.node`.
 
 ### S3 — Parser threads statement spans (`parser.rs`)
 At each statement site (`parse_program:123`, block body, method body), span the statement from its

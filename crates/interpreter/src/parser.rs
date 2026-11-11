@@ -4,7 +4,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::ast::*;
-use crate::lexer::{LexError, Lexer, SpannedToken, Token};
+use crate::lexer::{LexError, Lexer, TaggedToken, Token};
 use crate::span::{LineIndex, SourceId, SourceTagged, Span};
 
 /// A problem found while parsing. Each variant has a fixed [`Severity`].
@@ -85,7 +85,7 @@ impl TaggedDiagnostic {
 }
 
 pub struct Parser {
-    tokens: Vec<SpannedToken>,
+    tokens: Vec<TaggedToken>,
     pos: usize,
     comments: Vec<Arc<str>>,
     /// Diagnostics whose kind lets parsing continue, in the order found.
