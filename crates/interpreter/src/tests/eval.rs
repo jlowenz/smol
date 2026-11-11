@@ -935,11 +935,11 @@ fn block_with_locals() {
 
 #[test]
 fn non_local_block_assignment_is_parse_error() {
-    use crate::parser::{ParseError, Parser};
+    use crate::parser::{Diagnostic, Parser, TaggedDiagnostic};
     // Assigning a method temp from inside a block is rejected at parse time.
     let err = Parser::parse("Object >> m [ | n | [n := 1] value ]");
     assert!(
-        matches!(err, Err(ParseError::NonLocalBlockAssignment(ref name)) if name.as_ref() == "n"),
+        matches!(err, Err(TaggedDiagnostic { node: Diagnostic::NonLocalBlockAssignment(ref name), .. }) if name.as_ref() == "n"),
         "expected NonLocalBlockAssignment(\"n\"), got {err:?}"
     );
     // Assigning a block param or local is legal.

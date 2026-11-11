@@ -5,9 +5,14 @@ use thiserror::Error;
 
 use crate::ast::*;
 use crate::lexer::{LexError, Lexer, SpannedToken, Token};
+use crate::span::{LineIndex, SourceId, SourceTagged, Span};
 
+/// A problem found while parsing. Each variant has a fixed [`Severity`].
+///
+/// Bootstrap plumbing: a compiler written in Smol would signal conditions
+/// instead (`docs/q24_v0_plan.md` step 0).
 #[derive(Debug, Error, Clone, PartialEq)]
-pub enum ParseError {
+pub enum Diagnostic {
     #[error("lex error: {0}")]
     Lex(#[from] LexError),
     #[error("unexpected token {0:?}, expected {1}")]
@@ -27,12 +32,64 @@ pub enum ParseError {
     /// cross-entity mutation hazards.
     #[error("block assigns to `{0}`, which is not declared in this block's params or locals")]
     NonLocalBlockAssignment(Arc<str>),
+    /// `^` inside a block within a method (Q24).
+    #[error(
+        "`^` marks the method's answer and cannot appear in a block \
+         (Smalltalk's non-local return is not supported)"
+    )]
+    AnswerInBlock,
+    /// `^` statement followed by further statements in the same method body (Q24).
+    #[error("`^` marks the method's answer and must be the method's last statement")]
+    AnswerNotLast,
+    /// `^` in a chunk's own statements, outside any method (Q24).
+    #[error("`^` marks the method's answer and cannot appear outside a method")]
+    AnswerOutsideMethod,
+}
+
+impl Diagnostic {
+    /// Ensures: lexical and syntax errors, and the existing semantic checks, are
+    /// `Error`; the Q24 `^` rules are `Warning` until the kernel and tests no
+    /// longer violate them (`docs/q24_v0_plan.md` step 5).
+    pub fn severity(&self) -> Severity {
+        match self {
+            Diagnostic::AnswerInBlock
+            | Diagnostic::AnswerNotLast
+            | Diagnostic::AnswerOutsideMethod => Severity::Warning,
+            _ => Severity::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Warning,
+    Error,
+}
+
+/// A [`Diagnostic`] located at the source span it concerns.
+pub type TaggedDiagnostic = SourceTagged<Diagnostic>;
+
+impl TaggedDiagnostic {
+    /// One-line rendering `name:line:col: severity: message`.
+    ///
+    /// Requires: `self.span` indexes into `text`, the source named `name`.
+    /// Ensures: line and column are 1-based; the column counts chars.
+    pub fn render(&self, name: &str, text: &str) -> String {
+        let (line, col) = LineIndex::new(text).line_col(self.span.start);
+        let severity = match self.node.severity() {
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        };
+        format!("{name}:{line}:{col}: {severity}: {}", self.node)
+    }
 }
 
 pub struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
     comments: Vec<Arc<str>>,
+    /// Diagnostics whose kind lets parsing continue, in the order found.
+    diagnostics: Vec<TaggedDiagnostic>,
     /// True while parsing a method body. Lets `^` inside nested blocks pass.
     in_method: bool,
     /// True while parsing any block body. Combined with `in_method` to detect
@@ -45,24 +102,81 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn parse(src: &str) -> Result<Chunk, ParseError> {
-        Self::parse_source(crate::span::SourceId::ANON, src)
+    pub fn parse(src: &str) -> Result<Chunk, TaggedDiagnostic> {
+        Self::parse_source(SourceId::ANON, src)
     }
 
     /// Parse `src`, attributing every span to `source` (so coverage and
     /// diagnostics can map back to the right `.smol` file). [`Parser::parse`]
-    /// delegates here with [`crate::span::SourceId::ANON`].
-    pub fn parse_source(source: crate::span::SourceId, src: &str) -> Result<Chunk, ParseError> {
-        let tokens = Lexer::tokenize(source, src)?;
+    /// delegates here with [`SourceId::ANON`].
+    ///
+    /// Ensures: `Err(d)` ⇔ [`Parser::parse_with_diagnostics`] reports an error,
+    ///   and `d` is the first one in source order. Warnings are dropped.
+    pub fn parse_source(source: SourceId, src: &str) -> Result<Chunk, TaggedDiagnostic> {
+        match Self::parse_with_diagnostics(source, src) {
+            (Some(chunk), _) => Ok(chunk),
+            (None, diagnostics) => Err(diagnostics
+                .into_iter()
+                .find(|d| d.node.severity() == Severity::Error)
+                .expect("a failed parse reports at least one error")),
+        }
+    }
+
+    /// Parse `src`, answering the chunk together with every diagnostic.
+    ///
+    /// Ensures:
+    /// - `chunk.is_some()` ⇔ no diagnostic has `Severity::Error`;
+    /// - `diagnostics` is sorted by `span.start`;
+    /// - a lexical or syntax error ends parsing, so later problems are not reported.
+    pub fn parse_with_diagnostics(
+        source: SourceId,
+        src: &str,
+    ) -> (Option<Chunk>, Vec<TaggedDiagnostic>) {
+        let tokens = match Lexer::tokenize(source, src) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                let at = e.position() as u32;
+                let diagnostic =
+                    TaggedDiagnostic::new(Span::new(source, at, at), Diagnostic::Lex(e));
+                return (None, vec![diagnostic]);
+            }
+        };
         let mut p = Parser {
             tokens,
             pos: 0,
             comments: Vec::new(),
+            diagnostics: Vec::new(),
             in_method: false,
             in_block: false,
             block_scope_stack: Vec::new(),
         };
-        p.parse_chunk()
+        let result = p.parse_chunk();
+        let mut diagnostics = std::mem::take(&mut p.diagnostics);
+        let chunk = match result {
+            Ok(chunk) => Some(chunk),
+            Err(diagnostic) => {
+                let span = p.tokens[p.pos.min(p.tokens.len() - 1)].span;
+                diagnostics.push(TaggedDiagnostic::new(span, diagnostic));
+                None
+            }
+        };
+        diagnostics.sort_by_key(|d| d.span.start);
+        let has_error = diagnostics
+            .iter()
+            .any(|d| d.node.severity() == Severity::Error);
+        (chunk.filter(|_| !has_error), diagnostics)
+    }
+
+    /// Record a diagnostic that does not stop parsing.
+    fn report(&mut self, diagnostic: Diagnostic, span: Span) {
+        self.diagnostics
+            .push(TaggedDiagnostic::new(span, diagnostic));
+    }
+
+    /// Span of the next non-comment token.
+    fn peek_span(&mut self) -> Span {
+        self.skip_comments();
+        self.tokens[self.pos].span
     }
 
     // ── Token stream helpers ──────────────────────────────────────────────────
@@ -96,14 +210,14 @@ impl Parser {
         &mut self,
         expected: &'static str,
         pred: impl Fn(&Token) -> bool,
-    ) -> Result<Token, ParseError> {
+    ) -> Result<Token, Diagnostic> {
         let tok = self.peek().clone();
         if pred(&tok) {
             Ok(self.advance())
         } else if tok == Token::Eof {
-            Err(ParseError::UnexpectedEof(expected))
+            Err(Diagnostic::UnexpectedEof(expected))
         } else {
-            Err(ParseError::UnexpectedToken(tok, expected))
+            Err(Diagnostic::UnexpectedToken(tok, expected))
         }
     }
 
@@ -127,7 +241,7 @@ impl Parser {
 
     // ── Grammar ───────────────────────────────────────────────────────────────
 
-    fn parse_chunk(&mut self) -> Result<Chunk, ParseError> {
+    fn parse_chunk(&mut self) -> Result<Chunk, Diagnostic> {
         let mut stmts = Vec::new();
         while self.peek() != &Token::Eof {
             let start = self.pos;
@@ -146,7 +260,7 @@ impl Parser {
         })
     }
 
-    fn parse_local_decl(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_local_decl(&mut self) -> Result<Stmt, Diagnostic> {
         self.expect("'|'", |t| t == &Token::Pipe)?;
         let mut names = Vec::new();
         while let Token::Ident(name) = self.peek().clone() {
@@ -157,12 +271,16 @@ impl Parser {
         Ok(Stmt::LocalDecl(names))
     }
 
-    fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_stmt(&mut self) -> Result<Stmt, Diagnostic> {
         // `^` non-local return
         if self.peek() == &Token::Caret {
+            let caret = self.peek_span();
             self.advance();
-            if self.in_block && !self.in_method {
-                return Err(ParseError::NonLocalReturnOutsideMethod);
+            match (self.in_block, self.in_method) {
+                (true, false) => self.report(Diagnostic::NonLocalReturnOutsideMethod, caret),
+                (true, true) => self.report(Diagnostic::AnswerInBlock, caret),
+                (false, false) => self.report(Diagnostic::AnswerOutsideMethod, caret),
+                (false, true) => {}
             }
             let expr = self.parse_expr()?;
             return Ok(Stmt::Return(expr));
@@ -205,6 +323,7 @@ impl Parser {
                 matches!(self.tokens.get(i).map(|t| &t.node), Some(Token::Assign))
             };
             if is_assign {
+                let name_span = self.peek_span();
                 let name = match self.advance() {
                     Token::Ident(n) => n,
                     _ => unreachable!(),
@@ -214,7 +333,7 @@ impl Parser {
                     .last()
                     .is_some_and(|scope| !scope.contains(&name))
                 {
-                    return Err(ParseError::NonLocalBlockAssignment(name));
+                    self.report(Diagnostic::NonLocalBlockAssignment(name.clone()), name_span);
                 }
                 self.skip_comments();
                 self.advance(); // consume `:=`
@@ -229,7 +348,7 @@ impl Parser {
         Ok(Stmt::Expr(self.parse_expr()?))
     }
 
-    fn parse_method_def(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_method_def(&mut self) -> Result<Stmt, Diagnostic> {
         // Consume the class name ident
         let class_name = match self.advance() {
             Token::Ident(n) => n,
@@ -283,7 +402,7 @@ impl Parser {
                 MethodPattern::Keyword { parts }
             }
             tok => {
-                return Err(ParseError::UnexpectedToken(tok, "method pattern"));
+                return Err(Diagnostic::UnexpectedToken(tok, "method pattern"));
             }
         };
 
@@ -310,8 +429,12 @@ impl Parser {
         let prev_scope_stack = std::mem::take(&mut self.block_scope_stack);
         self.in_method = true;
         self.in_block = false;
-        let mut body = Vec::new();
+        let mut body: Vec<TaggedStmt> = Vec::new();
         while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
+            if let Some(prev) = body.last().filter(|s| matches!(s.node, Stmt::Return(_))) {
+                let span = prev.span;
+                self.report(Diagnostic::AnswerNotLast, span);
+            }
             let start = self.pos;
             let node = self.parse_stmt()?;
             body.push(self.tag_from(start, node));
@@ -338,11 +461,11 @@ impl Parser {
     // its own level. When none are present the result from the next level is
     // returned unchanged — the "fallthrough."
 
-    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
         self.parse_keyword_level()
     }
 
-    fn parse_keyword_level(&mut self) -> Result<Expr, ParseError> {
+    fn parse_keyword_level(&mut self) -> Result<Expr, Diagnostic> {
         let mut receiver = self.parse_binary_level()?;
         // Collect keyword parts greedily.
         if matches!(self.peek(), Token::Keyword(_)) {
@@ -364,13 +487,13 @@ impl Parser {
         Ok(receiver)
     }
 
-    fn parse_cascade(&mut self, first_receiver: Expr) -> Result<Expr, ParseError> {
+    fn parse_cascade(&mut self, first_receiver: Expr) -> Result<Expr, Diagnostic> {
         // The first message has already been folded into `first_receiver` as a
         // `Send`. Unwrap it so we have the bare receiver + first message.
         let (receiver, first_msg) = match first_receiver {
             Expr::Send { receiver, message } => (*receiver, message),
             _ => {
-                return Err(ParseError::UnexpectedToken(
+                return Err(Diagnostic::UnexpectedToken(
                     Token::Semi,
                     "message send before ';'",
                 ));
@@ -386,7 +509,7 @@ impl Parser {
         })
     }
 
-    fn parse_cascade_message(&mut self) -> Result<Message, ParseError> {
+    fn parse_cascade_message(&mut self) -> Result<Message, Diagnostic> {
         // After `;` we expect one of: unary, binary, or keyword message.
         match self.peek().clone() {
             Token::Ident(_) => {
@@ -419,11 +542,11 @@ impl Parser {
                 }
                 Ok(Message::Keyword { parts })
             }
-            tok => Err(ParseError::UnexpectedToken(tok, "cascade message")),
+            tok => Err(Diagnostic::UnexpectedToken(tok, "cascade message")),
         }
     }
 
-    fn parse_binary_level(&mut self) -> Result<Expr, ParseError> {
+    fn parse_binary_level(&mut self) -> Result<Expr, Diagnostic> {
         let mut left = self.parse_unary_level()?;
         loop {
             // `Token::Pipe` is also valid as the binary `|` operator in expression
@@ -452,7 +575,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_unary_level(&mut self) -> Result<Expr, ParseError> {
+    fn parse_unary_level(&mut self) -> Result<Expr, Diagnostic> {
         let mut expr = self.parse_primary()?;
         // Unary messages: consecutive identifiers that are NOT followed by `:=`.
         while let Token::Ident(_) = self.peek() {
@@ -480,7 +603,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+    fn parse_primary(&mut self) -> Result<Expr, Diagnostic> {
         let tok = self.peek().clone();
         match tok {
             Token::Int(n) => {
@@ -532,7 +655,7 @@ impl Parser {
                                 path.push(next);
                             }
                             tok => {
-                                return Err(ParseError::UnexpectedToken(
+                                return Err(Diagnostic::UnexpectedToken(
                                     tok,
                                     "identifier after ::",
                                 ));
@@ -562,8 +685,8 @@ impl Parser {
                 Ok(Expr::ArrayLiteral(self.parse_array_literal_elements()?))
             }
             Token::LBrace => self.parse_dynamic_array(),
-            Token::Eof => Err(ParseError::UnexpectedEof("expression")),
-            tok => Err(ParseError::UnexpectedToken(tok, "expression")),
+            Token::Eof => Err(Diagnostic::UnexpectedEof("expression")),
+            tok => Err(Diagnostic::UnexpectedToken(tok, "expression")),
         }
     }
 
@@ -572,7 +695,7 @@ impl Parser {
     /// Requires: the opening `{` has already been consumed.
     /// Ensures: each element expression is fully parsed; a trailing `.` before `}` is allowed;
     ///   returns `Expr::DynamicArray` with zero or more element expressions.
-    fn parse_dynamic_array(&mut self) -> Result<Expr, ParseError> {
+    fn parse_dynamic_array(&mut self) -> Result<Expr, Diagnostic> {
         self.advance(); // consume `{`
         let mut elements = Vec::new();
         while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
@@ -591,7 +714,7 @@ impl Parser {
     ///
     /// Requires: the opening `#(` has already been consumed.
     /// Ensures: returns all `Literal` elements found before `)`.
-    fn parse_array_literal_elements(&mut self) -> Result<Vec<Literal>, ParseError> {
+    fn parse_array_literal_elements(&mut self) -> Result<Vec<Literal>, Diagnostic> {
         let mut elements = Vec::new();
         while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
             elements.push(self.parse_literal_element()?);
@@ -600,7 +723,7 @@ impl Parser {
         Ok(elements)
     }
 
-    fn parse_literal_element(&mut self) -> Result<Literal, ParseError> {
+    fn parse_literal_element(&mut self) -> Result<Literal, Diagnostic> {
         let tok = self.peek().clone();
         match tok {
             Token::Int(n) => {
@@ -639,14 +762,14 @@ impl Parser {
                 self.advance();
                 Ok(Literal::Array(self.parse_array_literal_elements()?))
             }
-            tok => Err(ParseError::UnexpectedToken(
+            tok => Err(Diagnostic::UnexpectedToken(
                 tok,
                 "literal element in array literal",
             )),
         }
     }
 
-    fn parse_block(&mut self) -> Result<Expr, ParseError> {
+    fn parse_block(&mut self) -> Result<Expr, Diagnostic> {
         self.expect("'['", |t| t == &Token::LBracket)?;
         let mut params = Vec::new();
         // Block parameters: `[:x :y | body]`. The lexer emits `BlockParam` for

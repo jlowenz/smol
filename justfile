@@ -49,6 +49,12 @@ bench:
 bench-group group:
     cargo bench -p triple-store -- {{group}}
 
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+
+# List the parser's warnings for kernel.smol (Q24 migration progress).
+kernel-warnings:
+    cargo run -q --example kernel_warnings -p interpreter
+
 # ── Coverage ──────────────────────────────────────────────────────────────────
 
 # Paths to LLVM tools in the rustup-managed toolchain. Uses `rustup run` so

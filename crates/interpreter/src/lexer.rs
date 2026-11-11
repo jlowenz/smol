@@ -67,6 +67,18 @@ pub enum LexError {
     InvalidNumber(usize),
 }
 
+impl LexError {
+    /// Byte offset in the source at which the error was detected.
+    pub fn position(&self) -> usize {
+        match self {
+            LexError::UnexpectedChar(_, at)
+            | LexError::UnterminatedString(at)
+            | LexError::UnterminatedComment(at)
+            | LexError::InvalidNumber(at) => *at,
+        }
+    }
+}
+
 pub struct Lexer<'src> {
     src: &'src str,
     chars: std::iter::Peekable<std::str::CharIndices<'src>>,

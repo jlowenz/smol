@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 
 use crate::ast::{Chunk, Expr, Message, Stmt, TaggedStmt};
-use crate::span::Span;
+use crate::span::{LineIndex, Span};
 
 /// Accumulates the spans of statements executed during a run.
 #[derive(Debug, Default)]
@@ -161,14 +161,14 @@ pub fn report_source(
     all_spans: &[Span],
     touched: &HashSet<Span>,
 ) -> CoverageReport {
-    let starts = line_starts(text);
+    let lines = LineIndex::new(text);
     let mut covered = 0usize;
     let mut uncovered: BTreeSet<u32> = BTreeSet::new();
     for sp in all_spans {
         if touched.contains(sp) {
             covered += 1;
         } else {
-            uncovered.insert(line_of(&starts, sp.start));
+            uncovered.insert(lines.line_of(sp.start));
         }
     }
     CoverageReport {
@@ -177,22 +177,6 @@ pub fn report_source(
         covered,
         uncovered_lines: uncovered.into_iter().collect(),
     }
-}
-
-/// Byte offsets at which each line starts; `line_starts(text)[0] == 0`.
-fn line_starts(text: &str) -> Vec<u32> {
-    let mut starts = vec![0u32];
-    for (i, b) in text.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push((i + 1) as u32);
-        }
-    }
-    starts
-}
-
-/// 1-based line number containing byte `offset`.
-fn line_of(starts: &[u32], offset: u32) -> u32 {
-    starts.partition_point(|&s| s <= offset) as u32
 }
 
 // ── Whole-suite sink: a process-global collector gated by $SMOL_COVERAGE ──────

@@ -294,14 +294,14 @@ fn method_def_with_return() {
 
 #[test]
 fn caret_in_toplevel_block_is_parse_error() {
-    let err = Parser::parse("[^42] value").unwrap_err();
-    assert_eq!(err, ParseError::NonLocalReturnOutsideMethod);
+    let err = Parser::parse("[^42] value").unwrap_err().node;
+    assert_eq!(err, Diagnostic::NonLocalReturnOutsideMethod);
 }
 
 #[test]
 fn caret_in_nested_toplevel_block_is_parse_error() {
-    let err = Parser::parse("[[^42]] value value").unwrap_err();
-    assert_eq!(err, ParseError::NonLocalReturnOutsideMethod);
+    let err = Parser::parse("[[^42]] value value").unwrap_err().node;
+    assert_eq!(err, Diagnostic::NonLocalReturnOutsideMethod);
 }
 
 #[test]
@@ -371,10 +371,10 @@ fn namespace_ref_deep_path() {
 
 #[test]
 fn unexpected_token_after_colons_is_error() {
-    let err = Parser::parse("A:: 123").unwrap_err();
+    let err = Parser::parse("A:: 123").unwrap_err().node;
     assert!(matches!(
         err,
-        ParseError::UnexpectedToken(_, "identifier after ::")
+        Diagnostic::UnexpectedToken(_, "identifier after ::")
     ));
 }
 
@@ -414,10 +414,10 @@ fn array_literal_nested() {
 #[test]
 fn array_literal_invalid_element_is_error() {
     // `[` is not a valid literal element inside an array literal.
-    let err = Parser::parse("#([])").unwrap_err();
+    let err = Parser::parse("#([])").unwrap_err().node;
     assert!(matches!(
         err,
-        ParseError::UnexpectedToken(_, "literal element in array literal")
+        Diagnostic::UnexpectedToken(_, "literal element in array literal")
     ));
 }
 
@@ -425,15 +425,15 @@ fn array_literal_invalid_element_is_error() {
 
 #[test]
 fn unexpected_eof_as_primary_is_error() {
-    let err = Parser::parse("(").unwrap_err();
-    assert!(matches!(err, ParseError::UnexpectedEof(_)));
+    let err = Parser::parse("(").unwrap_err().node;
+    assert!(matches!(err, Diagnostic::UnexpectedEof(_)));
 }
 
 #[test]
 fn unexpected_token_as_primary_is_error() {
     // `]` is not a valid start of a primary expression.
-    let err = Parser::parse("]").unwrap_err();
-    assert!(matches!(err, ParseError::UnexpectedToken(_, "expression")));
+    let err = Parser::parse("]").unwrap_err().node;
+    assert!(matches!(err, Diagnostic::UnexpectedToken(_, "expression")));
 }
 
 #[test]
@@ -447,15 +447,15 @@ fn method_def_with_comment_between_class_and_arrow() {
 #[test]
 fn unclosed_array_literal_gives_unexpected_eof() {
     // `expect("')' to close array literal")` receives EOF.
-    let err = Parser::parse("#(1 2").unwrap_err();
-    assert!(matches!(err, ParseError::UnexpectedEof(_)));
+    let err = Parser::parse("#(1 2").unwrap_err().node;
+    assert!(matches!(err, Diagnostic::UnexpectedEof(_)));
 }
 
 #[test]
 fn unclosed_paren_with_extra_token_gives_unexpected_token() {
     // `expect("')'")` receives `3` instead.
-    let err = Parser::parse("(1 + 2 3)").unwrap_err();
-    assert!(matches!(err, ParseError::UnexpectedToken(_, _)));
+    let err = Parser::parse("(1 + 2 3)").unwrap_err().node;
+    assert!(matches!(err, Diagnostic::UnexpectedToken(_, _)));
 }
 
 // ── Assignment comment lookahead (lines 143-145) ──────────────────────────
@@ -471,10 +471,10 @@ fn assignment_with_comment_between_ident_and_assign() {
 
 #[test]
 fn method_def_invalid_pattern_errors() {
-    let err = Parser::parse("Foo >> 123 [ ]").unwrap_err();
+    let err = Parser::parse("Foo >> 123 [ ]").unwrap_err().node;
     assert!(matches!(
         err,
-        ParseError::UnexpectedToken(_, "method pattern")
+        Diagnostic::UnexpectedToken(_, "method pattern")
     ));
 }
 
@@ -495,18 +495,18 @@ fn cascade_keyword_message() {
 #[test]
 fn cascade_invalid_message_after_semi_errors() {
     // `123` after `;` is not a valid cascade message.
-    let err = Parser::parse("3 asString; 123").unwrap_err();
+    let err = Parser::parse("3 asString; 123").unwrap_err().node;
     assert!(matches!(
         err,
-        ParseError::UnexpectedToken(_, "cascade message")
+        Diagnostic::UnexpectedToken(_, "cascade message")
     ));
 }
 
 #[test]
 fn cascade_non_send_before_semi_errors() {
     // Bare literal before `;` is not a message send.
-    let err = Parser::parse("3; + 1").unwrap_err();
-    assert!(matches!(err, ParseError::UnexpectedToken(Token::Semi, _)));
+    let err = Parser::parse("3; + 1").unwrap_err().node;
+    assert!(matches!(err, Diagnostic::UnexpectedToken(Token::Semi, _)));
 }
 
 // ── Unary level: comment in assign lookahead (lines 339-340, 344) ─────────
@@ -563,7 +563,7 @@ fn block_assignment_to_method_temp_is_error() {
     // Assigning to a method temp from inside a block is rejected.
     let err = Parser::parse("Object >> m [ | n | [n := 1] value ]");
     assert!(
-        matches!(err, Err(ParseError::NonLocalBlockAssignment(ref name)) if name.as_ref() == "n"),
+        matches!(err, Err(TaggedDiagnostic { node: Diagnostic::NonLocalBlockAssignment(ref name), .. }) if name.as_ref() == "n"),
         "expected NonLocalBlockAssignment(\"n\"), got {err:?}"
     );
 }
@@ -573,7 +573,7 @@ fn block_assignment_to_outer_block_temp_is_error() {
     // Assigning to an outer block's local from an inner block is rejected.
     let err = Parser::parse("Object >> m [ [| n | [n := 1] value] value ]");
     assert!(
-        matches!(err, Err(ParseError::NonLocalBlockAssignment(ref name)) if name.as_ref() == "n"),
+        matches!(err, Err(TaggedDiagnostic { node: Diagnostic::NonLocalBlockAssignment(ref name), .. }) if name.as_ref() == "n"),
         "expected NonLocalBlockAssignment(\"n\"), got {err:?}"
     );
 }
@@ -591,4 +591,123 @@ fn method_body_inside_namespace_do_may_assign_ivars() {
         "MyNS do: [ Value subclass: #Foo instanceVariableNames: 'val'. Foo >> set: v [ val := v ] ]"
     )
     .is_ok());
+}
+
+// ── Diagnostics (Q24 step 0) ─────────────────────────────────────────────────
+
+fn diagnostics_of(src: &str) -> (Option<Chunk>, Vec<TaggedDiagnostic>) {
+    Parser::parse_with_diagnostics(SourceId::ANON, src)
+}
+
+fn kinds(diagnostics: &[TaggedDiagnostic]) -> Vec<Diagnostic> {
+    diagnostics.iter().map(|d| d.node.clone()).collect()
+}
+
+#[test]
+fn answer_in_block_inside_method_is_a_warning() {
+    let src = "Object >> m [ #(1) do: [:x | ^x] ]";
+    let (chunk, diagnostics) = diagnostics_of(src);
+    assert!(chunk.is_some());
+    assert_eq!(kinds(&diagnostics), vec![Diagnostic::AnswerInBlock]);
+    assert_eq!(diagnostics[0].node.severity(), Severity::Warning);
+    assert_eq!(diagnostics[0].span.start as usize, src.find('^').unwrap());
+}
+
+#[test]
+fn answer_not_last_is_reported_once_at_the_answer() {
+    let src = "Object >> m [ ^1. 2. 3 ]";
+    let (chunk, diagnostics) = diagnostics_of(src);
+    assert!(chunk.is_some());
+    assert_eq!(kinds(&diagnostics), vec![Diagnostic::AnswerNotLast]);
+    assert_eq!(diagnostics[0].span.start as usize, src.find('^').unwrap());
+}
+
+#[test]
+fn answer_as_last_method_statement_is_clean() {
+    let (chunk, diagnostics) = diagnostics_of("Object >> m [ 1. ^2 ]");
+    assert!(chunk.is_some());
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn answer_outside_method_is_a_warning() {
+    let (chunk, diagnostics) = diagnostics_of("1. ^2");
+    assert!(chunk.is_some());
+    assert_eq!(kinds(&diagnostics), vec![Diagnostic::AnswerOutsideMethod]);
+}
+
+#[test]
+fn answer_in_block_outside_method_stays_an_error() {
+    let (chunk, diagnostics) = diagnostics_of("[^42] value");
+    assert!(chunk.is_none());
+    assert_eq!(
+        kinds(&diagnostics),
+        vec![Diagnostic::NonLocalReturnOutsideMethod]
+    );
+}
+
+#[test]
+fn parse_source_drops_warnings() {
+    assert!(Parser::parse("Object >> m [ #(1) do: [:x | ^x] ]").is_ok());
+}
+
+#[test]
+fn continuable_errors_are_all_reported_in_source_order() {
+    // Both block assignments are reported; parsing went on after the first.
+    let src = "Object >> m [ | a b | [a := 1] value. [b := 2] value ]";
+    let (chunk, diagnostics) = diagnostics_of(src);
+    assert!(chunk.is_none());
+    assert_eq!(
+        kinds(&diagnostics),
+        vec![
+            Diagnostic::NonLocalBlockAssignment(Arc::from("a")),
+            Diagnostic::NonLocalBlockAssignment(Arc::from("b")),
+        ]
+    );
+    assert_eq!(
+        diagnostics[0].span.start as usize,
+        src.find("a :=").unwrap()
+    );
+}
+
+#[test]
+fn diagnostics_are_sorted_when_found_out_of_order() {
+    // The nested `^` is found while parsing the outer `^` statement; the outer
+    // statement's AnswerNotLast is found later but starts earlier.
+    let src = "Object >> m [ ^[^1] value. 2 ]";
+    let (_, diagnostics) = diagnostics_of(src);
+    assert_eq!(
+        kinds(&diagnostics),
+        vec![Diagnostic::AnswerNotLast, Diagnostic::AnswerInBlock]
+    );
+}
+
+#[test]
+fn syntax_error_after_a_warning_fails_the_parse_with_both_reported() {
+    let (chunk, diagnostics) = diagnostics_of("Object >> m [ #(1) do: [:x | ^x] ] (");
+    assert!(chunk.is_none());
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics[0].node, Diagnostic::AnswerInBlock);
+    assert!(matches!(diagnostics[1].node, Diagnostic::UnexpectedEof(_)));
+    let err = Parser::parse("Object >> m [ #(1) do: [:x | ^x] ] (").unwrap_err();
+    assert!(matches!(err.node, Diagnostic::UnexpectedEof(_)));
+}
+
+#[test]
+fn lex_error_is_located_at_its_position() {
+    let (chunk, diagnostics) = diagnostics_of("1 + 'abc");
+    assert!(chunk.is_none());
+    assert!(matches!(diagnostics[0].node, Diagnostic::Lex(_)));
+    assert_eq!(diagnostics[0].span.start, 4);
+}
+
+#[test]
+fn render_is_one_line_with_char_column() {
+    // `é` is two bytes; the column counts it as one char.
+    let src = "\"é\" 1.\nObject >> m [ ^1. 2 ]";
+    let (_, diagnostics) = diagnostics_of(src);
+    assert_eq!(
+        diagnostics[0].render("t.smol", src),
+        "t.smol:2:15: warning: `^` marks the method's answer and must be the method's last statement"
+    );
 }

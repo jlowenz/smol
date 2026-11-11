@@ -84,3 +84,39 @@ impl<T: PartialEq> PartialEq for SourceTagged<T> {
 }
 
 impl<T: Eq> Eq for SourceTagged<T> {}
+
+/// Maps byte offsets in one source text to 1-based line and column positions.
+pub struct LineIndex<'src> {
+    text: &'src str,
+    /// Byte offset at which each line starts; `line_starts[0] == 0`.
+    line_starts: Vec<u32>,
+}
+
+impl<'src> LineIndex<'src> {
+    pub fn new(text: &'src str) -> Self {
+        let mut line_starts = vec![0u32];
+        for (i, b) in text.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push((i + 1) as u32);
+            }
+        }
+        Self { text, line_starts }
+    }
+
+    /// 1-based line number containing byte `offset`.
+    ///
+    /// Requires: `offset as usize <= text.len()`.
+    pub fn line_of(&self, offset: u32) -> u32 {
+        self.line_starts.partition_point(|&s| s <= offset) as u32
+    }
+
+    /// 1-based `(line, column)` of byte `offset`; the column counts chars, not bytes.
+    ///
+    /// Requires: `offset as usize <= text.len()` and `offset` is on a char boundary.
+    pub fn line_col(&self, offset: u32) -> (u32, u32) {
+        let line = self.line_of(offset);
+        let line_start = self.line_starts[(line - 1) as usize] as usize;
+        let col = self.text[line_start..offset as usize].chars().count() as u32 + 1;
+        (line, col)
+    }
+}
