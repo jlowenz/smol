@@ -1,0 +1,65 @@
+"Q24 protocol v0 probe (2026-11-10): Reducible, reduceWith:initial:, Reduced. Design in docs/open_questions.md Q24."
+"Run: target/release/smol < docs/experiments/q24_protocols_v0.smol"
+"No ^ inside any block. Comments stay on one line because the REPL reads line by line."
+"Workspace code cannot make a kernel class use a trait (no standalone uses:, Q13), and a method added to a kernel class resolves names in Kernel (Q18). So Reducible is tested on stand-ins: Arr (an indexed entity, like Array) and Lst (a value list whose empty list is nil, like Cons)."
+
+"Reduced: a block answers Reduced with: x to stop reduceWith:. The fold recognizes it by an exact class test."
+Value subclass: #Reduced instanceVariableNames: 'value' classVariableNames: '' indexedSlots: #none.
+Reduced class >> with: x [ ^self _primNewValue: [:r | r pvtValue: x] ]
+Reduced >> pvtValue: x [ value := x ]
+Reduced >> value [ ^value ]
+
+"Private markers for the trait. Exact class tests on them avoid both nil sentinels and Value ==."
+Value subclass: #Unseeded instanceVariableNames: '' classVariableNames: '' indexedSlots: #none.
+Unseeded class >> make [ ^self _primNewValue: [:u | nil] ]
+Value subclass: #NotFound instanceVariableNames: '' classVariableNames: '' indexedSlots: #none.
+NotFound class >> make [ ^self _primNewValue: [:n | nil] ]
+
+"Reducible requires reduceWith:initial:, which answers the final accumulator, or the value of the first Reduced a step answers."
+Trait named: #Reducible.
+Reducible >> do: aBlock [ self reduceWith: [:acc :x | aBlock value: x. acc] initial: nil ]
+Reducible >> reduceWith: aBlock [ | r | r := self reduceWith: [:acc :x | acc class = Unseeded ifTrue: [x] ifFalse: [aBlock value: acc value: x]] initial: Unseeded make. ^r class = Unseeded ifTrue: [self error: 'reduceWith: empty collection'] ifFalse: [r] ]
+Reducible >> findIf: pred otherwise: alt [ | r | r := self reduceWith: [:acc :x | (pred value: x) ifTrue: [Reduced with: x] ifFalse: [acc]] initial: NotFound make. ^r class = NotFound ifTrue: [alt value] ifFalse: [r] ]
+Reducible >> findIf: pred [ ^self findIf: pred otherwise: [self error: 'findIf: no element satisfies the predicate'] ]
+Reducible >> anySatisfy: pred [ ^self reduceWith: [:acc :x | (pred value: x) ifTrue: [Reduced with: true] ifFalse: [false]] initial: false ]
+Reducible >> allSatisfy: pred [ ^self reduceWith: [:acc :x | (pred value: x) ifTrue: [true] ifFalse: [Reduced with: false]] initial: true ]
+Reducible >> noneSatisfy: pred [ ^(self anySatisfy: pred) not ]
+Reducible >> contains: v [ ^self anySatisfy: [:e | e = v] ]
+Reducible >> countIf: pred [ ^self reduceWith: [:n :x | (pred value: x) ifTrue: [n + 1] ifFalse: [n]] initial: 0 ]
+
+"Arr: an indexed entity. Its fold is a tail-recursive index walk."
+Object subclass: #Arr uses: Reducible instanceVariableNames: '' classVariableNames: '' indexedSlots: #pointer.
+Arr >> at: i put: v [ self _primAt: i put: v. ^v ]
+Arr class >> from: anArray [ | r | r := self new: anArray size. 0 until: anArray size do: [:i | r at: i put: (anArray at: i)]. ^r ]
+Arr >> reduceWith: aBlock initial: init [ ^self pvtReduceFrom: 0 acc: init with: aBlock ]
+Arr >> pvtReduceFrom: i acc: acc with: aBlock [ ^i >= self _primSize ifTrue: [acc] ifFalse: [self pvtReduceStep: (aBlock value: acc value: (self _primAt: i)) from: i + 1 with: aBlock] ]
+Arr >> pvtReduceStep: answer from: i with: aBlock [ ^answer class = Reduced ifTrue: [answer value] ifFalse: [self pvtReduceFrom: i acc: answer with: aBlock] ]
+
+"Lst: a value list; the empty list is nil."
+Value subclass: #Lst uses: Reducible instanceVariableNames: 'head tail' classVariableNames: '' indexedSlots: #none.
+Lst class >> with: h rest: t [ ^self _primNewValue: [:l | l pvtHead: h tail: t] ]
+Lst >> pvtHead: h tail: t [ head := h. tail := t ]
+Lst >> reduceWith: aBlock initial: init [ ^self pvtStep: (aBlock value: init value: head) with: aBlock ]
+Lst >> pvtStep: answer with: aBlock [ ^answer class = Reduced ifTrue: [answer value] ifFalse: [tail reduceWith: aBlock initial: answer] ]
+
+"Nil as the empty list: direct methods until Nil can take a trait. None of them needs to name Reduced."
+Nil >> reduceWith: aBlock initial: init [ ^init ]
+Nil >> reduceWith: aBlock [ ^self error: 'reduceWith: empty collection' ]
+Nil >> findIf: pred otherwise: alt [ ^alt value ]
+Nil >> findIf: pred [ ^self error: 'findIf: no element satisfies the predicate' ]
+Nil >> anySatisfy: pred [ ^false ]
+Nil >> allSatisfy: pred [ ^true ]
+Nil >> noneSatisfy: pred [ ^true ]
+Nil >> contains: v [ ^false ]
+Nil >> countIf: pred [ ^0 ]
+
+"do: on an entity answers before the adds it causes have landed unless the caller awaits it; kernel Array behaves the same (checked 2026-11-10)."
+"Judge: an entity whose answer reaches the fold as a Future. Used to check that reduceWith: forces before its Reduced test."
+Object subclass: #Judge instanceVariableNames: ''.
+Judge >> sum: acc with: x [ ^acc > 10 ifTrue: [Reduced with: acc] ifFalse: [acc + x] ]
+
+Object subclass: #Probe instanceVariableNames: 'out'.
+Probe >> check: label got: got want: want [ ^(got = want ifTrue: ['PASS  '] ifFalse: ['FAIL  ']) , label , ' got ' , got asString , ' want ' , want asString ]
+Probe >> report: line [ line printNl ]
+Probe >> run [ | a l j seen | a := Arr from: {3. 1. 4. 1. 5. 9. 2. 6}. l := Lst with: 3 rest: (Lst with: nil rest: (Lst with: 4 rest: nil)). j := Judge new. seen := OrderedCollection new. self report: (self check: 'Arr findIf:otherwise: found' got: (a findIf: [:x | x > 4] otherwise: [#none]) want: 5). self report: (self check: 'Arr findIf:otherwise: none' got: (a findIf: [:x | x > 40] otherwise: [#none]) want: #none). self report: (self check: 'Lst findIf: finds nil' got: (l findIf: [:x | x isNil] otherwise: [#none]) want: nil). self report: (self check: 'Arr contains: 9' got: (a contains: 9) want: true). self report: (self check: 'Arr contains: 7' got: (a contains: 7) want: false). self report: (self check: 'Arr allSatisfy: >0' got: (a allSatisfy: [:x | x > 0]) want: true). self report: (self check: 'Arr allSatisfy: <9' got: (a allSatisfy: [:x | x < 9]) want: false). self report: (self check: 'Arr noneSatisfy: >9' got: (a noneSatisfy: [:x | x > 9]) want: true). self report: (self check: 'Arr countIf: odd' got: (a countIf: [:x | x odd]) want: 5). self report: (self check: 'Arr reduceWith: sum' got: (a reduceWith: [:s :x | s + x]) want: 31). self report: (self check: 'Arr reduceWith:initial: stops' got: (a reduceWith: [:s :x | s > 10 ifTrue: [Reduced with: s] ifFalse: [s + x]] initial: 0) want: 14). self report: (self check: 'Arr stop via Future (forcing)' got: (a reduceWith: [:s :x | j sum: s with: x] initial: 0) want: 14). self report: (self check: 'nil contains: 3' got: (nil contains: 3) want: false). self report: (self check: 'nil countIf:' got: (nil countIf: [:x | true]) want: 0). self report: (self check: 'nil findIf:otherwise:' got: (nil findIf: [:x | true] otherwise: [#none]) want: #none). (a do: [:x | seen add: x]) await. self report: (self check: 'Arr do: visits all' got: seen size await want: 8). self report: (self check: 'Arr do: answers self' got: ((a do: [:x | nil]) == a) want: true). ^#done ]
+(Probe new run) await.

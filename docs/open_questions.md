@@ -624,6 +624,20 @@ Sub-questions:
 
 Not urgent: every trait is in Kernel today.
 
+**Also class extensions (found 2026-11-10, Q24 protocol probe).** A method that a
+workspace adds to a kernel class resolves free names in Kernel, because its defining
+class is in Kernel. It cannot see the workspace's own classes:
+
+```smalltalk
+Value subclass: #Zed instanceVariableNames: '' classVariableNames: '' indexedSlots: #none.
+Object >> zed [ ^Zed ]
+3 zed.        "error: undefined variable: Zed"
+```
+
+The same method on a workspace class resolves `Zed`. So any library that extends
+kernel classes and names its own classes breaks. The fix is probably the trait one: a
+method carries the namespace it was written in.
+
 ---
 
 ## Q19: What owns workspaces (and their anonymous namespaces)?
@@ -1370,5 +1384,82 @@ cases.
 Continue/Break), `cond:`, the missing query methods, records or tuples, and whether
 a guard statement at method level is wanted. That last one is likely moot: under
 this decision a method-level `^` cannot be conditional.
+
+**Protocol design (2026-11-10).**
+
+- **Stopping folds.** There will be a specific set of fold methods that honor
+  stopping, possibly alongside variants that do not. A method states in its contract
+  whether it honors stopping. `do:` and other loops need not.
+- **Stop is recognized by a class test inside the fold.** Nothing is added to
+  `Object` or to a trait that every object would carry. User code never writes the
+  test. The `done`-argument alternative was rejected. A stop must be the block's
+  last expression, because it is a value, not a jump.
+- **Names and forcing (2026-11-10).**
+  - `reduceWith:` and `reduceWith:initial:` are the stopping folds and the default.
+    `reduceAllWith:` and `reduceAllWith:initial:` never stop. They replace
+    `inject:into:`, which does not say what it does and leaves no room for variants.
+  - Without `initial:`, the first element is the seed. The empty case waits for an
+    Option sum type.
+  - Left fold in iteration order. A right fold can be added later for Cons lists.
+  - `reduceWith:` *forces* each step's answer before testing it for Stop, so a Stop
+    is honored even when it arrives in a Future. A non-forcing check would honor a
+    Stop only when the producing send ran inline, which breaks P4 and the
+    transparency of Futures.
+  - Cost (P8): with asynchronous steps, `reduceWith:` runs one step at a time.
+    `reduceAllWith:` never inspects the answer, so it can pass an unresolved Future
+    along and keep issuing steps. It is the variant for asynchronous pipelines.
+  - P3: behavior like "this send forces" or "this fold waits per step" needs a clear
+    marking in documentation, the environment, or syntax markup. The mechanism is
+    open.
+- **`Reduced` (2026-11-10).**
+  - A block stops `reduceWith:` by answering `Reduced with: x`, a Value. The accessor
+    is `value`. The name follows Clojure's `reduced`.
+  - The fold recognizes it with an exact class test (`answer class = Reduced`), not
+    `isKindOf:`. Smol has no final classes, so this makes `Reduced` final in effect:
+    a subclass cannot change what folds do.
+  - The test forces a Future: on a Future answered by another entity, `f class`
+    answers `Reduced`, checked 2026-11-10.
+  - `Reduced >> value` overrides `Value >> value [^self]`, so a `Reduced` used where
+    a block-or-value is expected yields its contents. If that conflicts with uses of
+    `Value >> value`, rename the accessor (for example `unwrap`).
+- **Trait `Reducible` (2026-11-10).** It requires `reduceWith:initial:` and provides
+  the seedless `reduceWith:` plus every query below. All the queries build on the
+  stopping fold: their blocks compute their own answers, so the forcing check costs
+  nothing. `reduceAllWith:` / `reduceAllWith:initial:` would form a separate trait.
+  It provides little beyond itself, but a trait also documents a capability. The
+  name is tentatively `AsyncReducible`, and it is deferred past v0 with the
+  composition and pipeline topic.
+- **Classes that use `Reducible` in v0:** Array, ByteArray, OrderedCollection,
+  Dictionary (over values), Cons and String. Nil is the empty list and is bootstrapped in
+  Rust, so it cannot take a trait until a standalone `uses:` exists (Q13). Until
+  then Nil gets `reduceWith:initial:` and the queries as direct methods. Alternative:
+  have the bootstrap apply the trait to Nil.
+- **`Reducible` also provides `do:`**, derived from the fold:
+  `do: aBlock [ self reduceWith: [:acc :x | aBlock value: x. acc] initial: nil ]`.
+  It forces nothing per element: the block answers the accumulator it was given, and
+  `aBlock`'s result is discarded. It answers `self`. Classes with their own `do:` keep
+  it, because class-defined methods take precedence over trait methods
+  (`traits_plan.md`).
+- **Query methods.** Names (2026-11-10):
+
+  | Selector | Answers | Stops early | Replaces (Pharo) |
+  |---|---|---|---|
+  | `findIf: pred otherwise: alt` | first element satisfying `pred`, else `alt value` | yes | `detect:ifNone:` |
+  | `findIf: pred` | same; none is an error | yes | `detect:` |
+  | `contains: x` | Boolean: some element `= x` | yes | `includes:` |
+  | `anySatisfy:` / `allSatisfy:` / `noneSatisfy:` | Boolean | yes | same names |
+  | `countIf: pred` | Integer | no (`reduceAllWith:`) | `count:` |
+
+  The Pharo names may also be offered. Equivalents in other languages: C++
+  `find_if`/`any_of`/`count_if`, Python `next`/`any`/`all`, Clojure
+  `some`/`every?`/`not-any?`, CL `find-if`/`count-if`, Haskell
+  `find`/`elem`/`any`/`all`.
+- **Deferred:** a named loop (`recur:`/`again`) and `iterate:until:`-style loops.
+  Recursive methods and `whileTrue` cover the need for now. If they are added, they
+  should not live on `Object`.
+- **Direction:** `{ … }` should build an immutable array (a value) by default, with
+  mutability opt-in. Tuples, records, sum types (Q20) and a cheap multi-way
+  conditional are wanted soon after v0. The multi-way conditional would be a trait
+  over pair collections, not `Object >> cond:`.
 
 **Related**: I5, Q21, Q23, R10, D13, P8, P9.
