@@ -17,6 +17,31 @@ discussion; entries here only cite sources.
 
 ---
 
+## Methods and messages
+
+### Answer
+
+- **Definition**: the value a method gives as its reply to the message that invoked
+  it. A method states its answer with `^expr` as its last statement; a method
+  without `^` answers `self`. The sender receives the answer as the value of its
+  send, as a Future when the receiver is another entity.
+- *Status*: working (DRAFT for the user to edit). Decided parts:
+  - `^` may appear only as a method's last statement and never in a block (Q24,
+    2026-11-10);
+  - a method without `^` answers `self` (C2, `chunk_21_plan.md`).
+- *Not to be confused with*:
+  - *Return.* In Smalltalk, `^` is a return, and from a block it is a non-local
+    return that exits the home method. Smol has no non-local return (Q24, I5).
+  - *The VM's `Return` instructions.* These are frame mechanics in the VM's own
+    context: pop the frame, settle the reply. They are not a language term.
+  - *Finishing.* In actor systems, answering and finishing a turn can differ
+    (Erlang's `gen_server:reply/2` answers and keeps running). In Smol today, a
+    method answers when it finishes.
+- *Source*: Smalltalk convention (Squeak/Pharo method comments read
+  "Answer the …"); Q24 in `docs/open_questions.md`.
+
+---
+
 ## Contexts and causality
 
 Working material: `docs/20261031 Thoughts on concurrent theory and contexts.md`;
